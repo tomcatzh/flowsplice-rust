@@ -7,7 +7,7 @@ FlowSplice has two independent trust domains:
 1. Management TLS authenticates Server, Relay, Home, and Travel control links.
 2. Business TLS authenticates only Travel and Home and carries logical TCP/UDP frames.
 
-The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. Mandatory SHA-256 SPKI allowlists further narrow every configured peer.
+The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. SHA-256 SPKI allowlists further narrow the explicitly configured Server, Relay, Travel, and business-Home peer relationships. Server-side Home admission currently trusts the management CA plus the certificate-bound Home role/ID rather than a Home pin.
 
 ## Control topology
 
