@@ -10,6 +10,8 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+    ports:
+      - "127.0.0.1:18443:8443"
     networks: [flowsplice]
 
   server:

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aws-lc-rs.workspace = true
 axum.workspace = true
 clap.workspace = true
 embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }

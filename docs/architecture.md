@@ -7,7 +7,7 @@ FlowSplice has two independent trust domains:
 1. Management TLS authenticates Server, Relay, Home, and Travel control links.
 2. Business TLS authenticates only Travel and Home and carries logical TCP/UDP frames.
 
-The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. SHA-256 SPKI allowlists further narrow the explicitly configured Server, Relay, Travel, and business-Home peer relationships. Server-side Home admission currently trusts the management CA plus the certificate-bound Home role/ID rather than a Home pin.
+The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. SHA-256 SPKI allowlists further narrow every explicitly configured Server, Relay, Travel, management-Home, and business-Home peer relationship. All TLS configurations explicitly permit TLS 1.3 only and use rustls with the AWS-LC provider.
 
 ## Control topology
 
@@ -15,7 +15,7 @@ The CAs are intentionally separate. A Relay management key cannot authenticate a
 Home Agent --outbound mTLS--> Server --outbound mTLS--> Relay <--mTLS-- Travel Agent
 ```
 
-Home publishes the canonical service catalog to Server. Server pushes it to Relay, which reveals it only after Travel authenticates. Server and Relay keep control traffic separate from data sockets.
+Home publishes the canonical service catalog to Server. Server pushes each generation to Relay, and Relay fans changes out over long-lived authenticated Travel catalog subscriptions. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
 
 ## Route and data setup
 
@@ -30,7 +30,7 @@ Home publishes the canonical service catalog to Server. Server pushes it to Rela
 9. Travel and Home complete a separate mutual TLS handshake through both opaque forwarders.
 10. Only inside that business TLS connection does Travel name and open a service.
 
-Every outer frame and payload has a hard bound. Public TLS handshakes and route setup have deadlines. Pending work, pending routes, and active Home/Travel flows have configurable process-local ceilings.
+Every outer frame and payload has a hard bound. The stateful frame decoder is safe to resume after cancellation and all pre-trust/setup reads have deadlines. Pending work, pending routes, and active Home/Travel flows have configurable process-local ceilings.
 
 ## Logical TCP
 
@@ -38,7 +38,7 @@ TCP uses explicit `OPEN`, offset-bearing `DATA`, cumulative `ACK`, and offset-be
 
 ## Logical UDP
 
-Each local client tuple becomes one association with one connected Home UDP socket. Datagram boundaries remain intact. Each direction has a monotonically increasing sequence, duplicates are discarded, and an idle timer reclaims the association. UDP remains best effort; the protocol does not turn it into a reliable stream.
+Each local client tuple becomes one association with one connected Home UDP socket. Datagram boundaries remain intact. Each direction has a monotonically increasing sequence, duplicates are discarded, and an idle timer reclaims the association. Per-association ingress queues are bounded and non-blocking: saturation drops only the current datagram instead of stalling the shared listener. UDP remains best effort; the protocol does not turn it into a reliable stream.
 
 ## Web UI
 

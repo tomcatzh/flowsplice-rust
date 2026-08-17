@@ -13,7 +13,7 @@ use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
     config::load_toml,
-    frame::{read_json, write_json},
+    frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, Role},
     route::{RouteSide, read_preface, verify_preface},
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc, watch},
     time::{interval, sleep, timeout},
 };
 use tokio_rustls::server::TlsStream;
@@ -50,6 +50,9 @@ struct Config {
     cert: PathBuf,
     key: PathBuf,
     management_ca: PathBuf,
+    home_id: String,
+    #[serde(default)]
+    home_spki_pins: Vec<String>,
     #[serde(default)]
     relay_spki_pins: Vec<String>,
     #[serde(default = "default_handshake_timeout")]
@@ -79,10 +82,16 @@ struct PendingWork {
     relay: Option<TcpStream>,
 }
 
+struct HomeSession {
+    session_id: Uuid,
+    tx: mpsc::Sender<ControlMessage>,
+    shutdown: watch::Sender<bool>,
+}
+
 #[derive(Default)]
 struct State {
     catalog: RwLock<Catalog>,
-    home_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
+    home_session: Mutex<Option<HomeSession>>,
     relay_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
     pending: Mutex<HashMap<Uuid, PendingWork>>,
 }
@@ -99,6 +108,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
+    validate_spki_pins(&config.home_spki_pins, "home")?;
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
     let state = Arc::new(State::default());
 
@@ -121,14 +131,14 @@ async fn run_home_listener(config: Config, state: Arc<State>) -> Result<()> {
         let (socket, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let state = Arc::clone(&state);
-        let server_id = config.id.clone();
+        let config = config.clone();
         let timeout_duration = Duration::from_secs(config.handshake_timeout_secs);
         tokio::spawn(async move {
             let result = async {
                 let stream = timeout(timeout_duration, acceptor.accept(socket))
                     .await
                     .context("home TLS handshake timed out")??;
-                handle_home(stream, state, server_id).await
+                handle_home(stream, state, &config).await
             }
             .await;
             if let Err(error) = result {
@@ -141,12 +151,22 @@ async fn run_home_listener(config: Config, state: Arc<State>) -> Result<()> {
 async fn handle_home(
     stream: TlsStream<TcpStream>,
     state: Arc<State>,
-    server_id: String,
+    config: &Config,
 ) -> Result<()> {
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Home, None, &[])?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    match read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await? {
+    require_peer(
+        &identity,
+        Role::Home,
+        Some(&config.home_id),
+        &config.home_spki_pins,
+    )?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    match reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Home && id == identity.id => {}
         _ => bail!("home HELLO does not match its certificate"),
     }
@@ -154,14 +174,40 @@ async fn handle_home(
         &mut writer,
         &ControlMessage::Hello {
             role: Role::Server,
-            id: server_id,
+            id: config.id.clone(),
         },
         CONTROL_FRAME_LIMIT,
     )
     .await?;
 
+    let ControlMessage::HomeRegister { catalog } = reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    else {
+        bail!("home did not register a catalog after HELLO");
+    };
+    if catalog.home_id != identity.id {
+        bail!("catalog home id does not match the authenticated home");
+    }
+    publish_catalog(&state, catalog.clone()).await;
+
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(32);
-    *state.home_tx.lock().await = Some(tx.clone());
+    let session_id = Uuid::new_v4();
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let previous = state.home_session.lock().await.replace(HomeSession {
+        session_id,
+        tx: tx.clone(),
+        shutdown,
+    });
+    if let Some(previous) = previous {
+        warn!(
+            old_session_id = %previous.session_id,
+            new_session_id = %session_id,
+            home_id = %identity.id,
+            "superseding existing Home session"
+        );
+        let _ = previous.shutdown.send(true);
+    }
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             write_json(&mut writer, &message, CONTROL_FRAME_LIMIT).await?;
@@ -170,27 +216,56 @@ async fn handle_home(
     });
 
     info!(home_id = %identity.id, "home agent connected");
-    loop {
-        let message = read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await?;
-        match message {
-            ControlMessage::HomeRegister { catalog } => {
-                if catalog.home_id != identity.id {
-                    bail!("catalog home id does not match the authenticated home");
+    let idle_timeout = Duration::from_secs(config.handshake_timeout_secs.saturating_mul(3).max(1));
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        bail!("Home session was superseded");
+                    }
                 }
-                *state.catalog.write().await = catalog.clone();
-                if let Some(relay) = state.relay_tx.lock().await.clone() {
-                    let _ = relay.send(ControlMessage::Catalog { catalog }).await;
+                message = reader.read_with_timeout::<ControlMessage>(idle_timeout) => {
+                    match message? {
+                        ControlMessage::HomeRegister { catalog } => {
+                            if catalog.home_id != identity.id {
+                                bail!("catalog home id does not match the authenticated home");
+                            }
+                            publish_catalog(&state, catalog).await;
+                        }
+                        ControlMessage::Heartbeat { nonce } => {
+                            tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
+                        }
+                        ControlMessage::HeartbeatAck { .. } => {}
+                        _ => bail!("unexpected message from home agent"),
+                    }
+                    if writer_task.is_finished() {
+                        bail!("home control writer stopped");
+                    }
                 }
             }
-            ControlMessage::Heartbeat { nonce } => {
-                tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
-            }
-            ControlMessage::HeartbeatAck { .. } => {}
-            _ => bail!("unexpected message from home agent"),
         }
-        if writer_task.is_finished() {
-            return Err(anyhow!("home control writer stopped"));
-        }
+    }
+    .await;
+    writer_task.abort();
+    clear_home_session(&state, session_id).await;
+    result
+}
+
+async fn clear_home_session(state: &Arc<State>, session_id: Uuid) {
+    let mut current = state.home_session.lock().await;
+    if current
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id)
+    {
+        *current = None;
+    }
+}
+
+async fn publish_catalog(state: &Arc<State>, catalog: Catalog) {
+    *state.catalog.write().await = catalog.clone();
+    if let Some(relay) = state.relay_tx.lock().await.clone() {
+        let _ = relay.send(ControlMessage::Catalog { catalog }).await;
     }
 }
 
@@ -230,7 +305,8 @@ async fn run_relay_session(
     config: &Config,
     state: &Arc<State>,
 ) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     write_json(
         &mut writer,
         &ControlMessage::Hello {
@@ -240,7 +316,10 @@ async fn run_relay_session(
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    match read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await? {
+    match reader
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Relay && id == config.relay_id => {}
         _ => bail!("relay HELLO does not match expected identity"),
     }
@@ -253,13 +332,15 @@ async fn run_relay_session(
 
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut nonce = 0_u64;
+    let mut last_received = Instant::now();
     loop {
         tokio::select! {
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { bail!("relay writer channel closed"); };
                 write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
             }
-            incoming = read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT) => {
+            incoming = reader.read::<ControlMessage>() => {
+                last_received = Instant::now();
                 match incoming? {
                     ControlMessage::RouteRequest { request_id, travel_id: _ } => {
                         handle_route_request(request_id, config, state, &mut writer).await?;
@@ -272,6 +353,9 @@ async fn run_relay_session(
                 }
             }
             _ = heartbeat.tick() => {
+                if last_received.elapsed() > Duration::from_secs(30) {
+                    bail!("relay control heartbeat timed out");
+                }
                 nonce = nonce.wrapping_add(1);
                 write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
             }
@@ -285,7 +369,12 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
-    let home = state.home_tx.lock().await.clone();
+    let home = state
+        .home_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| session.tx.clone());
     if home.is_none() {
         write_json(
             writer,

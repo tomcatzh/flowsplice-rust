@@ -13,7 +13,7 @@ use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
     config::load_toml,
-    frame::{read_json, write_json},
+    frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, Role},
     route::{RouteSide, read_preface, verify_preface, write_preface},
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tokio::io::copy_bidirectional;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
     time::{interval, timeout},
 };
 use tokio_rustls::server::TlsStream;
@@ -84,12 +84,29 @@ struct PendingRoute {
     expires: Instant,
 }
 
-#[derive(Default)]
+struct ServerSession {
+    session_id: Uuid,
+    tx: mpsc::Sender<ControlMessage>,
+    shutdown: watch::Sender<bool>,
+}
+
 struct State {
-    server_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
-    catalog: RwLock<Catalog>,
+    server_session: Mutex<Option<ServerSession>>,
+    catalog_tx: watch::Sender<Catalog>,
     requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
+}
+
+impl State {
+    fn new() -> Self {
+        let (catalog_tx, _) = watch::channel(Catalog::default());
+        Self {
+            server_session: Mutex::new(None),
+            catalog_tx,
+            requests: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 #[tokio::main]
@@ -106,7 +123,7 @@ async fn main() -> Result<()> {
     let config: Config = load_toml(&args.config)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
     validate_spki_pins(&config.travel_spki_pins, "travel")?;
-    let state = Arc::new(State::default());
+    let state = Arc::new(State::new());
     tokio::try_join!(
         run_management(config.clone(), Arc::clone(&state)),
         run_data(config, Arc::clone(&state)),
@@ -166,8 +183,12 @@ async fn handle_server(
     config: &Config,
     state: Arc<State>,
 ) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    match read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await? {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    match reader
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Server && id == server_id => {}
         _ => bail!("server HELLO does not match its certificate"),
     }
@@ -182,53 +203,97 @@ async fn handle_server(
     .await?;
 
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
-    *state.server_tx.lock().await = Some(tx);
+    let session_id = Uuid::new_v4();
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let previous = state.server_session.lock().await.replace(ServerSession {
+        session_id,
+        tx,
+        shutdown,
+    });
+    if let Some(previous) = previous {
+        warn!(
+            old_session_id = %previous.session_id,
+            new_session_id = %session_id,
+            %server_id,
+            "superseding existing Server session"
+        );
+        let _ = previous.shutdown.send(true);
+    }
     info!(%server_id, "server connected to relay");
 
-    loop {
-        tokio::select! {
-            outgoing = rx.recv() => {
-                let Some(outgoing) = outgoing else { bail!("server writer channel closed"); };
-                write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
-            }
-            incoming = read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT) => {
-                match incoming? {
-                    ControlMessage::Catalog { catalog } => {
-                        *state.catalog.write().await = catalog;
+    let mut liveness = interval(Duration::from_secs(10));
+    let mut last_received = Instant::now();
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        bail!("Server session was superseded");
                     }
-                    ControlMessage::ServerRouteGrant { request_id, work_id, work_secret } => {
-                        if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                            let _ = waiter.send(Ok(ServerGrant { work_id, work_secret }));
+                }
+                outgoing = rx.recv() => {
+                    let Some(outgoing) = outgoing else { bail!("server writer channel closed"); };
+                    write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
+                }
+                incoming = reader.read::<ControlMessage>() => {
+                    last_received = Instant::now();
+                    match incoming? {
+                        ControlMessage::Catalog { catalog } => {
+                            state.catalog_tx.send_replace(catalog);
                         }
-                    }
-                    ControlMessage::RouteDenied { request_id, reason } => {
-                        if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                            let _ = waiter.send(Err(reason));
+                        ControlMessage::ServerRouteGrant { request_id, work_id, work_secret } => {
+                            if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
+                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret }));
+                            }
                         }
+                        ControlMessage::RouteDenied { request_id, reason } => {
+                            if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
+                                let _ = waiter.send(Err(reason));
+                            }
+                        }
+                        ControlMessage::Heartbeat { nonce } => {
+                            write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
+                        }
+                        ControlMessage::HeartbeatAck { .. } => {}
+                        _ => bail!("unexpected message from server"),
                     }
-                    ControlMessage::Heartbeat { nonce } => {
-                        write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
+                }
+                _ = liveness.tick() => {
+                    if last_received.elapsed() > Duration::from_secs(30) {
+                        bail!("server control heartbeat timed out");
                     }
-                    ControlMessage::HeartbeatAck { .. } => {}
-                    _ => bail!("unexpected message from server"),
                 }
             }
         }
     }
+    .await;
+    let mut current = state.server_session.lock().await;
+    if current
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id)
+    {
+        *current = None;
+    }
+    result
 }
 
 async fn handle_travel(
-    mut stream: TlsStream<TcpStream>,
+    stream: TlsStream<TcpStream>,
     travel_id: String,
     config: &Config,
     state: Arc<State>,
 ) -> Result<()> {
-    match read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT).await? {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    match reader
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Travel && id == travel_id => {}
         _ => bail!("travel HELLO does not match its certificate"),
     }
     write_json(
-        &mut stream,
+        &mut writer,
         &ControlMessage::Hello {
             role: Role::Relay,
             id: config.id.clone(),
@@ -236,85 +301,121 @@ async fn handle_travel(
         CONTROL_FRAME_LIMIT,
     )
     .await?;
+    let mut catalog_rx = state.catalog_tx.subscribe();
+    let initial_catalog = catalog_rx.borrow().clone();
     write_json(
-        &mut stream,
+        &mut writer,
         &ControlMessage::Catalog {
-            catalog: state.catalog.read().await.clone(),
+            catalog: initial_catalog,
         },
         CONTROL_FRAME_LIMIT,
     )
     .await?;
 
+    let mut liveness = interval(Duration::from_secs(10));
+    let mut last_received = Instant::now();
     loop {
-        let message = read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT).await?;
-        match message {
-            ControlMessage::RouteRequest {
-                request_id,
-                travel_id: declared_id,
-            } if declared_id == travel_id => {
-                if state.routes.lock().await.len() >= config.max_pending_routes {
-                    write_json(
-                        &mut stream,
-                        &ControlMessage::RouteDenied {
-                            request_id,
-                            reason: "relay pending-route limit reached".to_owned(),
-                        },
-                        CONTROL_FRAME_LIMIT,
-                    )
-                    .await?;
-                    continue;
-                }
-                let result = request_server_route(request_id, &travel_id, &state).await;
-                match result {
-                    Ok(grant) => {
-                        let route_id = Uuid::new_v4();
-                        let mut route_secret = vec![0_u8; 32];
-                        SystemRandom::new()
-                            .fill(&mut route_secret)
-                            .map_err(|_| anyhow!("AWS-LC random generation failed"))?;
-                        state.routes.lock().await.insert(
-                            route_id,
-                            PendingRoute {
-                                work_id: grant.work_id,
-                                route_secret: route_secret.clone(),
-                                work_secret: grant.work_secret,
-                                expires: Instant::now()
-                                    + Duration::from_secs(config.route_ttl_secs),
-                            },
-                        );
+        tokio::select! {
+            message = reader.read::<ControlMessage>() => {
+                last_received = Instant::now();
+                match message? {
+                    ControlMessage::RouteRequest {
+                        request_id,
+                        travel_id: declared_id,
+                    } if declared_id == travel_id => {
+                        handle_travel_route(request_id, &travel_id, config, &state, &mut writer)
+                            .await?;
+                    }
+                    ControlMessage::Heartbeat { nonce } => {
                         write_json(
-                            &mut stream,
-                            &ControlMessage::RouteGrant {
-                                request_id,
-                                route_id,
-                                route_secret,
-                                data_addr: config.data_public_addr.clone(),
-                            },
+                            &mut writer,
+                            &ControlMessage::HeartbeatAck { nonce },
                             CONTROL_FRAME_LIMIT,
                         )
                         .await?;
                     }
-                    Err(reason) => {
-                        write_json(
-                            &mut stream,
-                            &ControlMessage::RouteDenied { request_id, reason },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
+                    ControlMessage::HeartbeatAck { .. } => {}
+                    _ => bail!("unexpected message from travel agent"),
                 }
             }
-            ControlMessage::Heartbeat { nonce } => {
+            changed = catalog_rx.changed() => {
+                changed.map_err(|_| anyhow!("catalog publisher closed"))?;
+                let catalog = catalog_rx.borrow_and_update().clone();
                 write_json(
-                    &mut stream,
-                    &ControlMessage::HeartbeatAck { nonce },
+                    &mut writer,
+                    &ControlMessage::Catalog {
+                        catalog,
+                    },
                     CONTROL_FRAME_LIMIT,
                 )
                 .await?;
             }
-            _ => bail!("unexpected message from travel agent"),
+            _ = liveness.tick() => {
+                if last_received.elapsed() > Duration::from_secs(30) {
+                    bail!("travel management heartbeat timed out");
+                }
+            }
         }
     }
+}
+
+async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
+    request_id: Uuid,
+    travel_id: &str,
+    config: &Config,
+    state: &Arc<State>,
+    writer: &mut W,
+) -> Result<()> {
+    if state.routes.lock().await.len() >= config.max_pending_routes {
+        write_json(
+            writer,
+            &ControlMessage::RouteDenied {
+                request_id,
+                reason: "relay pending-route limit reached".to_owned(),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    }
+    match request_server_route(request_id, travel_id, state).await {
+        Ok(grant) => {
+            let route_id = Uuid::new_v4();
+            let mut route_secret = vec![0_u8; 32];
+            SystemRandom::new()
+                .fill(&mut route_secret)
+                .map_err(|_| anyhow!("AWS-LC random generation failed"))?;
+            state.routes.lock().await.insert(
+                route_id,
+                PendingRoute {
+                    work_id: grant.work_id,
+                    route_secret: route_secret.clone(),
+                    work_secret: grant.work_secret,
+                    expires: Instant::now() + Duration::from_secs(config.route_ttl_secs),
+                },
+            );
+            write_json(
+                writer,
+                &ControlMessage::RouteGrant {
+                    request_id,
+                    route_id,
+                    route_secret,
+                    data_addr: config.data_public_addr.clone(),
+                },
+                CONTROL_FRAME_LIMIT,
+            )
+            .await?;
+        }
+        Err(reason) => {
+            write_json(
+                writer,
+                &ControlMessage::RouteDenied { request_id, reason },
+                CONTROL_FRAME_LIMIT,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn request_server_route(
@@ -323,10 +424,11 @@ async fn request_server_route(
     state: &Arc<State>,
 ) -> Result<ServerGrant, String> {
     let server = state
-        .server_tx
+        .server_session
         .lock()
         .await
-        .clone()
+        .as_ref()
+        .map(|session| session.tx.clone())
         .ok_or_else(|| "server is unavailable".to_owned())?;
     let (tx, rx) = oneshot::channel();
     state.requests.lock().await.insert(request_id, tx);

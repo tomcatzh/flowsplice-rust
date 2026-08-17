@@ -1,17 +1,9 @@
-use std::{
-    fs::File,
-    io::{self, BufReader},
-    path::Path,
-    sync::Arc,
-};
+use std::{io, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
-use rustls::{
-    ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
-    server::WebPkiClientVerifier,
-};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, server::WebPkiClientVerifier};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::{
     extensions::{GeneralName, ParsedExtension},
@@ -28,9 +20,8 @@ pub struct PeerIdentity {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open certificate {}", path.display()))?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(file))
+    let certs = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("failed to open certificate {}", path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse certificate {}", path.display()))?;
     if certs.is_empty() {
@@ -43,11 +34,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open private key {}", path.display()))?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
-        .with_context(|| format!("failed to parse private key {}", path.display()))?
-        .ok_or_else(|| anyhow!("private key file {} contains no key", path.display()))
+    PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("failed to parse private key {}", path.display()))
 }
 
 fn load_roots(path: &Path) -> Result<RootCertStore> {
@@ -72,7 +60,7 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
     let verifier = WebPkiClientVerifier::builder(Arc::new(load_roots(client_ca)?))
         .build()
         .context("failed to build client certificate verifier")?;
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(verifier)
         .with_single_cert(load_certs(cert)?, load_key(key)?)
         .context("failed to build TLS server config")?;
@@ -85,7 +73,7 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
 ///
 /// Returns an error when certificate material is missing, malformed, or inconsistent.
 pub fn client_connector(cert: &Path, key: &Path, server_ca: &Path) -> Result<TlsConnector> {
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(load_roots(server_ca)?)
         .with_client_auth_cert(load_certs(cert)?, load_key(key)?)
         .context("failed to build TLS client config")?;
@@ -208,7 +196,9 @@ pub fn io_other(error: impl Into<anyhow::Error>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_spki_pins;
+    use crate::protocol::Role;
+
+    use super::{PeerIdentity, require_peer, validate_spki_pins};
 
     #[test]
     fn spki_allowlists_are_required_and_strict() {
@@ -216,5 +206,18 @@ mod tests {
         assert!(validate_spki_pins(&["not-hex".to_owned()], "peer").is_err());
         assert!(validate_spki_pins(&["00".repeat(31)], "peer").is_err());
         assert!(validate_spki_pins(&["ab".repeat(32)], "peer").is_ok());
+    }
+
+    #[test]
+    fn peer_authorization_requires_role_id_and_pin() {
+        let identity = PeerIdentity {
+            role: Role::Home,
+            id: "home-1".to_owned(),
+            spki_sha256: "ab".repeat(32),
+        };
+        assert!(require_peer(&identity, Role::Home, Some("home-1"), &["ab".repeat(32)]).is_ok());
+        assert!(require_peer(&identity, Role::Home, Some("home-2"), &["ab".repeat(32)]).is_err());
+        assert!(require_peer(&identity, Role::Home, Some("home-1"), &["cd".repeat(32)]).is_err());
+        assert!(require_peer(&identity, Role::Travel, Some("home-1"), &["ab".repeat(32)]).is_err());
     }
 }

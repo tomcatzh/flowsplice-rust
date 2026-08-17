@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use aws_lc_rs::constant_time::verify_slices_are_equal;
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -23,7 +24,7 @@ use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     config::load_toml,
-    frame::{read_json, write_json},
+    frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, DataFrame, Role, ServiceProtocol},
     route::{RouteSide, write_preface},
@@ -36,9 +37,9 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, RwLock, Semaphore, mpsc},
     task::JoinSet,
-    time::{sleep, timeout},
+    time::{interval, sleep, timeout},
 };
-use tokio_rustls::client::TlsStream;
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -111,10 +112,17 @@ const fn default_max_active_flows() -> usize {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    tls: Arc<TlsMaterial>,
     catalog: Arc<RwLock<Catalog>>,
     started: Instant,
     active_flows: Arc<std::sync::atomic::AtomicUsize>,
     permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct TlsMaterial {
+    management_connector: TlsConnector,
+    business_connector: TlsConnector,
 }
 
 #[derive(Serialize)]
@@ -145,9 +153,22 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
     validate_config(&config)?;
+    let tls = Arc::new(TlsMaterial {
+        management_connector: client_connector(
+            &config.management_cert,
+            &config.management_key,
+            &config.management_ca,
+        )?,
+        business_connector: client_connector(
+            &config.business_cert,
+            &config.business_key,
+            &config.business_ca,
+        )?,
+    });
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let state = AppState {
         config: Arc::new(config),
+        tls,
         catalog: Arc::new(RwLock::new(Catalog::default())),
         started: Instant::now(),
         active_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -155,7 +176,7 @@ async fn main() -> Result<()> {
     };
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(refresh_catalog(state.clone()));
+    tasks.spawn(run_catalog_subscription(state.clone()));
     tasks.spawn(run_ui(state.clone()));
     for mapping in state.config.mappings.clone() {
         let state = state.clone();
@@ -202,34 +223,63 @@ fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn refresh_catalog(state: AppState) -> Result<()> {
+async fn run_catalog_subscription(state: AppState) -> Result<()> {
     loop {
-        match open_management(&state.config).await {
-            Ok((mut stream, catalog)) => {
+        match open_management(&state).await {
+            Ok((stream, catalog)) => {
                 *state.catalog.write().await = catalog;
-                let _ = write_json(
-                    &mut stream,
-                    &ControlMessage::Heartbeat { nonce: 1 },
-                    CONTROL_FRAME_LIMIT,
-                )
-                .await;
+                info!(relay = %state.config.relay_management_addr, "catalog subscription connected");
+                if let Err(error) = run_catalog_session(&state, stream).await {
+                    warn!(%error, "catalog subscription disconnected");
+                }
             }
-            Err(error) => warn!(%error, "catalog refresh failed"),
+            Err(error) => warn!(%error, "catalog subscription failed"),
         }
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn open_management(config: &Config) -> Result<(TlsStream<TcpStream>, Catalog)> {
-    let connector = client_connector(
-        &config.management_cert,
-        &config.management_key,
-        &config.management_ca,
-    )?;
+async fn run_catalog_session(state: &AppState, stream: TlsStream<TcpStream>) -> Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    let mut heartbeat = interval(Duration::from_secs(10));
+    let mut nonce = 0_u64;
+    let mut last_received = Instant::now();
+    loop {
+        tokio::select! {
+            message = reader.read::<ControlMessage>() => {
+                last_received = Instant::now();
+                match message? {
+                    ControlMessage::Catalog { catalog } => {
+                        *state.catalog.write().await = catalog;
+                    }
+                    ControlMessage::Heartbeat { nonce } => {
+                        write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
+                    }
+                    ControlMessage::HeartbeatAck { .. } => {}
+                    _ => bail!("unexpected message on catalog subscription"),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() > Duration::from_secs(30) {
+                    bail!("relay catalog heartbeat timed out");
+                }
+                nonce = nonce.wrapping_add(1);
+                write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
+            }
+        }
+    }
+}
+
+async fn open_management(state: &AppState) -> Result<(TlsStream<TcpStream>, Catalog)> {
+    let config = &state.config;
     let socket = TcpStream::connect(&config.relay_management_addr).await?;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
-        connector.connect(server_name(&config.relay_server_name)?, socket),
+        state
+            .tls
+            .management_connector
+            .connect(server_name(&config.relay_server_name)?, socket),
     )
     .await
     .context("relay TLS handshake timed out")??;
@@ -249,23 +299,33 @@ async fn open_management(config: &Config) -> Result<(TlsStream<TcpStream>, Catal
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    match read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT).await? {
+    let mut reader = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT);
+    let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    match reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Relay && id == config.relay_id => {}
         _ => bail!("relay sent an invalid HELLO"),
     }
-    let ControlMessage::Catalog { catalog } =
-        read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT).await?
+    let ControlMessage::Catalog { catalog } = reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
     else {
         bail!("relay did not send a catalog");
     };
+    drop(reader);
     Ok((stream, catalog))
 }
 
-async fn request_route(config: &Config) -> Result<RouteGrant> {
-    let (mut stream, _) = open_management(config).await?;
+async fn request_route(state: &AppState) -> Result<RouteGrant> {
+    let config = &state.config;
+    let (stream, _) = open_management(state).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let request_id = Uuid::new_v4();
     write_json(
-        &mut stream,
+        &mut writer,
         &ControlMessage::RouteRequest {
             request_id,
             travel_id: config.id.clone(),
@@ -273,33 +333,48 @@ async fn request_route(config: &Config) -> Result<RouteGrant> {
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    match timeout(
-        Duration::from_secs(10),
-        read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT),
-    )
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match reader.read::<ControlMessage>().await? {
+                ControlMessage::RouteGrant {
+                    request_id: response_id,
+                    route_id,
+                    route_secret,
+                    data_addr,
+                } if response_id == request_id => {
+                    return Ok(RouteGrant {
+                        route_id,
+                        route_secret,
+                        data_addr,
+                    });
+                }
+                ControlMessage::RouteDenied {
+                    request_id: response_id,
+                    reason,
+                } if response_id == request_id => bail!("route denied: {reason}"),
+                ControlMessage::Catalog { catalog } => {
+                    *state.catalog.write().await = catalog;
+                }
+                ControlMessage::Heartbeat { nonce } => {
+                    write_json(
+                        &mut writer,
+                        &ControlMessage::HeartbeatAck { nonce },
+                        CONTROL_FRAME_LIMIT,
+                    )
+                    .await?;
+                }
+                ControlMessage::HeartbeatAck { .. } => {}
+                _ => bail!("invalid route response"),
+            }
+        }
+    })
     .await
-    .context("route request timed out")??
-    {
-        ControlMessage::RouteGrant {
-            request_id: response_id,
-            route_id,
-            route_secret,
-            data_addr,
-        } if response_id == request_id => Ok(RouteGrant {
-            route_id,
-            route_secret,
-            data_addr,
-        }),
-        ControlMessage::RouteDenied {
-            request_id: response_id,
-            reason,
-        } if response_id == request_id => bail!("route denied: {reason}"),
-        _ => bail!("invalid route response"),
-    }
+    .context("route request timed out")?
 }
 
-async fn open_business(config: &Config) -> Result<TlsStream<TcpStream>> {
-    let grant = request_route(config).await?;
+async fn open_business(state: &AppState) -> Result<TlsStream<TcpStream>> {
+    let config = &state.config;
+    let grant = request_route(state).await?;
     let mut socket = TcpStream::connect(&grant.data_addr).await?;
     write_preface(
         &mut socket,
@@ -308,14 +383,12 @@ async fn open_business(config: &Config) -> Result<TlsStream<TcpStream>> {
         &grant.route_secret,
     )
     .await?;
-    let connector = client_connector(
-        &config.business_cert,
-        &config.business_key,
-        &config.business_ca,
-    )?;
     let stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
-        connector.connect(server_name(&config.home_server_name)?, socket),
+        state
+            .tls
+            .business_connector
+            .connect(server_name(&config.home_server_name)?, socket),
     )
     .await
     .context("business TLS handshake timed out")??;
@@ -343,15 +416,15 @@ async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
-            if let Err(error) = run_tcp_flow(&state.config, &mapping, local).await {
+            if let Err(error) = run_tcp_flow(&state, &mapping, local).await {
                 warn!(%peer, service_id = %mapping.service_id, %error, "TCP flow closed");
             }
         });
     }
 }
 
-async fn run_tcp_flow(config: &Config, mapping: &Mapping, local: TcpStream) -> Result<()> {
-    let mut business = open_business(config).await?;
+async fn run_tcp_flow(state: &AppState, mapping: &Mapping, local: TcpStream) -> Result<()> {
+    let mut business = open_business(state).await?;
     let flow_id = Uuid::new_v4();
     write_json(
         &mut business,
@@ -363,7 +436,10 @@ async fn run_tcp_flow(config: &Config, mapping: &Mapping, local: TcpStream) -> R
         DATA_FRAME_LIMIT,
     )
     .await?;
-    match read_json::<_, DataFrame>(&mut business, DATA_FRAME_LIMIT).await? {
+    match JsonFrameReader::new(&mut business, DATA_FRAME_LIMIT)
+        .read_with_timeout::<DataFrame>(Duration::from_secs(state.config.handshake_timeout_secs))
+        .await?
+    {
         DataFrame::OpenOk { flow_id: id } if id == flow_id => {}
         DataFrame::OpenError { reason, .. } => bail!("home rejected TCP flow: {reason}"),
         _ => bail!("invalid TCP OPEN response"),
@@ -373,6 +449,7 @@ async fn run_tcp_flow(config: &Config, mapping: &Mapping, local: TcpStream) -> R
 
 async fn pump_tcp(business: TlsStream<TcpStream>, local: TcpStream, flow_id: Uuid) -> Result<()> {
     let (mut tls_reader, mut tls_writer) = tokio::io::split(business);
+    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
     let (mut local_reader, mut local_writer) = local.into_split();
     let mut send_offset = 0_u64;
     let mut receive_offset = 0_u64;
@@ -393,7 +470,7 @@ async fn pump_tcp(business: TlsStream<TcpStream>, local: TcpStream, flow_id: Uui
                     send_offset += count as u64;
                 }
             }
-            frame = read_json::<_, DataFrame>(&mut tls_reader, DATA_FRAME_LIMIT) => {
+            frame = tls_reader.read::<DataFrame>() => {
                 match frame? {
                     DataFrame::Data { flow_id: id, offset, bytes } if id == flow_id && offset == receive_offset && bytes.len() <= MAX_DATA_PAYLOAD => {
                         local_writer.write_all(&bytes).await?;
@@ -422,19 +499,35 @@ async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
     let mut buffer = vec![0_u8; 65_507];
     loop {
         let (count, peer) = socket.recv_from(&mut buffer).await?;
-        let bytes = buffer[..count].to_vec();
+        let mut bytes = buffer[..count].to_vec();
         let existing = associations.lock().await.get(&peer).cloned();
         if let Some(tx) = existing {
-            let _ = tx.send(bytes).await;
-            continue;
+            match tx.try_send(bytes) {
+                Ok(()) => continue,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(%peer, "dropping UDP datagram for a saturated association");
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    bytes = returned;
+                    let mut current = associations.lock().await;
+                    if current
+                        .get(&peer)
+                        .is_some_and(|candidate| candidate.same_channel(&tx))
+                    {
+                        current.remove(&peer);
+                    }
+                }
+            }
         }
         let (tx, rx) = mpsc::channel(64);
         let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
             warn!(%peer, "travel active-flow limit reached");
             continue;
         };
-        tx.send(bytes).await?;
-        associations.lock().await.insert(peer, tx);
+        tx.try_send(bytes)
+            .map_err(|_| anyhow::anyhow!("new UDP association channel unexpectedly unavailable"))?;
+        associations.lock().await.insert(peer, tx.clone());
         let socket = Arc::clone(&socket);
         let associations = Arc::clone(&associations);
         let state = state.clone();
@@ -442,23 +535,29 @@ async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
-            if let Err(error) = run_udp_association(&state.config, &mapping, socket, peer, rx).await
-            {
+            if let Err(error) = run_udp_association(&state, &mapping, socket, peer, rx).await {
                 warn!(%peer, service_id = %mapping.service_id, %error, "UDP association closed");
             }
-            associations.lock().await.remove(&peer);
+            let mut current = associations.lock().await;
+            if current
+                .get(&peer)
+                .is_some_and(|candidate| candidate.same_channel(&tx))
+            {
+                current.remove(&peer);
+            }
         });
     }
 }
 
 async fn run_udp_association(
-    config: &Config,
+    state: &AppState,
     mapping: &Mapping,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     mut outgoing: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let mut business = open_business(config).await?;
+    let config = &state.config;
+    let mut business = open_business(state).await?;
     let flow_id = Uuid::new_v4();
     write_json(
         &mut business,
@@ -470,12 +569,16 @@ async fn run_udp_association(
         DATA_FRAME_LIMIT,
     )
     .await?;
-    match read_json::<_, DataFrame>(&mut business, DATA_FRAME_LIMIT).await? {
+    match JsonFrameReader::new(&mut business, DATA_FRAME_LIMIT)
+        .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
         DataFrame::OpenOk { flow_id: id } if id == flow_id => {}
         DataFrame::OpenError { reason, .. } => bail!("home rejected UDP flow: {reason}"),
         _ => bail!("invalid UDP OPEN response"),
     }
     let (mut reader, mut writer) = tokio::io::split(business);
+    let mut reader = JsonFrameReader::new(&mut reader, DATA_FRAME_LIMIT);
     let mut send_sequence = 0_u64;
     let mut receive_sequence = 0_u64;
     loop {
@@ -485,7 +588,7 @@ async fn run_udp_association(
                 write_json(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes }, DATA_FRAME_LIMIT).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(config.udp_idle_secs), read_json::<_, DataFrame>(&mut reader, DATA_FRAME_LIMIT)) => {
+            frame = timeout(Duration::from_secs(config.udp_idle_secs), reader.read::<DataFrame>()) => {
                 match frame.context("UDP association idle timeout")?? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
@@ -553,7 +656,9 @@ async fn authorize_ui(State(state): State<AppState>, request: Request, next: Nex
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected);
+        .is_some_and(|token| {
+            verify_slices_are_equal(token.as_bytes(), expected.as_bytes()).is_ok()
+        });
     if authorized {
         next.run(request).await
     } else {

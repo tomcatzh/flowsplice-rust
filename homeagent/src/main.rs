@@ -1,13 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::{future::pending, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    future::pending,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     config::load_toml,
-    frame::{read_json, write_json},
+    frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, DataFrame, Role, Service, ServiceProtocol},
     route::{RouteSide, write_preface},
@@ -23,7 +28,10 @@ use tokio::{
     sync::Semaphore,
     time::{interval, sleep, timeout},
 };
-use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream};
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
+    server::TlsStream as ServerTlsStream,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -72,6 +80,12 @@ const fn default_max_active_flows() -> usize {
     128
 }
 
+#[derive(Clone)]
+struct TlsMaterial {
+    management_connector: TlsConnector,
+    business_acceptor: TlsAcceptor,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_crypto();
@@ -86,10 +100,24 @@ async fn main() -> Result<()> {
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
     validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    let tls = Arc::new(TlsMaterial {
+        management_connector: client_connector(
+            &config.management_cert,
+            &config.management_key,
+            &config.management_ca,
+        )?,
+        business_acceptor: server_acceptor(
+            &config.business_cert,
+            &config.business_key,
+            &config.business_ca,
+        )?,
+    });
     let config = Arc::new(config);
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     loop {
-        if let Err(error) = run_control(Arc::clone(&config), Arc::clone(&permits)).await {
+        if let Err(error) =
+            run_control(Arc::clone(&config), Arc::clone(&permits), Arc::clone(&tls)).await
+        {
             warn!(%error, "server control disconnected; reconnecting");
         }
         sleep(Duration::from_secs(1)).await;
@@ -112,16 +140,16 @@ fn validate_services(services: &[Service]) -> Result<()> {
     Ok(())
 }
 
-async fn run_control(config: Arc<Config>, permits: Arc<Semaphore>) -> Result<()> {
-    let connector = client_connector(
-        &config.management_cert,
-        &config.management_key,
-        &config.management_ca,
-    )?;
+async fn run_control(
+    config: Arc<Config>,
+    permits: Arc<Semaphore>,
+    tls: Arc<TlsMaterial>,
+) -> Result<()> {
     let socket = TcpStream::connect(&config.server_control_addr).await?;
     let stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
-        connector.connect(server_name(&config.server_name)?, socket),
+        tls.management_connector
+            .connect(server_name(&config.server_name)?, socket),
     )
     .await
     .context("server TLS handshake timed out")??;
@@ -132,16 +160,19 @@ async fn run_control(config: Arc<Config>, permits: Arc<Semaphore>) -> Result<()>
         Some(&config.server_id),
         &config.server_spki_pins,
     )?;
-    run_control_session(stream, config, permits).await
+    run_control_session(stream, config, permits, tls).await
 }
 
 async fn run_control_session(
-    mut stream: ClientTlsStream<TcpStream>,
+    stream: ClientTlsStream<TcpStream>,
     config: Arc<Config>,
     permits: Arc<Semaphore>,
+    tls: Arc<TlsMaterial>,
 ) -> Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     write_json(
-        &mut stream,
+        &mut writer,
         &ControlMessage::Hello {
             role: Role::Home,
             id: config.id.clone(),
@@ -149,12 +180,15 @@ async fn run_control_session(
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    match read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT).await? {
+    match reader
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
         ControlMessage::Hello { role, id } if role == Role::Server && id == config.server_id => {}
         _ => bail!("server sent an invalid HELLO"),
     }
     write_json(
-        &mut stream,
+        &mut writer,
         &ControlMessage::HomeRegister {
             catalog: Catalog {
                 home_id: config.id.clone(),
@@ -170,9 +204,11 @@ async fn run_control_session(
 
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut nonce = 0_u64;
+    let mut last_received = Instant::now();
     loop {
         tokio::select! {
-            message = read_json::<_, ControlMessage>(&mut stream, CONTROL_FRAME_LIMIT) => {
+            message = reader.read::<ControlMessage>() => {
+                last_received = Instant::now();
                 match message? {
                     ControlMessage::OpenWork { work_id, work_secret } => {
                         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
@@ -180,46 +216,52 @@ async fn run_control_session(
                             continue;
                         };
                         let config = Arc::clone(&config);
+                        let tls = Arc::clone(&tls);
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(error) = run_work(config, work_id, work_secret).await {
+                            if let Err(error) = run_work(config, tls, work_id, work_secret).await {
                                 warn!(%work_id, %error, "home work failed");
                             }
                         });
                     }
                     ControlMessage::Heartbeat { nonce } => {
-                        write_json(&mut stream, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
+                        write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
                     }
                     ControlMessage::HeartbeatAck { .. } => {}
                     _ => bail!("unexpected message from server"),
                 }
             }
             _ = heartbeat.tick() => {
+                if last_received.elapsed() > Duration::from_secs(30) {
+                    bail!("server control heartbeat timed out");
+                }
                 nonce = nonce.wrapping_add(1);
-                write_json(&mut stream, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
+                write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
             }
         }
     }
 }
 
-async fn run_work(config: Arc<Config>, work_id: Uuid, work_secret: Vec<u8>) -> Result<()> {
+async fn run_work(
+    config: Arc<Config>,
+    tls: Arc<TlsMaterial>,
+    work_id: Uuid,
+    work_secret: Vec<u8>,
+) -> Result<()> {
     let mut socket = TcpStream::connect(&config.server_data_addr).await?;
     write_preface(&mut socket, RouteSide::Home, work_id, &work_secret).await?;
-    let acceptor = server_acceptor(
-        &config.business_cert,
-        &config.business_key,
-        &config.business_ca,
-    )?;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
-        acceptor.accept(socket),
+        tls.business_acceptor.accept(socket),
     )
     .await
     .context("business TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
     require_peer(&identity, Role::Travel, None, &config.travel_spki_pins)?;
 
-    let open = read_json::<_, DataFrame>(&mut stream, DATA_FRAME_LIMIT).await?;
+    let open = JsonFrameReader::new(&mut stream, DATA_FRAME_LIMIT)
+        .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?;
     let DataFrame::Open {
         flow_id,
         service_id,
@@ -250,6 +292,7 @@ async fn serve_tcp(
         .await
         .with_context(|| format!("failed to connect service {}", service.id))?;
     let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
+    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
     let (mut target_reader, mut target_writer) = target.into_split();
     write_json(
         &mut tls_writer,
@@ -278,7 +321,7 @@ async fn serve_tcp(
                     send_offset += count as u64;
                 }
             }
-            frame = read_json::<_, DataFrame>(&mut tls_reader, DATA_FRAME_LIMIT) => {
+            frame = tls_reader.read::<DataFrame>() => {
                 match frame? {
                     DataFrame::Data { flow_id: id, offset, bytes } if id == flow_id && offset == receive_offset && bytes.len() <= MAX_DATA_PAYLOAD => {
                         target_writer.write_all(&bytes).await?;
@@ -308,6 +351,7 @@ async fn serve_udp(
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(&service.target).await?;
     let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
+    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
     write_json(
         &mut tls_writer,
         &DataFrame::OpenOk { flow_id },
@@ -324,7 +368,7 @@ async fn serve_udp(
                 write_json(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: buffer[..count].to_vec() }, DATA_FRAME_LIMIT).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(idle_secs), read_json::<_, DataFrame>(&mut tls_reader, DATA_FRAME_LIMIT)) => {
+            frame = timeout(Duration::from_secs(idle_secs), tls_reader.read::<DataFrame>()) => {
                 match frame.context("UDP association idle timeout")?? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {

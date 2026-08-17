@@ -17,6 +17,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 The management plane uses mutual TLS. Every leaf certificate contains exactly one FlowSplice URI SAN in the form `flowsplice://identity/<role>/<id>`. Management and business traffic use separate CA roots, and selected peer relationships are narrowed further with SHA-256 SPKI allowlists. Business TLS is terminated only by Travel and Home; Relay and Server forward its bytes without possessing the business private keys. Exact trust, visibility, and current limitations are documented below.
 
 See [Architecture](docs/architecture.md) for the detailed boundary and protocol flow.
+See [Security Audit Remediation — 2026-08-17](docs/security-audit-remediation-2026-08-17.md) for the finding-by-finding verification and disposition of the independent Kimi K3 review.
 
 ## Repository layout
 
@@ -50,12 +51,13 @@ FlowSplice does not attempt to hide IP addresses, connection timing, byte counts
 
 ### Cryptographic primitives and versions
 
-- TLS is implemented by [`rustls`](https://docs.rs/rustls/latest/rustls/) through `tokio-rustls`. Cargo disables rustls default features and explicitly enables the `aws_lc_rs`, `std`, and `tls12` features.
+- TLS is implemented by [`rustls`](https://docs.rs/rustls/latest/rustls/) through `tokio-rustls`. Cargo disables rustls default features and explicitly enables only the `aws_lc_rs` and `std` features.
 - Every executable calls `rustls::crypto::aws_lc_rs::default_provider().install_default()` during startup. The resolved initial release uses rustls 0.23.43 and `aws-lc-rs` 1.18.0; `Cargo.lock` is the exact version authority.
-- The current builders use rustls' default protocol versions and cipher-suite selection. Because the `tls12` feature is enabled, the current implementation permits TLS 1.2 and TLS 1.3; it does not enforce TLS-1.3-only operation. TLS 1.3 is standardized in [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446).
+- Every client and server configuration explicitly selects TLS 1.3 through rustls' protocol-version builder; TLS 1.2 code is not enabled. Cipher suites, key exchange, signature verification, and secure randomness come from the rustls AWS-LC provider. TLS 1.3 is standardized in [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446).
 - Route and work admission use HMAC-SHA256 from `aws-lc-rs`, following the standard HMAC construction defined by [RFC 2104](https://www.rfc-editor.org/rfc/rfc2104). Each HMAC key is an independent 32-byte value generated with AWS-LC `SystemRandom`.
 - SPKI pins are the lowercase hexadecimal SHA-256 digest of the peer leaf certificate's DER SubjectPublicKeyInfo. The comparison is case-insensitive; each configured value must decode to exactly 32 bytes.
 - Certificates are ordinary X.509 certificates validated through rustls/webpki. FlowSplice adds an application identity URI in Subject Alternative Name, whose general PKI form is defined by [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280).
+- PEM certificate and private-key loading uses `rustls-pki-types`; the runtime does not depend on the unmaintained `rustls-pemfile` crate.
 - UUIDs identify requests, routes, work items, and flows, but UUID secrecy is not a security boundary. Possession of the corresponding random HMAC secret or a valid mutually authenticated TLS identity is what grants admission.
 - FlowSplice does not implement a custom encryption algorithm, custom hash construction, or custom certificate-signature scheme. The `fips` feature is not enabled, so the project makes no FIPS claim.
 
@@ -93,10 +95,12 @@ Successful TLS chain validation is necessary but not sufficient. FlowSplice appl
 Current SPKI coverage is directional and explicit:
 
 - Server pins the Relay it connects to.
+- Server pins the expected management Home and requires its configured stable Home ID.
 - Relay pins its Server and the Travel certificates it accepts.
 - Home pins its Server and the business Travel certificates it accepts.
 - Travel pins its Relay and the business Home certificate it accepts.
-- Server currently does **not** have a Home SPKI allowlist or configured expected Home ID. It accepts a Home management certificate signed by the management CA when its URI role is `home` and its `HELLO` ID matches the certificate. Therefore the management CA is the current Server-side Home enrollment authority.
+
+The single active Home session is explicit: a newly authenticated session for the configured Home identity supersedes the previous session, logs the takeover, and actively closes the old session. A different Home ID or a Home key outside Server's allowlist is rejected before registration.
 
 An SPKI pin binds the public key rather than the full certificate. Renewing a certificate with the same key preserves the pin; rotating the key requires deploying an overlapping old/new allowlist before switching certificates. CA roots and pins serve different purposes: the CA establishes a valid credential domain, while a pin narrows which keys inside that domain are accepted.
 
@@ -131,6 +135,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 ### Secret storage and lifecycle
 
 - Runtime processes load leaf certificates, leaf private keys, and public CA certificates from configured PEM files. CA private keys are not required by any runtime component.
+- TLS client/server configurations are built once at process startup and reused. Certificate and key changes therefore take effect after a deliberate process restart rather than being reparsed on every flow.
 - Production private keys and configuration files must be protected with filesystem ownership and permissions. The current loader does not provide encrypted-key prompting, an HSM abstraction, or an OS keychain integration.
 - Route and work secrets exist only in process memory, are independently generated, are bounded by TTL, and are not persisted across restart. Application logging intentionally records IDs and errors, not secret byte values.
 - Secret vectors may be cloned while being delivered to the required components and are not backed by a guaranteed zeroizing memory type. Process-memory compromise is outside the current protection boundary.
@@ -139,11 +144,13 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 
 ### Fail-closed and resource boundaries
 
-- Control and data JSON frames are capped at 1 MiB; a single logical data payload is capped at 64 KiB.
-- Public TLS handshakes and route-preface reads default to 10-second deadlines.
+- Control and data JSON frames are capped at 1 MiB; a single logical data payload is capped at 64 KiB. The stateful reader preserves partial-frame progress when a `select` branch is cancelled.
+- Public TLS handshakes, route-preface reads, control setup frames, route responses, and the business `OPEN` frame default to bounded deadlines. Established control links are disconnected after three missed 10-second heartbeat intervals.
 - Pending Server work and Relay routes default to 256 entries each; Home and Travel active-flow limits default to 128.
 - Route IDs are unknown after expiry, completed pairings are removed, duplicate sides are rejected, and a consumed Relay route cannot be reused.
 - Unexpected message types, identity disagreement, discontinuous TCP offsets, oversized payloads, and invalid route MACs close the affected connection.
+- Travel keeps one long-lived catalog subscription. Server pushes catalog changes to Relay and Relay immediately fans them out to connected Travel sessions; this avoids periodic full mTLS polling.
+- UDP association ingress uses bounded non-blocking queues. A saturated association loses its current datagram, consistent with UDP semantics, without blocking unrelated peers.
 - Workspace Rust code forbids `unsafe`; this does not mean that every transitive dependency or the AWS-LC C implementation contains no unsafe/native code.
 
 ### Current security limits and operator obligations
@@ -152,10 +159,8 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Remotely bound TCP/UDP mappings do not gain bearer-token authentication. `allow_remote_listen = true` only permits the bind; network access must be restricted by a firewall, VPN, or an application-level protocol.
 - All business-authorized Travel keys in Home's pin list can request any published service. Per-Travel service ACLs are not implemented.
 - Catalog integrity is hop-by-hop through management TLS, not end-to-end signed by Home. A compromised Server or Relay can falsify the catalog shown to Travel, although Home still refuses an unknown or protocol-mismatched service ID.
-- TLS 1.2 remains enabled. Enforcing TLS 1.3 only requires an implementation and compatibility decision, not merely a configuration assumption.
-- Server-side Home trust currently rests on the management CA plus certificate/HELLO role-ID consistency rather than a Home SPKI pin.
 - The system does not hide traffic metadata, resist endpoint compromise, guarantee availability against Relay/Server or network denial, provide durable replay state across restart, or claim protection after a CA/private key is stolen.
-- The project has not undergone an independent security audit. Deployments should treat this release as an auditable implementation baseline, not as a certified security product.
+- The project has not undergone a professional third-party security audit. Deployments should treat this release as an auditable implementation baseline, not as a certified security product.
 
 ### Frontend containment
 
@@ -176,6 +181,8 @@ make e2e
 - TCP and UDP data through the complete topology;
 - mutual management TLS and separate Travel-to-Home business TLS;
 - single-use HMAC-authenticated route setup;
+- TLS-1.2 rejection, TLS-1.3 mutual authentication, and incomplete-control-frame expiry;
+- live catalog push across a Home restart without reconnecting Travel's subscription, followed by TCP/UDP regression checks;
 - the embedded UI, gzip/Brotli selection, representation-specific ETags, and correct `404` boundaries.
 
 Generated keys, web output, build targets, and release binaries are ignored by Git.

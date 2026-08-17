@@ -13,6 +13,8 @@ make_ca() {
   local name="$1"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -nodes \
     -days 30 -subj "/CN=FlowSplice ${name}" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -keyout "${cert_dir}/${name}.key" -out "${cert_dir}/${name}.crt" >/dev/null 2>&1
 }
 
@@ -58,6 +60,7 @@ spki_pin() {
 
 server_pin="$(spki_pin server)"
 relay_pin="$(spki_pin relay)"
+home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
 travel_management_pin="$(spki_pin travel-management)"
 travel_business_pin="$(spki_pin travel-business)"
@@ -67,6 +70,7 @@ for template in "${script_dir}"/config/*.toml; do
   sed \
     -e "s/__SERVER_PIN__/${server_pin}/g" \
     -e "s/__RELAY_PIN__/${relay_pin}/g" \
+    -e "s/__HOME_MANAGEMENT_PIN__/${home_management_pin}/g" \
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
     -e "s/__TRAVEL_MANAGEMENT_PIN__/${travel_management_pin}/g" \
     -e "s/__TRAVEL_BUSINESS_PIN__/${travel_business_pin}/g" \

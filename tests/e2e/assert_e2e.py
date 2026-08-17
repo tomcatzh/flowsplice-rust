@@ -2,8 +2,11 @@
 import gzip
 import http.client
 import json
+from pathlib import Path
 import re
 import socket
+import ssl
+import sys
 import time
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
@@ -21,7 +24,7 @@ def http_get(path: str, headers: dict[str, str] | None = None):
     return result
 
 
-def wait_ready() -> dict:
+def wait_ready(expected_services: int, expected_home_alias: str) -> dict:
     deadline = time.monotonic() + 90
     last_error = None
     while time.monotonic() < deadline:
@@ -31,7 +34,11 @@ def wait_ready() -> dict:
             if status == 200 and catalog_status == 200:
                 state = json.loads(body)
                 catalog = json.loads(catalog_body)
-                if state["ok"] and len(catalog["services"]) == 2:
+                if (
+                    state["ok"]
+                    and catalog["home_alias"] == expected_home_alias
+                    and len(catalog["services"]) == expected_services
+                ):
                     return state
         except Exception as error:  # startup polling deliberately records all transport failures
             last_error = error
@@ -86,8 +93,59 @@ def check_embedded_spa() -> None:
     assert asset_status == 404
 
 
-state = wait_ready()
-check_tcp()
-check_udp()
-check_embedded_spa()
-print(json.dumps({"result": "ok", "travel": state["travel_id"], "checks": ["tcp", "udp", "embedded-spa"]}))
+def management_tls_context(version: ssl.TLSVersion) -> ssl.SSLContext:
+    cert_dir = Path(__file__).resolve().parent / "generated" / "certs"
+    context = ssl.create_default_context(cafile=str(cert_dir / "management-ca.crt"))
+    context.minimum_version = version
+    context.maximum_version = version
+    context.load_cert_chain(
+        certfile=str(cert_dir / "travel-management.crt"),
+        keyfile=str(cert_dir / "travel-management.key"),
+    )
+    return context
+
+
+def check_tls_policy_and_slow_loris_deadline() -> None:
+    tls12 = management_tls_context(ssl.TLSVersion.TLSv1_2)
+    try:
+        with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
+            with tls12.wrap_socket(raw, server_hostname="relay.flowsplice"):
+                pass
+    except (OSError, ssl.SSLError):
+        pass
+    else:
+        raise AssertionError("Relay unexpectedly accepted TLS 1.2")
+
+    tls13 = management_tls_context(ssl.TLSVersion.TLSv1_3)
+    with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
+        with tls13.wrap_socket(raw, server_hostname="relay.flowsplice") as stream:
+            assert stream.version() == "TLSv1.3"
+            stream.settimeout(13)
+            stream.sendall(b"\x00\x00")
+            started = time.monotonic()
+            try:
+                closed = stream.recv(1) == b""
+            except ssl.SSLEOFError:
+                closed = True
+            elapsed = time.monotonic() - started
+            assert closed, "Relay did not close the incomplete control frame"
+            assert elapsed < 12, f"slow control frame survived too long: {elapsed:.2f}s"
+
+
+phase = sys.argv[1] if len(sys.argv) > 1 else "initial"
+if phase == "initial":
+    state = wait_ready(2, "E2E Home")
+    check_tcp()
+    check_udp()
+    check_embedded_spa()
+    check_tls_policy_and_slow_loris_deadline()
+    checks = ["tcp", "udp", "embedded-spa", "tls13-only", "slow-frame-deadline"]
+elif phase == "catalog-update":
+    state = wait_ready(3, "E2E Home Updated")
+    check_tcp()
+    check_udp()
+    checks = ["catalog-push", "tcp-after-home-restart", "udp-after-home-restart"]
+else:
+    raise AssertionError(f"unknown E2E phase: {phase}")
+
+print(json.dumps({"result": "ok", "phase": phase, "travel": state["travel_id"], "checks": checks}))
