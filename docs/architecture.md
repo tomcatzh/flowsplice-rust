@@ -12,41 +12,49 @@ The CAs are intentionally separate. A Relay management key cannot authenticate a
 ## Control topology
 
 ```text
-                                   ┌--outbound mTLS--> Relay A <--mTLS--┐
-Home Agent --outbound mTLS--> Server                                  Travel Agent
-                                   └--outbound mTLS--> Relay B <--mTLS--┘
+Home Agent A --outbound mTLS--┐       ┌--outbound mTLS--> Relay A <--mTLS--┐
+                              ├--> Server                                  Travel Agent
+Home Agent B --outbound mTLS--┘       └--outbound mTLS--> Relay B <--mTLS--┘
 ```
 
-Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog, complete Relay directory, and Travel authorization snapshot to each one, and each Relay fans catalog/directory changes out over authenticated Travel management sessions. Home and every Relay must durably apply and acknowledge the initial authorization generation before their control session becomes available. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed 10-second heartbeat intervals.
+Each Home publishes its own catalog. Server authenticates each configured Home ID against that Home's management SPKI pins, keeps one replaceable session per Home ID, and publishes a sorted aggregate catalog. Reconnecting one Home supersedes only that ID's old session; disconnecting it removes only its catalog. Server also maintains an isolated reconnect loop and sender for every configured Relay, pushes the aggregate catalog, complete Relay directory, and Travel authorization snapshot to each one, and each Relay fans catalog/directory changes out over authenticated Travel management sessions. Every Home and Relay must durably apply and acknowledge the initial authorization generation before its control session becomes available. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed 10-second heartbeat intervals.
 
 At process startup Travel creates a random in-memory session UUID. The first catalog connection for a signed Travel credential acquires a 45-second renewable lease in Server through its Relay. Connections through other Relays are allowed only when they carry the same credential ID and process-session UUID, which is required for multi-Relay route competition. A different process-session UUID for the same credential is rejected globally and cannot displace the active session. Server prunes an unrenewed lease, allowing a later process to log in after the old process is no longer demonstrably online.
 
-Server may bind multiple explicit IPv4 and IPv6 addresses for both Home control and Relay/Home data
-pairing. All configured listeners are bound before their accept loops start, so a partial bind failure
-fails startup instead of silently exposing an incomplete topology.
+Server binds exactly one explicit Home-control address shared by all configured Home identities and may bind multiple explicit IPv4 and IPv6 addresses for Relay/Home data pairing. All configured data listeners are bound before their accept loops start, so a partial bind failure fails startup instead of silently exposing an incomplete topology.
 
 ## Route and data setup
 
-1. An authenticated Travel control connection presents its signed credential ID and admitted process-session UUID and asks Relay for an opaque route. It does not reveal a service ID.
-2. Relay asks Server for work on behalf of that credential-bound Travel identity.
-3. Server creates a random 32-byte work secret, records a short expiry, and asks Home to connect a work socket.
+1. An authenticated Travel control connection presents its signed credential ID, admitted process-session UUID, and the logical business's Home ID, then asks Relay for an opaque route. It does not reveal a service ID.
+2. Relay asks Server for work on behalf of that credential-bound Travel identity and the same Home ID.
+3. Server selects exactly that configured and online Home, creates a random 32-byte work secret, records the Home ID with a short expiry, and asks only that Home to connect a work socket.
 4. Relay creates a separate random 32-byte single-use route secret for Travel.
 5. Travel authenticates its Relay data preface with HMAC-SHA256.
 6. Relay atomically consumes the route and authenticates its work connection to Server with the Server-issued secret.
 7. Home independently authenticates its work connection with the same secret.
 8. Server pairs the Home and Relay sockets. Relay enters Linux `splice(2)` forwarding.
 9. Travel and Home complete a separate mutual TLS handshake through both opaque forwarders.
-10. Only inside that business TLS connection does Travel name and open a service.
+10. Travel verifies the selected Home's exact identity, server name, and SPKI pins. Only inside that business TLS connection does it name and open a service.
 
 The credential ID is carried through route authorization and `OPEN_WORK`, then Home requires the business certificate to resolve to that exact credential. A management certificate from one Travel credential therefore cannot be paired with a business certificate from another.
 
-## Live Travel revocation
+## Offline Travel issuance and live revocation
+
+Travel generates two distinct P-256 private keys locally and immediately stores them as password-encrypted PKCS#8. Its enrollment request exposes only management/business CSRs with proof of possession and the requested stable Travel ID. Server validates that request and creates a random credential ID plus a bounded validity interval, defaulting to 365 days. It does not sign certificates.
+
+The standalone offline issuer decrypts the management CA, business CA, and Travel-authorization keys only on the signing machine. It signs the two CSR public keys under separate roots and signs an authorization payload binding the credential ID, Travel ID, both SPKI hashes, and validity interval. Travel import verifies the response against its original request, encrypted local keys, both CA roots, and the configured authority public key before installing it. Server independently verifies the same response and live-imports only the signed authorization record; duplicate exact imports are idempotent and conflicting reuse of a credential ID fails closed.
 
 The offline issuer signs add-only Travel credential payloads containing the credential ID, stable Travel ID, both SPKI hashes, and validity interval. Runtime nodes contain only the issuer public key. Server owns the monotonic revocation log and a mode-`0600` local administration socket; it persists each revocation before broadcasting a new generation over the already established control sessions.
 
 Relay and Home verify every signature and persist the highest generation plus all observed revoked IDs. A lower generation or missing prior revocation is rejected even after either process restarts. Applying a valid update does not restart a component and does not change Carrier heartbeat or recompetition rules. It only terminates state owned by the revoked credential: Relay management sessions, pending routes, and data forwarding; Server leases, pending/active work; Home TCP/UDP flows, Carriers, and target sockets. Expiry uses the same active-termination boundary. A revoked credential can never be restored; replacement uses a new key pair, certificate pair, and credential ID.
 
 Every outer frame and payload has a hard bound. The stateful frame decoder is safe to resume after cancellation and all pre-trust/setup reads have deadlines. Pending work, pending routes, and active Home/Travel flows have configurable process-local ceilings.
+
+## Logical business routing
+
+A Travel listener connects one logical business identified by `(home_id, service_id, protocol)`. `service_id` is unique only within one Home; two Homes may intentionally publish the same service ID and target port while remaining different businesses. The mapping's Home ID is immutable for the lifetime of a Flow. Relay competition replaces only the path to that Home: a failed, unavailable, or misconfigured Home never causes fallback to another Home, even when that other Home publishes the same service ID.
+
+The aggregate catalog is informational and supports UI readiness. Route authorization uses the mapping's explicit Home ID, then business TLS and `OPEN` enforce the same Home/service pair. A Home disconnect removes only its catalog and route availability; other Homes and their Flows remain independent.
 
 ## Logical TCP
 
@@ -62,20 +70,16 @@ Each local client tuple becomes one association with one connected Home UDP sock
 
 ## Web UI
 
-The Travel Agent mounts `/api/status`, `/api/catalog`, and `/api/relays` before the embedded SPA fallback. Status includes the Relay-directory generation and Relays carrying active TCP Flows. The build emits identity, gzip, and Brotli representations. `embedded-spa` selects by `Accept-Encoding`, supplies strong representation-specific ETags, and prevents missing API or hashed-asset requests from receiving `index.html`.
+The Travel Agent mounts `/api/status`, `/api/catalog`, and `/api/relays` before the embedded SPA fallback. The catalog contains all currently online Homes, and each mapping is resolved with the composite Home/service/protocol key rather than service ID alone. Status includes the Relay-directory generation and Relays carrying active TCP Flows. The build emits identity, gzip, and Brotli representations. `embedded-spa` selects by `Accept-Encoding`, supplies strong representation-specific ETags, and prevents missing API or hashed-asset requests from receiving `index.html`.
 
 ## Portability
 
 Linux Relay builds use `tokio-splice` for the zero-copy steady state. macOS retains the identical opaque-forwarding and protocol behavior through a portable copying fallback. Linux release targets use musl and are static; the macOS arm64 release is one application executable per component.
 
-On OpenWrt, one package installs the Server and Relay executables, a UCI-to-TOML renderer, one procd
-service, and one LuCI page. procd runs one named Server instance and one named process per enabled
-Relay section. Separate LAN and WAN6 Relay identities therefore share binaries and administration
-without sharing listener configuration or lifecycle state. The package is inert by default and leaves
-firewall policy outside its authority.
+On OpenWrt, one package installs the Server and Relay executables, a UCI-to-TOML renderer, one procd service, and one LuCI page with standard Chinese/English catalogs. Server exposes one LAN-only Home control listener, a list of data listeners, and a UCI list of independently pinned Home identities. procd runs one named Server instance and one named process per enabled Relay section. Separate LAN and WAN6 Relay identities therefore share binaries and administration without sharing listener configuration or lifecycle state. LuCI handles only the public enrollment exchange—request upload, approval download, signed-response import, status, and revocation—while signing private keys stay offline. The package is inert by default and leaves firewall policy outside its authority.
 
 ## Process restart boundary
 
-No test or design claim may describe Home process restart as preserving an established TCP connection. Home owns the target TCP socket, so restarting Home destroys that socket. Relay handover is a different requirement: Home and Travel remain alive while only the replaceable Carrier changes.
+No test or design claim may describe Home process restart as preserving an established TCP connection. The selected Home owns the target TCP socket, so restarting it destroys that socket; another Home is a different logical business and is not a substitute. Relay handover is a different requirement: the selected Home and Travel remain alive while only the replaceable Carrier changes.
 
 Restarting Travel also creates a new process-session UUID and destroys its local client sockets. The new process may have to wait up to the 45-second old-session lease before Server admits it. Restarting Server clears the in-memory Travel lease registry but preserves the durable revocation log. After Server recovery the first process to reclaim each still-active credential wins; duplicate-session exclusion is supplementary and is not a substitute for live revocation of a stolen certificate and key.
