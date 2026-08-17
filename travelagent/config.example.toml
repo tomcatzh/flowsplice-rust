@@ -1,7 +1,4 @@
 id = "travel-1"
-relay_management_addr = "relay.example.net:8443"
-relay_server_name = "relay.example.net"
-relay_id = "relay-1"
 home_server_name = "home.flowsplice"
 home_id = "home-1"
 management_cert = "/etc/flowsplice/travel-management.crt"
@@ -17,6 +14,18 @@ allow_remote_listen = false
 handshake_timeout_secs = 10
 udp_idle_secs = 60
 max_active_flows = 128
+carrier_heartbeat_secs = 2
+carrier_timeout_secs = 8
+carrier_race_timeout_secs = 10
+carrier_recovery_timeout_secs = 90
+carrier_reevaluate_secs = 60
+max_carrier_reevaluate_secs = 900
+max_unacked_bytes = 1048576
+
+[[seed_relays]]
+id = "relay-1"
+management_addr = "relay-1.example.net:8443"
+server_name = "relay-1.example.net"
 
 [[mappings]]
 service_id = "ssh"

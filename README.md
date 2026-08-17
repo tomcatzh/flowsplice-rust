@@ -8,7 +8,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 
 | Package | Role |
 | --- | --- |
-| `flowsplice-server` | Home-side controller, service-catalog authority, and opaque work-socket coordinator. |
+| `flowsplice-server` | Home-side controller, service-catalog and Relay-directory authority, and opaque work-socket coordinator. |
 | `flowsplice-relay` | Public management/data ingress and Linux `splice(2)` opaque forwarding. |
 | `flowsplice-homeagent` | Publishes configured services, terminates business TLS, and connects flows to home targets. |
 | `flowsplice-travelagent` | Creates local TCP/UDP mappings, originates business TLS, and serves the embedded TypeScript UI. |
@@ -94,11 +94,11 @@ Successful TLS chain validation is necessary but not sufficient. FlowSplice appl
 
 Current SPKI coverage is directional and explicit:
 
-- Server pins the Relay it connects to.
+- Server pins every Relay it connects to.
 - Server pins the expected management Home and requires its configured stable Home ID.
 - Relay pins its Server and the Travel certificates it accepts.
 - Home pins its Server and the business Travel certificates it accepts.
-- Travel pins its Relay and the business Home certificate it accepts.
+- Travel pins its accepted Relays and the business Home certificate it accepts.
 
 The single active Home session is explicit: a newly authenticated session for the configured Home identity supersedes the previous session, logs the takeover, and actively closes the old session. A different Home ID or a Home key outside Server's allowlist is rejected before registration.
 
@@ -150,6 +150,8 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Route IDs are unknown after expiry, completed pairings are removed, duplicate sides are rejected, and a consumed Relay route cannot be reused.
 - Unexpected message types, identity disagreement, discontinuous TCP offsets, oversized payloads, and invalid route MACs close the affected connection.
 - Travel keeps one long-lived catalog subscription. Server pushes catalog changes to Relay and Relay immediately fans them out to connected Travel sessions; this avoids periodic full mTLS polling.
+- Server maintains independent control sessions to every configured Relay and publishes the complete Relay directory through each one. Travel needs only one reachable seed to bootstrap the directory.
+- TCP Flows retain bounded unacknowledged data independently of a Carrier. Travel detects Carrier failure before Home's longer detach timeout, races replacement Carriers, and Home keeps the target TCP socket while waiting for reattachment.
 - UDP association ingress uses bounded non-blocking queues. A saturated association loses its current datagram, consistent with UDP semantics, without blocking unrelated peers.
 - Workspace Rust code forbids `unsafe`; this does not mean that every transitive dependency or the AWS-LC C implementation contains no unsafe/native code.
 
@@ -158,7 +160,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Keep Travel UI and TCP/UDP mappings on loopback whenever possible. The UI server is HTTP, not HTTPS. A remotely bound UI requires a bearer token of at least 32 characters, but the application does not measure token entropy and the token is exposed to interception on an untrusted cleartext network unless an external secure tunnel or TLS reverse proxy is used. Generate a high-entropy random token.
 - Remotely bound TCP/UDP mappings do not gain bearer-token authentication. `allow_remote_listen = true` only permits the bind; network access must be restricted by a firewall, VPN, or an application-level protocol.
 - All business-authorized Travel keys in Home's pin list can request any published service. Per-Travel service ACLs are not implemented.
-- Catalog integrity is hop-by-hop through management TLS, not end-to-end signed by Home. A compromised Server or Relay can falsify the catalog shown to Travel, although Home still refuses an unknown or protocol-mismatched service ID.
+- Catalog and Relay-directory integrity are hop-by-hop through management TLS, not end-to-end signed. A compromised Server or Relay can falsify the control data shown to Travel, although Home still refuses an unknown or protocol-mismatched service ID and Travel still requires every contacted Relay to present an allowed certificate identity and key.
 - The system does not hide traffic metadata, resist endpoint compromise, guarantee availability against Relay/Server or network denial, provide durable replay state across restart, or claim protection after a CA/private key is stolen.
 - The project has not undergone a professional third-party security audit. Deployments should treat this release as an auditable implementation baseline, not as a certified security product.
 
@@ -176,15 +178,19 @@ make test
 make e2e
 ```
 
-`make e2e` generates two temporary test CAs, builds the Linux applications, starts all four components plus TCP/UDP echo targets, and validates:
+`make e2e` generates two temporary test CAs, builds the Linux applications, starts two Relays plus Server, Home, Travel, and TCP/UDP echo targets, and validates:
 
 - TCP and UDP data through the complete topology;
 - mutual management TLS and separate Travel-to-Home business TLS;
 - single-use HMAC-authenticated route setup;
+- complete two-Relay discovery from one configured seed and concurrent full-path Carrier competition;
+- survival of one established client TCP socket and one Home target TCP socket while the selected Relay is killed;
 - TLS-1.2 rejection, TLS-1.3 mutual authentication, and incomplete-control-frame expiry;
 - the embedded UI, gzip/Brotli selection, representation-specific ETags, and correct `404` boundaries.
 
-Generated keys, web output, build targets, and release binaries are ignored by Git.
+The E2E suite enables component `DEBUG` logging, saves the combined log as the ignored `tests/e2e/generated/e2e.log`, and prints its last 300 lines automatically on failure. Production defaults to `INFO`; `RUST_LOG=flowsplice_travelagent=debug,info` (or the corresponding component target) enables per-offset ACK/DUP/retransmission diagnostics. Logs contain operational IDs, offsets, state transitions, and errors—not business payloads, route/work secrets, bearer tokens, or private keys.
+
+Generated keys, E2E logs, web output, build targets, and release binaries are ignored by Git.
 
 ## Configuration
 
@@ -215,9 +221,11 @@ Linux artifacts are genuinely static. macOS does not support fully static linkag
 
 ## Current scope
 
-The current executable supports one active Home Agent, a canonical catalog, TCP streams, and UDP associations. Each accepted local connection/association receives an independent end-to-end TLS Carrier. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, and per-Travel service ACLs remain explicit later protocol work.
+The current executable supports one active Home Agent, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race with configurable exponential spacing, capped by default at 15 minutes.
 
-This boundary does **not** satisfy FlowSplice's required Relay-handover behavior. Travel is fixed to one configured Relay, does not receive a complete Server-authorized Relay directory, does not race end-to-end Carriers through multiple Relays, and cannot keep an established TCP Flow alive when its Carrier fails. Deployment acceptance requires a stable Travel-to-Home Agent Session, replaceable primary/standby Carriers, acknowledged retransmission state, and an E2E test that preserves one TCP socket while the active Relay fails or degrades.
+Carrier EOF, reset, TLS/read/write failure, or heartbeat timeout causes immediate recompetition. Travel's recovery timeout is required to be shorter than Home's detach timeout. During that window both endpoints retain bounded unacknowledged data; Home keeps the target TCP connection and retransmits after reattachment. Docker E2E proves this behavior with two Relays and the same endpoint sockets while the active Relay is killed.
+
+This guarantee is in-memory and TCP-specific. Restarting Home destroys its target TCP sockets; restarting Travel destroys its local client sockets. UDP associations currently select the first usable Relay but do not migrate between Carriers. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, per-Travel service ACLs, OpenWrt packaging, and production service definitions remain later work.
 
 ## License
 

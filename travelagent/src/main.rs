@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    future::pending,
+    io::{self, IsTerminal},
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -26,14 +26,15 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, DataFrame, Role, ServiceProtocol},
+    protocol::{
+        Catalog, ControlMessage, DataFrame, RelayDirectory, RelayEndpoint, Role, ServiceProtocol,
+    },
     route::{RouteSide, write_preface},
     tls::{client_connector, peer_identity, require_peer, server_name, validate_spki_pins},
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, RwLock, Semaphore, mpsc},
     task::JoinSet,
@@ -42,6 +43,8 @@ use tokio::{
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+mod tcp_flow;
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -61,9 +64,7 @@ struct Args {
 #[derive(Clone, Deserialize)]
 struct Config {
     id: String,
-    relay_management_addr: String,
-    relay_server_name: String,
-    relay_id: String,
+    seed_relays: Vec<RelayEndpoint>,
     home_server_name: String,
     home_id: String,
     management_cert: PathBuf,
@@ -88,6 +89,20 @@ struct Config {
     udp_idle_secs: u64,
     #[serde(default = "default_max_active_flows")]
     max_active_flows: usize,
+    #[serde(default = "default_carrier_heartbeat")]
+    carrier_heartbeat_secs: u64,
+    #[serde(default = "default_carrier_timeout")]
+    carrier_timeout_secs: u64,
+    #[serde(default = "default_carrier_race_timeout")]
+    carrier_race_timeout_secs: u64,
+    #[serde(default = "default_carrier_recovery_timeout")]
+    carrier_recovery_timeout_secs: u64,
+    #[serde(default = "default_carrier_reevaluate")]
+    carrier_reevaluate_secs: u64,
+    #[serde(default = "default_max_carrier_reevaluate")]
+    max_carrier_reevaluate_secs: u64,
+    #[serde(default = "default_max_unacked_bytes")]
+    max_unacked_bytes: usize,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -109,14 +124,44 @@ const fn default_max_active_flows() -> usize {
     128
 }
 
+const fn default_carrier_heartbeat() -> u64 {
+    2
+}
+
+const fn default_carrier_timeout() -> u64 {
+    8
+}
+
+const fn default_carrier_race_timeout() -> u64 {
+    10
+}
+
+const fn default_carrier_recovery_timeout() -> u64 {
+    90
+}
+
+const fn default_carrier_reevaluate() -> u64 {
+    60
+}
+
+const fn default_max_carrier_reevaluate() -> u64 {
+    900
+}
+
+const fn default_max_unacked_bytes() -> usize {
+    1_048_576
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     tls: Arc<TlsMaterial>,
     catalog: Arc<RwLock<Catalog>>,
+    directory: Arc<RwLock<RelayDirectory>>,
     started: Instant,
     active_flows: Arc<std::sync::atomic::AtomicUsize>,
     permits: Arc<Semaphore>,
+    flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 #[derive(Clone)]
@@ -132,6 +177,8 @@ struct StatusResponse {
     uptime_secs: u64,
     active_flows: usize,
     catalog_generation: u64,
+    relay_directory_generation: u64,
+    active_relays: Vec<String>,
     mappings: Vec<Mapping>,
 }
 
@@ -145,6 +192,7 @@ struct RouteGrant {
 async fn main() -> Result<()> {
     init_crypto();
     tracing_subscriber::fmt()
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "flowsplice_travelagent=info".into()),
@@ -170,9 +218,11 @@ async fn main() -> Result<()> {
         config: Arc::new(config),
         tls,
         catalog: Arc::new(RwLock::new(Catalog::default())),
+        directory: Arc::new(RwLock::new(RelayDirectory::default())),
         started: Instant::now(),
         active_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         permits,
+        flow_relays: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let mut tasks = JoinSet::new();
@@ -194,6 +244,29 @@ async fn main() -> Result<()> {
 fn validate_config(config: &Config) -> Result<()> {
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
     validate_spki_pins(&config.home_spki_pins, "home")?;
+    if config.seed_relays.is_empty() {
+        bail!("at least one seed relay is required");
+    }
+    let mut relay_ids = HashSet::new();
+    for relay in &config.seed_relays {
+        if relay.id.is_empty()
+            || relay.management_addr.is_empty()
+            || relay.server_name.is_empty()
+            || !relay_ids.insert(&relay.id)
+        {
+            bail!("seed relay ids must be non-empty and unique");
+        }
+    }
+    if config.carrier_heartbeat_secs == 0
+        || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
+        || config.carrier_race_timeout_secs == 0
+        || config.carrier_recovery_timeout_secs <= config.carrier_race_timeout_secs
+        || config.carrier_reevaluate_secs == 0
+        || config.max_carrier_reevaluate_secs < config.carrier_reevaluate_secs
+        || config.max_unacked_bytes < MAX_DATA_PAYLOAD
+    {
+        bail!("carrier timeout, reevaluation, or unacknowledged-data limits are invalid");
+    }
     let ui_addr: SocketAddr = config.ui_listen.parse().context("invalid ui_listen")?;
     if !config.allow_remote_listen && !ui_addr.ip().is_loopback() {
         bail!("ui_listen must be loopback unless allow_remote_listen is true");
@@ -225,21 +298,36 @@ fn validate_config(config: &Config) -> Result<()> {
 
 async fn run_catalog_subscription(state: AppState) -> Result<()> {
     loop {
-        match open_management(&state).await {
-            Ok((stream, catalog)) => {
-                *state.catalog.write().await = catalog;
-                info!(relay = %state.config.relay_management_addr, "catalog subscription connected");
-                if let Err(error) = run_catalog_session(&state, stream).await {
-                    warn!(%error, "catalog subscription disconnected");
+        let mut connected = false;
+        for relay in relay_candidates(&state).await {
+            match open_management(&state, &relay).await {
+                Ok((stream, directory, catalog)) => {
+                    update_directory(&state, directory).await;
+                    *state.catalog.write().await = catalog;
+                    info!(relay_id = %relay.id, relay = %relay.management_addr, "catalog subscription connected");
+                    connected = true;
+                    if let Err(error) = run_catalog_session(&state, &relay, stream).await {
+                        warn!(relay_id = %relay.id, %error, "catalog subscription disconnected");
+                    }
+                    break;
+                }
+                Err(error) => {
+                    warn!(relay_id = %relay.id, %error, "catalog subscription attempt failed");
                 }
             }
-            Err(error) => warn!(%error, "catalog subscription failed"),
+        }
+        if !connected {
+            warn!("all catalog subscription candidates failed");
         }
         sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn run_catalog_session(state: &AppState, stream: TlsStream<TcpStream>) -> Result<()> {
+async fn run_catalog_session(
+    state: &AppState,
+    relay: &RelayEndpoint,
+    stream: TlsStream<TcpStream>,
+) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let mut heartbeat = interval(Duration::from_secs(10));
@@ -253,6 +341,9 @@ async fn run_catalog_session(state: &AppState, stream: TlsStream<TcpStream>) -> 
                     ControlMessage::Catalog { catalog } => {
                         *state.catalog.write().await = catalog;
                     }
+                    ControlMessage::RelayDirectory { directory } => {
+                        update_directory(state, directory).await;
+                    }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
                     }
@@ -262,7 +353,7 @@ async fn run_catalog_session(state: &AppState, stream: TlsStream<TcpStream>) -> 
             }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > Duration::from_secs(30) {
-                    bail!("relay catalog heartbeat timed out");
+                    bail!("relay {} catalog heartbeat timed out", relay.id);
                 }
                 nonce = nonce.wrapping_add(1);
                 write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -271,15 +362,24 @@ async fn run_catalog_session(state: &AppState, stream: TlsStream<TcpStream>) -> 
     }
 }
 
-async fn open_management(state: &AppState) -> Result<(TlsStream<TcpStream>, Catalog)> {
+async fn open_management(
+    state: &AppState,
+    relay: &RelayEndpoint,
+) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog)> {
     let config = &state.config;
-    let socket = TcpStream::connect(&config.relay_management_addr).await?;
+    let socket = timeout(
+        Duration::from_secs(config.handshake_timeout_secs),
+        TcpStream::connect(&relay.management_addr),
+    )
+    .await
+    .context("relay TCP connection timed out")??;
+    socket.set_nodelay(true)?;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         state
             .tls
             .management_connector
-            .connect(server_name(&config.relay_server_name)?, socket),
+            .connect(server_name(&relay.server_name)?, socket),
     )
     .await
     .context("relay TLS handshake timed out")??;
@@ -287,7 +387,7 @@ async fn open_management(state: &AppState) -> Result<(TlsStream<TcpStream>, Cata
     require_peer(
         &identity,
         Role::Relay,
-        Some(&config.relay_id),
+        Some(&relay.id),
         &config.relay_spki_pins,
     )?;
     write_json(
@@ -305,22 +405,34 @@ async fn open_management(state: &AppState) -> Result<(TlsStream<TcpStream>, Cata
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Relay && id == config.relay_id => {}
+        ControlMessage::Hello { role, id } if role == Role::Relay && id == relay.id => {}
         _ => bail!("relay sent an invalid HELLO"),
     }
-    let ControlMessage::Catalog { catalog } = reader
-        .read_with_timeout::<ControlMessage>(setup_timeout)
-        .await?
-    else {
-        bail!("relay did not send a catalog");
-    };
+    let mut directory = None;
+    let mut catalog = None;
+    while directory.is_none() || catalog.is_none() {
+        match reader
+            .read_with_timeout::<ControlMessage>(setup_timeout)
+            .await?
+        {
+            ControlMessage::RelayDirectory { directory: value } => directory = Some(value),
+            ControlMessage::Catalog { catalog: value } => catalog = Some(value),
+            _ => bail!("relay did not send initial directory and catalog"),
+        }
+    }
     drop(reader);
-    Ok((stream, catalog))
+    Ok((
+        stream,
+        directory.ok_or_else(|| anyhow::anyhow!("missing relay directory"))?,
+        catalog.ok_or_else(|| anyhow::anyhow!("missing catalog"))?,
+    ))
 }
 
-async fn request_route(state: &AppState) -> Result<RouteGrant> {
+async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteGrant> {
     let config = &state.config;
-    let (stream, _) = open_management(state).await?;
+    let (stream, directory, catalog) = open_management(state, relay).await?;
+    update_directory(state, directory).await;
+    *state.catalog.write().await = catalog;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let request_id = Uuid::new_v4();
@@ -355,6 +467,9 @@ async fn request_route(state: &AppState) -> Result<RouteGrant> {
                 ControlMessage::Catalog { catalog } => {
                     *state.catalog.write().await = catalog;
                 }
+                ControlMessage::RelayDirectory { directory } => {
+                    update_directory(state, directory).await;
+                }
                 ControlMessage::Heartbeat { nonce } => {
                     write_json(
                         &mut writer,
@@ -372,10 +487,31 @@ async fn request_route(state: &AppState) -> Result<RouteGrant> {
     .context("route request timed out")?
 }
 
-async fn open_business(state: &AppState) -> Result<TlsStream<TcpStream>> {
+struct BusinessCarrier {
+    carrier_id: Uuid,
+    relay_id: String,
+    stream: TlsStream<TcpStream>,
+    home_receive_offset: u64,
+    home_send_offset: u64,
+}
+
+async fn open_business_on(
+    state: &AppState,
+    relay: &RelayEndpoint,
+    flow_id: Uuid,
+    carrier_id: Uuid,
+    service_id: &str,
+    protocol: ServiceProtocol,
+) -> Result<BusinessCarrier> {
     let config = &state.config;
-    let grant = request_route(state).await?;
-    let mut socket = TcpStream::connect(&grant.data_addr).await?;
+    let grant = request_route(state, relay).await?;
+    let mut socket = timeout(
+        Duration::from_secs(config.handshake_timeout_secs),
+        TcpStream::connect(&grant.data_addr),
+    )
+    .await
+    .context("relay data connection timed out")??;
+    socket.set_nodelay(true)?;
     write_preface(
         &mut socket,
         RouteSide::Travel,
@@ -383,7 +519,7 @@ async fn open_business(state: &AppState) -> Result<TlsStream<TcpStream>> {
         &grant.route_secret,
     )
     .await?;
-    let stream = timeout(
+    let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         state
             .tls
@@ -399,7 +535,71 @@ async fn open_business(state: &AppState) -> Result<TlsStream<TcpStream>> {
         Some(&config.home_id),
         &config.home_spki_pins,
     )?;
-    Ok(stream)
+    write_json(
+        &mut stream,
+        &DataFrame::Open {
+            flow_id,
+            carrier_id,
+            service_id: service_id.to_owned(),
+            protocol,
+        },
+        DATA_FRAME_LIMIT,
+    )
+    .await?;
+    match JsonFrameReader::new(&mut stream, DATA_FRAME_LIMIT)
+        .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    {
+        DataFrame::OpenOk {
+            flow_id: response_flow,
+            carrier_id: response_carrier,
+            receive_offset,
+            send_offset,
+        } if response_flow == flow_id && response_carrier == carrier_id => Ok(BusinessCarrier {
+            carrier_id,
+            relay_id: relay.id.clone(),
+            stream,
+            home_receive_offset: receive_offset,
+            home_send_offset: send_offset,
+        }),
+        DataFrame::OpenError { reason, .. } => bail!("home rejected carrier: {reason}"),
+        _ => bail!("invalid carrier OPEN response"),
+    }
+}
+
+async fn relay_candidates(state: &AppState) -> Vec<RelayEndpoint> {
+    let directory = state.directory.read().await.clone();
+    let source = if directory.relays.is_empty() {
+        state.config.seed_relays.clone()
+    } else {
+        directory.relays
+    };
+    let mut seen = HashSet::new();
+    source
+        .into_iter()
+        .filter(|relay| seen.insert(relay.id.clone()))
+        .collect()
+}
+
+async fn update_directory(state: &AppState, directory: RelayDirectory) {
+    let mut current = state.directory.write().await;
+    if directory.generation >= current.generation && !directory.relays.is_empty() {
+        if *current != directory {
+            let relay_ids: Vec<_> = directory
+                .relays
+                .iter()
+                .map(|relay| relay.id.as_str())
+                .collect();
+            info!(
+                event = "relay_directory_updated",
+                generation = directory.generation,
+                relay_count = directory.relays.len(),
+                ?relay_ids,
+                "travel updated relay directory"
+            );
+        }
+        *current = directory;
+    }
 }
 
 async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
@@ -424,71 +624,7 @@ async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
 }
 
 async fn run_tcp_flow(state: &AppState, mapping: &Mapping, local: TcpStream) -> Result<()> {
-    let mut business = open_business(state).await?;
-    let flow_id = Uuid::new_v4();
-    write_json(
-        &mut business,
-        &DataFrame::Open {
-            flow_id,
-            service_id: mapping.service_id.clone(),
-            protocol: ServiceProtocol::Tcp,
-        },
-        DATA_FRAME_LIMIT,
-    )
-    .await?;
-    match JsonFrameReader::new(&mut business, DATA_FRAME_LIMIT)
-        .read_with_timeout::<DataFrame>(Duration::from_secs(state.config.handshake_timeout_secs))
-        .await?
-    {
-        DataFrame::OpenOk { flow_id: id } if id == flow_id => {}
-        DataFrame::OpenError { reason, .. } => bail!("home rejected TCP flow: {reason}"),
-        _ => bail!("invalid TCP OPEN response"),
-    }
-    pump_tcp(business, local, flow_id).await
-}
-
-async fn pump_tcp(business: TlsStream<TcpStream>, local: TcpStream, flow_id: Uuid) -> Result<()> {
-    let (mut tls_reader, mut tls_writer) = tokio::io::split(business);
-    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
-    let (mut local_reader, mut local_writer) = local.into_split();
-    let mut send_offset = 0_u64;
-    let mut receive_offset = 0_u64;
-    let mut local_eof = false;
-    let mut remote_eof = false;
-    let mut buffer = vec![0_u8; MAX_DATA_PAYLOAD];
-    while !(local_eof && remote_eof) {
-        tokio::select! {
-            read = async {
-                if local_eof { pending::<std::io::Result<usize>>().await } else { local_reader.read(&mut buffer).await }
-            } => {
-                let count = read?;
-                if count == 0 {
-                    local_eof = true;
-                    write_json(&mut tls_writer, &DataFrame::Fin { flow_id, final_offset: send_offset }, DATA_FRAME_LIMIT).await?;
-                } else {
-                    write_json(&mut tls_writer, &DataFrame::Data { flow_id, offset: send_offset, bytes: buffer[..count].to_vec() }, DATA_FRAME_LIMIT).await?;
-                    send_offset += count as u64;
-                }
-            }
-            frame = tls_reader.read::<DataFrame>() => {
-                match frame? {
-                    DataFrame::Data { flow_id: id, offset, bytes } if id == flow_id && offset == receive_offset && bytes.len() <= MAX_DATA_PAYLOAD => {
-                        local_writer.write_all(&bytes).await?;
-                        receive_offset += bytes.len() as u64;
-                        write_json(&mut tls_writer, &DataFrame::Ack { flow_id, next_offset: receive_offset }, DATA_FRAME_LIMIT).await?;
-                    }
-                    DataFrame::Fin { flow_id: id, final_offset } if id == flow_id && final_offset == receive_offset => {
-                        local_writer.shutdown().await?;
-                        remote_eof = true;
-                    }
-                    DataFrame::Ack { flow_id: id, .. } if id == flow_id => {}
-                    DataFrame::Close { flow_id: id, reason } if id == flow_id => bail!("home closed flow: {reason}"),
-                    _ => bail!("invalid TCP flow frame"),
-                }
-            }
-        }
-    }
-    Ok(())
+    tcp_flow::run(state.clone(), mapping.clone(), local).await
 }
 
 async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
@@ -557,26 +693,28 @@ async fn run_udp_association(
     mut outgoing: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let config = &state.config;
-    let mut business = open_business(state).await?;
     let flow_id = Uuid::new_v4();
-    write_json(
-        &mut business,
-        &DataFrame::Open {
+    let mut opened = None;
+    for relay in relay_candidates(state).await {
+        let carrier_id = Uuid::new_v4();
+        match open_business_on(
+            state,
+            &relay,
             flow_id,
-            service_id: mapping.service_id.clone(),
-            protocol: ServiceProtocol::Udp,
-        },
-        DATA_FRAME_LIMIT,
-    )
-    .await?;
-    match JsonFrameReader::new(&mut business, DATA_FRAME_LIMIT)
-        .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
-        .await?
-    {
-        DataFrame::OpenOk { flow_id: id } if id == flow_id => {}
-        DataFrame::OpenError { reason, .. } => bail!("home rejected UDP flow: {reason}"),
-        _ => bail!("invalid UDP OPEN response"),
+            carrier_id,
+            &mapping.service_id,
+            ServiceProtocol::Udp,
+        )
+        .await
+        {
+            Ok(carrier) => {
+                opened = Some(carrier.stream);
+                break;
+            }
+            Err(error) => warn!(relay_id = %relay.id, %error, "UDP carrier attempt failed"),
+        }
     }
+    let business = opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))?;
     let (mut reader, mut writer) = tokio::io::split(business);
     let mut reader = JsonFrameReader::new(&mut reader, DATA_FRAME_LIMIT);
     let mut send_sequence = 0_u64;
@@ -608,6 +746,7 @@ async fn run_ui(state: AppState) -> Result<()> {
     let api = Router::new()
         .route("/status", get(api_status))
         .route("/catalog", get(api_catalog))
+        .route("/relays", get(api_relays))
         .fallback(|| async { StatusCode::NOT_FOUND });
     let app = Router::new()
         .nest("/api", api)
@@ -623,18 +762,28 @@ async fn run_ui(state: AppState) -> Result<()> {
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
     use std::sync::atomic::Ordering;
     let generation = state.catalog.read().await.generation;
+    let directory_generation = state.directory.read().await.generation;
+    let mut active_relays: Vec<_> = state.flow_relays.lock().await.values().cloned().collect();
+    active_relays.sort();
+    active_relays.dedup();
     Json(StatusResponse {
         ok: true,
         travel_id: state.config.id.clone(),
         uptime_secs: state.started.elapsed().as_secs(),
         active_flows: state.active_flows.load(Ordering::Relaxed),
         catalog_generation: generation,
+        relay_directory_generation: directory_generation,
+        active_relays,
         mappings: state.config.mappings.clone(),
     })
 }
 
 async fn api_catalog(State(state): State<AppState>) -> Json<Catalog> {
     Json(state.catalog.read().await.clone())
+}
+
+async fn api_relays(State(state): State<AppState>) -> Json<RelayDirectory> {
+    Json(state.directory.read().await.clone())
 }
 
 async fn serve_spa(request: Request) -> Response {

@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UdpSocket},
 };
 
@@ -14,17 +19,25 @@ async fn main() -> Result<()> {
 
 async fn tcp_echo() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:7001").await?;
+    let next_connection = Arc::new(AtomicU64::new(1));
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
+        let connection_id = next_connection.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            let mut buffer = vec![0_u8; 64 * 1024];
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = Vec::new();
             loop {
-                let count = socket.read(&mut buffer).await?;
+                line.clear();
+                let count = reader.read_until(b'\n', &mut line).await?;
                 if count == 0 {
-                    socket.shutdown().await?;
+                    writer.shutdown().await?;
                     return Ok::<_, std::io::Error>(());
                 }
-                socket.write_all(&buffer[..count]).await?;
+                writer
+                    .write_all(format!("{connection_id}:").as_bytes())
+                    .await?;
+                writer.write_all(&line).await?;
             }
         });
     }

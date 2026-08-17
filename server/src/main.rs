@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::{self, IsTerminal},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,7 +16,7 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, Role},
+    protocol::{Catalog, ControlMessage, RelayDirectory, RelayEndpoint, Role},
     route::{RouteSide, read_preface, verify_preface},
     tls::{
         client_connector, peer_identity, require_peer, server_acceptor, server_name,
@@ -27,6 +28,7 @@ use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, mpsc, watch},
+    task::JoinSet,
     time::{interval, sleep, timeout},
 };
 use tokio_rustls::server::TlsStream;
@@ -44,9 +46,7 @@ struct Config {
     id: String,
     control_listen: String,
     data_listen: String,
-    relay_addr: String,
-    relay_server_name: String,
-    relay_id: String,
+    relays: Vec<RelayEndpoint>,
     cert: PathBuf,
     key: PathBuf,
     management_ca: PathBuf,
@@ -92,7 +92,7 @@ struct HomeSession {
 struct State {
     catalog: RwLock<Catalog>,
     home_session: Mutex<Option<HomeSession>>,
-    relay_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
+    relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
     pending: Mutex<HashMap<Uuid, PendingWork>>,
 }
 
@@ -100,6 +100,7 @@ struct State {
 async fn main() -> Result<()> {
     init_crypto();
     tracing_subscriber::fmt()
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "flowsplice_server=info".into()),
@@ -110,14 +111,32 @@ async fn main() -> Result<()> {
     let config: Config = load_toml(&args.config)?;
     validate_spki_pins(&config.home_spki_pins, "home")?;
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
+    validate_relays(&config.relays)?;
     let state = Arc::new(State::default());
 
     let control = run_home_listener(config.clone(), Arc::clone(&state));
     let data = run_data_listener(config.clone(), Arc::clone(&state));
-    let relay = run_relay_connector(config, Arc::clone(&state));
+    let relay = run_relay_connectors(config, Arc::clone(&state));
     let cleanup = cleanup_pending(state);
 
     tokio::try_join!(control, data, relay, cleanup)?;
+    Ok(())
+}
+
+fn validate_relays(relays: &[RelayEndpoint]) -> Result<()> {
+    if relays.is_empty() {
+        bail!("at least one relay is required");
+    }
+    let mut ids = std::collections::HashSet::new();
+    for relay in relays {
+        if relay.id.is_empty()
+            || relay.management_addr.is_empty()
+            || relay.server_name.is_empty()
+            || !ids.insert(&relay.id)
+        {
+            bail!("relay ids must be non-empty and unique, with non-empty addresses and names");
+        }
+    }
     Ok(())
 }
 
@@ -264,17 +283,45 @@ async fn clear_home_session(state: &Arc<State>, session_id: Uuid) {
 
 async fn publish_catalog(state: &Arc<State>, catalog: Catalog) {
     *state.catalog.write().await = catalog.clone();
-    if let Some(relay) = state.relay_tx.lock().await.clone() {
-        let _ = relay.send(ControlMessage::Catalog { catalog }).await;
+    let relays = state.relay_txs.lock().await.clone();
+    for (relay_id, relay) in relays {
+        if relay
+            .send(ControlMessage::Catalog {
+                catalog: catalog.clone(),
+            })
+            .await
+            .is_err()
+        {
+            warn!(%relay_id, "failed to publish catalog to relay");
+        }
     }
 }
 
-async fn run_relay_connector(config: Config, state: Arc<State>) -> Result<()> {
+async fn run_relay_connectors(config: Config, state: Arc<State>) -> Result<()> {
+    let mut tasks = JoinSet::new();
+    for relay in config.relays.clone() {
+        tasks.spawn(run_relay_connector(
+            config.clone(),
+            relay,
+            Arc::clone(&state),
+        ));
+    }
+    while let Some(result) = tasks.join_next().await {
+        result??;
+    }
+    bail!("all relay connector tasks stopped")
+}
+
+async fn run_relay_connector(
+    config: Config,
+    relay: RelayEndpoint,
+    state: Arc<State>,
+) -> Result<()> {
     let connector = client_connector(&config.cert, &config.key, &config.management_ca)?;
-    let dns_name = server_name(&config.relay_server_name)?;
+    let dns_name = server_name(&relay.server_name)?;
     loop {
         let result = async {
-            let socket = TcpStream::connect(&config.relay_addr).await?;
+            let socket = TcpStream::connect(&relay.management_addr).await?;
             socket.set_nodelay(true)?;
             let stream = timeout(
                 Duration::from_secs(config.handshake_timeout_secs),
@@ -286,16 +333,16 @@ async fn run_relay_connector(config: Config, state: Arc<State>) -> Result<()> {
             require_peer(
                 &identity,
                 Role::Relay,
-                Some(&config.relay_id),
+                Some(&relay.id),
                 &config.relay_spki_pins,
             )?;
-            run_relay_session(stream, &config, &state).await
+            run_relay_session(stream, &config, &relay, &state).await
         }
         .await;
         if let Err(error) = result {
-            warn!(%error, "relay control disconnected; reconnecting");
+            warn!(relay_id = %relay.id, %error, "relay control disconnected; reconnecting");
         }
-        *state.relay_tx.lock().await = None;
+        state.relay_txs.lock().await.remove(&relay.id);
         sleep(Duration::from_secs(1)).await;
     }
 }
@@ -303,6 +350,7 @@ async fn run_relay_connector(config: Config, state: Arc<State>) -> Result<()> {
 async fn run_relay_session(
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     config: &Config,
+    relay: &RelayEndpoint,
     state: &Arc<State>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -320,15 +368,33 @@ async fn run_relay_session(
         .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Relay && id == config.relay_id => {}
+        ControlMessage::Hello { role, id } if role == Role::Relay && id == relay.id => {}
         _ => bail!("relay HELLO does not match expected identity"),
     }
 
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
-    *state.relay_tx.lock().await = Some(tx.clone());
+    state
+        .relay_txs
+        .lock()
+        .await
+        .insert(relay.id.clone(), tx.clone());
+    tx.send(ControlMessage::RelayDirectory {
+        directory: RelayDirectory {
+            generation: 1,
+            relays: config.relays.clone(),
+        },
+    })
+    .await?;
+    info!(
+        event = "relay_directory_published",
+        relay_id = %relay.id,
+        generation = 1,
+        relay_count = config.relays.len(),
+        "published relay directory to relay"
+    );
     let catalog = state.catalog.read().await.clone();
     tx.send(ControlMessage::Catalog { catalog }).await?;
-    info!(relay_id = %config.relay_id, "relay control connected");
+    info!(relay_id = %relay.id, "relay control connected");
 
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut nonce = 0_u64;

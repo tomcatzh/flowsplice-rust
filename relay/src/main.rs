@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::{self, IsTerminal},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,7 +16,7 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, Role},
+    protocol::{Catalog, ControlMessage, RelayDirectory, Role},
     route::{RouteSide, read_preface, verify_preface, write_preface},
     tls::{peer_identity, require_peer, server_acceptor, validate_spki_pins},
 };
@@ -93,6 +94,7 @@ struct ServerSession {
 struct State {
     server_session: Mutex<Option<ServerSession>>,
     catalog_tx: watch::Sender<Catalog>,
+    directory_tx: watch::Sender<RelayDirectory>,
     requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
 }
@@ -100,9 +102,11 @@ struct State {
 impl State {
     fn new() -> Self {
         let (catalog_tx, _) = watch::channel(Catalog::default());
+        let (directory_tx, _) = watch::channel(RelayDirectory::default());
         Self {
             server_session: Mutex::new(None),
             catalog_tx,
+            directory_tx,
             requests: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
         }
@@ -113,6 +117,7 @@ impl State {
 async fn main() -> Result<()> {
     init_crypto();
     tracing_subscriber::fmt()
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "flowsplice_relay=info".into()),
@@ -177,6 +182,7 @@ async fn run_management(config: Config, state: Arc<State>) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_server(
     stream: TlsStream<TcpStream>,
     server_id: String,
@@ -241,6 +247,15 @@ async fn handle_server(
                         ControlMessage::Catalog { catalog } => {
                             state.catalog_tx.send_replace(catalog);
                         }
+                        ControlMessage::RelayDirectory { directory } => {
+                            info!(
+                                event = "relay_directory_received",
+                                generation = directory.generation,
+                                relay_count = directory.relays.len(),
+                                "relay received directory from server"
+                            );
+                            state.directory_tx.send_replace(directory);
+                        }
                         ControlMessage::ServerRouteGrant { request_id, work_id, work_secret } => {
                             if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
                                 let _ = waiter.send(Ok(ServerGrant { work_id, work_secret }));
@@ -277,6 +292,7 @@ async fn handle_server(
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_travel(
     stream: TlsStream<TcpStream>,
     travel_id: String,
@@ -302,6 +318,23 @@ async fn handle_travel(
     )
     .await?;
     let mut catalog_rx = state.catalog_tx.subscribe();
+    let mut directory_rx = state.directory_tx.subscribe();
+    let initial_directory = directory_rx.borrow().clone();
+    info!(
+        event = "relay_directory_forwarded",
+        %travel_id,
+        generation = initial_directory.generation,
+        relay_count = initial_directory.relays.len(),
+        "relay forwarded initial directory to travel"
+    );
+    write_json(
+        &mut writer,
+        &ControlMessage::RelayDirectory {
+            directory: initial_directory,
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
     let initial_catalog = catalog_rx.borrow().clone();
     write_json(
         &mut writer,
@@ -346,6 +379,16 @@ async fn handle_travel(
                     &ControlMessage::Catalog {
                         catalog,
                     },
+                    CONTROL_FRAME_LIMIT,
+                )
+                .await?;
+            }
+            changed = directory_rx.changed() => {
+                changed.map_err(|_| anyhow!("directory publisher closed"))?;
+                let directory = directory_rx.borrow_and_update().clone();
+                write_json(
+                    &mut writer,
+                    &ControlMessage::RelayDirectory { directory },
                     CONTROL_FRAME_LIMIT,
                 )
                 .await?;

@@ -12,10 +12,12 @@ The CAs are intentionally separate. A Relay management key cannot authenticate a
 ## Control topology
 
 ```text
-Home Agent --outbound mTLS--> Server --outbound mTLS--> Relay <--mTLS-- Travel Agent
+                                   ┌--outbound mTLS--> Relay A <--mTLS--┐
+Home Agent --outbound mTLS--> Server                                  Travel Agent
+                                   └--outbound mTLS--> Relay B <--mTLS--┘
 ```
 
-Home publishes the canonical service catalog to Server. Server pushes each generation to Relay, and Relay fans changes out over long-lived authenticated Travel catalog subscriptions. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
+Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog and complete Relay directory to each one, and each Relay fans changes out over authenticated Travel management sessions. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
 
 ## Route and data setup
 
@@ -34,17 +36,19 @@ Every outer frame and payload has a hard bound. The stateful frame decoder is sa
 
 ## Logical TCP
 
-TCP uses explicit `OPEN`, offset-bearing `DATA`, cumulative `ACK`, and offset-bearing `FIN` frames. Both directions validate contiguous offsets. Backpressure comes from bounded frame payloads and the underlying TCP/TLS write path. Half-close is preserved: receipt of a valid logical FIN shuts down only the target write half until the reverse direction also finishes.
+TCP uses a stable Flow ID plus replaceable Carrier IDs. `OPEN` attaches a complete end-to-end business-TLS Carrier to an existing or new Flow. Offset-bearing `DATA`, cumulative `ACK`/`DUP`, and offset-bearing `FIN`/`FIN_ACK` frames preserve ordered delivery in both directions. Backpressure comes from bounded unacknowledged buffers, bounded frame payloads, and the underlying TCP/TLS write path. Half-close is preserved: receipt of a valid logical FIN shuts down only the target write half until the reverse direction also finishes.
 
-The current executable does not retain acknowledged send state or detach a Flow from its Carrier. Each Flow owns one business-TLS/TCP Carrier, so Carrier loss closes that Flow. The required architecture instead keeps a stable in-memory Travel-to-Home Agent Session while Home and Travel remain alive, races complete end-to-end Carriers through the complete Server-authorized Relay directory, retains a primary plus warm standby, and reattaches existing Flows with bounded retransmission and deduplication when a Relay path fails or degrades.
+For a new Flow or reselection, Travel concurrently opens a complete Carrier through every known Relay and sends the same race ID and acknowledged offset on each path. Home accepts the first valid arrival with `RACE_ACK`; later arrivals for that race receive `RACE_DUPLICATE` containing the winning Carrier ID. Travel keeps the winner, closes the losing candidates, retransmits unacknowledged frames, and uses that Carrier until failure or the next periodic race. The periodic interval begins at 60 seconds by default and doubles to a configurable 15-minute cap.
+
+Carrier EOF, reset, TLS/read/write failure, or heartbeat expiry immediately detaches only the Carrier. Travel starts a new full-path race and locally backs off only when no candidate succeeds. Home never initiates a Carrier, but it retains the target TCP socket, offsets, and bounded reverse-direction retransmission data while detached. Home's detach timeout must exceed Travel's recovery timeout so ordinary Relay handover does not close the business TCP endpoints.
 
 ## Logical UDP
 
-Each local client tuple becomes one association with one connected Home UDP socket. Datagram boundaries remain intact. Each direction has a monotonically increasing sequence, duplicates are discarded, and an idle timer reclaims the association. Per-association ingress queues are bounded and non-blocking: saturation drops only the current datagram instead of stalling the shared listener. UDP remains best effort; the protocol does not turn it into a reliable stream.
+Each local client tuple becomes one association with one connected Home UDP socket. Datagram boundaries remain intact. Each direction has a monotonically increasing sequence, duplicates are discarded, and an idle timer reclaims the association. Per-association ingress queues are bounded and non-blocking: saturation drops only the current datagram instead of stalling the shared listener. UDP remains best effort and currently selects one usable Relay without Carrier migration; the protocol does not turn it into a reliable stream.
 
 ## Web UI
 
-The Travel Agent mounts `/api/status` and `/api/catalog` before the embedded SPA fallback. The build emits identity, gzip, and Brotli representations. `embedded-spa` selects by `Accept-Encoding`, supplies strong representation-specific ETags, and prevents missing API or hashed-asset requests from receiving `index.html`.
+The Travel Agent mounts `/api/status`, `/api/catalog`, and `/api/relays` before the embedded SPA fallback. Status includes the Relay-directory generation and Relays carrying active TCP Flows. The build emits identity, gzip, and Brotli representations. `embedded-spa` selects by `Accept-Encoding`, supplies strong representation-specific ETags, and prevents missing API or hashed-asset requests from receiving `index.html`.
 
 ## Portability
 

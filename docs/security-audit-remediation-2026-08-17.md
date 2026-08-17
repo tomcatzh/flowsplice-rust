@@ -23,10 +23,10 @@ This document records the repository-side verification of the user-supplied Kimi
 
 ## Verification
 
-- `cargo test --workspace --all-targets`: 7 tests passed.
+- `cargo test --workspace --all-targets`: 9 tests passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo audit`: zero vulnerabilities and zero warnings.
-- Docker E2E: initial TCP/UDP, embedded SPA, TLS-1.3-only policy, and incomplete-frame expiry passed. It does not validate Relay competition, Carrier handover, or survival of an established TCP Flow.
+- Docker E2E: two-Relay discovery from one seed, concurrent Carrier competition, same-client-socket and same-target-socket TCP handover after killing the selected Relay, UDP, embedded SPA, TLS-1.3-only policy, and incomplete-frame expiry passed. The suite archives DEBUG-level state-transition and ACK/DUP/retransmission logs under the ignored generated directory.
 - Release build: macOS arm64 plus static Linux amd64 and arm64 versions of all four executables completed.
 
 ## Primary references

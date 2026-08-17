@@ -1,7 +1,4 @@
 id = "travel-1"
-relay_management_addr = "relay:8443"
-relay_server_name = "relay.flowsplice"
-relay_id = "relay-1"
 home_server_name = "home.flowsplice"
 home_id = "home-1"
 management_cert = "/certs/travel-management.crt"
@@ -10,13 +7,26 @@ management_ca = "/certs/management-ca.crt"
 business_cert = "/certs/travel-business.crt"
 business_key = "/certs/travel-business.key"
 business_ca = "/certs/business-ca.crt"
-relay_spki_pins = ["__RELAY_PIN__"]
+relay_spki_pins = ["__RELAY1_PIN__", "__RELAY2_PIN__"]
 home_spki_pins = ["__HOME_BUSINESS_PIN__"]
 ui_listen = "0.0.0.0:9080"
 allow_remote_listen = true
 admin_token = "flowsplice-e2e-administrator-token"
 handshake_timeout_secs = 10
 udp_idle_secs = 10
+max_active_flows = 128
+carrier_heartbeat_secs = 1
+carrier_timeout_secs = 4
+carrier_race_timeout_secs = 5
+carrier_recovery_timeout_secs = 40
+carrier_reevaluate_secs = 3600
+max_carrier_reevaluate_secs = 3600
+max_unacked_bytes = 1048576
+
+[[seed_relays]]
+id = "relay-1"
+management_addr = "relay1:8443"
+server_name = "relay-1.flowsplice"
 
 [[mappings]]
 service_id = "tcp-echo"

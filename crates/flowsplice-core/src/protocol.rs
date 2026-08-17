@@ -45,6 +45,19 @@ pub struct Catalog {
     pub services: Vec<Service>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct RelayEndpoint {
+    pub id: String,
+    pub management_addr: String,
+    pub server_name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelayDirectory {
+    pub generation: u64,
+    pub relays: Vec<RelayEndpoint>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -63,6 +76,9 @@ pub enum ControlMessage {
     },
     Catalog {
         catalog: Catalog,
+    },
+    RelayDirectory {
+        directory: RelayDirectory,
     },
     RouteRequest {
         request_id: Uuid,
@@ -98,15 +114,35 @@ pub enum ControlMessage {
 pub enum DataFrame {
     Open {
         flow_id: Uuid,
+        carrier_id: Uuid,
         service_id: String,
         protocol: ServiceProtocol,
     },
     OpenOk {
         flow_id: Uuid,
+        carrier_id: Uuid,
+        receive_offset: u64,
+        send_offset: u64,
     },
     OpenError {
         flow_id: Uuid,
+        carrier_id: Uuid,
         reason: String,
+    },
+    Race {
+        flow_id: Uuid,
+        race_id: Uuid,
+        next_offset: u64,
+    },
+    RaceAck {
+        flow_id: Uuid,
+        race_id: Uuid,
+        winner_carrier_id: Uuid,
+    },
+    RaceDuplicate {
+        flow_id: Uuid,
+        race_id: Uuid,
+        winner_carrier_id: Uuid,
     },
     Data {
         flow_id: Uuid,
@@ -117,12 +153,21 @@ pub enum DataFrame {
         flow_id: Uuid,
         next_offset: u64,
     },
+    Duplicate {
+        flow_id: Uuid,
+        next_offset: u64,
+        winner_carrier_id: Uuid,
+    },
     Datagram {
         flow_id: Uuid,
         sequence: u64,
         bytes: Vec<u8>,
     },
     Fin {
+        flow_id: Uuid,
+        final_offset: u64,
+    },
+    FinAck {
         flow_id: Uuid,
         final_offset: u64,
     },
@@ -136,4 +181,61 @@ pub enum DataFrame {
     Pong {
         nonce: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlMessage, DataFrame, RelayDirectory, RelayEndpoint};
+    use uuid::Uuid;
+
+    #[test]
+    fn relay_directory_round_trips() -> Result<(), serde_json::Error> {
+        let message = ControlMessage::RelayDirectory {
+            directory: RelayDirectory {
+                generation: 7,
+                relays: vec![RelayEndpoint {
+                    id: "relay-1".to_owned(),
+                    management_addr: "relay.example:8443".to_owned(),
+                    server_name: "relay.example".to_owned(),
+                }],
+            },
+        };
+        let encoded = serde_json::to_vec(&message)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        match decoded {
+            ControlMessage::RelayDirectory { directory } => {
+                assert_eq!(directory.generation, 7);
+                assert_eq!(directory.relays[0].id, "relay-1");
+            }
+            _ => panic!("wrong control message variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn carrier_race_duplicate_preserves_winner() -> Result<(), serde_json::Error> {
+        let flow_id = Uuid::new_v4();
+        let race_id = Uuid::new_v4();
+        let winner_carrier_id = Uuid::new_v4();
+        let frame = DataFrame::RaceDuplicate {
+            flow_id,
+            race_id,
+            winner_carrier_id,
+        };
+        let encoded = serde_json::to_vec(&frame)?;
+        let decoded: DataFrame = serde_json::from_slice(&encoded)?;
+        match decoded {
+            DataFrame::RaceDuplicate {
+                flow_id: decoded_flow,
+                race_id: decoded_race,
+                winner_carrier_id: decoded_winner,
+            } => {
+                assert_eq!(decoded_flow, flow_id);
+                assert_eq!(decoded_race, race_id);
+                assert_eq!(decoded_winner, winner_carrier_id);
+            }
+            _ => panic!("wrong data frame variant"),
+        }
+        Ok(())
+    }
 }

@@ -41,7 +41,8 @@ issue() {
 make_ca management-ca
 make_ca business-ca
 issue server server server-1 server.flowsplice serverAuth,clientAuth management-ca
-issue relay relay relay-1 relay.flowsplice serverAuth management-ca
+issue relay1 relay relay-1 relay-1.flowsplice serverAuth management-ca
+issue relay2 relay relay-2 relay-2.flowsplice serverAuth management-ca
 issue home-management home home-1 home-management.flowsplice clientAuth management-ca
 issue travel-management travel travel-1 travel-management.flowsplice clientAuth management-ca
 issue home-business home home-1 home.flowsplice serverAuth business-ca
@@ -59,7 +60,8 @@ spki_pin() {
 }
 
 server_pin="$(spki_pin server)"
-relay_pin="$(spki_pin relay)"
+relay1_pin="$(spki_pin relay1)"
+relay2_pin="$(spki_pin relay2)"
 home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
 travel_management_pin="$(spki_pin travel-management)"
@@ -69,7 +71,8 @@ for template in "${script_dir}"/config/*.toml; do
   output="${config_dir}/$(basename -- "${template}")"
   sed \
     -e "s/__SERVER_PIN__/${server_pin}/g" \
-    -e "s/__RELAY_PIN__/${relay_pin}/g" \
+    -e "s/__RELAY1_PIN__/${relay1_pin}/g" \
+    -e "s/__RELAY2_PIN__/${relay2_pin}/g" \
     -e "s/__HOME_MANAGEMENT_PIN__/${home_management_pin}/g" \
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
     -e "s/__TRAVEL_MANAGEMENT_PIN__/${travel_management_pin}/g" \

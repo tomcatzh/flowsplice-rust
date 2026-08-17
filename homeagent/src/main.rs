@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    future::pending,
+    io::{self, IsTerminal},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -23,7 +23,6 @@ use flowsplice_core::{
 };
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     sync::Semaphore,
     time::{interval, sleep, timeout},
@@ -34,6 +33,10 @@ use tokio_rustls::{
 };
 use tracing::{info, warn};
 use uuid::Uuid;
+
+mod tcp_flow;
+
+use tcp_flow::{IncomingCarrier, TcpFlowRegistry};
 
 #[derive(Parser)]
 struct Args {
@@ -66,6 +69,14 @@ struct Config {
     udp_idle_secs: u64,
     #[serde(default = "default_max_active_flows")]
     max_active_flows: usize,
+    #[serde(default = "default_carrier_heartbeat")]
+    carrier_heartbeat_secs: u64,
+    #[serde(default = "default_carrier_timeout")]
+    carrier_timeout_secs: u64,
+    #[serde(default = "default_flow_detach_timeout")]
+    flow_detach_timeout_secs: u64,
+    #[serde(default = "default_max_unacked_bytes")]
+    max_unacked_bytes: usize,
 }
 
 const fn default_handshake_timeout() -> u64 {
@@ -80,6 +91,22 @@ const fn default_max_active_flows() -> usize {
     128
 }
 
+const fn default_carrier_heartbeat() -> u64 {
+    5
+}
+
+const fn default_carrier_timeout() -> u64 {
+    30
+}
+
+const fn default_flow_detach_timeout() -> u64 {
+    120
+}
+
+const fn default_max_unacked_bytes() -> usize {
+    1_048_576
+}
+
 #[derive(Clone)]
 struct TlsMaterial {
     management_connector: TlsConnector,
@@ -90,6 +117,7 @@ struct TlsMaterial {
 async fn main() -> Result<()> {
     init_crypto();
     tracing_subscriber::fmt()
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "flowsplice_homeagent=info".into()),
@@ -100,6 +128,13 @@ async fn main() -> Result<()> {
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
     validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    if config.carrier_heartbeat_secs == 0
+        || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
+        || config.flow_detach_timeout_secs <= config.carrier_timeout_secs
+        || config.max_unacked_bytes < MAX_DATA_PAYLOAD
+    {
+        bail!("carrier/flow timeout or unacknowledged-data limits are invalid");
+    }
     let tls = Arc::new(TlsMaterial {
         management_connector: client_connector(
             &config.management_cert,
@@ -114,9 +149,21 @@ async fn main() -> Result<()> {
     });
     let config = Arc::new(config);
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
+    let tcp_flows = TcpFlowRegistry::new(
+        Arc::clone(&permits),
+        Duration::from_secs(config.carrier_heartbeat_secs),
+        Duration::from_secs(config.carrier_timeout_secs),
+        Duration::from_secs(config.flow_detach_timeout_secs),
+        config.max_unacked_bytes,
+    );
     loop {
-        if let Err(error) =
-            run_control(Arc::clone(&config), Arc::clone(&permits), Arc::clone(&tls)).await
+        if let Err(error) = run_control(
+            Arc::clone(&config),
+            Arc::clone(&permits),
+            Arc::clone(&tls),
+            Arc::clone(&tcp_flows),
+        )
+        .await
         {
             warn!(%error, "server control disconnected; reconnecting");
         }
@@ -144,6 +191,7 @@ async fn run_control(
     config: Arc<Config>,
     permits: Arc<Semaphore>,
     tls: Arc<TlsMaterial>,
+    tcp_flows: Arc<TcpFlowRegistry>,
 ) -> Result<()> {
     let socket = TcpStream::connect(&config.server_control_addr).await?;
     let stream = timeout(
@@ -160,7 +208,7 @@ async fn run_control(
         Some(&config.server_id),
         &config.server_spki_pins,
     )?;
-    run_control_session(stream, config, permits, tls).await
+    run_control_session(stream, config, permits, tls, tcp_flows).await
 }
 
 async fn run_control_session(
@@ -168,6 +216,7 @@ async fn run_control_session(
     config: Arc<Config>,
     permits: Arc<Semaphore>,
     tls: Arc<TlsMaterial>,
+    tcp_flows: Arc<TcpFlowRegistry>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -211,15 +260,12 @@ async fn run_control_session(
                 last_received = Instant::now();
                 match message? {
                     ControlMessage::OpenWork { work_id, work_secret } => {
-                        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                            warn!(%work_id, "home active-flow limit reached");
-                            continue;
-                        };
                         let config = Arc::clone(&config);
                         let tls = Arc::clone(&tls);
+                        let permits = Arc::clone(&permits);
+                        let tcp_flows = Arc::clone(&tcp_flows);
                         tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(error) = run_work(config, tls, work_id, work_secret).await {
+                            if let Err(error) = run_work(config, tls, permits, tcp_flows, work_id, work_secret).await {
                                 warn!(%work_id, %error, "home work failed");
                             }
                         });
@@ -245,6 +291,8 @@ async fn run_control_session(
 async fn run_work(
     config: Arc<Config>,
     tls: Arc<TlsMaterial>,
+    permits: Arc<Semaphore>,
+    tcp_flows: Arc<TcpFlowRegistry>,
     work_id: Uuid,
     work_secret: Vec<u8>,
 ) -> Result<()> {
@@ -264,6 +312,7 @@ async fn run_work(
         .await?;
     let DataFrame::Open {
         flow_id,
+        carrier_id,
         service_id,
         protocol,
     } = open
@@ -278,73 +327,29 @@ async fn run_work(
         .ok_or_else(|| anyhow::anyhow!("unknown or mismatched service"))?;
 
     match protocol {
-        ServiceProtocol::Tcp => serve_tcp(stream, flow_id, &service).await,
-        ServiceProtocol::Udp => serve_udp(stream, flow_id, &service, config.udp_idle_secs).await,
-    }
-}
-
-async fn serve_tcp(
-    stream: ServerTlsStream<TcpStream>,
-    flow_id: Uuid,
-    service: &Service,
-) -> Result<()> {
-    let target = TcpStream::connect(&service.target)
-        .await
-        .with_context(|| format!("failed to connect service {}", service.id))?;
-    let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
-    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
-    let (mut target_reader, mut target_writer) = target.into_split();
-    write_json(
-        &mut tls_writer,
-        &DataFrame::OpenOk { flow_id },
-        DATA_FRAME_LIMIT,
-    )
-    .await?;
-
-    let mut send_offset = 0_u64;
-    let mut receive_offset = 0_u64;
-    let mut local_eof = false;
-    let mut remote_eof = false;
-    let mut buffer = vec![0_u8; MAX_DATA_PAYLOAD];
-    while !(local_eof && remote_eof) {
-        tokio::select! {
-            read = async {
-                if local_eof { pending::<std::io::Result<usize>>().await } else { target_reader.read(&mut buffer).await }
-            } => {
-                let count = read?;
-                if count == 0 {
-                    local_eof = true;
-                    write_json(&mut tls_writer, &DataFrame::Fin { flow_id, final_offset: send_offset }, DATA_FRAME_LIMIT).await?;
-                } else {
-                    let bytes = buffer[..count].to_vec();
-                    write_json(&mut tls_writer, &DataFrame::Data { flow_id, offset: send_offset, bytes }, DATA_FRAME_LIMIT).await?;
-                    send_offset += count as u64;
-                }
-            }
-            frame = tls_reader.read::<DataFrame>() => {
-                match frame? {
-                    DataFrame::Data { flow_id: id, offset, bytes } if id == flow_id && offset == receive_offset && bytes.len() <= MAX_DATA_PAYLOAD => {
-                        target_writer.write_all(&bytes).await?;
-                        receive_offset += bytes.len() as u64;
-                        write_json(&mut tls_writer, &DataFrame::Ack { flow_id, next_offset: receive_offset }, DATA_FRAME_LIMIT).await?;
-                    }
-                    DataFrame::Fin { flow_id: id, final_offset } if id == flow_id && final_offset == receive_offset => {
-                        target_writer.shutdown().await?;
-                        remote_eof = true;
-                    }
-                    DataFrame::Ack { flow_id: id, .. } if id == flow_id => {}
-                    DataFrame::Close { flow_id: id, reason } if id == flow_id => bail!("peer closed flow: {reason}"),
-                    _ => bail!("invalid TCP flow frame"),
-                }
-            }
+        ServiceProtocol::Tcp => {
+            tcp_flows
+                .attach(
+                    identity.id,
+                    flow_id,
+                    service,
+                    IncomingCarrier { carrier_id, stream },
+                )
+                .await
+        }
+        ServiceProtocol::Udp => {
+            let _permit = permits
+                .try_acquire_owned()
+                .map_err(|_| anyhow::anyhow!("home active-flow limit reached"))?;
+            serve_udp(stream, flow_id, carrier_id, &service, config.udp_idle_secs).await
         }
     }
-    Ok(())
 }
 
 async fn serve_udp(
     stream: ServerTlsStream<TcpStream>,
     flow_id: Uuid,
+    carrier_id: Uuid,
     service: &Service,
     idle_secs: u64,
 ) -> Result<()> {
@@ -354,7 +359,12 @@ async fn serve_udp(
     let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
     write_json(
         &mut tls_writer,
-        &DataFrame::OpenOk { flow_id },
+        &DataFrame::OpenOk {
+            flow_id,
+            carrier_id,
+            receive_offset: 0,
+            send_offset: 0,
+        },
         DATA_FRAME_LIMIT,
     )
     .await?;

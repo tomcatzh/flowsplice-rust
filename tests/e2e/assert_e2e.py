@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import subprocess
 import time
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
@@ -30,13 +31,18 @@ def wait_ready() -> dict:
         try:
             status, _, body = http_get("/api/status", {"Accept": "application/json"})
             catalog_status, _, catalog_body = http_get("/api/catalog", {"Accept": "application/json"})
-            if status == 200 and catalog_status == 200:
+            relay_status, _, relay_body = http_get("/api/relays", {"Accept": "application/json"})
+            if status == 200 and catalog_status == 200 and relay_status == 200:
                 state = json.loads(body)
                 catalog = json.loads(catalog_body)
+                directory = json.loads(relay_body)
                 if (
                     state["ok"]
                     and catalog["home_alias"] == "E2E Home"
                     and len(catalog["services"]) == 2
+                    and directory["generation"] >= 1
+                    and {relay["id"] for relay in directory["relays"]}
+                    == {"relay-1", "relay-2"}
                 ):
                     return state
         except Exception as error:  # startup polling deliberately records all transport failures
@@ -45,18 +51,55 @@ def wait_ready() -> dict:
     raise AssertionError(f"Travel Agent did not become ready: {last_error}")
 
 
-def check_tcp() -> None:
-    expected = b"flowsplice-tcp-e2e-" + bytes(range(64))
+def read_line(stream: socket.socket) -> bytes:
+    received = bytearray()
+    while not received.endswith(b"\n"):
+        chunk = stream.recv(4096)
+        if not chunk:
+            raise AssertionError("TCP flow closed before a complete response")
+        received.extend(chunk)
+    return bytes(received)
+
+
+def exchange_line(stream: socket.socket, payload: bytes) -> int:
+    stream.sendall(payload + b"\n")
+    response = read_line(stream)
+    connection, echoed = response.split(b":", 1)
+    assert echoed == payload + b"\n", (echoed, payload)
+    return int(connection)
+
+
+def wait_active_relay(excluded: str | None = None) -> str:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        status, _, body = http_get("/api/status", {"Accept": "application/json"})
+        if status == 200:
+            active = json.loads(body)["active_relays"]
+            if len(active) == 1 and active[0] != excluded:
+                return active[0]
+        time.sleep(0.2)
+    raise AssertionError(f"Travel did not select a replacement Relay; excluded={excluded}")
+
+
+def check_tcp_relay_failover() -> tuple[str, str]:
+    compose_file = Path(__file__).resolve().parent / "compose.yaml"
     with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
-        stream.sendall(expected)
-        stream.shutdown(socket.SHUT_WR)
-        received = bytearray()
-        while len(received) < len(expected):
-            chunk = stream.recv(4096)
-            if not chunk:
-                break
-            received.extend(chunk)
-    assert bytes(received) == expected, (len(received), len(expected))
+        stream.settimeout(30)
+        connection_id = exchange_line(stream, b"before-relay-failure")
+        active = wait_active_relay()
+        service = {"relay-1": "relay1", "relay-2": "relay2"}[active]
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "kill", "-s", "KILL", service],
+            check=True,
+        )
+
+        for sequence in range(32):
+            observed = exchange_line(stream, f"after-relay-failure-{sequence:04d}".encode())
+            assert observed == connection_id, (observed, connection_id)
+
+        replacement = wait_active_relay(excluded=active)
+        assert replacement != active
+        return active, replacement
 
 
 def check_udp() -> None:
@@ -108,7 +151,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
     tls12 = management_tls_context(ssl.TLSVersion.TLSv1_2)
     try:
         with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
-            with tls12.wrap_socket(raw, server_hostname="relay.flowsplice"):
+            with tls12.wrap_socket(raw, server_hostname="relay-1.flowsplice"):
                 pass
     except (OSError, ssl.SSLError):
         pass
@@ -117,7 +160,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 
     tls13 = management_tls_context(ssl.TLSVersion.TLSv1_3)
     with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
-        with tls13.wrap_socket(raw, server_hostname="relay.flowsplice") as stream:
+        with tls13.wrap_socket(raw, server_hostname="relay-1.flowsplice") as stream:
             assert stream.version() == "TLSv1.3"
             stream.settimeout(13)
             stream.sendall(b"\x00\x00")
@@ -132,9 +175,27 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 
 
 state = wait_ready()
-check_tcp()
 check_udp()
 check_embedded_spa()
 check_tls_policy_and_slow_loris_deadline()
-checks = ["tcp", "udp", "embedded-spa", "tls13-only", "slow-frame-deadline"]
-print(json.dumps({"result": "ok", "travel": state["travel_id"], "checks": checks}))
+failed_relay, replacement_relay = check_tcp_relay_failover()
+checks = [
+    "two-relay-directory",
+    "same-tcp-flow-relay-failover",
+    "same-home-target-connection",
+    "udp",
+    "embedded-spa",
+    "tls13-only",
+    "slow-frame-deadline",
+]
+print(
+    json.dumps(
+        {
+            "result": "ok",
+            "travel": state["travel_id"],
+            "failed_relay": failed_relay,
+            "replacement_relay": replacement_relay,
+            "checks": checks,
+        }
+    )
+)

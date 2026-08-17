@@ -1,14 +1,21 @@
 id = "server-1"
 control_listen = "0.0.0.0:7443"
 data_listen = "0.0.0.0:7444"
-relay_addr = "relay:8443"
-relay_server_name = "relay.flowsplice"
-relay_id = "relay-1"
 cert = "/certs/server.crt"
 key = "/certs/server.key"
 management_ca = "/certs/management-ca.crt"
 home_id = "home-1"
 home_spki_pins = ["__HOME_MANAGEMENT_PIN__"]
-relay_spki_pins = ["__RELAY_PIN__"]
+relay_spki_pins = ["__RELAY1_PIN__", "__RELAY2_PIN__"]
 handshake_timeout_secs = 10
 work_ttl_secs = 15
+
+[[relays]]
+id = "relay-1"
+management_addr = "relay1:8443"
+server_name = "relay-1.flowsplice"
+
+[[relays]]
+id = "relay-2"
+management_addr = "relay2:8443"
+server_name = "relay-2.flowsplice"

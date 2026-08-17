@@ -15,6 +15,10 @@ travel_spki_pins = ["replace-with-travel-spki-sha256-hex"]
 handshake_timeout_secs = 10
 udp_idle_secs = 60
 max_active_flows = 128
+carrier_heartbeat_secs = 5
+carrier_timeout_secs = 30
+flow_detach_timeout_secs = 120
+max_unacked_bytes = 1048576
 
 [[services]]
 id = "ssh"

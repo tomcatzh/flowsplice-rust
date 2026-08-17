@@ -1,11 +1,11 @@
-id = "relay-1"
+id = "relay-2"
 management_listen = "0.0.0.0:8443"
 data_listen = "0.0.0.0:8444"
-data_public_addr = "relay1:8444"
+data_public_addr = "relay2:8444"
 server_data_addr = "server:7444"
 server_id = "server-1"
-cert = "/certs/relay1.crt"
-key = "/certs/relay1.key"
+cert = "/certs/relay2.crt"
+key = "/certs/relay2.key"
 management_ca = "/certs/management-ca.crt"
 server_spki_pins = ["__SERVER_PIN__"]
 travel_spki_pins = ["__TRAVEL_MANAGEMENT_PIN__"]
