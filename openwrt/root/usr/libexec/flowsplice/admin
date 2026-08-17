@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+SERVER_BIN=/usr/bin/flowsplice-server
+RENDERER=/usr/libexec/flowsplice/render-config
+RUNTIME_DIR=/var/run/flowsplice
+SERVER_CONFIG="$RUNTIME_DIR/server.toml"
+REQUEST_FILE="$RUNTIME_DIR/luci-enrollment-request.json"
+APPROVAL_FILE="$RUNTIME_DIR/luci-enrollment-approval.json"
+RESPONSE_FILE="$RUNTIME_DIR/luci-enrollment-response.json"
+REVOCATION_FILE="$RUNTIME_DIR/luci-revocation.json"
+
+usage() {
+	echo "usage: $0 status|prepare|import|revoke" >&2
+	exit 2
+}
+
+prepare_config() {
+	mkdir -p "$RUNTIME_DIR"
+	chmod 700 "$RUNTIME_DIR"
+	"$RENDERER" server "$SERVER_CONFIG"
+}
+
+require_regular_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || {
+		echo "missing or unsafe input file: $1" >&2
+		exit 1
+	}
+	chmod 600 "$1"
+}
+
+[ "$#" -eq 1 ] || usage
+umask 077
+prepare_config
+
+case "$1" in
+	status)
+		exec "$SERVER_BIN" --config "$SERVER_CONFIG" --travel-authorization-status
+		;;
+	prepare)
+		require_regular_file "$REQUEST_FILE"
+		rm -f "$APPROVAL_FILE"
+		"$SERVER_BIN" --config "$SERVER_CONFIG" \
+			--prepare-travel-enrollment "$REQUEST_FILE" \
+			--output "$APPROVAL_FILE" >/dev/null
+		cat "$APPROVAL_FILE"
+		;;
+	import)
+		require_regular_file "$RESPONSE_FILE"
+		exec "$SERVER_BIN" --config "$SERVER_CONFIG" \
+			--import-travel-enrollment "$RESPONSE_FILE"
+		;;
+	revoke)
+		require_regular_file "$REVOCATION_FILE"
+		credential_id="$(jsonfilter -i "$REVOCATION_FILE" -e '@.credential_id')"
+		reason="$(jsonfilter -i "$REVOCATION_FILE" -e '@.reason')"
+		case "$credential_id" in
+			????????-????-????-????-????????????) ;;
+			*) echo 'invalid Travel credential id' >&2; exit 1 ;;
+		esac
+		[ -n "$reason" ] || { echo 'revocation reason is required' >&2; exit 1; }
+		exec "$SERVER_BIN" --config "$SERVER_CONFIG" \
+			"--revoke-travel-credential=$credential_id" \
+			"--revocation-reason=$reason"
+		;;
+	*) usage ;;
+esac

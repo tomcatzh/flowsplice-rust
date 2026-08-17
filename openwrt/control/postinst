@@ -10,6 +10,7 @@ mkdir -p /etc/flowsplice/state
 chown flowsplice:flowsplice /etc/flowsplice/state
 chmod 700 /etc/flowsplice/state
 /etc/init.d/flowsplice enable
-rm -f /tmp/luci-indexcache
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
 exit 0

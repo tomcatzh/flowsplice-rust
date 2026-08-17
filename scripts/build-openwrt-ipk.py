@@ -12,10 +12,13 @@ import re
 import tarfile
 import tempfile
 
+from po2lmo import compile_po
+
 
 PACKAGE = "flowsplice-openwrt"
 EXECUTABLE_PATHS = {
     "etc/init.d/flowsplice",
+    "usr/libexec/flowsplice/admin",
     "usr/libexec/flowsplice/render-config",
 }
 
@@ -66,7 +69,7 @@ def gzip_tar(entries: list[tuple[str, bytes | None, int]], epoch: int) -> bytes:
 
 
 def collect_data(
-    root: Path, server: Path, relay: Path, license_file: Path
+    root: Path, server: Path, relay: Path, license_file: Path, translation: Path
 ) -> list[tuple[str, bytes | None, int]]:
     files: dict[str, tuple[bytes, int]] = {}
     for path in sorted(root.rglob("*")):
@@ -85,6 +88,7 @@ def collect_data(
             raise ValueError(f"missing binary: {source}")
         files[relative] = (source.read_bytes(), 0o755)
     files["usr/share/licenses/flowsplice-openwrt/LICENSE"] = (license_file.read_bytes(), 0o644)
+    files["usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo"] = (compile_po(translation), 0o644)
     directories: set[str] = set()
     for name in files:
         parent = Path(name).parent
@@ -138,7 +142,13 @@ def build(args: argparse.Namespace) -> Path:
         raise ValueError("source date epoch must not be negative")
 
     repository = Path(__file__).resolve().parents[1]
-    data_entries = collect_data(repository / "openwrt/root", args.server, args.relay, repository / "LICENSE")
+    data_entries = collect_data(
+        repository / "openwrt/root",
+        args.server,
+        args.relay,
+        repository / "LICENSE",
+        repository / "openwrt/po/zh_Hans/flowsplice.po",
+    )
     installed_size = (
         sum(len(data) for _, data, _ in data_entries if data is not None) + 1023
     ) // 1024

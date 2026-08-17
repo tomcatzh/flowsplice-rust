@@ -73,41 +73,53 @@ write_relay_endpoint() {
 	RELAY_ENDPOINT_COUNT=$((RELAY_ENDPOINT_COUNT + 1))
 }
 
+write_home() {
+	local section="$1" id
+	id="$(require_option "$section" id)"
+	printf '\n[[homes]]\n' >>"$RENDER_OUTPUT"
+	write_string id "$id" "$RENDER_OUTPUT"
+	write_list "$section" spki_pin spki_pins "$RENDER_OUTPUT"
+	HOME_COUNT=$((HOME_COUNT + 1))
+}
+
 render_server() {
 	local output="$1" tmp section=server
-	local id cert key management_ca home_id authority credentials revocations admin_socket handshake work_ttl max_pending
+	local id control_listen cert key management_ca authority credentials revocations admin_socket travel_valid_days handshake work_ttl max_pending
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
 	id="$(require_option "$section" id)"
+	control_listen="$(require_option "$section" control_listen)"
 	cert="$(require_option "$section" cert)"
 	key="$(require_option "$section" key)"
 	management_ca="$(require_option "$section" management_ca)"
-	home_id="$(require_option "$section" home_id)"
 	authority="$(require_option "$section" travel_authority_public_key)"
 	credentials="$(require_option "$section" travel_credentials)"
 	revocations="$(require_option "$section" travel_revocations)"
 	admin_socket="$(require_option "$section" admin_socket)"
+	config_get travel_valid_days "$section" travel_valid_days 365
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get work_ttl "$section" work_ttl_secs 15
 	config_get max_pending "$section" max_pending_work 256
 	write_string id "$id" "$tmp"
-	write_list "$section" control_listen control_listens "$tmp"
+	write_string control_listen "$control_listen" "$tmp"
 	write_list "$section" data_listen data_listens "$tmp"
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
 	write_string management_ca "$management_ca" "$tmp"
-	write_string home_id "$home_id" "$tmp"
-	write_list "$section" home_spki_pin home_spki_pins "$tmp"
 	write_list "$section" relay_spki_pin relay_spki_pins "$tmp"
 	write_string travel_authority_public_key "$authority" "$tmp"
 	write_string travel_credentials "$credentials" "$tmp"
 	write_string travel_revocations "$revocations" "$tmp"
 	write_string admin_socket "$admin_socket" "$tmp"
+	write_integer travel_valid_days "$travel_valid_days" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer work_ttl_secs "$work_ttl" "$tmp"
 	write_integer max_pending_work "$max_pending" "$tmp"
 	RENDER_OUTPUT="$tmp"
+	HOME_COUNT=0
+	config_foreach write_home home
+	[ "$HOME_COUNT" -gt 0 ] || die 'an enabled Server requires at least one home section'
 	RELAY_ENDPOINT_COUNT=0
 	config_foreach write_relay_endpoint relay_endpoint
 	[ "$RELAY_ENDPOINT_COUNT" -gt 0 ] || die 'an enabled Server requires at least one enabled relay_endpoint section'
