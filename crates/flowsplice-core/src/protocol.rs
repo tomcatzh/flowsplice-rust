@@ -46,12 +46,17 @@ pub struct Service {
     pub target: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Catalog {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HomeCatalog {
     pub home_id: String,
     pub home_alias: String,
-    pub generation: u64,
     pub services: Vec<Service>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Catalog {
+    pub generation: u64,
+    pub homes: Vec<HomeCatalog>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -93,7 +98,7 @@ pub enum ControlMessage {
         nonce: u64,
     },
     HomeRegister {
-        catalog: Catalog,
+        home: HomeCatalog,
     },
     Catalog {
         catalog: Catalog,
@@ -106,6 +111,7 @@ pub enum ControlMessage {
         travel_id: String,
         travel_session_id: Uuid,
         credential_id: Uuid,
+        home_id: String,
     },
     TravelSessionAuthorize {
         request_id: Uuid,
@@ -126,6 +132,7 @@ pub enum ControlMessage {
         work_id: Uuid,
         work_secret: Vec<u8>,
         credential_id: Uuid,
+        home_id: String,
     },
     RouteGrant {
         request_id: Uuid,
@@ -231,7 +238,8 @@ pub enum DataFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlMessage, DataFrame, RelayDirectory, RelayEndpoint, TravelConnectionPurpose,
+        Catalog, ControlMessage, DataFrame, HomeCatalog, RelayDirectory, RelayEndpoint, Service,
+        ServiceProtocol, TravelConnectionPurpose,
     };
     use uuid::Uuid;
 
@@ -308,6 +316,62 @@ mod tests {
             }
             _ => panic!("wrong control message variant"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_preserves_services_with_the_same_id_on_different_homes()
+    -> Result<(), serde_json::Error> {
+        let service = |target: &str| Service {
+            id: "ssh".to_owned(),
+            alias: "SSH".to_owned(),
+            protocol: ServiceProtocol::Tcp,
+            target: target.to_owned(),
+        };
+        let message = ControlMessage::Catalog {
+            catalog: Catalog {
+                generation: 9,
+                homes: vec![
+                    HomeCatalog {
+                        home_id: "home-1".to_owned(),
+                        home_alias: "Home One".to_owned(),
+                        services: vec![service("127.0.0.1:22")],
+                    },
+                    HomeCatalog {
+                        home_id: "home-2".to_owned(),
+                        home_alias: "Home Two".to_owned(),
+                        services: vec![service("127.0.0.1:22")],
+                    },
+                ],
+            },
+        };
+        let encoded = serde_json::to_vec(&message)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        let ControlMessage::Catalog { catalog } = decoded else {
+            panic!("wrong control message variant");
+        };
+        assert_eq!(catalog.generation, 9);
+        assert_eq!(catalog.homes.len(), 2);
+        assert_eq!(catalog.homes[0].services[0].id, "ssh");
+        assert_eq!(catalog.homes[1].services[0].id, "ssh");
+        Ok(())
+    }
+
+    #[test]
+    fn route_request_carries_the_selected_home() -> Result<(), serde_json::Error> {
+        let message = ControlMessage::RouteRequest {
+            request_id: Uuid::new_v4(),
+            travel_id: "travel-1".to_owned(),
+            travel_session_id: Uuid::new_v4(),
+            credential_id: Uuid::new_v4(),
+            home_id: "home-2".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&message)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        let ControlMessage::RouteRequest { home_id, .. } = decoded else {
+            panic!("wrong control message variant");
+        };
+        assert_eq!(home_id, "home-2");
         Ok(())
     }
 }

@@ -19,12 +19,17 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, RelayDirectory, RelayEndpoint, Role},
+    protocol::{Catalog, ControlMessage, HomeCatalog, RelayDirectory, RelayEndpoint, Role},
     route::{RouteSide, read_preface, verify_preface},
     tls::{
         client_connector, peer_identity, require_peer, server_acceptor, server_name,
         validate_spki_pins,
     },
+};
+use flowsplice_enrollment::{
+    DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentApproval, TravelEnrollmentRequest,
+    TravelEnrollmentResponse, load_json as load_enrollment_json, prepare_enrollment_approval,
+    validate_enrollment_response, write_json_private,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -57,33 +62,49 @@ struct Args {
     reload_travel_credentials: bool,
     #[arg(long)]
     travel_authorization_status: bool,
+    #[arg(long)]
+    prepare_travel_enrollment: Option<PathBuf>,
+    #[arg(long)]
+    import_travel_enrollment: Option<PathBuf>,
+    #[arg(long)]
+    travel_valid_days: Option<u32>,
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     id: String,
-    control_listens: Vec<String>,
+    control_listen: String,
     data_listens: Vec<String>,
     relays: Vec<RelayEndpoint>,
     cert: PathBuf,
     key: PathBuf,
     management_ca: PathBuf,
-    home_id: String,
-    #[serde(default)]
-    home_spki_pins: Vec<String>,
+    homes: Vec<ConfiguredHome>,
     #[serde(default)]
     relay_spki_pins: Vec<String>,
     travel_authority_public_key: String,
     travel_credentials: PathBuf,
     travel_revocations: PathBuf,
     admin_socket: PathBuf,
+    #[serde(default = "default_travel_valid_days")]
+    travel_valid_days: u32,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
     #[serde(default = "default_work_ttl")]
     work_ttl_secs: u64,
     #[serde(default = "default_max_pending_work")]
     max_pending_work: usize,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredHome {
+    id: String,
+    #[serde(default)]
+    spki_pins: Vec<String>,
 }
 
 const fn default_handshake_timeout() -> u64 {
@@ -98,20 +119,111 @@ const fn default_max_pending_work() -> usize {
     256
 }
 
+const fn default_travel_valid_days() -> u32 {
+    DEFAULT_VALID_DAYS
+}
+
 const TRAVEL_SESSION_LEASE: Duration = Duration::from_secs(45);
 
 struct PendingWork {
     credential_id: Uuid,
+    home_id: String,
     secret: Vec<u8>,
     expires: Instant,
     home: Option<TcpStream>,
     relay: Option<TcpStream>,
 }
 
+struct RouteRequestContext {
+    request: Uuid,
+    travel: String,
+    travel_session: Uuid,
+    credential: Uuid,
+    home: String,
+}
+
+#[derive(Clone)]
 struct HomeSession {
     session_id: Uuid,
     tx: mpsc::Sender<ControlMessage>,
     shutdown: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct HomeRegistry {
+    generation: u64,
+    sessions: HashMap<String, HomeSession>,
+    catalogs: HashMap<String, HomeCatalog>,
+}
+
+impl HomeRegistry {
+    fn catalog(&self) -> Catalog {
+        let mut homes = self.catalogs.values().cloned().collect::<Vec<_>>();
+        homes.sort_by(|left, right| left.home_id.cmp(&right.home_id));
+        Catalog {
+            generation: self.generation,
+            homes,
+        }
+    }
+
+    fn register(
+        &mut self,
+        home: HomeCatalog,
+        session: HomeSession,
+    ) -> (Option<HomeSession>, Option<Catalog>) {
+        let home_id = home.home_id.clone();
+        let previous = self.sessions.insert(home_id.clone(), session);
+        let changed = self.catalogs.get(&home_id) != Some(&home);
+        self.catalogs.insert(home_id, home);
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+            (previous, Some(self.catalog()))
+        } else {
+            (previous, None)
+        }
+    }
+
+    fn update_catalog(&mut self, home: HomeCatalog, session_id: Uuid) -> Option<Catalog> {
+        let home_id = home.home_id.clone();
+        if self
+            .sessions
+            .get(&home_id)
+            .is_none_or(|session| session.session_id != session_id)
+            || self.catalogs.get(&home_id) == Some(&home)
+        {
+            return None;
+        }
+        self.catalogs.insert(home_id, home);
+        self.generation = self.generation.saturating_add(1);
+        Some(self.catalog())
+    }
+
+    fn remove(&mut self, home_id: &str, session_id: Uuid) -> Option<Catalog> {
+        if self
+            .sessions
+            .get(home_id)
+            .is_none_or(|session| session.session_id != session_id)
+        {
+            return None;
+        }
+        self.sessions.remove(home_id);
+        if self.catalogs.remove(home_id).is_some() {
+            self.generation = self.generation.saturating_add(1);
+            return Some(self.catalog());
+        }
+        None
+    }
+
+    fn sender(&self, home_id: &str) -> Option<mpsc::Sender<ControlMessage>> {
+        self.sessions.get(home_id).map(|session| session.tx.clone())
+    }
+
+    fn senders(&self) -> Vec<(String, mpsc::Sender<ControlMessage>)> {
+        self.sessions
+            .iter()
+            .map(|(home_id, session)| (home_id.clone(), session.tx.clone()))
+            .collect()
+    }
 }
 
 struct TravelSession {
@@ -181,28 +293,28 @@ impl TravelSessionRegistry {
 }
 
 struct State {
-    catalog: RwLock<Catalog>,
-    home_session: Mutex<Option<HomeSession>>,
+    homes: Mutex<HomeRegistry>,
     relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
     travel_sessions: Mutex<TravelSessionRegistry>,
     pending: Mutex<HashMap<Uuid, PendingWork>>,
     authorization: RwLock<ServerAuthorization>,
     authorization_acks: Mutex<HashMap<String, u64>>,
     authorization_tx: watch::Sender<u64>,
+    default_travel_valid_days: u32,
 }
 
 impl State {
-    fn new(authorization: ServerAuthorization) -> Self {
+    fn new(authorization: ServerAuthorization, default_travel_valid_days: u32) -> Self {
         let (authorization_tx, _) = watch::channel(authorization.snapshot().generation);
         Self {
-            catalog: RwLock::new(Catalog::default()),
-            home_session: Mutex::new(None),
+            homes: Mutex::new(HomeRegistry::default()),
             relay_txs: Mutex::new(HashMap::new()),
             travel_sessions: Mutex::new(TravelSessionRegistry::default()),
             pending: Mutex::new(HashMap::new()),
             authorization: RwLock::new(authorization),
             authorization_acks: Mutex::new(HashMap::new()),
             authorization_tx,
+            default_travel_valid_days,
         }
     }
 }
@@ -210,9 +322,28 @@ impl State {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum AdminRequest {
-    Revoke { credential_id: Uuid, reason: String },
+    Revoke {
+        credential_id: Uuid,
+        reason: String,
+    },
     ReloadCredentials,
+    PrepareEnrollment {
+        request: TravelEnrollmentRequest,
+        valid_days: Option<u32>,
+    },
+    ImportEnrollment {
+        response: TravelEnrollmentResponse,
+    },
     Status,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct TravelCredentialStatus {
+    credential_id: Uuid,
+    travel_id: String,
+    not_after_unix_secs: u64,
+    revoked: bool,
+    active: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -221,8 +352,12 @@ struct AdminResponse {
     changed: bool,
     generation: u64,
     acknowledgements: HashMap<String, u64>,
+    approval: Option<TravelEnrollmentApproval>,
+    credentials: Vec<TravelCredentialStatus>,
     error: Option<String>,
 }
+
+const ADMIN_FRAME_LIMIT: usize = 512 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -241,13 +376,20 @@ async fn main() -> Result<()> {
     let admin_request = admin_request_from_args(&args)?;
     if let Some(request) = admin_request {
         let response = run_admin_client(&config.admin_socket, request).await?;
-        println!("{}", serde_json::to_string(&response)?);
         if !response.ok {
             bail!(
                 "admin request failed: {}",
                 response.error.as_deref().unwrap_or("unknown error")
             );
         }
+        if let Some(output) = &args.output {
+            let approval = response
+                .approval
+                .as_ref()
+                .ok_or_else(|| anyhow!("admin response did not contain an enrollment approval"))?;
+            write_json_private(output, approval)?;
+        }
+        println!("{}", serde_json::to_string(&response)?);
         return Ok(());
     }
     if args.check_config {
@@ -259,7 +401,7 @@ async fn main() -> Result<()> {
         config.travel_credentials.clone(),
         config.travel_revocations.clone(),
     )?;
-    let state = Arc::new(State::new(authorization));
+    let state = Arc::new(State::new(authorization, config.travel_valid_days));
 
     let control = run_home_listeners(config.clone(), Arc::clone(&state));
     let data = run_data_listeners(config.clone(), Arc::clone(&state));
@@ -272,15 +414,18 @@ async fn main() -> Result<()> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    if config.id.is_empty() || config.home_id.is_empty() {
-        bail!("server and Home ids must be non-empty");
+    if config.id.is_empty() {
+        bail!("server id must be non-empty");
     }
-    validate_listens(&config.control_listens, "control")?;
+    validate_listen(&config.control_listen, "control")?;
     validate_listens(&config.data_listens, "data")?;
-    validate_spki_pins(&config.home_spki_pins, "home")?;
+    validate_homes(&config.homes)?;
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
     if config.admin_socket.as_os_str().is_empty() {
         bail!("server admin_socket must not be empty");
+    }
+    if config.travel_valid_days == 0 || config.travel_valid_days > MAX_VALID_DAYS {
+        bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
     }
     ServerAuthorization::validate(
         config.travel_authority_public_key.clone(),
@@ -302,10 +447,32 @@ fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn validate_homes(homes: &[ConfiguredHome]) -> Result<()> {
+    if homes.is_empty() {
+        bail!("at least one Home Agent is required");
+    }
+    let mut ids = std::collections::HashSet::new();
+    for home in homes {
+        if home.id.is_empty() || !ids.insert(&home.id) {
+            bail!("Home ids must be non-empty and unique");
+        }
+        validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
+    }
+    Ok(())
+}
+
 fn admin_request_from_args(args: &Args) -> Result<Option<AdminRequest>> {
+    if args.travel_valid_days.is_some() && args.prepare_travel_enrollment.is_none() {
+        bail!("--travel-valid-days requires --prepare-travel-enrollment");
+    }
+    if args.output.is_some() && args.prepare_travel_enrollment.is_none() {
+        bail!("--output requires --prepare-travel-enrollment");
+    }
     let selected = usize::from(args.revoke_travel_credential.is_some())
         + usize::from(args.reload_travel_credentials)
-        + usize::from(args.travel_authorization_status);
+        + usize::from(args.travel_authorization_status)
+        + usize::from(args.prepare_travel_enrollment.is_some())
+        + usize::from(args.import_travel_enrollment.is_some());
     if selected > 1 || (selected != 0 && args.check_config) {
         bail!("select exactly one admin action, without --check-config");
     }
@@ -328,11 +495,24 @@ fn admin_request_from_args(args: &Args) -> Result<Option<AdminRequest>> {
     if args.travel_authorization_status {
         return Ok(Some(AdminRequest::Status));
     }
+    if let Some(path) = &args.prepare_travel_enrollment {
+        if args.output.is_none() {
+            bail!("--output is required with --prepare-travel-enrollment");
+        }
+        return Ok(Some(AdminRequest::PrepareEnrollment {
+            request: load_enrollment_json(path)?,
+            valid_days: args.travel_valid_days,
+        }));
+    }
+    if let Some(path) = &args.import_travel_enrollment {
+        return Ok(Some(AdminRequest::ImportEnrollment {
+            response: load_enrollment_json(path)?,
+        }));
+    }
     Ok(None)
 }
 
 async fn run_admin_client(socket: &PathBuf, request: AdminRequest) -> Result<AdminResponse> {
-    const ADMIN_FRAME_LIMIT: usize = 64 * 1024;
     let mut stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("failed to connect admin socket {}", socket.display()))?;
@@ -359,6 +539,16 @@ fn validate_listens(listens: &[String], label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_listen(address: &str, label: &str) -> Result<()> {
+    if address.is_empty() {
+        bail!("{label} listener address must be non-empty");
+    }
+    address
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid {label} listener {address}"))?;
+    Ok(())
+}
+
 fn validate_relays(relays: &[RelayEndpoint]) -> Result<()> {
     if relays.is_empty() {
         bail!("at least one relay is required");
@@ -378,26 +568,11 @@ fn validate_relays(relays: &[RelayEndpoint]) -> Result<()> {
 
 async fn run_home_listeners(config: Config, state: Arc<State>) -> Result<()> {
     let acceptor = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
-    let mut listeners = Vec::with_capacity(config.control_listens.len());
-    for address in &config.control_listens {
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("failed to bind home control {address}"))?;
-        listeners.push((address.clone(), listener));
-    }
-    let mut tasks = JoinSet::new();
-    for (address, listener) in listeners {
-        let acceptor = acceptor.clone();
-        let config = config.clone();
-        let state = Arc::clone(&state);
-        tasks.spawn(async move {
-            run_home_accept_loop(listener, address, acceptor, config, state).await
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result??;
-    }
-    bail!("all Home control listeners stopped")
+    let address = config.control_listen.clone();
+    let listener = TcpListener::bind(&address)
+        .await
+        .with_context(|| format!("failed to bind home control {address}"))?;
+    run_home_accept_loop(listener, address, acceptor, config, state).await
 }
 
 async fn run_home_accept_loop(
@@ -436,11 +611,16 @@ async fn handle_home(
     config: &Config,
 ) -> Result<()> {
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    let configured_home = config
+        .homes
+        .iter()
+        .find(|home| home.id == identity.id)
+        .ok_or_else(|| anyhow!("Home {} is not configured", identity.id))?;
     require_peer(
         &identity,
         Role::Home,
-        Some(&config.home_id),
-        &config.home_spki_pins,
+        Some(&configured_home.id),
+        &configured_home.spki_pins,
     )?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -462,13 +642,13 @@ async fn handle_home(
     )
     .await?;
 
-    let ControlMessage::HomeRegister { catalog } = reader
+    let ControlMessage::HomeRegister { home } = reader
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     else {
         bail!("home did not register a catalog after HELLO");
     };
-    if catalog.home_id != identity.id {
+    if home.home_id != identity.id {
         bail!("catalog home id does not match the authenticated home");
     }
     let snapshot = state.authorization.read().await.snapshot();
@@ -491,16 +671,17 @@ async fn handle_home(
         }
         _ => bail!("home did not acknowledge the current Travel authorization snapshot"),
     }
-    publish_catalog(&state, catalog.clone()).await;
-
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(32);
     let session_id = Uuid::new_v4();
     let (shutdown, mut shutdown_rx) = watch::channel(false);
-    let previous = state.home_session.lock().await.replace(HomeSession {
-        session_id,
-        tx: tx.clone(),
-        shutdown,
-    });
+    let (previous, catalog) = state.homes.lock().await.register(
+        home,
+        HomeSession {
+            session_id,
+            tx: tx.clone(),
+            shutdown,
+        },
+    );
     if let Some(previous) = previous {
         warn!(
             old_session_id = %previous.session_id,
@@ -509,6 +690,9 @@ async fn handle_home(
             "superseding existing Home session"
         );
         let _ = previous.shutdown.send(true);
+    }
+    if let Some(catalog) = catalog {
+        publish_catalog(&state, catalog).await;
     }
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -536,11 +720,14 @@ async fn handle_home(
                 }
                 message = reader.read_with_timeout::<ControlMessage>(idle_timeout) => {
                     match message? {
-                        ControlMessage::HomeRegister { catalog } => {
-                            if catalog.home_id != identity.id {
+                        ControlMessage::HomeRegister { home } => {
+                            if home.home_id != identity.id {
                                 bail!("catalog home id does not match the authenticated home");
                             }
-                            publish_catalog(&state, catalog).await;
+                            let catalog = state.homes.lock().await.update_catalog(home, session_id);
+                            if let Some(catalog) = catalog {
+                                publish_catalog(&state, catalog).await;
+                            }
                         }
                         ControlMessage::Heartbeat { nonce } => {
                             tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
@@ -565,22 +752,18 @@ async fn handle_home(
 }
 
 async fn clear_home_session(state: &Arc<State>, session_id: Uuid, home_id: &str) {
-    let mut current = state.home_session.lock().await;
-    if current
-        .as_ref()
-        .is_some_and(|session| session.session_id == session_id)
-    {
-        *current = None;
+    let catalog = state.homes.lock().await.remove(home_id, session_id);
+    if let Some(catalog) = catalog {
         state
             .authorization_acks
             .lock()
             .await
             .remove(&format!("home:{home_id}"));
+        publish_catalog(state, catalog).await;
     }
 }
 
 async fn publish_catalog(state: &Arc<State>, catalog: Catalog) {
-    *state.catalog.write().await = catalog.clone();
     let relays = state.relay_txs.lock().await.clone();
     for (relay_id, relay) in relays {
         if relay
@@ -724,7 +907,7 @@ async fn run_relay_session(
         relay_count = config.relays.len(),
         "published relay directory to relay"
     );
-    let catalog = state.catalog.read().await.clone();
+    let catalog = state.homes.lock().await.catalog();
     tx.send(ControlMessage::Catalog { catalog }).await?;
     info!(relay_id = %relay.id, "relay control connected");
 
@@ -785,12 +968,16 @@ async fn run_relay_session(
                         travel_id,
                         travel_session_id,
                         credential_id,
+                        home_id,
                     } => {
                         handle_route_request(
-                            request_id,
-                            &travel_id,
-                            travel_session_id,
-                            credential_id,
+                            RouteRequestContext {
+                                request: request_id,
+                                travel: travel_id,
+                                travel_session: travel_session_id,
+                                credential: credential_id,
+                                home: home_id,
+                            },
                             config,
                             state,
                             &mut writer,
@@ -819,37 +1006,38 @@ async fn run_relay_session(
 }
 
 async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
-    request_id: Uuid,
-    travel_id: &str,
-    travel_session_id: Uuid,
-    credential_id: Uuid,
+    request: RouteRequestContext,
     config: &Config,
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
-    if let Err(reason) =
-        authorize_travel(state, credential_id, travel_id, travel_session_id, None).await
+    if let Err(reason) = authorize_travel(
+        state,
+        request.credential,
+        &request.travel,
+        request.travel_session,
+        None,
+    )
+    .await
     {
         write_json(
             writer,
-            &ControlMessage::RouteDenied { request_id, reason },
+            &ControlMessage::RouteDenied {
+                request_id: request.request,
+                reason,
+            },
             CONTROL_FRAME_LIMIT,
         )
         .await?;
         return Ok(());
     }
-    let home = state
-        .home_session
-        .lock()
-        .await
-        .as_ref()
-        .map(|session| session.tx.clone());
+    let home = state.homes.lock().await.sender(&request.home);
     if home.is_none() {
         write_json(
             writer,
             &ControlMessage::RouteDenied {
-                request_id,
-                reason: "home agent is unavailable".to_owned(),
+                request_id: request.request,
+                reason: format!("Home Agent {} is unavailable", request.home),
             },
             CONTROL_FRAME_LIMIT,
         )
@@ -867,7 +1055,7 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
         write_json(
             writer,
             &ControlMessage::RouteDenied {
-                request_id,
+                request_id: request.request,
                 reason: "server pending-work limit reached".to_owned(),
             },
             CONTROL_FRAME_LIMIT,
@@ -878,7 +1066,8 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     pending.insert(
         work_id,
         PendingWork {
-            credential_id,
+            credential_id: request.credential,
+            home_id: request.home.clone(),
             secret: secret.clone(),
             expires: Instant::now() + Duration::from_secs(config.work_ttl_secs),
             home: None,
@@ -890,16 +1079,17 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     home.send(ControlMessage::OpenWork {
         work_id,
         work_secret: secret.clone(),
-        credential_id,
+        credential_id: request.credential,
     })
     .await?;
     write_json(
         writer,
         &ControlMessage::ServerRouteGrant {
-            request_id,
+            request_id: request.request,
             work_id,
             work_secret: secret,
-            credential_id,
+            credential_id: request.credential,
+            home_id: request.home,
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -959,6 +1149,7 @@ async fn run_data_accept_loop(
                             .ok_or_else(|| anyhow!("pending work vanished"))?;
                         Some((
                             completed.credential_id,
+                            completed.home_id,
                             completed
                                 .home
                                 .take()
@@ -972,8 +1163,8 @@ async fn run_data_accept_loop(
                         None
                     }
                 };
-                if let Some((credential_id, mut home, mut relay)) = pair {
-                    info!(work_id = %preface.id, %credential_id, "paired opaque server work sockets");
+                if let Some((credential_id, home_id, mut home, mut relay)) = pair {
+                    info!(work_id = %preface.id, %credential_id, %home_id, "paired opaque server work sockets");
                     tokio::select! {
                         result = copy_bidirectional(&mut home, &mut relay) => {
                             let _ = result?;
@@ -1060,15 +1251,11 @@ async fn broadcast_authorization(state: &Arc<State>, snapshot: TravelAuthorizati
             warn!(%relay_id, "failed to publish Travel authorization state to Relay");
         }
     }
-    if let Some(home) = state
-        .home_session
-        .lock()
-        .await
-        .as_ref()
-        .map(|session| session.tx.clone())
-        && home.send(message).await.is_err()
-    {
-        warn!("failed to publish Travel authorization state to Home");
+    let homes = state.homes.lock().await.senders();
+    for (home_id, home) in homes {
+        if home.send(message.clone()).await.is_err() {
+            warn!(%home_id, "failed to publish Travel authorization state to Home");
+        }
     }
     info!(
         event = "travel_authorization_published",
@@ -1143,16 +1330,17 @@ async fn run_admin(config: Config, state: Arc<State>) -> Result<()> {
 }
 
 async fn handle_admin(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
-    const ADMIN_FRAME_LIMIT: usize = 64 * 1024;
     let request = JsonFrameReader::new(&mut stream, ADMIN_FRAME_LIMIT)
         .read_with_timeout::<AdminRequest>(Duration::from_secs(5))
         .await?;
     let response = match handle_admin_request(&state, request).await {
-        Ok((changed, generation)) => AdminResponse {
+        Ok((changed, generation, approval)) => AdminResponse {
             ok: true,
             changed,
             generation,
             acknowledgements: state.authorization_acks.lock().await.clone(),
+            approval,
+            credentials: credential_statuses(&state).await,
             error: None,
         },
         Err(error) => AdminResponse {
@@ -1160,6 +1348,8 @@ async fn handle_admin(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
             changed: false,
             generation: state.authorization.read().await.snapshot().generation,
             acknowledgements: state.authorization_acks.lock().await.clone(),
+            approval: None,
+            credentials: credential_statuses(&state).await,
             error: Some(error.to_string()),
         },
     };
@@ -1167,8 +1357,11 @@ async fn handle_admin(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
     Ok(())
 }
 
-async fn handle_admin_request(state: &Arc<State>, request: AdminRequest) -> Result<(bool, u64)> {
-    let (changed, revoked_id, snapshot) = {
+async fn handle_admin_request(
+    state: &Arc<State>,
+    request: AdminRequest,
+) -> Result<(bool, u64, Option<TravelEnrollmentApproval>)> {
+    let (changed, revoked_id, snapshot, approval) = {
         let mut authorization = state.authorization.write().await;
         match request {
             AdminRequest::Revoke {
@@ -1184,13 +1377,34 @@ async fn handle_admin_request(state: &Arc<State>, request: AdminRequest) -> Resu
                     changed,
                     changed.then_some(credential_id),
                     authorization.snapshot(),
+                    None,
                 )
             }
             AdminRequest::ReloadCredentials => {
                 let changed = authorization.reload_credentials()?;
-                (changed, None, authorization.snapshot())
+                (changed, None, authorization.snapshot(), None)
             }
-            AdminRequest::Status => (false, None, authorization.snapshot()),
+            AdminRequest::PrepareEnrollment {
+                request,
+                valid_days,
+            } => {
+                let approval = prepare_enrollment_approval(
+                    request,
+                    valid_days.unwrap_or(state.default_travel_valid_days),
+                    unix_time_secs()?,
+                )?;
+                (false, None, authorization.snapshot(), Some(approval))
+            }
+            AdminRequest::ImportEnrollment { response } => {
+                let _ = validate_enrollment_response(
+                    &response,
+                    authorization.authority_public_key(),
+                    unix_time_secs()?,
+                )?;
+                let changed = authorization.import_credential(response.signed_credential)?;
+                (changed, None, authorization.snapshot(), None)
+            }
+            AdminRequest::Status => (false, None, authorization.snapshot(), None),
         }
     };
     if let Some(credential_id) = revoked_id {
@@ -1205,16 +1419,67 @@ async fn handle_admin_request(state: &Arc<State>, request: AdminRequest) -> Resu
     if changed {
         broadcast_authorization(state, snapshot.clone()).await;
     }
-    Ok((changed, snapshot.generation))
+    Ok((changed, snapshot.generation, approval))
+}
+
+async fn credential_statuses(state: &Arc<State>) -> Vec<TravelCredentialStatus> {
+    let now = unix_time_secs().unwrap_or_default();
+    let authorization = state.authorization.read().await;
+    let snapshot = authorization.snapshot();
+    snapshot
+        .credentials
+        .iter()
+        .filter_map(|signed| signed.verify(authorization.authority_public_key()).ok())
+        .map(|credential| TravelCredentialStatus {
+            credential_id: credential.credential_id,
+            travel_id: credential.travel_id,
+            not_after_unix_secs: credential.not_after_unix_secs,
+            revoked: snapshot
+                .revocations
+                .iter()
+                .any(|item| item.credential_id == credential.credential_id),
+            active: authorization
+                .verified()
+                .is_active(credential.credential_id, now),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
+    use flowsplice_core::protocol::{HomeCatalog, Service, ServiceProtocol};
+    use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
-    use super::{TRAVEL_SESSION_LEASE, TravelSessionRegistry, validate_listens};
+    use super::{
+        ConfiguredHome, HomeRegistry, HomeSession, TRAVEL_SESSION_LEASE, TravelSessionRegistry,
+        validate_homes, validate_listens,
+    };
+
+    fn home_session(session_id: Uuid) -> HomeSession {
+        let (tx, _) = mpsc::channel(1);
+        let (shutdown, _) = watch::channel(false);
+        HomeSession {
+            session_id,
+            tx,
+            shutdown,
+        }
+    }
+
+    fn home_catalog(home_id: &str, target: &str) -> HomeCatalog {
+        HomeCatalog {
+            home_id: home_id.to_owned(),
+            home_alias: home_id.to_owned(),
+            services: vec![Service {
+                id: "same-service".to_owned(),
+                alias: "Same name".to_owned(),
+                protocol: ServiceProtocol::Tcp,
+                target: target.to_owned(),
+            }],
+        }
+    }
 
     #[test]
     fn accepts_distinct_ipv4_and_ipv6_listeners() {
@@ -1233,6 +1498,85 @@ mod tests {
             .is_err()
         );
         assert!(validate_listens(&["not-an-address".to_owned()], "data").is_err());
+    }
+
+    #[test]
+    fn configured_homes_require_unique_ids_and_independent_pins() {
+        let pin = "11".repeat(32);
+        let homes = vec![
+            ConfiguredHome {
+                id: "home-1".to_owned(),
+                spki_pins: vec![pin.clone()],
+            },
+            ConfiguredHome {
+                id: "home-2".to_owned(),
+                spki_pins: vec!["22".repeat(32)],
+            },
+        ];
+        assert!(validate_homes(&homes).is_ok());
+        assert!(validate_homes(&[]).is_err());
+        assert!(
+            validate_homes(&[
+                ConfiguredHome {
+                    id: "home-1".to_owned(),
+                    spki_pins: vec![pin.clone()],
+                },
+                ConfiguredHome {
+                    id: "home-1".to_owned(),
+                    spki_pins: vec![pin],
+                },
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn home_registry_keeps_identically_named_services_isolated_by_home() {
+        let mut registry = HomeRegistry::default();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let (_, first_catalog) = registry.register(
+            home_catalog("home-1", "127.0.0.1:1001"),
+            home_session(first_id),
+        );
+        let Some(first_catalog) = first_catalog else {
+            panic!("first Home did not publish a catalog");
+        };
+        assert_eq!(first_catalog.generation, 1);
+        let (_, second_catalog) = registry.register(
+            home_catalog("home-2", "127.0.0.1:1001"),
+            home_session(second_id),
+        );
+        let Some(catalog) = second_catalog else {
+            panic!("second Home did not publish a catalog");
+        };
+        assert_eq!(catalog.generation, 2);
+        assert_eq!(catalog.homes.len(), 2);
+        assert!(registry.sender("home-1").is_some());
+        assert!(registry.sender("home-2").is_some());
+        assert!(registry.sender("missing").is_none());
+    }
+
+    #[test]
+    fn stale_home_disconnect_cannot_remove_replacement_session() {
+        let mut registry = HomeRegistry::default();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        registry.register(
+            home_catalog("home-1", "127.0.0.1:1001"),
+            home_session(old_id),
+        );
+        let (_, unchanged) = registry.register(
+            home_catalog("home-1", "127.0.0.1:1001"),
+            home_session(new_id),
+        );
+        assert!(unchanged.is_none());
+        assert!(registry.remove("home-1", old_id).is_none());
+        assert!(registry.sender("home-1").is_some());
+        let Some(catalog) = registry.remove("home-1", new_id) else {
+            panic!("current Home session did not remove its catalog");
+        };
+        assert!(catalog.homes.is_empty());
     }
 
     #[test]

@@ -2,14 +2,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    env, fs,
     io::{self, IsTerminal},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::constant_time::verify_slices_are_equal;
 use axum::{
     Json, Router,
@@ -19,10 +20,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    authorization::unix_time_secs,
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
@@ -31,7 +33,15 @@ use flowsplice_core::{
         TravelConnectionPurpose,
     },
     route::{RouteSide, write_preface},
-    tls::{client_connector, peer_identity, require_peer, server_name, validate_spki_pins},
+    tls::{
+        client_connector_with_private_key, peer_identity, require_peer, server_name,
+        validate_spki_pins,
+    },
+};
+use flowsplice_enrollment::{
+    TravelEnrollmentResponse, create_enrollment_request, install_enrollment_response,
+    key::{is_encrypted_private_key, load_private_key},
+    load_json,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -44,6 +54,7 @@ use tokio::{
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 mod tcp_flow;
 
@@ -57,17 +68,50 @@ static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
 });
 
 #[derive(Parser)]
-struct Args {
+struct Cli {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "travelagent.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    EnrollInit(EnrollInitArgs),
+    EnrollImport(EnrollImportArgs),
+}
+
+#[derive(clap::Args)]
+struct EnrollInitArgs {
+    #[arg(long)]
+    travel_id: String,
+    #[arg(long)]
+    authority_public_key: String,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, hide = true)]
+    test_password_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct EnrollImportArgs {
+    #[arg(long)]
+    enrollment_dir: PathBuf,
+    #[arg(long)]
+    response: PathBuf,
+    #[arg(long)]
+    management_ca: PathBuf,
+    #[arg(long)]
+    business_ca: PathBuf,
+    #[arg(long, hide = true)]
+    test_password_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
 struct Config {
     id: String,
     seed_relays: Vec<RelayEndpoint>,
-    home_server_name: String,
-    home_id: String,
+    homes: Vec<ConfiguredHome>,
     management_cert: PathBuf,
     management_key: PathBuf,
     management_ca: PathBuf,
@@ -77,8 +121,6 @@ struct Config {
     ui_listen: String,
     #[serde(default)]
     relay_spki_pins: Vec<String>,
-    #[serde(default)]
-    home_spki_pins: Vec<String>,
     #[serde(default)]
     allow_remote_listen: bool,
     #[serde(default)]
@@ -106,8 +148,18 @@ struct Config {
     max_unacked_bytes: usize,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredHome {
+    id: String,
+    server_name: String,
+    #[serde(default)]
+    spki_pins: Vec<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Mapping {
+    home_id: String,
     service_id: String,
     protocol: ServiceProtocol,
     bind: String,
@@ -200,18 +252,22 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "flowsplice_travelagent=info".into()),
         )
         .init();
-    let args = Args::parse();
-    let config: Config = load_toml(&args.config)?;
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        return run_command(command);
+    }
+    let config: Config = load_toml(&cli.config)?;
     validate_config(&config)?;
+    let (management_key, business_key) = load_runtime_private_keys(&config)?;
     let tls = Arc::new(TlsMaterial {
-        management_connector: client_connector(
+        management_connector: client_connector_with_private_key(
             &config.management_cert,
-            &config.management_key,
+            management_key,
             &config.management_ca,
         )?,
-        business_connector: client_connector(
+        business_connector: client_connector_with_private_key(
             &config.business_cert,
-            &config.business_key,
+            business_key,
             &config.business_ca,
         )?,
     });
@@ -244,9 +300,147 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_command(command: Command) -> Result<()> {
+    match command {
+        Command::EnrollInit(args) => {
+            let password = if let Some(path) = args.test_password_file.as_deref() {
+                test_password(path)?
+            } else {
+                prompt_new_private_key_password()?
+            };
+            if password.len() < 12 {
+                bail!("private-key password must contain at least 12 characters");
+            }
+            let request = create_enrollment_request(
+                &args.travel_id,
+                &args.authority_public_key,
+                password.as_bytes(),
+                &args.output_dir,
+                unix_time_secs()?,
+            )?;
+            println!(
+                "created Travel enrollment request {} ({})",
+                request.request_id,
+                args.output_dir.display()
+            );
+            Ok(())
+        }
+        Command::EnrollImport(args) => {
+            let password = if let Some(path) = args.test_password_file.as_deref() {
+                test_password(path)?
+            } else {
+                Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?)
+            };
+            if password.is_empty() {
+                bail!("private-key password must not be empty");
+            }
+            let response: TravelEnrollmentResponse = load_json(&args.response)?;
+            let credential = install_enrollment_response(
+                &args.enrollment_dir,
+                &response,
+                &args.management_ca,
+                &args.business_ca,
+                password.as_bytes(),
+                unix_time_secs()?,
+            )?;
+            println!(
+                "installed Travel credential {} for {}",
+                credential.credential_id, credential.travel_id
+            );
+            Ok(())
+        }
+    }
+}
+
+fn prompt_new_private_key_password() -> Result<Zeroizing<String>> {
+    let password = Zeroizing::new(rpassword::prompt_password(
+        "New Travel private-key password: ",
+    )?);
+    if password.len() < 12 {
+        bail!("private-key password must contain at least 12 characters");
+    }
+    let confirmation = Zeroizing::new(rpassword::prompt_password("Confirm password: ")?);
+    if password.as_bytes() != confirmation.as_bytes() {
+        bail!("private-key passwords do not match");
+    }
+    Ok(password)
+}
+
+fn load_runtime_private_keys(
+    config: &Config,
+) -> Result<(
+    rustls_pki_types::PrivateKeyDer<'static>,
+    rustls_pki_types::PrivateKeyDer<'static>,
+)> {
+    let management_encrypted = is_encrypted_private_key(&config.management_key)?;
+    let business_encrypted = is_encrypted_private_key(&config.business_key)?;
+    if management_encrypted != business_encrypted {
+        bail!("Travel management and business keys must use the same protection mode");
+    }
+    if !management_encrypted {
+        if env::var("FLOWSPLICE_ALLOW_UNENCRYPTED_TEST_KEYS").as_deref() != Ok("1") {
+            bail!("unencrypted Travel private keys are forbidden");
+        }
+        return Ok((
+            load_private_key(&config.management_key, None, true)?,
+            load_private_key(&config.business_key, None, true)?,
+        ));
+    }
+    let password = runtime_password()?;
+    Ok((
+        load_private_key(&config.management_key, Some(password.as_bytes()), false)?,
+        load_private_key(&config.business_key, Some(password.as_bytes()), false)?,
+    ))
+}
+
+fn runtime_password() -> Result<Zeroizing<String>> {
+    if let Some(path) = env::var_os("FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE") {
+        if env::var("FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE").as_deref() != Ok("1") {
+            bail!("test private-key password files are disabled");
+        }
+        return read_password_file(Path::new(&path));
+    }
+    let password = Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?);
+    if password.is_empty() {
+        bail!("private-key password must not be empty");
+    }
+    Ok(password)
+}
+
+fn test_password(path: &Path) -> Result<Zeroizing<String>> {
+    if env::var("FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE").as_deref() != Ok("1") {
+        bail!("--test-password-file is disabled outside the explicit test environment");
+    }
+    read_password_file(path)
+}
+
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    let mut password = Zeroizing::new(
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read test password file {}", path.display()))?,
+    );
+    while password.ends_with('\n') || password.ends_with('\r') {
+        password.pop();
+    }
+    if password.is_empty() {
+        return Err(anyhow!("test private-key password file must not be empty"));
+    }
+    Ok(password)
+}
+
 fn validate_config(config: &Config) -> Result<()> {
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
-    validate_spki_pins(&config.home_spki_pins, "home")?;
+    let mut home_ids = HashSet::new();
+    for home in &config.homes {
+        if home.id.is_empty() || home.server_name.is_empty() || !home_ids.insert(home.id.as_str()) {
+            bail!("Home ids must be non-empty and unique, with non-empty TLS server names");
+        }
+        validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
+        let _ = server_name(&home.server_name)?;
+    }
+    if config.homes.is_empty() {
+        bail!("at least one Home Agent is required");
+    }
     if config.seed_relays.is_empty() {
         bail!("at least one seed relay is required");
     }
@@ -285,12 +479,15 @@ fn validate_config(config: &Config) -> Result<()> {
     let mut services = HashSet::new();
     let mut binds = HashSet::new();
     for mapping in &config.mappings {
+        if mapping.service_id.is_empty() || !home_ids.contains(mapping.home_id.as_str()) {
+            bail!("every mapping must name a configured Home and a non-empty service");
+        }
         let bind: SocketAddr = mapping.bind.parse().context("invalid mapping bind")?;
         if !config.allow_remote_listen && !bind.ip().is_loopback() {
             bail!("mapping binds must be loopback unless allow_remote_listen is true");
         }
-        if !services.insert((&mapping.service_id, mapping.protocol)) {
-            bail!("mapping service/protocol pairs must be unique");
+        if !services.insert((&mapping.home_id, &mapping.service_id, mapping.protocol)) {
+            bail!("mapping Home/service/protocol tuples must be unique");
         }
         if !binds.insert(bind) {
             bail!("mapping bind addresses must be unique");
@@ -440,7 +637,11 @@ async fn open_management(
     ))
 }
 
-async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteGrant> {
+async fn request_route(
+    state: &AppState,
+    relay: &RelayEndpoint,
+    home_id: &str,
+) -> Result<RouteGrant> {
     let config = &state.config;
     let (stream, directory, catalog, credential_id) =
         open_management(state, relay, TravelConnectionPurpose::Route).await?;
@@ -456,6 +657,7 @@ async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteG
             travel_id: config.id.clone(),
             travel_session_id: state.session_id,
             credential_id,
+            home_id: home_id.to_owned(),
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -517,9 +719,15 @@ async fn open_business_on(
     carrier_id: Uuid,
     service_id: &str,
     protocol: ServiceProtocol,
+    home_id: &str,
 ) -> Result<BusinessCarrier> {
     let config = &state.config;
-    let grant = request_route(state, relay).await?;
+    let home = config
+        .homes
+        .iter()
+        .find(|home| home.id == home_id)
+        .ok_or_else(|| anyhow!("Home {home_id} is not configured"))?;
+    let grant = request_route(state, relay, home_id).await?;
     let mut socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         TcpStream::connect(&grant.data_addr),
@@ -539,17 +747,12 @@ async fn open_business_on(
         state
             .tls
             .business_connector
-            .connect(server_name(&config.home_server_name)?, socket),
+            .connect(server_name(&home.server_name)?, socket),
     )
     .await
     .context("business TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(
-        &identity,
-        Role::Home,
-        Some(&config.home_id),
-        &config.home_spki_pins,
-    )?;
+    require_peer(&identity, Role::Home, Some(&home.id), &home.spki_pins)?;
     write_json(
         &mut stream,
         &DataFrame::Open {
@@ -619,7 +822,7 @@ async fn update_directory(state: &AppState, directory: RelayDirectory) {
 
 async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
     let listener = TcpListener::bind(&mapping.bind).await?;
-    info!(service_id = %mapping.service_id, address = %mapping.bind, "local TCP mapping ready");
+    info!(home_id = %mapping.home_id, service_id = %mapping.service_id, address = %mapping.bind, "local TCP mapping ready");
     loop {
         let (local, peer) = listener.accept().await?;
         let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
@@ -632,7 +835,7 @@ async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
             let _permit = permit;
             let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
             if let Err(error) = run_tcp_flow(&state, &mapping, local).await {
-                warn!(%peer, service_id = %mapping.service_id, %error, "TCP flow closed");
+                warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "TCP flow closed");
             }
         });
     }
@@ -644,7 +847,7 @@ async fn run_tcp_flow(state: &AppState, mapping: &Mapping, local: TcpStream) -> 
 
 async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(&mapping.bind).await?);
-    info!(service_id = %mapping.service_id, address = %mapping.bind, "local UDP mapping ready");
+    info!(home_id = %mapping.home_id, service_id = %mapping.service_id, address = %mapping.bind, "local UDP mapping ready");
     let associations: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut buffer = vec![0_u8; 65_507];
@@ -687,7 +890,7 @@ async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
             let _permit = permit;
             let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
             if let Err(error) = run_udp_association(&state, &mapping, socket, peer, rx).await {
-                warn!(%peer, service_id = %mapping.service_id, %error, "UDP association closed");
+                warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "UDP association closed");
             }
             let mut current = associations.lock().await;
             if current
@@ -719,6 +922,7 @@ async fn run_udp_association(
             carrier_id,
             &mapping.service_id,
             ServiceProtocol::Udp,
+            &mapping.home_id,
         )
         .await
         {

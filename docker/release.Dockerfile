@@ -17,6 +17,7 @@ COPY server/ server/
 COPY relay/ relay/
 COPY homeagent/ homeagent/
 COPY travelagent/ travelagent/
+COPY issuer/ issuer/
 COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
 COPY --from=web /src/travelagent/web/dist/ travelagent/web/dist/
@@ -25,12 +26,14 @@ RUN cargo build --locked --release --target "${RUST_TARGET}" \
     -p flowsplice-relay \
     -p flowsplice-homeagent \
     -p flowsplice-travelagent \
+    -p flowsplice-issuer \
     -p flowsplice-foobar
 RUN mkdir /out && \
     cp "target/${RUST_TARGET}/release/flowsplice-server" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-relay" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-homeagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-travelagent" /out/ && \
+    cp "target/${RUST_TARGET}/release/flowsplice-issuer" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-foobar" /out/ && \
     file /out/*
 

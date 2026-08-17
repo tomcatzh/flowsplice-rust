@@ -63,6 +63,7 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
     info!(
         event = "tcp_flow_started",
         %flow_id,
+        home_id = %mapping.home_id,
         service_id = %mapping.service_id,
         "travel TCP flow started"
     );
@@ -254,6 +255,8 @@ async fn perform_race(
         event = "carrier_race_started",
         %flow_id,
         %race_id,
+        home_id = %mapping.home_id,
+        service_id = %mapping.service_id,
         candidate_count = candidates.len(),
         ?relay_ids,
         had_active_carrier = old_active.is_some(),
@@ -264,6 +267,7 @@ async fn perform_race(
             continue;
         }
         let state = state.clone();
+        let home_id = mapping.home_id.clone();
         let service_id = mapping.service_id.clone();
         opens.spawn(async move {
             let carrier_id = Uuid::new_v4();
@@ -274,6 +278,7 @@ async fn perform_race(
                 carrier_id,
                 &service_id,
                 ServiceProtocol::Tcp,
+                &home_id,
             )
             .await;
             (relay.id, result)

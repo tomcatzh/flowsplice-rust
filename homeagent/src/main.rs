@@ -18,7 +18,7 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, DataFrame, Role, Service, ServiceProtocol},
+    protocol::{ControlMessage, DataFrame, HomeCatalog, Role, Service, ServiceProtocol},
     route::{RouteSide, write_preface},
     tls::{
         client_connector, peer_identity, require_peer, server_acceptor, server_name,
@@ -268,10 +268,9 @@ async fn run_control_session(
     write_json(
         &mut writer,
         &ControlMessage::HomeRegister {
-            catalog: Catalog {
+            home: HomeCatalog {
                 home_id: config.id.clone(),
                 home_alias: config.alias.clone(),
-                generation: 1,
                 services: config.services.clone(),
             },
         },

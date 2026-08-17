@@ -82,9 +82,22 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
 ///
 /// Returns an error when certificate material is missing, malformed, or inconsistent.
 pub fn client_connector(cert: &Path, key: &Path, server_ca: &Path) -> Result<TlsConnector> {
+    client_connector_with_private_key(cert, load_key(key)?, server_ca)
+}
+
+/// Builds a mutual-TLS client connector from an already decrypted private key.
+///
+/// # Errors
+///
+/// Returns an error when certificate material is missing, malformed, or inconsistent.
+pub fn client_connector_with_private_key(
+    cert: &Path,
+    key: PrivateKeyDer<'static>,
+    server_ca: &Path,
+) -> Result<TlsConnector> {
     let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(load_roots(server_ca)?)
-        .with_client_auth_cert(load_certs(cert)?, load_key(key)?)
+        .with_client_auth_cert(load_certs(cert)?, key)
         .context("failed to build TLS client config")?;
     Ok(TlsConnector::from(Arc::new(config)))
 }

@@ -1,19 +1,26 @@
 id = "server-1"
-control_listens = ["192.0.2.10:7443"]
+control_listen = "192.0.2.10:7443"
 data_listens = ["192.0.2.10:7444", "[2001:db8::10]:7444"]
 cert = "/etc/flowsplice/server.crt"
 key = "/etc/flowsplice/server.key"
 management_ca = "/etc/flowsplice/management-ca.crt"
-home_id = "home-1"
-home_spki_pins = ["replace-with-home-management-spki-sha256-hex"]
 relay_spki_pins = ["replace-with-relay-spki-sha256-hex"]
 travel_authority_public_key = "replace-with-uncompressed-p256-public-key-hex"
 travel_credentials = "/etc/flowsplice/travel-credentials.json"
 travel_revocations = "/var/lib/flowsplice/travel-revocations.json"
 admin_socket = "/var/run/flowsplice/server-admin.sock"
+travel_valid_days = 365
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 max_pending_work = 256
+
+[[homes]]
+id = "home-1"
+spki_pins = ["replace-with-home-management-spki-sha256-hex"]
+
+[[homes]]
+id = "home-2"
+spki_pins = ["replace-with-second-home-management-spki-sha256-hex"]
 
 [[relays]]
 id = "relay-1"

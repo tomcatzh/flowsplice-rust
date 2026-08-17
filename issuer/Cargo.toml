@@ -1,0 +1,16 @@
+[package]
+name = "flowsplice-issuer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flowsplice-enrollment.workspace = true
+rpassword.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

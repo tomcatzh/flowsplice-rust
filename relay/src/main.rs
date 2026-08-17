@@ -85,10 +85,20 @@ struct ServerGrant {
     work_id: Uuid,
     work_secret: Vec<u8>,
     credential_id: Uuid,
+    home_id: String,
+}
+
+struct TravelRouteContext {
+    request: Uuid,
+    credential: Uuid,
+    travel: String,
+    travel_session: Uuid,
+    home: String,
 }
 
 struct PendingRoute {
     credential_id: Uuid,
+    home_id: String,
     work_id: Uuid,
     route_secret: Vec<u8>,
     work_secret: Vec<u8>,
@@ -333,9 +343,9 @@ async fn handle_server(
                             )
                             .await?;
                         }
-                        ControlMessage::ServerRouteGrant { request_id, work_id, work_secret, credential_id } => {
+                        ControlMessage::ServerRouteGrant { request_id, work_id, work_secret, credential_id, home_id } => {
                             if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret, credential_id }));
+                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret, credential_id, home_id }));
                             }
                         }
                         ControlMessage::RouteDenied { request_id, reason } => {
@@ -480,15 +490,19 @@ async fn handle_travel(
                         travel_id: declared_id,
                         travel_session_id: declared_session,
                         credential_id: declared_credential,
+                        home_id,
                     } if purpose == TravelConnectionPurpose::Route
                         && declared_id == travel_id
                         && declared_session == travel_session_id
                         && declared_credential == credential_id => {
                         handle_travel_route(
-                            request_id,
-                            credential_id,
-                            &travel_id,
-                            travel_session_id,
+                            TravelRouteContext {
+                                request: request_id,
+                                credential: credential_id,
+                                travel: travel_id.clone(),
+                                travel_session: travel_session_id,
+                                home: home_id,
+                            },
                             config,
                             &state,
                             &mut writer,
@@ -600,10 +614,7 @@ async fn authorize_travel_session(
 }
 
 async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
-    request_id: Uuid,
-    credential_id: Uuid,
-    travel_id: &str,
-    travel_session_id: Uuid,
+    request: TravelRouteContext,
     config: &Config,
     state: &Arc<State>,
     writer: &mut W,
@@ -612,7 +623,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         write_json(
             writer,
             &ControlMessage::RouteDenied {
-                request_id,
+                request_id: request.request,
                 reason: "relay pending-route limit reached".to_owned(),
             },
             CONTROL_FRAME_LIMIT,
@@ -620,16 +631,8 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     }
-    match request_server_route(
-        request_id,
-        credential_id,
-        travel_id,
-        travel_session_id,
-        state,
-    )
-    .await
-    {
-        Ok(grant) if grant.credential_id == credential_id => {
+    match request_server_route(&request, state).await {
+        Ok(grant) if grant.credential_id == request.credential && grant.home_id == request.home => {
             let route_id = Uuid::new_v4();
             let mut route_secret = vec![0_u8; 32];
             SystemRandom::new()
@@ -638,7 +641,8 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
             state.routes.lock().await.insert(
                 route_id,
                 PendingRoute {
-                    credential_id,
+                    credential_id: request.credential,
+                    home_id: request.home.clone(),
                     work_id: grant.work_id,
                     route_secret: route_secret.clone(),
                     work_secret: grant.work_secret,
@@ -648,7 +652,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
             write_json(
                 writer,
                 &ControlMessage::RouteGrant {
-                    request_id,
+                    request_id: request.request,
                     route_id,
                     route_secret,
                     data_addr: config.data_public_addr.clone(),
@@ -661,8 +665,8 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
             write_json(
                 writer,
                 &ControlMessage::RouteDenied {
-                    request_id,
-                    reason: "Server route credential mismatch".to_owned(),
+                    request_id: request.request,
+                    reason: "Server route credential or Home mismatch".to_owned(),
                 },
                 CONTROL_FRAME_LIMIT,
             )
@@ -671,7 +675,10 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         Err(reason) => {
             write_json(
                 writer,
-                &ControlMessage::RouteDenied { request_id, reason },
+                &ControlMessage::RouteDenied {
+                    request_id: request.request,
+                    reason,
+                },
                 CONTROL_FRAME_LIMIT,
             )
             .await?;
@@ -681,10 +688,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 async fn request_server_route(
-    request_id: Uuid,
-    credential_id: Uuid,
-    travel_id: &str,
-    travel_session_id: Uuid,
+    request: &TravelRouteContext,
     state: &Arc<State>,
 ) -> Result<ServerGrant, String> {
     let server = state
@@ -695,25 +699,26 @@ async fn request_server_route(
         .map(|session| session.tx.clone())
         .ok_or_else(|| "server is unavailable".to_owned())?;
     let (tx, rx) = oneshot::channel();
-    state.requests.lock().await.insert(request_id, tx);
+    state.requests.lock().await.insert(request.request, tx);
     if server
         .send(ControlMessage::RouteRequest {
-            request_id,
-            travel_id: travel_id.to_owned(),
-            travel_session_id,
-            credential_id,
+            request_id: request.request,
+            travel_id: request.travel.clone(),
+            travel_session_id: request.travel_session,
+            credential_id: request.credential,
+            home_id: request.home.clone(),
         })
         .await
         .is_err()
     {
-        state.requests.lock().await.remove(&request_id);
+        state.requests.lock().await.remove(&request.request);
         return Err("server connection closed".to_owned());
     }
     match timeout(Duration::from_secs(10), rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("route response channel closed".to_owned()),
         Err(_) => {
-            state.requests.lock().await.remove(&request_id);
+            state.requests.lock().await.remove(&request.request);
             Err("route request timed out".to_owned())
         }
     }
@@ -755,7 +760,7 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
                     &route.work_secret,
                 )
                 .await?;
-                info!(route_id = %preface.id, work_id = %route.work_id, "relay entered opaque forwarding");
+                info!(route_id = %preface.id, work_id = %route.work_id, home_id = %route.home_id, "relay entered opaque forwarding");
                 tokio::select! {
                     result = zero_copy_or_portable(&mut travel, &mut server) => result?,
                     () = wait_until_authorization_inactive(authorization_rx, route.credential_id) => {

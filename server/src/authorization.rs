@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use flowsplice_core::authorization::{
-    TravelAuthorizationSnapshot, TravelCredentialBundle, TravelRevocation, VerifiedAuthorization,
-    load_json, store_json_atomic, unix_time_secs, validate_authority_public_key,
+    SignedTravelCredential, TravelAuthorizationSnapshot, TravelCredentialBundle, TravelRevocation,
+    VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
+    validate_authority_public_key,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -100,6 +101,10 @@ impl ServerAuthorization {
         &self.verified
     }
 
+    pub fn authority_public_key(&self) -> &str {
+        &self.authority_public_key
+    }
+
     pub fn revoke(&mut self, credential_id: Uuid, reason: String) -> Result<bool> {
         if self.verified.credential(credential_id).is_none() {
             bail!("unknown Travel credential {credential_id}");
@@ -156,6 +161,42 @@ impl ServerAuthorization {
             revocations: self.snapshot.revocations.clone(),
         };
         let verified = VerifiedAuthorization::verify(&proposed, &self.authority_public_key)?;
+        self.persist_revocations(&proposed)?;
+        self.snapshot = proposed;
+        self.verified = verified;
+        Ok(true)
+    }
+
+    pub fn import_credential(&mut self, signed: SignedTravelCredential) -> Result<bool> {
+        let credential = signed.verify(&self.authority_public_key)?;
+        if let Some(existing) = self.snapshot.credentials.iter().find(|existing| {
+            existing
+                .verify(&self.authority_public_key)
+                .is_ok_and(|value| value.credential_id == credential.credential_id)
+        }) {
+            if existing.payload_hex == signed.payload_hex {
+                return Ok(false);
+            }
+            bail!(
+                "Travel credential id {} is already assigned to different material",
+                credential.credential_id
+            );
+        }
+        let generation = self
+            .snapshot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Travel authorization generation exhausted"))?;
+        let mut proposed = self.snapshot.clone();
+        proposed.generation = generation;
+        proposed.credentials.push(signed);
+        let verified = VerifiedAuthorization::verify(&proposed, &self.authority_public_key)?;
+        store_json_atomic(
+            &self.credentials_path,
+            &TravelCredentialBundle {
+                credentials: proposed.credentials.clone(),
+            },
+        )?;
         self.persist_revocations(&proposed)?;
         self.snapshot = proposed;
         self.verified = verified;
@@ -279,6 +320,63 @@ mod tests {
         );
         fs::remove_dir_all(&directory)
             .with_context(|| format!("failed to remove {}", directory.display()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn credential_import_is_add_only_idempotent_and_cannot_resurrect_revocation() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("flowsplice-import-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory)?;
+        let credentials_path = directory.join("credentials.json");
+        let revocations_path = directory.join("revocations.json");
+        let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("failed to generate fixture key"))?;
+        store_json_atomic(
+            &credentials_path,
+            &TravelCredentialBundle {
+                credentials: Vec::new(),
+            },
+        )?;
+        let public_key = hex::encode(key.public_key().as_ref());
+        let mut authorization = ServerAuthorization::load(
+            public_key.clone(),
+            credentials_path.clone(),
+            revocations_path.clone(),
+        )?;
+        let credential = TravelCredential {
+            credential_id: Uuid::new_v4(),
+            travel_id: "travel-new".to_owned(),
+            management_spki_sha256: "55".repeat(32),
+            business_spki_sha256: "66".repeat(32),
+            not_before_unix_secs: 1,
+            not_after_unix_secs: u64::MAX,
+        };
+        let first_signature = signed(&key, &credential)?;
+        assert!(authorization.import_credential(first_signature.clone())?);
+        assert_eq!(authorization.snapshot().generation, 2);
+        assert!(!authorization.import_credential(first_signature)?);
+        assert!(!authorization.import_credential(signed(&key, &credential)?)?);
+        assert_eq!(authorization.snapshot().generation, 2);
+
+        assert!(authorization.revoke(credential.credential_id, "lost".to_owned())?);
+        assert!(!authorization.import_credential(signed(&key, &credential)?)?);
+        assert!(
+            authorization
+                .verified()
+                .revoked_credentials()
+                .contains(&credential.credential_id)
+        );
+
+        let mut conflicting = credential.clone();
+        conflicting.travel_id = "travel-conflict".to_owned();
+        assert!(
+            authorization
+                .import_credential(signed(&key, &conflicting)?)
+                .is_err()
+        );
+        let reloaded = ServerAuthorization::load(public_key, credentials_path, revocations_path)?;
+        assert_eq!(reloaded.snapshot(), authorization.snapshot());
+        fs::remove_dir_all(directory).ok();
         Ok(())
     }
 }
