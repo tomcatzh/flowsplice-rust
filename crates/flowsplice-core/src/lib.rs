@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod authorization;
 pub mod config;
 pub mod frame;
 pub mod protocol;

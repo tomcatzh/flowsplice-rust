@@ -22,7 +22,7 @@ python3 scripts/build-openwrt-ipk.py \
 
 The builder emits the opkg-compatible gzip-compressed GNU-tar outer format and deterministic nested archives. Always confirm the target release, package manager, package architecture, ABI, and available storage before building. Validate the resulting archive locally, run the target package manager's no-action parser, and preserve a rollback snapshot before installation.
 
-After installation, place identity material below `/etc/flowsplice/pki` or configure other paths, restrict it to the `flowsplice` service account, then use LuCI or UCI to populate real values. Validate before starting:
+After installation, place identity material below `/etc/flowsplice/pki` or configure other paths, restrict it to the `flowsplice` service account, then use LuCI or UCI to populate real values. Travel access is distributed as offline-signed credentials; only the P-256 public key is installed on OpenWrt. The Server keeps an add-only revocation log and each Relay keeps a persistent anti-rollback cache below `/etc/flowsplice/state`, allowing revocation to take effect without restarting any process. Validate before starting:
 
 ```sh
 /etc/init.d/flowsplice validate

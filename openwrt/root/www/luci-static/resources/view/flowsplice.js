@@ -173,6 +173,11 @@ return view.extend({
 		required(s.taboption('trust', form.Value, 'home_id', _('Expected Home ID')));
 		required(s.taboption('trust', form.DynamicList, 'home_spki_pin', _('Home SPKI pins')));
 		required(s.taboption('trust', form.DynamicList, 'relay_spki_pin', _('Relay SPKI pins')));
+		o = required(s.taboption('trust', form.Value, 'travel_authority_public_key', _('Travel authorization public key'),
+			_('Uncompressed P-256 public key in hexadecimal. The matching offline private key must never be installed on this router.')));
+		addPathOption(s, 'trust', 'travel_credentials', _('Signed Travel credentials'));
+		addPathOption(s, 'trust', 'travel_revocations', _('Persistent Travel revocations'));
+		addPathOption(s, 'trust', 'admin_socket', _('Local administration socket'));
 		o = required(s.taboption('limits', form.Value, 'handshake_timeout_secs', _('Handshake timeout (seconds)')));
 		o.datatype = 'uinteger';
 		o.default = '10';
@@ -205,10 +210,14 @@ return view.extend({
 			var pathOption = required(s.option(form.Value, item[0], item[1]));
 			pathOption.modalonly = true;
 		});
-		[ [ 'server_spki_pin', _('Server SPKI pins') ], [ 'travel_spki_pin', _('Travel SPKI pins') ] ].forEach(function(item) {
+		[ [ 'server_spki_pin', _('Server SPKI pins') ] ].forEach(function(item) {
 			var pinOption = required(s.option(form.DynamicList, item[0], item[1]));
 			pinOption.modalonly = true;
 		});
+		o = required(s.option(form.Value, 'travel_authority_public_key', _('Travel authorization public key')));
+		o.modalonly = true;
+		o = required(s.option(form.Value, 'travel_authorization_cache', _('Persistent revocation cache')));
+		o.modalonly = true;
 		[ [ 'handshake_timeout_secs', _('Handshake timeout'), '10' ], [ 'route_ttl_secs', _('Route TTL'), '15' ], [ 'max_pending_routes', _('Maximum pending routes'), '256' ] ].forEach(function(item) {
 			var limitOption = required(s.option(form.Value, item[0], item[1]));
 			limitOption.datatype = 'uinteger';

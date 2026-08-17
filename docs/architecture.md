@@ -7,7 +7,7 @@ FlowSplice has two independent trust domains:
 1. Management TLS authenticates Server, Relay, Home, and Travel control links.
 2. Business TLS authenticates only Travel and Home and carries logical TCP/UDP frames.
 
-The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. SHA-256 SPKI allowlists further narrow every explicitly configured Server, Relay, Travel, management-Home, and business-Home peer relationship. All TLS configurations explicitly permit TLS 1.3 only and use rustls with the AWS-LC provider.
+The CAs are intentionally separate. A Relay management key cannot authenticate as Travel to Home. In addition to certification-path and EKU verification, applications require the certificate URI SAN role and stable ID to match the protocol peer. SHA-256 SPKI allowlists narrow Server, Relay, management-Home, and business-Home relationships. Travel management and business SPKIs are jointly bound to one credential ID by an offline ECDSA P-256 signature. All TLS configurations explicitly permit TLS 1.3 only and use rustls with the AWS-LC provider.
 
 ## Control topology
 
@@ -17,9 +17,9 @@ Home Agent --outbound mTLS--> Server                                  Travel Age
                                    └--outbound mTLS--> Relay B <--mTLS--┘
 ```
 
-Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog and complete Relay directory to each one, and each Relay fans changes out over authenticated Travel management sessions. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
+Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog, complete Relay directory, and Travel authorization snapshot to each one, and each Relay fans catalog/directory changes out over authenticated Travel management sessions. Home and every Relay must durably apply and acknowledge the initial authorization generation before their control session becomes available. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed 10-second heartbeat intervals.
 
-At process startup Travel creates a random in-memory session UUID. The first catalog connection for a certificate-bound Travel ID acquires a 45-second renewable lease in Server through its Relay. Connections through other Relays are allowed only when they carry the same process-session UUID, which is required for multi-Relay route competition. A different process-session UUID for the same Travel ID is rejected globally and cannot displace the active session. Server prunes an unrenewed lease, allowing a later process to log in after the old process is no longer demonstrably online.
+At process startup Travel creates a random in-memory session UUID. The first catalog connection for a signed Travel credential acquires a 45-second renewable lease in Server through its Relay. Connections through other Relays are allowed only when they carry the same credential ID and process-session UUID, which is required for multi-Relay route competition. A different process-session UUID for the same credential is rejected globally and cannot displace the active session. Server prunes an unrenewed lease, allowing a later process to log in after the old process is no longer demonstrably online.
 
 Server may bind multiple explicit IPv4 and IPv6 addresses for both Home control and Relay/Home data
 pairing. All configured listeners are bound before their accept loops start, so a partial bind failure
@@ -27,8 +27,8 @@ fails startup instead of silently exposing an incomplete topology.
 
 ## Route and data setup
 
-1. An authenticated Travel control connection presents its admitted process-session UUID and asks Relay for an opaque route. It does not reveal a service ID.
-2. Relay asks Server for work on behalf of the certificate-bound Travel identity.
+1. An authenticated Travel control connection presents its signed credential ID and admitted process-session UUID and asks Relay for an opaque route. It does not reveal a service ID.
+2. Relay asks Server for work on behalf of that credential-bound Travel identity.
 3. Server creates a random 32-byte work secret, records a short expiry, and asks Home to connect a work socket.
 4. Relay creates a separate random 32-byte single-use route secret for Travel.
 5. Travel authenticates its Relay data preface with HMAC-SHA256.
@@ -37,6 +37,14 @@ fails startup instead of silently exposing an incomplete topology.
 8. Server pairs the Home and Relay sockets. Relay enters Linux `splice(2)` forwarding.
 9. Travel and Home complete a separate mutual TLS handshake through both opaque forwarders.
 10. Only inside that business TLS connection does Travel name and open a service.
+
+The credential ID is carried through route authorization and `OPEN_WORK`, then Home requires the business certificate to resolve to that exact credential. A management certificate from one Travel credential therefore cannot be paired with a business certificate from another.
+
+## Live Travel revocation
+
+The offline issuer signs add-only Travel credential payloads containing the credential ID, stable Travel ID, both SPKI hashes, and validity interval. Runtime nodes contain only the issuer public key. Server owns the monotonic revocation log and a mode-`0600` local administration socket; it persists each revocation before broadcasting a new generation over the already established control sessions.
+
+Relay and Home verify every signature and persist the highest generation plus all observed revoked IDs. A lower generation or missing prior revocation is rejected even after either process restarts. Applying a valid update does not restart a component and does not change Carrier heartbeat or recompetition rules. It only terminates state owned by the revoked credential: Relay management sessions, pending routes, and data forwarding; Server leases, pending/active work; Home TCP/UDP flows, Carriers, and target sockets. Expiry uses the same active-termination boundary. A revoked credential can never be restored; replacement uses a new key pair, certificate pair, and credential ID.
 
 Every outer frame and payload has a hard bound. The stateful frame decoder is safe to resume after cancellation and all pre-trust/setup reads have deadlines. Pending work, pending routes, and active Home/Travel flows have configurable process-local ceilings.
 
@@ -70,4 +78,4 @@ firewall policy outside its authority.
 
 No test or design claim may describe Home process restart as preserving an established TCP connection. Home owns the target TCP socket, so restarting Home destroys that socket. Relay handover is a different requirement: Home and Travel remain alive while only the replaceable Carrier changes.
 
-Restarting Travel also creates a new process-session UUID and destroys its local client sockets. The new process may have to wait up to the 45-second old-session lease before Server admits it. Restarting Server clears the in-memory Travel lease registry; after Server recovery the first process to reclaim each Travel ID wins, so duplicate-session exclusion is not a substitute for revoking a stolen certificate and key.
+Restarting Travel also creates a new process-session UUID and destroys its local client sockets. The new process may have to wait up to the 45-second old-session lease before Server admits it. Restarting Server clears the in-memory Travel lease registry but preserves the durable revocation log. After Server recovery the first process to reclaim each still-active credential wins; duplicate-session exclusion is supplementary and is not a substitute for live revocation of a stolen certificate and key.

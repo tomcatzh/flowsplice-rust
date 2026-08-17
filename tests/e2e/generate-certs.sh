@@ -4,10 +4,19 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cert_dir="${script_dir}/generated/certs"
 config_dir="${script_dir}/generated/config"
+authorization_dir="${script_dir}/generated/authorization"
+state_dir="${script_dir}/generated/state"
+offline_dir="${script_dir}/generated/offline"
 mkdir -p "${cert_dir}"
 mkdir -p "${config_dir}"
+mkdir -p "${authorization_dir}"
+mkdir -p "${state_dir}"
+mkdir -p "${offline_dir}"
 find "${cert_dir}" -maxdepth 1 -type f -delete
 find "${config_dir}" -maxdepth 1 -type f -delete
+find "${authorization_dir}" -maxdepth 1 -type f -delete
+find "${state_dir}" -maxdepth 1 -type f -delete
+find "${offline_dir}" -maxdepth 1 -type f -delete
 
 make_ca() {
   local name="$1"
@@ -47,9 +56,12 @@ issue home-management home home-1 home-management.flowsplice clientAuth manageme
 issue travel-management travel travel-1 travel-management.flowsplice clientAuth management-ca
 issue home-business home home-1 home.flowsplice serverAuth business-ca
 issue travel-business travel travel-1 travel.flowsplice clientAuth business-ca
+openssl ecparam -name prime256v1 -genkey -noout \
+  -out "${offline_dir}/travel-authority.key" >/dev/null 2>&1
 
 find "${cert_dir}" -maxdepth 1 \( -name '*.csr' -o -name '*.ext' -o -name '*.srl' \) -delete
 chmod 600 "${cert_dir}"/*.key
+chmod 600 "${offline_dir}"/*.key
 chmod 644 "${cert_dir}"/*.crt
 
 spki_pin() {
@@ -67,6 +79,15 @@ home_business_pin="$(spki_pin home-business)"
 travel_management_pin="$(spki_pin travel-management)"
 travel_business_pin="$(spki_pin travel-business)"
 
+python3 "${script_dir}/generate-authorization.py" \
+  --authority-key "${offline_dir}/travel-authority.key" \
+  --output-dir "${authorization_dir}" \
+  --credential-id "11111111-1111-4111-8111-111111111111" \
+  --travel-id "travel-1" \
+  --management-pin "${travel_management_pin}" \
+  --business-pin "${travel_business_pin}"
+travel_authority_public_key="$(tr -d '\n' <"${authorization_dir}/authority-public-key.txt")"
+
 for template in "${script_dir}"/config/*.toml; do
   output="${config_dir}/$(basename -- "${template}")"
   sed \
@@ -77,6 +98,7 @@ for template in "${script_dir}"/config/*.toml; do
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
     -e "s/__TRAVEL_MANAGEMENT_PIN__/${travel_management_pin}/g" \
     -e "s/__TRAVEL_BUSINESS_PIN__/${travel_business_pin}/g" \
+    -e "s/__TRAVEL_AUTHORITY_PUBLIC_KEY__/${travel_authority_public_key}/g" \
     "${template}" >"${output}"
 done
 printf 'Generated E2E certificates in %s\n' "${cert_dir}"

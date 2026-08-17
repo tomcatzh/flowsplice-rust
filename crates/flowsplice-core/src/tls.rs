@@ -17,6 +17,15 @@ pub struct PeerIdentity {
     pub role: Role,
     pub id: String,
     pub spki_sha256: String,
+    pub not_before_unix_secs: u64,
+    pub not_after_unix_secs: u64,
+}
+
+impl PeerIdentity {
+    #[must_use]
+    pub const fn active_at(&self, unix_secs: u64) -> bool {
+        unix_secs >= self.not_before_unix_secs && unix_secs < self.not_after_unix_secs
+    }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -133,10 +142,16 @@ pub fn peer_identity(certs: Option<&[CertificateDer<'_>]>) -> Result<PeerIdentit
         identity.ok_or_else(|| anyhow!("peer certificate has no FlowSplice URI SAN"))?;
     let spki = cert.public_key().raw;
     let hash = digest::digest(&digest::SHA256, spki);
+    let not_before_unix_secs = u64::try_from(cert.validity().not_before.timestamp())
+        .context("peer certificate not-before predates the Unix epoch")?;
+    let not_after_unix_secs = u64::try_from(cert.validity().not_after.timestamp())
+        .context("peer certificate not-after predates the Unix epoch")?;
     Ok(PeerIdentity {
         role,
         id,
         spki_sha256: hex::encode(hash.as_ref()),
+        not_before_unix_secs,
+        not_after_unix_secs,
     })
 }
 
@@ -181,11 +196,21 @@ pub fn validate_spki_pins(pins: &[String], label: &str) -> Result<()> {
         bail!("{label} SPKI allowlist must not be empty");
     }
     for pin in pins {
-        let decoded = hex::decode(pin)
-            .with_context(|| format!("{label} SPKI pin must be hexadecimal SHA-256"))?;
-        if decoded.len() != 32 {
-            bail!("{label} SPKI pin must contain exactly 32 bytes");
-        }
+        validate_spki_pin(pin, label)?;
+    }
+    Ok(())
+}
+
+/// Validates one SHA-256 SPKI pin.
+///
+/// # Errors
+///
+/// Returns an error when the pin is not exactly 32 hexadecimal bytes.
+pub fn validate_spki_pin(pin: &str, label: &str) -> Result<()> {
+    let decoded = hex::decode(pin)
+        .with_context(|| format!("{label} SPKI pin must be hexadecimal SHA-256"))?;
+    if decoded.len() != 32 {
+        bail!("{label} SPKI pin must contain exactly 32 bytes");
     }
     Ok(())
 }
@@ -214,6 +239,8 @@ mod tests {
             role: Role::Home,
             id: "home-1".to_owned(),
             spki_sha256: "ab".repeat(32),
+            not_before_unix_secs: 1,
+            not_after_unix_secs: u64::MAX,
         };
         assert!(require_peer(&identity, Role::Home, Some("home-1"), &["ab".repeat(32)]).is_ok());
         assert!(require_peer(&identity, Role::Home, Some("home-2"), &["ab".repeat(32)]).is_err());

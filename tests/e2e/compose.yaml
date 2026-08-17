@@ -12,6 +12,7 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+      - ./generated/state:/state
     ports:
       - "127.0.0.1:18443:8443"
     networks: [flowsplice]
@@ -24,6 +25,7 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+      - ./generated/state:/state
     ports:
       - "127.0.0.1:28443:8443"
     networks: [flowsplice]
@@ -37,6 +39,8 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+      - ./generated/authorization:/authorization:ro
+      - ./generated/state:/state
     networks: [flowsplice]
 
   homeagent:
@@ -48,6 +52,7 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+      - ./generated/state:/state
     networks: [flowsplice]
 
   travelagent:

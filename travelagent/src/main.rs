@@ -304,7 +304,7 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
         let mut connected = false;
         for relay in relay_candidates(&state).await {
             match open_management(&state, &relay, TravelConnectionPurpose::Catalog).await {
-                Ok((stream, directory, catalog)) => {
+                Ok((stream, directory, catalog, _credential_id)) => {
                     update_directory(&state, directory).await;
                     *state.catalog.write().await = catalog;
                     info!(relay_id = %relay.id, relay = %relay.management_addr, "catalog subscription connected");
@@ -369,7 +369,7 @@ async fn open_management(
     state: &AppState,
     relay: &RelayEndpoint,
     purpose: TravelConnectionPurpose,
-) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog)> {
+) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog, Uuid)> {
     let config = &state.config;
     let socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
@@ -406,16 +406,19 @@ async fn open_management(
     .await?;
     let mut reader = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT);
     let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
-    match reader
+    let credential_id = match reader
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::TravelHelloAccepted { relay_id } if relay_id == relay.id => {}
+        ControlMessage::TravelHelloAccepted {
+            relay_id,
+            credential_id,
+        } if relay_id == relay.id => credential_id,
         ControlMessage::TravelHelloDenied { reason } => {
             bail!("Travel session rejected by Relay {}: {reason}", relay.id);
         }
         _ => bail!("relay sent an invalid Travel HELLO response"),
-    }
+    };
     let mut directory = None;
     let mut catalog = None;
     while directory.is_none() || catalog.is_none() {
@@ -433,12 +436,13 @@ async fn open_management(
         stream,
         directory.ok_or_else(|| anyhow::anyhow!("missing relay directory"))?,
         catalog.ok_or_else(|| anyhow::anyhow!("missing catalog"))?,
+        credential_id,
     ))
 }
 
 async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteGrant> {
     let config = &state.config;
-    let (stream, directory, catalog) =
+    let (stream, directory, catalog, credential_id) =
         open_management(state, relay, TravelConnectionPurpose::Route).await?;
     update_directory(state, directory).await;
     *state.catalog.write().await = catalog;
@@ -451,6 +455,7 @@ async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteG
             request_id,
             travel_id: config.id.clone(),
             travel_session_id: state.session_id,
+            credential_id,
         },
         CONTROL_FRAME_LIMIT,
     )

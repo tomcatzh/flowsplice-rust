@@ -6,6 +6,9 @@ set -e
 . /lib/functions.sh
 gid="$(group_add_next flowsplice)"
 user_exists flowsplice || user_add flowsplice '' "$gid" FlowSplice /var/run/flowsplice /bin/false
+mkdir -p /etc/flowsplice/state
+chown flowsplice:flowsplice /etc/flowsplice/state
+chmod 700 /etc/flowsplice/state
 /etc/init.d/flowsplice enable
 rm -f /tmp/luci-indexcache
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true

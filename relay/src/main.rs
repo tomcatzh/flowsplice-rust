@@ -13,12 +13,16 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
+    authorization::{
+        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization, load_json,
+        store_json_atomic, unix_time_secs, validate_authority_public_key,
+    },
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, RelayDirectory, Role, TravelConnectionPurpose},
     route::{RouteSide, read_preface, verify_preface, write_preface},
-    tls::{peer_identity, require_peer, server_acceptor, validate_spki_pins},
+    tls::{PeerIdentity, peer_identity, require_peer, server_acceptor, validate_spki_pins},
 };
 use serde::Deserialize;
 #[cfg(not(target_os = "linux"))]
@@ -55,8 +59,8 @@ struct Config {
     management_ca: PathBuf,
     #[serde(default)]
     server_spki_pins: Vec<String>,
-    #[serde(default)]
-    travel_spki_pins: Vec<String>,
+    travel_authority_public_key: String,
+    travel_authorization_cache: PathBuf,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
     #[serde(default = "default_route_ttl")]
@@ -80,9 +84,11 @@ const fn default_max_pending_routes() -> usize {
 struct ServerGrant {
     work_id: Uuid,
     work_secret: Vec<u8>,
+    credential_id: Uuid,
 }
 
 struct PendingRoute {
+    credential_id: Uuid,
     work_id: Uuid,
     route_secret: Vec<u8>,
     work_secret: Vec<u8>,
@@ -102,12 +108,15 @@ struct State {
     requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
     session_requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<(), String>>>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
+    authorization_tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
+    authorization_cache: Mutex<AuthorizationCache>,
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(authorization_cache: AuthorizationCache) -> Self {
         let (catalog_tx, _) = watch::channel(Catalog::default());
         let (directory_tx, _) = watch::channel(RelayDirectory::default());
+        let (authorization_tx, _) = watch::channel(None);
         Self {
             server_session: Mutex::new(None),
             catalog_tx,
@@ -115,6 +124,8 @@ impl State {
             requests: Mutex::new(HashMap::new()),
             session_requests: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
+            authorization_tx,
+            authorization_cache: Mutex::new(authorization_cache),
         }
     }
 }
@@ -137,7 +148,12 @@ async fn main() -> Result<()> {
         info!(event = "config_validated", path = %args.config.display(), "relay configuration is valid");
         return Ok(());
     }
-    let state = Arc::new(State::new());
+    let authorization_cache = if config.travel_authorization_cache.exists() {
+        load_json(&config.travel_authorization_cache)?
+    } else {
+        AuthorizationCache::default()
+    };
+    let state = Arc::new(State::new(authorization_cache));
     tokio::try_join!(
         run_management(config.clone(), Arc::clone(&state)),
         run_data(config, Arc::clone(&state)),
@@ -169,7 +185,10 @@ fn validate_config(config: &Config) -> Result<()> {
         bail!("Relay timeout and pending-route limits must be positive");
     }
     validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    validate_authority_public_key(&config.travel_authority_public_key)?;
+    if config.travel_authorization_cache.exists() {
+        let _: AuthorizationCache = load_json(&config.travel_authorization_cache)?;
+    }
     let _ = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
     Ok(())
 }
@@ -205,8 +224,20 @@ async fn run_management(config: Config, state: Arc<State>) -> Result<()> {
                         handle_server(stream, identity.id, &config, state).await
                     }
                     Role::Travel => {
-                        require_peer(&identity, Role::Travel, None, &config.travel_spki_pins)?;
-                        handle_travel(stream, identity.id, &config, state).await
+                        require_peer(&identity, Role::Travel, None, &[])?;
+                        let authorization_rx = state.authorization_tx.subscribe();
+                        let (credential_id, not_after_unix_secs) =
+                            authorize_management_identity(&identity, &authorization_rx)?;
+                        handle_travel(
+                            stream,
+                            identity.id,
+                            credential_id,
+                            not_after_unix_secs,
+                            authorization_rx,
+                            &config,
+                            state,
+                        )
+                        .await
                     }
                     _ => bail!("unsupported management peer role"),
                 }
@@ -293,9 +324,18 @@ async fn handle_server(
                             );
                             state.directory_tx.send_replace(directory);
                         }
-                        ControlMessage::ServerRouteGrant { request_id, work_id, work_secret } => {
+                        ControlMessage::TravelAuthorizationSnapshot { snapshot } => {
+                            let generation = apply_authorization_snapshot(&state, config, snapshot).await?;
+                            write_json(
+                                &mut writer,
+                                &ControlMessage::TravelAuthorizationAck { generation },
+                                CONTROL_FRAME_LIMIT,
+                            )
+                            .await?;
+                        }
+                        ControlMessage::ServerRouteGrant { request_id, work_id, work_secret, credential_id } => {
                             if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret }));
+                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret, credential_id }));
                             }
                         }
                         ControlMessage::RouteDenied { request_id, reason } => {
@@ -343,6 +383,9 @@ async fn handle_server(
 async fn handle_travel(
     stream: TlsStream<TcpStream>,
     travel_id: String,
+    credential_id: Uuid,
+    not_after_unix_secs: u64,
+    mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
     config: &Config,
     state: Arc<State>,
 ) -> Result<()> {
@@ -360,8 +403,15 @@ async fn handle_travel(
         _ => bail!("travel HELLO does not match its certificate"),
     };
     let lease_id = (purpose == TravelConnectionPurpose::Catalog).then(Uuid::new_v4);
-    if let Err(error) =
-        authorize_travel_session(&travel_id, travel_session_id, lease_id, config, &state).await
+    if let Err(error) = authorize_travel_session(
+        credential_id,
+        &travel_id,
+        travel_session_id,
+        lease_id,
+        config,
+        &state,
+    )
+    .await
     {
         let reason = error.clone();
         write_json(
@@ -378,6 +428,7 @@ async fn handle_travel(
         &mut writer,
         &ControlMessage::TravelHelloAccepted {
             relay_id: config.id.clone(),
+            credential_id,
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -428,11 +479,14 @@ async fn handle_travel(
                         request_id,
                         travel_id: declared_id,
                         travel_session_id: declared_session,
+                        credential_id: declared_credential,
                     } if purpose == TravelConnectionPurpose::Route
                         && declared_id == travel_id
-                        && declared_session == travel_session_id => {
+                        && declared_session == travel_session_id
+                        && declared_credential == credential_id => {
                         handle_travel_route(
                             request_id,
+                            credential_id,
                             &travel_id,
                             travel_session_id,
                             config,
@@ -475,12 +529,20 @@ async fn handle_travel(
                 )
                 .await?;
             }
+            changed = authorization_rx.changed() => {
+                changed.map_err(|_| anyhow!("Travel authorization publisher closed"))?;
+                ensure_credential_active(&authorization_rx, credential_id)?;
+            }
+            () = sleep_until_unix(not_after_unix_secs) => {
+                bail!("Travel credential expired");
+            }
             _ = liveness.tick() => {
                 if last_received.elapsed() > Duration::from_secs(30) {
                     bail!("travel management heartbeat timed out");
                 }
                 if let Some(lease_id) = lease_id {
                     authorize_travel_session(
+                        credential_id,
                         &travel_id,
                         travel_session_id,
                         Some(lease_id),
@@ -496,6 +558,7 @@ async fn handle_travel(
 }
 
 async fn authorize_travel_session(
+    credential_id: Uuid,
     travel_id: &str,
     travel_session_id: Uuid,
     lease_id: Option<Uuid>,
@@ -517,6 +580,7 @@ async fn authorize_travel_session(
             request_id,
             travel_id: travel_id.to_owned(),
             travel_session_id,
+            credential_id,
             lease_id,
         })
         .await
@@ -537,6 +601,7 @@ async fn authorize_travel_session(
 
 async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
     request_id: Uuid,
+    credential_id: Uuid,
     travel_id: &str,
     travel_session_id: Uuid,
     config: &Config,
@@ -555,8 +620,16 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     }
-    match request_server_route(request_id, travel_id, travel_session_id, state).await {
-        Ok(grant) => {
+    match request_server_route(
+        request_id,
+        credential_id,
+        travel_id,
+        travel_session_id,
+        state,
+    )
+    .await
+    {
+        Ok(grant) if grant.credential_id == credential_id => {
             let route_id = Uuid::new_v4();
             let mut route_secret = vec![0_u8; 32];
             SystemRandom::new()
@@ -565,6 +638,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
             state.routes.lock().await.insert(
                 route_id,
                 PendingRoute {
+                    credential_id,
                     work_id: grant.work_id,
                     route_secret: route_secret.clone(),
                     work_secret: grant.work_secret,
@@ -578,6 +652,17 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
                     route_id,
                     route_secret,
                     data_addr: config.data_public_addr.clone(),
+                },
+                CONTROL_FRAME_LIMIT,
+            )
+            .await?;
+        }
+        Ok(_) => {
+            write_json(
+                writer,
+                &ControlMessage::RouteDenied {
+                    request_id,
+                    reason: "Server route credential mismatch".to_owned(),
                 },
                 CONTROL_FRAME_LIMIT,
             )
@@ -597,6 +682,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
 
 async fn request_server_route(
     request_id: Uuid,
+    credential_id: Uuid,
     travel_id: &str,
     travel_session_id: Uuid,
     state: &Arc<State>,
@@ -615,6 +701,7 @@ async fn request_server_route(
             request_id,
             travel_id: travel_id.to_owned(),
             travel_session_id,
+            credential_id,
         })
         .await
         .is_err()
@@ -655,6 +742,8 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
                     .await
                     .remove(&preface.id)
                     .ok_or_else(|| anyhow!("unknown, expired, or already consumed route"))?;
+                let authorization_rx = state.authorization_tx.subscribe();
+                ensure_credential_active(&authorization_rx, route.credential_id)?;
                 if !verify_preface(preface, &mac, &route.route_secret) {
                     bail!("invalid route ticket MAC");
                 }
@@ -667,7 +756,12 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
                 )
                 .await?;
                 info!(route_id = %preface.id, work_id = %route.work_id, "relay entered opaque forwarding");
-                zero_copy_or_portable(&mut travel, &mut server).await?;
+                tokio::select! {
+                    result = zero_copy_or_portable(&mut travel, &mut server) => result?,
+                    () = wait_until_authorization_inactive(authorization_rx, route.credential_id) => {
+                        info!(event = "revoked_carrier_closed", route_id = %preface.id, credential_id = %route.credential_id, "Relay closed data carrier for inactive Travel credential");
+                    }
+                }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
@@ -703,4 +797,98 @@ async fn cleanup_routes(state: Arc<State>) -> Result<()> {
             keep
         });
     }
+}
+
+fn authorize_management_identity(
+    identity: &PeerIdentity,
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+) -> Result<(Uuid, u64)> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("Travel authorization has not synchronized from Server"))?;
+    let credential = authorization.authorize_management(identity, now)?;
+    Ok((
+        credential.credential_id,
+        credential
+            .not_after_unix_secs
+            .min(identity.not_after_unix_secs),
+    ))
+}
+
+fn ensure_credential_active(
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    credential_id: Uuid,
+) -> Result<u64> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("Travel authorization has not synchronized from Server"))?;
+    if !authorization.is_active(credential_id, now) {
+        bail!("Travel credential is revoked, expired, or not yet valid");
+    }
+    authorization
+        .credential(credential_id)
+        .map(|credential| credential.not_after_unix_secs)
+        .ok_or_else(|| anyhow!("unknown Travel credential"))
+}
+
+async fn sleep_until_unix(not_after_unix_secs: u64) {
+    let now = unix_time_secs().unwrap_or(not_after_unix_secs);
+    tokio::time::sleep(Duration::from_secs(not_after_unix_secs.saturating_sub(now))).await;
+}
+
+async fn wait_until_authorization_inactive(
+    mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    credential_id: Uuid,
+) {
+    loop {
+        let Ok(not_after) = ensure_credential_active(&authorization_rx, credential_id) else {
+            return;
+        };
+        tokio::select! {
+            changed = authorization_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = sleep_until_unix(not_after) => return,
+        }
+    }
+}
+
+async fn apply_authorization_snapshot(
+    state: &Arc<State>,
+    config: &Config,
+    snapshot: TravelAuthorizationSnapshot,
+) -> Result<u64> {
+    let authorization =
+        VerifiedAuthorization::verify(&snapshot, &config.travel_authority_public_key)?;
+    let mut cache = state.authorization_cache.lock().await;
+    let proposed_cache = cache.accept(&authorization)?;
+    if proposed_cache != *cache {
+        store_json_atomic(&config.travel_authorization_cache, &proposed_cache)?;
+        *cache = proposed_cache;
+    }
+    drop(cache);
+    let now = unix_time_secs()?;
+    state
+        .routes
+        .lock()
+        .await
+        .retain(|_, route| authorization.is_active(route.credential_id, now));
+    let generation = authorization.generation();
+    state
+        .authorization_tx
+        .send_replace(Some(Arc::new(authorization)));
+    info!(
+        event = "travel_authorization_applied",
+        generation,
+        revoked = snapshot.revocations.len(),
+        credentials = snapshot.credentials.len(),
+        "Relay applied Travel authorization state without restart"
+    );
+    Ok(generation)
 }

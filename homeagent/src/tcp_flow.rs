@@ -7,21 +7,24 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use flowsplice_core::{
     DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    authorization::{VerifiedAuthorization, unix_time_secs},
     frame::{JsonFrameReader, write_json},
     protocol::{DataFrame, Service},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     time::{Instant, interval, sleep_until},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FlowKey {
+    credential_id: Uuid,
     travel_id: String,
     flow_id: Uuid,
 }
@@ -30,6 +33,7 @@ struct FlowHandle {
     instance_id: Uuid,
     service_id: String,
     tx: mpsc::Sender<IncomingCarrier>,
+    shutdown: watch::Sender<bool>,
 }
 
 pub struct IncomingCarrier {
@@ -66,12 +70,18 @@ impl TcpFlowRegistry {
 
     pub async fn attach(
         self: &Arc<Self>,
+        credential_id: Uuid,
         travel_id: String,
         flow_id: Uuid,
         service: Service,
         carrier: IncomingCarrier,
+        not_after_unix_secs: u64,
     ) -> Result<()> {
-        let key = FlowKey { travel_id, flow_id };
+        let key = FlowKey {
+            credential_id,
+            travel_id,
+            flow_id,
+        };
         let tx = {
             let mut flows = self.flows.lock().await;
             if let Some(existing) = flows.get(&key) {
@@ -84,6 +94,7 @@ impl TcpFlowRegistry {
                     .try_acquire_owned()
                     .map_err(|_| anyhow!("home active-flow limit reached"))?;
                 let (tx, rx) = mpsc::channel(16);
+                let (shutdown, shutdown_rx) = watch::channel(false);
                 let instance_id = Uuid::new_v4();
                 flows.insert(
                     key.clone(),
@@ -91,6 +102,7 @@ impl TcpFlowRegistry {
                         instance_id,
                         service_id: service.id.clone(),
                         tx: tx.clone(),
+                        shutdown,
                     },
                 );
                 let registry = Arc::clone(self);
@@ -101,6 +113,8 @@ impl TcpFlowRegistry {
                         instance_id,
                         service,
                         rx,
+                        shutdown_rx,
+                        not_after_unix_secs,
                         permit,
                     )
                     .await
@@ -126,6 +140,16 @@ impl TcpFlowRegistry {
             flows.remove(key);
         }
     }
+
+    pub async fn revoke_inactive(&self, authorization: &VerifiedAuthorization, unix_secs: u64) {
+        let flows = self.flows.lock().await;
+        for (key, flow) in flows.iter() {
+            if !authorization.is_active(key.credential_id, unix_secs) {
+                let _ = flow.shutdown.send(true);
+                info!(event = "revoked_flow_closed", credential_id = %key.credential_id, travel_id = %key.travel_id, flow_id = %key.flow_id, "Home closed TCP flow for inactive Travel credential");
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -142,13 +166,15 @@ enum FlowEvent {
     TargetError(String),
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_flow(
     registry: Arc<TcpFlowRegistry>,
     key: FlowKey,
     _instance_id: Uuid,
     service: Service,
     mut incoming: mpsc::Receiver<IncomingCarrier>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    not_after_unix_secs: u64,
     _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let target = TcpStream::connect(&service.target)
@@ -430,6 +456,14 @@ async fn run_flow(
             () = wait_for_deadline(detached_deadline), if detached_deadline.is_some() => {
                 bail!("home detached-flow timeout expired");
             }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    bail!("Travel credential was revoked");
+                }
+            }
+            () = sleep_until_unix(not_after_unix_secs) => {
+                bail!("Travel credential expired");
+            }
         }
     }
 }
@@ -572,4 +606,9 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     if let Some(deadline) = deadline {
         sleep_until(deadline).await;
     }
+}
+
+async fn sleep_until_unix(not_after_unix_secs: u64) {
+    let now = unix_time_secs().unwrap_or(not_after_unix_secs);
+    tokio::time::sleep(Duration::from_secs(not_after_unix_secs.saturating_sub(now))).await;
 }

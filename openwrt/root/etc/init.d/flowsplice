@@ -15,8 +15,11 @@ VALIDATION_FAILED=0
 
 prepare_runtime() {
 	mkdir -p "$RUNTIME_DIR"
+	mkdir -p /etc/flowsplice/state
 	chown flowsplice:flowsplice "$RUNTIME_DIR"
+	chown flowsplice:flowsplice /etc/flowsplice/state
 	chmod 700 "$RUNTIME_DIR"
+	chmod 700 /etc/flowsplice/state
 }
 
 validate_relay_section() {

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::authorization::TravelAuthorizationSnapshot;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -79,6 +81,7 @@ pub enum ControlMessage {
     },
     TravelHelloAccepted {
         relay_id: String,
+        credential_id: Uuid,
     },
     TravelHelloDenied {
         reason: String,
@@ -102,11 +105,13 @@ pub enum ControlMessage {
         request_id: Uuid,
         travel_id: String,
         travel_session_id: Uuid,
+        credential_id: Uuid,
     },
     TravelSessionAuthorize {
         request_id: Uuid,
         travel_id: String,
         travel_session_id: Uuid,
+        credential_id: Uuid,
         lease_id: Option<Uuid>,
     },
     TravelSessionAccepted {
@@ -120,6 +125,7 @@ pub enum ControlMessage {
         request_id: Uuid,
         work_id: Uuid,
         work_secret: Vec<u8>,
+        credential_id: Uuid,
     },
     RouteGrant {
         request_id: Uuid,
@@ -134,6 +140,13 @@ pub enum ControlMessage {
     OpenWork {
         work_id: Uuid,
         work_secret: Vec<u8>,
+        credential_id: Uuid,
+    },
+    TravelAuthorizationSnapshot {
+        snapshot: TravelAuthorizationSnapshot,
+    },
+    TravelAuthorizationAck {
+        generation: u64,
     },
     Error {
         code: String,

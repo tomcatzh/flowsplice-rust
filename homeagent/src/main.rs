@@ -11,6 +11,10 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    authorization::{
+        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization, load_json,
+        store_json_atomic, unix_time_secs, validate_authority_public_key,
+    },
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
@@ -24,7 +28,7 @@ use flowsplice_core::{
 use serde::Deserialize;
 use tokio::{
     net::{TcpStream, UdpSocket},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore, watch},
     time::{interval, sleep, timeout},
 };
 use tokio_rustls::{
@@ -60,8 +64,8 @@ struct Config {
     business_ca: PathBuf,
     #[serde(default)]
     server_spki_pins: Vec<String>,
-    #[serde(default)]
-    travel_spki_pins: Vec<String>,
+    travel_authority_public_key: String,
+    travel_authorization_cache: PathBuf,
     services: Vec<Service>,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
@@ -113,6 +117,21 @@ struct TlsMaterial {
     business_acceptor: TlsAcceptor,
 }
 
+struct TravelAuthorizationState {
+    tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
+    cache: Mutex<AuthorizationCache>,
+}
+
+impl TravelAuthorizationState {
+    fn new(cache: AuthorizationCache) -> Arc<Self> {
+        let (tx, _) = watch::channel(None);
+        Arc::new(Self {
+            tx,
+            cache: Mutex::new(cache),
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_crypto();
@@ -127,7 +146,7 @@ async fn main() -> Result<()> {
     let config: Config = load_toml(&args.config)?;
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    validate_authority_public_key(&config.travel_authority_public_key)?;
     if config.carrier_heartbeat_secs == 0
         || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
         || config.flow_detach_timeout_secs <= config.carrier_timeout_secs
@@ -148,6 +167,12 @@ async fn main() -> Result<()> {
         )?,
     });
     let config = Arc::new(config);
+    let authorization_cache = if config.travel_authorization_cache.exists() {
+        load_json(&config.travel_authorization_cache)?
+    } else {
+        AuthorizationCache::default()
+    };
+    let authorization = TravelAuthorizationState::new(authorization_cache);
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let tcp_flows = TcpFlowRegistry::new(
         Arc::clone(&permits),
@@ -162,6 +187,7 @@ async fn main() -> Result<()> {
             Arc::clone(&permits),
             Arc::clone(&tls),
             Arc::clone(&tcp_flows),
+            Arc::clone(&authorization),
         )
         .await
         {
@@ -192,6 +218,7 @@ async fn run_control(
     permits: Arc<Semaphore>,
     tls: Arc<TlsMaterial>,
     tcp_flows: Arc<TcpFlowRegistry>,
+    authorization: Arc<TravelAuthorizationState>,
 ) -> Result<()> {
     let socket = TcpStream::connect(&config.server_control_addr).await?;
     let stream = timeout(
@@ -208,15 +235,17 @@ async fn run_control(
         Some(&config.server_id),
         &config.server_spki_pins,
     )?;
-    run_control_session(stream, config, permits, tls, tcp_flows).await
+    run_control_session(stream, config, permits, tls, tcp_flows, authorization).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_control_session(
     stream: ClientTlsStream<TcpStream>,
     config: Arc<Config>,
     permits: Arc<Semaphore>,
     tls: Arc<TlsMaterial>,
     tcp_flows: Arc<TcpFlowRegistry>,
+    authorization: Arc<TravelAuthorizationState>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -249,6 +278,22 @@ async fn run_control_session(
         CONTROL_FRAME_LIMIT,
     )
     .await?;
+    let ControlMessage::TravelAuthorizationSnapshot {
+        snapshot: initial_snapshot,
+    } = reader
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .await?
+    else {
+        bail!("Server did not send initial Travel authorization state");
+    };
+    let generation =
+        apply_authorization_snapshot(&authorization, &tcp_flows, &config, initial_snapshot).await?;
+    write_json(
+        &mut writer,
+        &ControlMessage::TravelAuthorizationAck { generation },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
     info!(server = %config.server_control_addr, "home agent registered");
 
     let mut heartbeat = interval(Duration::from_secs(10));
@@ -259,13 +304,30 @@ async fn run_control_session(
             message = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match message? {
-                    ControlMessage::OpenWork { work_id, work_secret } => {
+                    ControlMessage::TravelAuthorizationSnapshot { snapshot } => {
+                        let generation = apply_authorization_snapshot(
+                            &authorization,
+                            &tcp_flows,
+                            &config,
+                            snapshot,
+                        )
+                        .await?;
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::TravelAuthorizationAck { generation },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::OpenWork { work_id, work_secret, credential_id } => {
+                        ensure_credential_active(&authorization.tx.subscribe(), credential_id)?;
                         let config = Arc::clone(&config);
                         let tls = Arc::clone(&tls);
                         let permits = Arc::clone(&permits);
                         let tcp_flows = Arc::clone(&tcp_flows);
+                        let authorization_rx = authorization.tx.subscribe();
                         tokio::spawn(async move {
-                            if let Err(error) = run_work(config, tls, permits, tcp_flows, work_id, work_secret).await {
+                            if let Err(error) = run_work(config, tls, permits, tcp_flows, authorization_rx, credential_id, work_id, work_secret).await {
                                 warn!(%work_id, %error, "home work failed");
                             }
                         });
@@ -288,11 +350,14 @@ async fn run_control_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_work(
     config: Arc<Config>,
     tls: Arc<TlsMaterial>,
     permits: Arc<Semaphore>,
     tcp_flows: Arc<TcpFlowRegistry>,
+    authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    expected_credential_id: Uuid,
     work_id: Uuid,
     work_secret: Vec<u8>,
 ) -> Result<()> {
@@ -305,7 +370,12 @@ async fn run_work(
     .await
     .context("business TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Travel, None, &config.travel_spki_pins)?;
+    require_peer(&identity, Role::Travel, None, &[])?;
+    let (credential_id, not_after_unix_secs) =
+        authorize_business_identity(&identity, &authorization_rx)?;
+    if credential_id != expected_credential_id {
+        bail!("business certificate does not match the routed Travel credential");
+    }
 
     let open = JsonFrameReader::new(&mut stream, DATA_FRAME_LIMIT)
         .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
@@ -330,10 +400,12 @@ async fn run_work(
         ServiceProtocol::Tcp => {
             tcp_flows
                 .attach(
+                    credential_id,
                     identity.id,
                     flow_id,
                     service,
                     IncomingCarrier { carrier_id, stream },
+                    not_after_unix_secs,
                 )
                 .await
         }
@@ -341,17 +413,31 @@ async fn run_work(
             let _permit = permits
                 .try_acquire_owned()
                 .map_err(|_| anyhow::anyhow!("home active-flow limit reached"))?;
-            serve_udp(stream, flow_id, carrier_id, &service, config.udp_idle_secs).await
+            serve_udp(
+                stream,
+                flow_id,
+                carrier_id,
+                &service,
+                config.udp_idle_secs,
+                authorization_rx,
+                credential_id,
+                not_after_unix_secs,
+            )
+            .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_udp(
     stream: ServerTlsStream<TcpStream>,
     flow_id: Uuid,
     carrier_id: Uuid,
     service: &Service,
     idle_secs: u64,
+    mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    credential_id: Uuid,
+    not_after_unix_secs: u64,
 ) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(&service.target).await?;
@@ -390,6 +476,83 @@ async fn serve_udp(
                     _ => bail!("invalid UDP flow frame"),
                 }
             }
+            changed = authorization_rx.changed() => {
+                changed.map_err(|_| anyhow::anyhow!("Travel authorization publisher closed"))?;
+                ensure_credential_active(&authorization_rx, credential_id)?;
+            }
+            () = sleep_until_unix(not_after_unix_secs) => {
+                bail!("Travel credential expired");
+            }
         }
     }
+}
+
+fn authorize_business_identity(
+    identity: &flowsplice_core::tls::PeerIdentity,
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+) -> Result<(Uuid, u64)> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Travel authorization has not synchronized from Server"))?;
+    let credential = authorization.authorize_business(identity, now)?;
+    Ok((
+        credential.credential_id,
+        credential
+            .not_after_unix_secs
+            .min(identity.not_after_unix_secs),
+    ))
+}
+
+fn ensure_credential_active(
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    credential_id: Uuid,
+) -> Result<u64> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Travel authorization has not synchronized from Server"))?;
+    if !authorization.is_active(credential_id, now) {
+        bail!("Travel credential is revoked, expired, or not yet valid");
+    }
+    authorization
+        .credential(credential_id)
+        .map(|credential| credential.not_after_unix_secs)
+        .ok_or_else(|| anyhow::anyhow!("unknown Travel credential"))
+}
+
+async fn sleep_until_unix(not_after_unix_secs: u64) {
+    let now = unix_time_secs().unwrap_or(not_after_unix_secs);
+    tokio::time::sleep(Duration::from_secs(not_after_unix_secs.saturating_sub(now))).await;
+}
+
+async fn apply_authorization_snapshot(
+    state: &TravelAuthorizationState,
+    tcp_flows: &TcpFlowRegistry,
+    config: &Config,
+    snapshot: TravelAuthorizationSnapshot,
+) -> Result<u64> {
+    let authorization =
+        VerifiedAuthorization::verify(&snapshot, &config.travel_authority_public_key)?;
+    let mut cache = state.cache.lock().await;
+    let proposed_cache = cache.accept(&authorization)?;
+    if proposed_cache != *cache {
+        store_json_atomic(&config.travel_authorization_cache, &proposed_cache)?;
+        *cache = proposed_cache;
+    }
+    drop(cache);
+    let now = unix_time_secs()?;
+    tcp_flows.revoke_inactive(&authorization, now).await;
+    let generation = authorization.generation();
+    state.tx.send_replace(Some(Arc::new(authorization)));
+    info!(
+        event = "travel_authorization_applied",
+        generation,
+        revoked = snapshot.revocations.len(),
+        credentials = snapshot.credentials.len(),
+        "Home applied Travel authorization state without restart"
+    );
+    Ok(generation)
 }

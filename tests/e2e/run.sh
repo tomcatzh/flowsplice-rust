@@ -46,6 +46,17 @@ for event in \
     exit 1
   fi
 done
+for event in \
+  'event="travel_credential_revoked"' \
+  'event="travel_authorization_published"' \
+  'event="travel_authorization_ack"' \
+  'event="travel_authorization_applied"' \
+  'event="revoked_flow_closed"'; do
+  if ! grep -Fq "${event}" "${log_file}"; then
+    echo "missing required live-revocation E2E log event: ${event}" >&2
+    exit 1
+  fi
+done
 if ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=false' "${log_file}"; then
   echo 'missing stable active-Carrier reevaluation result' >&2
   exit 1
