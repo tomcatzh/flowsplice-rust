@@ -1,0 +1,47 @@
+services:
+  echo:
+    image: flowsplice-e2e:local
+    command: ["/usr/local/bin/flowsplice-echo"]
+    networks: [flowsplice]
+
+  relay:
+    image: flowsplice-e2e:local
+    command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay.toml"]
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+    networks: [flowsplice]
+
+  server:
+    image: flowsplice-e2e:local
+    command: ["/usr/local/bin/flowsplice-server", "--config", "/config/server.toml"]
+    depends_on: [relay]
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+    networks: [flowsplice]
+
+  homeagent:
+    image: flowsplice-e2e:local
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent.toml"]
+    depends_on: [server, echo]
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+    networks: [flowsplice]
+
+  travelagent:
+    image: flowsplice-e2e:local
+    command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/config/travelagent.toml"]
+    depends_on: [relay, homeagent]
+    ports:
+      - "127.0.0.1:19080:9080"
+      - "127.0.0.1:11080:10080"
+      - "127.0.0.1:11081:10081/udp"
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+    networks: [flowsplice]
+
+networks:
+  flowsplice: {}

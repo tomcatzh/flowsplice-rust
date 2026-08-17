@@ -1,0 +1,24 @@
+id = "travel-1"
+relay_management_addr = "relay.example.net:8443"
+relay_server_name = "relay.example.net"
+relay_id = "relay-1"
+home_server_name = "home.flowsplice"
+home_id = "home-1"
+management_cert = "/etc/flowsplice/travel-management.crt"
+management_key = "/etc/flowsplice/travel-management.key"
+management_ca = "/etc/flowsplice/management-ca.crt"
+business_cert = "/etc/flowsplice/travel-business.crt"
+business_key = "/etc/flowsplice/travel-business.key"
+business_ca = "/etc/flowsplice/business-ca.crt"
+relay_spki_pins = ["replace-with-relay-spki-sha256-hex"]
+home_spki_pins = ["replace-with-home-spki-sha256-hex"]
+ui_listen = "127.0.0.1:9080"
+allow_remote_listen = false
+handshake_timeout_secs = 10
+udp_idle_secs = 60
+max_active_flows = 128
+
+[[mappings]]
+service_id = "ssh"
+protocol = "tcp"
+bind = "127.0.0.1:10022"

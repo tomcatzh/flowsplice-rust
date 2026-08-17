@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flowsplice-core",
+    "server",
+    "relay",
+    "homeagent",
+    "travelagent",
+    "tests/fixtures/echo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/tomcatzh/flowsplice-rust"
+
+[workspace.dependencies]
+anyhow = "1.0"
+aws-lc-rs = "1.17"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+flowsplice-core = { path = "crates/flowsplice-core" }
+futures-util = "0.3"
+hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+x509-parser = "0.18"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

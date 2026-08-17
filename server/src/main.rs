@@ -1,0 +1,420 @@
+#![forbid(unsafe_code)]
+
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use clap::Parser;
+use flowsplice_core::{
+    CONTROL_FRAME_LIMIT,
+    config::load_toml,
+    frame::{read_json, write_json},
+    init_crypto,
+    protocol::{Catalog, ControlMessage, Role},
+    route::{RouteSide, read_preface, verify_preface},
+    tls::{
+        client_connector, peer_identity, require_peer, server_acceptor, server_name,
+        validate_spki_pins,
+    },
+};
+use serde::Deserialize;
+use tokio::{
+    io::copy_bidirectional,
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, RwLock, mpsc},
+    time::{interval, sleep, timeout},
+};
+use tokio_rustls::server::TlsStream;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "server.toml")]
+    config: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+struct Config {
+    id: String,
+    control_listen: String,
+    data_listen: String,
+    relay_addr: String,
+    relay_server_name: String,
+    relay_id: String,
+    cert: PathBuf,
+    key: PathBuf,
+    management_ca: PathBuf,
+    #[serde(default)]
+    relay_spki_pins: Vec<String>,
+    #[serde(default = "default_handshake_timeout")]
+    handshake_timeout_secs: u64,
+    #[serde(default = "default_work_ttl")]
+    work_ttl_secs: u64,
+    #[serde(default = "default_max_pending_work")]
+    max_pending_work: usize,
+}
+
+const fn default_handshake_timeout() -> u64 {
+    10
+}
+
+const fn default_work_ttl() -> u64 {
+    15
+}
+
+const fn default_max_pending_work() -> usize {
+    256
+}
+
+struct PendingWork {
+    secret: Vec<u8>,
+    expires: Instant,
+    home: Option<TcpStream>,
+    relay: Option<TcpStream>,
+}
+
+#[derive(Default)]
+struct State {
+    catalog: RwLock<Catalog>,
+    home_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
+    relay_tx: Mutex<Option<mpsc::Sender<ControlMessage>>>,
+    pending: Mutex<HashMap<Uuid, PendingWork>>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_crypto();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "flowsplice_server=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+    let config: Config = load_toml(&args.config)?;
+    validate_spki_pins(&config.relay_spki_pins, "relay")?;
+    let state = Arc::new(State::default());
+
+    let control = run_home_listener(config.clone(), Arc::clone(&state));
+    let data = run_data_listener(config.clone(), Arc::clone(&state));
+    let relay = run_relay_connector(config, Arc::clone(&state));
+    let cleanup = cleanup_pending(state);
+
+    tokio::try_join!(control, data, relay, cleanup)?;
+    Ok(())
+}
+
+async fn run_home_listener(config: Config, state: Arc<State>) -> Result<()> {
+    let listener = TcpListener::bind(&config.control_listen)
+        .await
+        .with_context(|| format!("failed to bind home control {}", config.control_listen))?;
+    let acceptor = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    info!(address = %config.control_listen, "home control listener ready");
+    loop {
+        let (socket, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let state = Arc::clone(&state);
+        let server_id = config.id.clone();
+        let timeout_duration = Duration::from_secs(config.handshake_timeout_secs);
+        tokio::spawn(async move {
+            let result = async {
+                let stream = timeout(timeout_duration, acceptor.accept(socket))
+                    .await
+                    .context("home TLS handshake timed out")??;
+                handle_home(stream, state, server_id).await
+            }
+            .await;
+            if let Err(error) = result {
+                warn!(%peer, %error, "home control connection closed");
+            }
+        });
+    }
+}
+
+async fn handle_home(
+    stream: TlsStream<TcpStream>,
+    state: Arc<State>,
+    server_id: String,
+) -> Result<()> {
+    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    require_peer(&identity, Role::Home, None, &[])?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    match read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await? {
+        ControlMessage::Hello { role, id } if role == Role::Home && id == identity.id => {}
+        _ => bail!("home HELLO does not match its certificate"),
+    }
+    write_json(
+        &mut writer,
+        &ControlMessage::Hello {
+            role: Role::Server,
+            id: server_id,
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
+
+    let (tx, mut rx) = mpsc::channel::<ControlMessage>(32);
+    *state.home_tx.lock().await = Some(tx.clone());
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            write_json(&mut writer, &message, CONTROL_FRAME_LIMIT).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+
+    info!(home_id = %identity.id, "home agent connected");
+    loop {
+        let message = read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await?;
+        match message {
+            ControlMessage::HomeRegister { catalog } => {
+                if catalog.home_id != identity.id {
+                    bail!("catalog home id does not match the authenticated home");
+                }
+                *state.catalog.write().await = catalog.clone();
+                if let Some(relay) = state.relay_tx.lock().await.clone() {
+                    let _ = relay.send(ControlMessage::Catalog { catalog }).await;
+                }
+            }
+            ControlMessage::Heartbeat { nonce } => {
+                tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
+            }
+            ControlMessage::HeartbeatAck { .. } => {}
+            _ => bail!("unexpected message from home agent"),
+        }
+        if writer_task.is_finished() {
+            return Err(anyhow!("home control writer stopped"));
+        }
+    }
+}
+
+async fn run_relay_connector(config: Config, state: Arc<State>) -> Result<()> {
+    let connector = client_connector(&config.cert, &config.key, &config.management_ca)?;
+    let dns_name = server_name(&config.relay_server_name)?;
+    loop {
+        let result = async {
+            let socket = TcpStream::connect(&config.relay_addr).await?;
+            socket.set_nodelay(true)?;
+            let stream = timeout(
+                Duration::from_secs(config.handshake_timeout_secs),
+                connector.connect(dns_name.clone(), socket),
+            )
+            .await
+            .context("relay TLS handshake timed out")??;
+            let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+            require_peer(
+                &identity,
+                Role::Relay,
+                Some(&config.relay_id),
+                &config.relay_spki_pins,
+            )?;
+            run_relay_session(stream, &config, &state).await
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(%error, "relay control disconnected; reconnecting");
+        }
+        *state.relay_tx.lock().await = None;
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_relay_session(
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    config: &Config,
+    state: &Arc<State>,
+) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    write_json(
+        &mut writer,
+        &ControlMessage::Hello {
+            role: Role::Server,
+            id: config.id.clone(),
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
+    match read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT).await? {
+        ControlMessage::Hello { role, id } if role == Role::Relay && id == config.relay_id => {}
+        _ => bail!("relay HELLO does not match expected identity"),
+    }
+
+    let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
+    *state.relay_tx.lock().await = Some(tx.clone());
+    let catalog = state.catalog.read().await.clone();
+    tx.send(ControlMessage::Catalog { catalog }).await?;
+    info!(relay_id = %config.relay_id, "relay control connected");
+
+    let mut heartbeat = interval(Duration::from_secs(10));
+    let mut nonce = 0_u64;
+    loop {
+        tokio::select! {
+            outgoing = rx.recv() => {
+                let Some(outgoing) = outgoing else { bail!("relay writer channel closed"); };
+                write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
+            }
+            incoming = read_json::<_, ControlMessage>(&mut reader, CONTROL_FRAME_LIMIT) => {
+                match incoming? {
+                    ControlMessage::RouteRequest { request_id, travel_id: _ } => {
+                        handle_route_request(request_id, config, state, &mut writer).await?;
+                    }
+                    ControlMessage::Heartbeat { nonce } => {
+                        write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
+                    }
+                    ControlMessage::HeartbeatAck { .. } => {}
+                    _ => bail!("unexpected message from relay"),
+                }
+            }
+            _ = heartbeat.tick() => {
+                nonce = nonce.wrapping_add(1);
+                write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
+            }
+        }
+    }
+}
+
+async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
+    request_id: Uuid,
+    config: &Config,
+    state: &Arc<State>,
+    writer: &mut W,
+) -> Result<()> {
+    let home = state.home_tx.lock().await.clone();
+    if home.is_none() {
+        write_json(
+            writer,
+            &ControlMessage::RouteDenied {
+                request_id,
+                reason: "home agent is unavailable".to_owned(),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let work_id = Uuid::new_v4();
+    let mut secret = vec![0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut secret)
+        .map_err(|_| anyhow!("AWS-LC random generation failed"))?;
+    let mut pending = state.pending.lock().await;
+    if pending.len() >= config.max_pending_work {
+        write_json(
+            writer,
+            &ControlMessage::RouteDenied {
+                request_id,
+                reason: "server pending-work limit reached".to_owned(),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    }
+    pending.insert(
+        work_id,
+        PendingWork {
+            secret: secret.clone(),
+            expires: Instant::now() + Duration::from_secs(config.work_ttl_secs),
+            home: None,
+            relay: None,
+        },
+    );
+    drop(pending);
+    let home = home.ok_or_else(|| anyhow!("home disappeared during route setup"))?;
+    home.send(ControlMessage::OpenWork {
+        work_id,
+        work_secret: secret.clone(),
+    })
+    .await?;
+    write_json(
+        writer,
+        &ControlMessage::ServerRouteGrant {
+            request_id,
+            work_id,
+            work_secret: secret,
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_data_listener(config: Config, state: Arc<State>) -> Result<()> {
+    let listener = TcpListener::bind(&config.data_listen)
+        .await
+        .with_context(|| format!("failed to bind data listener {}", config.data_listen))?;
+    info!(address = %config.data_listen, "data pairing listener ready");
+    loop {
+        let (mut socket, peer) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let result = async {
+                let (preface, mac) = timeout(Duration::from_secs(10), read_preface(&mut socket))
+                    .await
+                    .context("route preface timed out")??;
+                let pair = {
+                    let mut pending = state.pending.lock().await;
+                    let entry = pending
+                        .get_mut(&preface.id)
+                        .ok_or_else(|| anyhow!("unknown or expired work id"))?;
+                    if !verify_preface(preface, &mac, &entry.secret) {
+                        bail!("invalid work preface MAC");
+                    }
+                    match preface.side {
+                        RouteSide::Home if entry.home.is_none() => entry.home = Some(socket),
+                        RouteSide::Relay if entry.relay.is_none() => entry.relay = Some(socket),
+                        _ => bail!("duplicate or invalid work side"),
+                    }
+                    if entry.home.is_some() && entry.relay.is_some() {
+                        let mut completed = pending
+                            .remove(&preface.id)
+                            .ok_or_else(|| anyhow!("pending work vanished"))?;
+                        Some((
+                            completed
+                                .home
+                                .take()
+                                .ok_or_else(|| anyhow!("missing home"))?,
+                            completed
+                                .relay
+                                .take()
+                                .ok_or_else(|| anyhow!("missing relay"))?,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((mut home, mut relay)) = pair {
+                    info!(work_id = %preface.id, "paired opaque server work sockets");
+                    let _ = copy_bidirectional(&mut home, &mut relay).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                warn!(%peer, %error, "data work connection rejected");
+            }
+        });
+    }
+}
+
+async fn cleanup_pending(state: Arc<State>) -> Result<()> {
+    let mut timer = interval(Duration::from_secs(1));
+    loop {
+        timer.tick().await;
+        let now = Instant::now();
+        state.pending.lock().await.retain(|work_id, pending| {
+            let keep = pending.expires > now;
+            if !keep {
+                warn!(%work_id, "expired incomplete work pairing");
+            }
+            keep
+        });
+    }
+}

@@ -1,0 +1,14 @@
+id = "relay-1"
+management_listen = "0.0.0.0:8443"
+data_listen = "0.0.0.0:8444"
+data_public_addr = "relay.example.net:8444"
+server_data_addr = "home.example.net:7444"
+server_id = "server-1"
+cert = "/etc/flowsplice/relay.crt"
+key = "/etc/flowsplice/relay.key"
+management_ca = "/etc/flowsplice/management-ca.crt"
+server_spki_pins = ["replace-with-server-spki-sha256-hex"]
+travel_spki_pins = ["replace-with-travel-spki-sha256-hex"]
+handshake_timeout_secs = 10
+route_ttl_secs = 15
+max_pending_routes = 256

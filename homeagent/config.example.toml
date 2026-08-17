@@ -1,0 +1,23 @@
+id = "home-1"
+alias = "My Home"
+server_control_addr = "127.0.0.1:7443"
+server_data_addr = "127.0.0.1:7444"
+server_name = "server.home.example"
+server_id = "server-1"
+management_cert = "/etc/flowsplice/home-management.crt"
+management_key = "/etc/flowsplice/home-management.key"
+management_ca = "/etc/flowsplice/management-ca.crt"
+business_cert = "/etc/flowsplice/home-business.crt"
+business_key = "/etc/flowsplice/home-business.key"
+business_ca = "/etc/flowsplice/business-ca.crt"
+server_spki_pins = ["replace-with-server-spki-sha256-hex"]
+travel_spki_pins = ["replace-with-travel-spki-sha256-hex"]
+handshake_timeout_secs = 10
+udp_idle_secs = 60
+max_active_flows = 128
+
+[[services]]
+id = "ssh"
+alias = "Home SSH"
+protocol = "tcp"
+target = "127.0.0.1:22"

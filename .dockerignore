@@ -1,0 +1,9 @@
+.git
+.llmwiki
+AGENTS.md
+CLAUDE.md
+target
+dist
+**/node_modules
+tests/e2e/generated
+.DS_Store
