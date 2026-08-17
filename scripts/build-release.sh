@@ -7,8 +7,9 @@ mkdir -p "${dist_dir}/macos-arm64"
 
 (cd "${repo_root}/travelagent/web" && npm ci && npm run build)
 (cd "${repo_root}" && cargo build --locked --release \
-  -p flowsplice-server -p flowsplice-relay -p flowsplice-homeagent -p flowsplice-travelagent)
-for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent; do
+  -p flowsplice-server -p flowsplice-relay -p flowsplice-homeagent -p flowsplice-travelagent \
+  -p flowsplice-foobar)
+for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar; do
   cp "${repo_root}/target/release/${binary}" "${dist_dir}/macos-arm64/${binary}"
 done
 

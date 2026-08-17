@@ -12,6 +12,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 | `flowsplice-relay` | Public management/data ingress and Linux `splice(2)` opaque forwarding. |
 | `flowsplice-homeagent` | Publishes configured services, terminates business TLS, and connects flows to home targets. |
 | `flowsplice-travelagent` | Creates local TCP/UDP mappings, originates business TLS, and serves the embedded TypeScript UI. |
+| `flowsplice-foobar` | Low-rate single-TCP-connection loopback target and CLI continuity probe for deployment acceptance. |
 | `flowsplice-core` | Shared protocol framing, route-ticket authentication, TLS identity, and configuration support. |
 
 The management plane uses mutual TLS. Every leaf certificate contains exactly one FlowSplice URI SAN in the form `flowsplice://identity/<role>/<id>`. Management and business traffic use separate CA roots, and selected peer relationships are narrowed further with SHA-256 SPKI allowlists. Business TLS is terminated only by Travel and Home; Relay and Server forward its bytes without possessing the business private keys. Exact trust, visibility, and current limitations are documented below.
@@ -27,6 +28,7 @@ server/                   independent server application
 relay/                    independent relay application
 homeagent/                independent home agent application
 travelagent/              independent travel agent + TypeScript UI
+foobar/                   continuous loopback target and CLI probe
 tests/                    shared fixtures and Docker E2E suite
 docker/                   E2E and static-release builders
 scripts/                  release orchestration
@@ -200,6 +202,14 @@ of named Relay instances managed by one procd service and one LuCI page. It does
 deployment addresses, credentials, firewall policy, or private regression tooling, and it does not
 create firewall rules. See [OpenWrt integration](openwrt/README.md).
 
+## Deployment continuity probe
+
+`flowsplice-foobar` provides a loopback-only TCP echo target and a Linux/macOS-friendly CLI probe.
+The probe opens one connection, sends one 64-byte sequence record every five seconds, validates the
+exact echo, and never reconnects. A timeout, EOF/reset, stale/duplicate data, reordering, or corruption
+therefore exits nonzero instead of hiding a broken Flow behind a new connection. See
+[foobar/README.md](foobar/README.md) for usage.
+
 ## Configuration
 
 Every executable accepts `--config <path>` or `FLOWSPLICE_CONFIG`. Server and Relay also accept
@@ -221,7 +231,7 @@ The Travel UI and local mappings bind to loopback by default. A non-loopback UI 
 ./scripts/build-release.sh
 ```
 
-This produces four executables under each of:
+This produces five executables under each of:
 
 - `dist/linux-amd64/` — static PIE, musl;
 - `dist/linux-arm64/` — statically linked, musl;

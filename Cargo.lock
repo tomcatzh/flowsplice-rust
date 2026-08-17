@@ -432,6 +432,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowsplice-foobar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "flowsplice-homeagent"
 version = "0.1.0"
 dependencies = [
