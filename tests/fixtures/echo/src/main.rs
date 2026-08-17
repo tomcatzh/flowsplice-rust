@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    env,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use tokio::{
@@ -20,9 +23,11 @@ async fn main() -> Result<()> {
 async fn tcp_echo() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:7001").await?;
     let next_connection = Arc::new(AtomicU64::new(1));
+    let label = Arc::new(env::var("FLOWSPLICE_ECHO_LABEL").unwrap_or_default());
     loop {
         let (socket, _) = listener.accept().await?;
         let connection_id = next_connection.fetch_add(1, Ordering::Relaxed);
+        let label = Arc::clone(&label);
         tokio::spawn(async move {
             let (reader, mut writer) = socket.into_split();
             let mut reader = BufReader::new(reader);
@@ -34,9 +39,12 @@ async fn tcp_echo() -> Result<()> {
                     writer.shutdown().await?;
                     return Ok::<_, std::io::Error>(());
                 }
-                writer
-                    .write_all(format!("{connection_id}:").as_bytes())
-                    .await?;
+                let prefix = if label.is_empty() {
+                    format!("{connection_id}:")
+                } else {
+                    format!("{label}:{connection_id}:")
+                };
+                writer.write_all(prefix.as_bytes()).await?;
                 writer.write_all(&line).await?;
             }
         });

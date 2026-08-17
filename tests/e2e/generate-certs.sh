@@ -7,24 +7,34 @@ config_dir="${script_dir}/generated/config"
 authorization_dir="${script_dir}/generated/authorization"
 state_dir="${script_dir}/generated/state"
 offline_dir="${script_dir}/generated/offline"
+travel_dir="${script_dir}/generated/travel"
 mkdir -p "${cert_dir}"
 mkdir -p "${config_dir}"
 mkdir -p "${authorization_dir}"
 mkdir -p "${state_dir}"
 mkdir -p "${offline_dir}"
+rm -rf "${travel_dir}"
 find "${cert_dir}" -maxdepth 1 -type f -delete
 find "${config_dir}" -maxdepth 1 -type f -delete
 find "${authorization_dir}" -maxdepth 1 -type f -delete
 find "${state_dir}" -maxdepth 1 -type f -delete
 find "${offline_dir}" -maxdepth 1 -type f -delete
+password_file="${offline_dir}/test-password.txt"
+printf '%s\n' 'flowsplice-e2e-private-key-password' >"${password_file}"
+chmod 600 "${password_file}"
 
 make_ca() {
   local name="$1"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -nodes \
-    -days 30 -subj "/CN=FlowSplice ${name}" \
+    -days 730 -subj "/CN=FlowSplice ${name}" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
-    -keyout "${cert_dir}/${name}.key" -out "${cert_dir}/${name}.crt" >/dev/null 2>&1
+    -keyout "${offline_dir}/${name}.plain.key" -out "${cert_dir}/${name}.crt" >/dev/null 2>&1
+  openssl pkcs8 -topk8 -v2 aes-256-cbc \
+    -in "${offline_dir}/${name}.plain.key" \
+    -passout "file:${password_file}" \
+    -out "${offline_dir}/${name}.key" >/dev/null 2>&1
+  rm -f "${offline_dir}/${name}.plain.key"
 }
 
 issue() {
@@ -40,7 +50,8 @@ issue() {
     printf 'subjectAltName=URI:flowsplice://identity/%s/%s,DNS:%s\n' "${role}" "${id}" "${dns}"
   } >"${ext}"
   openssl x509 -req -sha256 -days 30 -in "${cert_dir}/${name}.csr" \
-    -CA "${cert_dir}/${ca}.crt" -CAkey "${cert_dir}/${ca}.key" -CAcreateserial \
+    -CA "${cert_dir}/${ca}.crt" -CAkey "${offline_dir}/${ca}.key" \
+    -passin "file:${password_file}" -CAcreateserial \
     -extfile "${ext}" -out "${cert_dir}/${name}.crt" >/dev/null 2>&1
   openssl verify -CAfile "${cert_dir}/${ca}.crt" "${cert_dir}/${name}.crt" >/dev/null
   openssl x509 -in "${cert_dir}/${name}.crt" -noout -ext subjectAltName \
@@ -53,10 +64,11 @@ issue server server server-1 server.flowsplice serverAuth,clientAuth management-
 issue relay1 relay relay-1 relay-1.flowsplice serverAuth management-ca
 issue relay2 relay relay-2 relay-2.flowsplice serverAuth management-ca
 issue home-management home home-1 home-management.flowsplice clientAuth management-ca
-issue travel-management travel travel-1 travel-management.flowsplice clientAuth management-ca
-issue home-business home home-1 home.flowsplice serverAuth business-ca
-issue travel-business travel travel-1 travel.flowsplice clientAuth business-ca
-openssl ecparam -name prime256v1 -genkey -noout \
+issue home-business home home-1 home-1.flowsplice serverAuth business-ca
+issue home2-management home home-2 home2-management.flowsplice clientAuth management-ca
+issue home2-business home home-2 home-2.flowsplice serverAuth business-ca
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -aes-256-cbc -pass "file:${password_file}" \
   -out "${offline_dir}/travel-authority.key" >/dev/null 2>&1
 
 find "${cert_dir}" -maxdepth 1 \( -name '*.csr' -o -name '*.ext' -o -name '*.srl' \) -delete
@@ -76,17 +88,28 @@ relay1_pin="$(spki_pin relay1)"
 relay2_pin="$(spki_pin relay2)"
 home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
-travel_management_pin="$(spki_pin travel-management)"
-travel_business_pin="$(spki_pin travel-business)"
-
-python3 "${script_dir}/generate-authorization.py" \
+home2_management_pin="$(spki_pin home2-management)"
+home2_business_pin="$(spki_pin home2-business)"
+python3 "${script_dir}/authority-public-key.py" \
   --authority-key "${offline_dir}/travel-authority.key" \
-  --output-dir "${authorization_dir}" \
-  --credential-id "11111111-1111-4111-8111-111111111111" \
-  --travel-id "travel-1" \
-  --management-pin "${travel_management_pin}" \
-  --business-pin "${travel_business_pin}"
+  --password-file "${password_file}" \
+  --output "${authorization_dir}/authority-public-key.txt"
 travel_authority_public_key="$(tr -d '\n' <"${authorization_dir}/authority-public-key.txt")"
+printf '{"credentials":[]}\n' >"${authorization_dir}/credentials.json"
+
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
+  -v "${script_dir}/generated:/generated" \
+  flowsplice-e2e:local \
+  /usr/local/bin/flowsplice-travelagent enroll-init \
+  --travel-id travel-1 \
+  --authority-public-key "${travel_authority_public_key}" \
+  --output-dir /generated/travel \
+  --test-password-file /generated/offline/test-password.txt
+cp "${password_file}" "${travel_dir}/test-password.txt"
+cp "${travel_dir}/enrollment-request.json" "${authorization_dir}/enrollment-request.json"
+chmod 600 "${travel_dir}/test-password.txt"
 
 for template in "${script_dir}"/config/*.toml; do
   output="${config_dir}/$(basename -- "${template}")"
@@ -96,8 +119,8 @@ for template in "${script_dir}"/config/*.toml; do
     -e "s/__RELAY2_PIN__/${relay2_pin}/g" \
     -e "s/__HOME_MANAGEMENT_PIN__/${home_management_pin}/g" \
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
-    -e "s/__TRAVEL_MANAGEMENT_PIN__/${travel_management_pin}/g" \
-    -e "s/__TRAVEL_BUSINESS_PIN__/${travel_business_pin}/g" \
+    -e "s/__HOME2_MANAGEMENT_PIN__/${home2_management_pin}/g" \
+    -e "s/__HOME2_BUSINESS_PIN__/${home2_business_pin}/g" \
     -e "s/__TRAVEL_AUTHORITY_PUBLIC_KEY__/${travel_authority_public_key}/g" \
     "${template}" >"${output}"
 done

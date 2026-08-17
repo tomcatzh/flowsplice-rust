@@ -1,11 +1,21 @@
 services:
   echo:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-echo"]
+    networks: [flowsplice]
+
+  echo2:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-echo"]
+    environment:
+      FLOWSPLICE_ECHO_LABEL: home-2
     networks: [flowsplice]
 
   relay1:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay.toml"]
     environment:
       RUST_LOG: flowsplice_relay=debug,info
@@ -19,6 +29,7 @@ services:
 
   relay2:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay2.toml"]
     environment:
       RUST_LOG: flowsplice_relay=debug,info
@@ -32,6 +43,7 @@ services:
 
   server:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-server", "--config", "/config/server.toml"]
     environment:
       RUST_LOG: flowsplice_server=debug,info
@@ -39,12 +51,13 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
-      - ./generated/authorization:/authorization:ro
+      - ./generated/authorization:/authorization
       - ./generated/state:/state
     networks: [flowsplice]
 
   homeagent:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent.toml"]
     environment:
       RUST_LOG: flowsplice_homeagent=debug,info
@@ -55,19 +68,38 @@ services:
       - ./generated/state:/state
     networks: [flowsplice]
 
+  homeagent2:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent2.toml"]
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+    depends_on: [server, echo2]
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+      - ./generated/state:/state
+    networks: [flowsplice]
+
   travelagent:
     image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/config/travelagent.toml"]
     environment:
       RUST_LOG: flowsplice_travelagent=debug,info
-    depends_on: [relay1, relay2, homeagent]
+      FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
+      FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /travel/test-password.txt
+    depends_on: [relay1, relay2, homeagent, homeagent2]
     ports:
       - "127.0.0.1:19080:9080"
       - "127.0.0.1:11080:10080"
       - "127.0.0.1:11081:10081/udp"
+      - "127.0.0.1:11082:10082"
+      - "127.0.0.1:11083:10083"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
+      - ./generated/travel:/travel:ro
     networks: [flowsplice]
 
 networks:

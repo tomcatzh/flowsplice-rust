@@ -1,18 +1,25 @@
 id = "server-1"
-control_listens = ["0.0.0.0:7443"]
+control_listen = "0.0.0.0:7443"
 data_listens = ["0.0.0.0:7444"]
 cert = "/certs/server.crt"
 key = "/certs/server.key"
 management_ca = "/certs/management-ca.crt"
-home_id = "home-1"
-home_spki_pins = ["__HOME_MANAGEMENT_PIN__"]
 relay_spki_pins = ["__RELAY1_PIN__", "__RELAY2_PIN__"]
 travel_authority_public_key = "__TRAVEL_AUTHORITY_PUBLIC_KEY__"
 travel_credentials = "/authorization/credentials.json"
 travel_revocations = "/state/server-revocations.json"
 admin_socket = "/state/server-admin.sock"
+travel_valid_days = 365
 handshake_timeout_secs = 10
 work_ttl_secs = 15
+
+[[homes]]
+id = "home-1"
+spki_pins = ["__HOME_MANAGEMENT_PIN__"]
+
+[[homes]]
+id = "home-2"
+spki_pins = ["__HOME2_MANAGEMENT_PIN__"]
 
 [[relays]]
 id = "relay-1"

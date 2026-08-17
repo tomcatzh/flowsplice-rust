@@ -5,14 +5,10 @@ import json
 from pathlib import Path
 import re
 import socket
-import ssl
-import struct
 import subprocess
 import time
-import uuid
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
-CREDENTIAL_ID = "11111111-1111-4111-8111-111111111111"
 COMPOSE_FILE = Path(__file__).resolve().parent / "compose.yaml"
 
 
@@ -40,10 +36,16 @@ def wait_ready() -> dict:
                 state = json.loads(body)
                 catalog = json.loads(catalog_body)
                 directory = json.loads(relay_body)
+                homes = {home["home_id"]: home for home in catalog["homes"]}
                 if (
                     state["ok"]
-                    and catalog["home_alias"] == "E2E Home"
-                    and len(catalog["services"]) == 2
+                    and set(homes) == {"home-1", "home-2"}
+                    and homes["home-1"]["home_alias"] == "E2E Home"
+                    and homes["home-2"]["home_alias"] == "E2E Home Two"
+                    and {service["id"] for service in homes["home-1"]["services"]}
+                    == {"tcp-echo", "udp-echo", "home-1-only"}
+                    and {service["id"] for service in homes["home-2"]["services"]}
+                    == {"tcp-echo"}
                     and directory["generation"] >= 1
                     and {relay["id"] for relay in directory["relays"]}
                     == {"relay-1", "relay-2"}
@@ -65,12 +67,78 @@ def read_line(stream: socket.socket) -> bytes:
     return bytes(received)
 
 
-def exchange_line(stream: socket.socket, payload: bytes) -> int:
+def exchange_line(
+    stream: socket.socket, payload: bytes, expected_home: bytes | None = None
+) -> int:
     stream.sendall(payload + b"\n")
     response = read_line(stream)
-    connection, echoed = response.split(b":", 1)
+    if expected_home is None:
+        connection, echoed = response.split(b":", 1)
+    else:
+        home, connection, echoed = response.split(b":", 2)
+        assert home == expected_home, (home, expected_home)
     assert echoed == payload + b"\n", (echoed, payload)
     return int(connection)
+
+
+def wait_catalog_homes(expected: set[str]) -> dict:
+    deadline = time.monotonic() + 30
+    last = None
+    while time.monotonic() < deadline:
+        status, _, body = http_get("/api/catalog", {"Accept": "application/json"})
+        if status == 200:
+            last = json.loads(body)
+            if {home["home_id"] for home in last["homes"]} == expected:
+                return last
+        time.sleep(0.2)
+    raise AssertionError(f"catalog did not reach Home set {expected}: {last}")
+
+
+def expect_mapping_unavailable_without_cross_home_fallback(port: int) -> None:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+        stream.settimeout(6)
+        stream.sendall(b"must-not-cross-home-boundary\n")
+        try:
+            received = stream.recv(4096)
+        except socket.timeout:
+            # Travel intentionally keeps retrying within its recovery window.
+            # Silence proves it did not fall back to another Home's same-name service.
+            return
+        except (ConnectionError, OSError):
+            return
+        assert received == b"", received
+
+
+def check_multi_home_business_routing() -> None:
+    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+        home_one.settimeout(15)
+        exchange_line(home_one, b"same-service-on-home-one")
+    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+        home_two.settimeout(15)
+        exchange_line(home_two, b"same-service-on-home-two", b"home-2")
+    # This service exists on home-1 only, while the mapping explicitly selects
+    # home-2. It must fail instead of falling back across the Home boundary.
+    expect_mapping_unavailable_without_cross_home_fallback(11083)
+
+
+def check_home_lifecycle_is_isolated() -> None:
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "homeagent2"],
+        check=True,
+    )
+    wait_catalog_homes({"home-1"})
+    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+        home_one.settimeout(15)
+        exchange_line(home_one, b"home-one-survives-home-two-offline")
+    expect_mapping_unavailable_without_cross_home_fallback(11082)
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "homeagent2"],
+        check=True,
+    )
+    wait_catalog_homes({"home-1", "home-2"})
+    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+        home_two.settimeout(15)
+        exchange_line(home_two, b"home-two-returned", b"home-2")
 
 
 def wait_active_relay(excluded: str | None = None) -> str:
@@ -141,62 +209,33 @@ def check_embedded_spa() -> None:
     assert asset_status == 404
 
 
-def management_tls_context(version: ssl.TLSVersion) -> ssl.SSLContext:
-    cert_dir = Path(__file__).resolve().parent / "generated" / "certs"
-    context = ssl.create_default_context(cafile=str(cert_dir / "management-ca.crt"))
-    context.minimum_version = version
-    context.maximum_version = version
-    context.load_cert_chain(
-        certfile=str(cert_dir / "travel-management.crt"),
-        keyfile=str(cert_dir / "travel-management.key"),
-    )
-    return context
-
-
-def write_control_frame(stream: ssl.SSLSocket, message: dict) -> None:
-    payload = json.dumps(message, separators=(",", ":")).encode()
-    stream.sendall(struct.pack("!I", len(payload)) + payload)
-
-
-def read_control_frame(stream: ssl.SSLSocket) -> dict:
-    prefix = bytearray()
-    while len(prefix) < 4:
-        chunk = stream.recv(4 - len(prefix))
-        if not chunk:
-            raise AssertionError("Relay closed before the control-frame length")
-        prefix.extend(chunk)
-    length = struct.unpack("!I", prefix)[0]
-    assert 0 < length <= 262_144, length
-    payload = bytearray()
-    while len(payload) < length:
-        chunk = stream.recv(length - len(payload))
-        if not chunk:
-            raise AssertionError("Relay closed before the complete control frame")
-        payload.extend(chunk)
-    return json.loads(payload)
-
-
 def check_duplicate_travel_login_is_rejected() -> None:
-    context = management_tls_context(ssl.TLSVersion.TLSv1_3)
-    for port, server_name in [
-        (18443, "relay-1.flowsplice"),
-        (28443, "relay-2.flowsplice"),
+    generated_dir = Path(__file__).resolve().parent / "generated"
+    network = "e2e_flowsplice"
+    for relay_addr, server_name, relay_id in [
+        ("relay1:8443", "relay-1.flowsplice", "relay-1"),
+        ("relay2:8443", "relay-2.flowsplice", "relay-2"),
     ]:
-        with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
-            with context.wrap_socket(raw, server_hostname=server_name) as stream:
-                stream.settimeout(5)
-                write_control_frame(
-                    stream,
-                    {
-                        "type": "travel_hello",
-                        "id": "travel-1",
-                        "session_id": str(uuid.uuid4()),
-                        "purpose": "catalog",
-                    },
-                )
-                response = read_control_frame(stream)
-                assert response["type"] == "travel_hello_denied", response
-                assert "already online" in response["reason"], response
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                network,
+                "-v",
+                f"{generated_dir / 'travel'}:/travel:ro",
+                "-v",
+                f"{generated_dir / 'certs'}:/certs:ro",
+                "flowsplice-e2e:local",
+                "/usr/local/bin/flowsplice-travel-login-probe",
+                "duplicate",
+                relay_addr,
+                server_name,
+                relay_id,
+            ],
+            check=True,
+        )
 
 
 def server_admin(*arguments: str) -> dict:
@@ -240,7 +279,7 @@ def container_pid(service: str) -> int:
 
 
 def wait_authorization_acks(generation: int) -> dict:
-    expected = {"home:home-1", "relay:relay-1", "relay:relay-2"}
+    expected = {"home:home-1", "home:home-2", "relay:relay-1", "relay:relay-2"}
     deadline = time.monotonic() + 30
     last = None
     while time.monotonic() < deadline:
@@ -252,32 +291,54 @@ def wait_authorization_acks(generation: int) -> dict:
     raise AssertionError(f"authorization generation {generation} was not acknowledged: {last}")
 
 
-def assert_revoked_management_certificate_rejected(port: int, server_name: str) -> None:
-    context = management_tls_context(ssl.TLSVersion.TLSv1_3)
-    with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
-        try:
-            with context.wrap_socket(raw, server_hostname=server_name) as stream:
-                stream.settimeout(3)
-                write_control_frame(
-                    stream,
-                    {
-                        "type": "travel_hello",
-                        "id": "travel-1",
-                        "session_id": str(uuid.uuid4()),
-                        "purpose": "catalog",
-                    },
-                )
-                response = read_control_frame(stream)
-                if response["type"] == "travel_hello_denied":
-                    return
-                raise AssertionError(f"Relay {server_name} accepted revoked Travel: {response}")
-        except AssertionError as error:
-            if "closed before" in str(error):
-                return
-            raise
-        except (ConnectionError, ssl.SSLError):
-            return
-    raise AssertionError(f"Relay {server_name} accepted a revoked Travel certificate")
+def check_enrollment_import() -> tuple[str, int]:
+    status = server_admin("--travel-authorization-status")
+    credentials = [
+        credential
+        for credential in status["credentials"]
+        if credential["travel_id"] == "travel-1"
+    ]
+    assert len(credentials) == 1, status
+    credential = credentials[0]
+    remaining = credential["not_after_unix_secs"] - int(time.time())
+    assert 364 * 86400 <= remaining <= 366 * 86400, remaining
+    assert credential["active"] and not credential["revoked"], credential
+    duplicate = server_admin(
+        "--import-travel-enrollment",
+        "/authorization/enrollment-response.json",
+    )
+    assert duplicate["ok"] and not duplicate["changed"], duplicate
+    assert duplicate["generation"] == status["generation"], duplicate
+    wait_authorization_acks(status["generation"])
+    return credential["credential_id"], status["generation"]
+
+
+def assert_revoked_management_certificate_rejected(relay: str, server_name: str) -> None:
+    generated_dir = Path(__file__).resolve().parent / "generated"
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "e2e_flowsplice",
+            "-v",
+            f"{generated_dir / 'travel'}:/travel:ro",
+            "-v",
+            f"{generated_dir / 'certs'}:/certs:ro",
+            "flowsplice-e2e:local",
+            "/usr/local/bin/flowsplice-travel-login-probe",
+            "duplicate",
+            f"{relay}:8443",
+            server_name,
+            relay.replace("relay", "relay-"),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert result.returncode != 0, result.stdout
+    assert "accepted a duplicate Travel login" not in result.stdout, result.stdout
 
 
 def wait_local_flow_closed(stream: socket.socket) -> None:
@@ -301,54 +362,76 @@ def wait_local_flow_closed(stream: socket.socket) -> None:
     raise AssertionError("revoked Travel flow remained open past recovery timeout")
 
 
-def check_live_revocation(failed_relay: str) -> None:
+def check_live_revocation(
+    failed_relay: str, credential_id: str, imported_generation: int
+) -> None:
     service = {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay]
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", service],
         check=True,
     )
-    wait_authorization_acks(1)
+    wait_authorization_acks(imported_generation)
     pids = {
         service_name: container_pid(service_name)
-        for service_name in ("server", "relay1", "relay2", "homeagent")
+        for service_name in ("server", "relay1", "relay2", "homeagent", "homeagent2")
     }
 
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
-        stream.settimeout(10)
-        exchange_line(stream, b"before-live-revocation")
+    with (
+        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+    ):
+        home_one.settimeout(10)
+        home_two.settimeout(10)
+        exchange_line(home_one, b"before-live-revocation-home-one")
+        exchange_line(home_two, b"before-live-revocation-home-two", b"home-2")
         response = server_admin(
             "--revoke-travel-credential",
-            CREDENTIAL_ID,
+            credential_id,
             "--revocation-reason",
             "E2E revocation",
         )
-        assert response["ok"] and response["changed"] and response["generation"] == 2, response
-        wait_authorization_acks(2)
-        wait_local_flow_closed(stream)
+        revoked_generation = imported_generation + 1
+        assert (
+            response["ok"]
+            and response["changed"]
+            and response["generation"] == revoked_generation
+        ), response
+        wait_authorization_acks(revoked_generation)
+        wait_local_flow_closed(home_one)
+        wait_local_flow_closed(home_two)
 
     duplicate = server_admin(
         "--revoke-travel-credential",
-        CREDENTIAL_ID,
+        credential_id,
         "--revocation-reason",
         "idempotency check",
     )
-    assert duplicate["ok"] and not duplicate["changed"] and duplicate["generation"] == 2
-    assert_revoked_management_certificate_rejected(18443, "relay-1.flowsplice")
-    assert_revoked_management_certificate_rejected(28443, "relay-2.flowsplice")
+    assert (
+        duplicate["ok"]
+        and not duplicate["changed"]
+        and duplicate["generation"] == revoked_generation
+    )
+    assert_revoked_management_certificate_rejected("relay1", "relay-1.flowsplice")
+    assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
     assert pids == {
         service_name: container_pid(service_name)
-        for service_name in ("server", "relay1", "relay2", "homeagent")
+        for service_name in ("server", "relay1", "relay2", "homeagent", "homeagent2")
     }
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "relay2"],
         check=True,
     )
-    wait_authorization_acks(2)
-    assert_revoked_management_certificate_rejected(28443, "relay-2.flowsplice")
+    wait_authorization_acks(revoked_generation)
+    assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
 
 
 def check_tls_policy_and_slow_loris_deadline() -> None:
-    tls12 = management_tls_context(ssl.TLSVersion.TLSv1_2)
+    import ssl
+
+    cert_dir = Path(__file__).resolve().parent / "generated" / "certs"
+    tls12 = ssl.create_default_context(cafile=str(cert_dir / "management-ca.crt"))
+    tls12.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls12.maximum_version = ssl.TLSVersion.TLSv1_2
     try:
         with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
             with tls12.wrap_socket(raw, server_hostname="relay-1.flowsplice"):
@@ -358,31 +441,47 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
     else:
         raise AssertionError("Relay unexpectedly accepted TLS 1.2")
 
-    tls13 = management_tls_context(ssl.TLSVersion.TLSv1_3)
-    with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
-        with tls13.wrap_socket(raw, server_hostname="relay-1.flowsplice") as stream:
-            assert stream.version() == "TLSv1.3"
-            stream.settimeout(13)
-            stream.sendall(b"\x00\x00")
-            started = time.monotonic()
-            try:
-                closed = stream.recv(1) == b""
-            except ssl.SSLEOFError:
-                closed = True
-            elapsed = time.monotonic() - started
-            assert closed, "Relay did not close the incomplete control frame"
-            assert elapsed < 12, f"slow control frame survived too long: {elapsed:.2f}s"
+    generated_dir = Path(__file__).resolve().parent / "generated"
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "e2e_flowsplice",
+            "-v",
+            f"{generated_dir / 'travel'}:/travel:ro",
+            "-v",
+            f"{generated_dir / 'certs'}:/certs:ro",
+            "flowsplice-e2e:local",
+            "/usr/local/bin/flowsplice-travel-login-probe",
+            "slow-frame",
+            "relay1:8443",
+            "relay-1.flowsplice",
+            "relay-1",
+        ],
+        check=True,
+    )
 
 
 state = wait_ready()
+credential_id, imported_generation = check_enrollment_import()
 check_udp()
+check_multi_home_business_routing()
+check_home_lifecycle_is_isolated()
 check_embedded_spa()
 check_duplicate_travel_login_is_rejected()
 check_tls_policy_and_slow_loris_deadline()
 failed_relay, replacement_relay = check_tcp_relay_failover()
-check_live_revocation(failed_relay)
+check_live_revocation(failed_relay, credential_id, imported_generation)
 checks = [
     "two-relay-directory",
+    "two-home-catalog",
+    "same-service-id-isolated-by-home",
+    "logical-business-selects-exact-home",
+    "wrong-home-service-fails-without-fallback",
+    "one-home-offline-does-not-affect-other-home",
+    "home-catalog-removal-and-return",
     "same-tcp-flow-relay-failover",
     "same-home-target-connection",
     "udp",
@@ -390,8 +489,13 @@ checks = [
     "tls13-only",
     "slow-frame-deadline",
     "duplicate-travel-login-rejected-across-relays",
-    "live-revocation-three-node-ack",
-    "live-revocation-closes-existing-flow",
+    "encrypted-local-travel-enrollment",
+    "offline-dual-ca-issuance",
+    "default-one-year-validity",
+    "live-add-only-credential-import",
+    "duplicate-credential-import-idempotent",
+    "live-revocation-four-node-ack",
+    "live-revocation-closes-flows-on-both-homes",
     "revoked-certificate-rejected-by-both-relays",
     "revocation-without-process-restart",
     "duplicate-revocation-idempotent",
