@@ -6,7 +6,6 @@ from pathlib import Path
 import re
 import socket
 import ssl
-import sys
 import time
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
@@ -24,7 +23,7 @@ def http_get(path: str, headers: dict[str, str] | None = None):
     return result
 
 
-def wait_ready(expected_services: int, expected_home_alias: str) -> dict:
+def wait_ready() -> dict:
     deadline = time.monotonic() + 90
     last_error = None
     while time.monotonic() < deadline:
@@ -36,8 +35,8 @@ def wait_ready(expected_services: int, expected_home_alias: str) -> dict:
                 catalog = json.loads(catalog_body)
                 if (
                     state["ok"]
-                    and catalog["home_alias"] == expected_home_alias
-                    and len(catalog["services"]) == expected_services
+                    and catalog["home_alias"] == "E2E Home"
+                    and len(catalog["services"]) == 2
                 ):
                     return state
         except Exception as error:  # startup polling deliberately records all transport failures
@@ -132,20 +131,10 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
             assert elapsed < 12, f"slow control frame survived too long: {elapsed:.2f}s"
 
 
-phase = sys.argv[1] if len(sys.argv) > 1 else "initial"
-if phase == "initial":
-    state = wait_ready(2, "E2E Home")
-    check_tcp()
-    check_udp()
-    check_embedded_spa()
-    check_tls_policy_and_slow_loris_deadline()
-    checks = ["tcp", "udp", "embedded-spa", "tls13-only", "slow-frame-deadline"]
-elif phase == "catalog-update":
-    state = wait_ready(3, "E2E Home Updated")
-    check_tcp()
-    check_udp()
-    checks = ["catalog-push", "tcp-after-home-restart", "udp-after-home-restart"]
-else:
-    raise AssertionError(f"unknown E2E phase: {phase}")
-
-print(json.dumps({"result": "ok", "phase": phase, "travel": state["travel_id"], "checks": checks}))
+state = wait_ready()
+check_tcp()
+check_udp()
+check_embedded_spa()
+check_tls_policy_and_slow_loris_deadline()
+checks = ["tcp", "udp", "embedded-spa", "tls13-only", "slow-frame-deadline"]
+print(json.dumps({"result": "ok", "travel": state["travel_id"], "checks": checks}))

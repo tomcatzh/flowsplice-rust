@@ -36,6 +36,8 @@ Every outer frame and payload has a hard bound. The stateful frame decoder is sa
 
 TCP uses explicit `OPEN`, offset-bearing `DATA`, cumulative `ACK`, and offset-bearing `FIN` frames. Both directions validate contiguous offsets. Backpressure comes from bounded frame payloads and the underlying TCP/TLS write path. Half-close is preserved: receipt of a valid logical FIN shuts down only the target write half until the reverse direction also finishes.
 
+The current executable does not retain acknowledged send state or detach a Flow from its Carrier. Each Flow owns one business-TLS/TCP Carrier, so Carrier loss closes that Flow. The required architecture instead keeps a stable in-memory Travel-to-Home Agent Session while Home and Travel remain alive, races complete end-to-end Carriers through the complete Server-authorized Relay directory, retains a primary plus warm standby, and reattaches existing Flows with bounded retransmission and deduplication when a Relay path fails or degrades.
+
 ## Logical UDP
 
 Each local client tuple becomes one association with one connected Home UDP socket. Datagram boundaries remain intact. Each direction has a monotonically increasing sequence, duplicates are discarded, and an idle timer reclaims the association. Per-association ingress queues are bounded and non-blocking: saturation drops only the current datagram instead of stalling the shared listener. UDP remains best effort; the protocol does not turn it into a reliable stream.
@@ -47,3 +49,7 @@ The Travel Agent mounts `/api/status` and `/api/catalog` before the embedded SPA
 ## Portability
 
 Linux Relay builds use `tokio-splice` for the zero-copy steady state. macOS retains the identical opaque-forwarding and protocol behavior through a portable copying fallback. Linux release targets use musl and are static; the macOS arm64 release is one application executable per component.
+
+## Process restart boundary
+
+No test or design claim may describe Home process restart as preserving an established TCP connection. Home owns the target TCP socket, so restarting Home destroys that socket. Relay handover is a different requirement: Home and Travel remain alive while only the replaceable Carrier changes.

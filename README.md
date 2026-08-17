@@ -182,7 +182,6 @@ make e2e
 - mutual management TLS and separate Travel-to-Home business TLS;
 - single-use HMAC-authenticated route setup;
 - TLS-1.2 rejection, TLS-1.3 mutual authentication, and incomplete-control-frame expiry;
-- live catalog push across a Home restart without reconnecting Travel's subscription, followed by TCP/UDP regression checks;
 - the embedded UI, gzip/Brotli selection, representation-specific ETags, and correct `404` boundaries.
 
 Generated keys, web output, build targets, and release binaries are ignored by Git.
@@ -216,7 +215,9 @@ Linux artifacts are genuinely static. macOS does not support fully static linkag
 
 ## Current scope
 
-The first release supports one active Home Agent, a canonical catalog, TCP streams, and UDP associations. Each accepted local connection/association receives an independent end-to-end TLS Carrier. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, multiple Carriers per logical session, and per-Travel service ACLs remain explicit later protocol work.
+The current executable supports one active Home Agent, a canonical catalog, TCP streams, and UDP associations. Each accepted local connection/association receives an independent end-to-end TLS Carrier. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, and per-Travel service ACLs remain explicit later protocol work.
+
+This boundary does **not** satisfy FlowSplice's required Relay-handover behavior. Travel is fixed to one configured Relay, does not receive a complete Server-authorized Relay directory, does not race end-to-end Carriers through multiple Relays, and cannot keep an established TCP Flow alive when its Carrier fails. Deployment acceptance requires a stable Travel-to-Home Agent Session, replaceable primary/standby Carriers, acknowledged retransmission state, and an E2E test that preserves one TCP socket while the active Relay fails or degrades.
 
 ## License
 

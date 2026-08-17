@@ -8,7 +8,7 @@ This document records the repository-side verification of the user-supplied Kimi
 | --- | --- | --- |
 | H1 — unbounded frame reads / slow-loris | Confirmed. The former `read_exact`-based helper also lost partial framing state when cancelled inside a repeated `tokio::select!`. | Replaced by a persistent stateful decoder built from cancellation-safe `read` calls. HELLO, registration, catalog, route-response, TLS setup, and business `OPEN` reads now have deadlines. Unit and Docker slow-frame regressions cover the failure. |
 | H2 — UDP association queue can block the shared listener | Confirmed. Awaiting a full per-peer channel stopped ingress for every peer. | The listener now uses `try_send`; saturation drops only the current datagram and a closed association is removed safely. |
-| H3 — catalog polling creates a full mTLS connection every five seconds | Confirmed, including the missing Relay-to-Travel push path. | Travel now keeps one authenticated catalog subscription. Relay uses a watch channel to push every catalog replacement. Docker E2E restarts Home with a changed catalog and proves that Travel receives it without reconnecting. |
+| H3 — catalog polling creates a full mTLS connection every five seconds | Confirmed, including the missing Relay-to-Travel push path. | Travel now keeps one authenticated catalog subscription and Relay uses a watch channel to publish catalog replacements. The former Home-restart phase demonstrated catalog replacement and new-flow recovery only; it was removed because it was incorrectly presented as established-flow continuity evidence. |
 | M1 — Home session can be silently replaced and is not pinned by Server | Confirmed. | Server now requires `home_id` plus a non-empty Home management SPKI allowlist. A valid replacement explicitly closes the old session and logs the takeover. Relay applies the same explicit supersession discipline to Server sessions. |
 | M2 — restart loses in-memory route/work secrets | Confirmed as a documented availability boundary. | No code change. Cross-process continuity requires a separate persistence/resume design and must not be implied by the current protocol. |
 | M3 — secrets are JSON byte arrays and are not guaranteed to be zeroized | Confirmed as protocol and memory-hygiene debt, not an immediate authentication break. | Deferred to a versioned protocol change. The README continues to disclose cloning, representation, and zeroization limits. |
@@ -26,7 +26,7 @@ This document records the repository-side verification of the user-supplied Kimi
 - `cargo test --workspace --all-targets`: 7 tests passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo audit`: zero vulnerabilities and zero warnings.
-- Docker E2E: initial TCP/UDP, embedded SPA, TLS-1.3-only policy, incomplete-frame expiry, Home restart, live catalog push, and post-restart TCP/UDP all passed.
+- Docker E2E: initial TCP/UDP, embedded SPA, TLS-1.3-only policy, and incomplete-frame expiry passed. It does not validate Relay competition, Carrier handover, or survival of an established TCP Flow.
 - Release build: macOS arm64 plus static Linux amd64 and arm64 versions of all four executables completed.
 
 ## Primary references
