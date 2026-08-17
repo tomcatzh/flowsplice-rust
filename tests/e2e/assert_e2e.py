@@ -87,6 +87,9 @@ def check_tcp_relay_failover() -> tuple[str, str]:
         stream.settimeout(30)
         connection_id = exchange_line(stream, b"before-relay-failure")
         active = wait_active_relay()
+        time.sleep(3)
+        assert exchange_line(stream, b"after-stable-reevaluation") == connection_id
+        assert wait_active_relay() == active
         service = {"relay-1": "relay1", "relay-2": "relay2"}[active]
         subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "kill", "-s", "KILL", service],

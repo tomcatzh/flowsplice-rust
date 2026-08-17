@@ -19,8 +19,8 @@ carrier_heartbeat_secs = 1
 carrier_timeout_secs = 4
 carrier_race_timeout_secs = 5
 carrier_recovery_timeout_secs = 40
-carrier_reevaluate_secs = 3600
-max_carrier_reevaluate_secs = 3600
+carrier_reevaluate_secs = 2
+max_carrier_reevaluate_secs = 4
 max_unacked_bytes = 1048576
 
 [[seed_relays]]

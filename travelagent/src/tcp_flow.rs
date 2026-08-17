@@ -116,6 +116,7 @@ async fn run_inner(
         }
 
         if active.is_none() || Instant::now() >= next_reevaluation {
+            let previous_active = active;
             if active.is_none()
                 && recovery_started.elapsed()
                     > Duration::from_secs(state.config.carrier_recovery_timeout_secs)
@@ -148,18 +149,41 @@ async fn run_inner(
                     info!(event = "carrier_selected", %flow_id, carrier_id = %winner, %relay_id, "travel selected carrier");
                     recovery_started = Instant::now();
                     retry_backoff = Duration::from_millis(250);
-                    next_reevaluation = Instant::now() + Duration::from_secs(reevaluate_secs);
-                    reevaluate_secs = reevaluate_secs
-                        .saturating_mul(2)
-                        .min(state.config.max_carrier_reevaluate_secs);
+                    let stable = previous_active == Some(winner);
+                    let switched = previous_active.is_some() && !stable;
+                    let (delay_secs, next_delay_secs) = advance_reevaluation(
+                        reevaluate_secs,
+                        state.config.carrier_reevaluate_secs,
+                        state.config.max_carrier_reevaluate_secs,
+                        stable,
+                    );
+                    next_reevaluation = Instant::now() + Duration::from_secs(delay_secs);
+                    reevaluate_secs = next_delay_secs;
+                    info!(
+                        event = "carrier_reevaluation_scheduled",
+                        %flow_id,
+                        stable,
+                        switched,
+                        delay_secs,
+                        next_delay_secs,
+                        "scheduled next carrier race"
+                    );
                 }
                 None if active.is_some() => {
-                    info!(
-                        event = "carrier_race_no_replacement",
-                        %flow_id,
-                        "periodic carrier race kept the current carrier"
+                    let (delay_secs, next_delay_secs) = advance_reevaluation(
+                        reevaluate_secs,
+                        state.config.carrier_reevaluate_secs,
+                        state.config.max_carrier_reevaluate_secs,
+                        false,
                     );
-                    next_reevaluation = Instant::now() + Duration::from_secs(reevaluate_secs);
+                    warn!(
+                        event = "carrier_race_no_winner",
+                        %flow_id,
+                        delay_secs,
+                        "carrier race produced no winner; retained current carrier and reset reevaluation"
+                    );
+                    next_reevaluation = Instant::now() + Duration::from_secs(delay_secs);
+                    reevaluate_secs = next_delay_secs;
                 }
                 None => {
                     warn!(
@@ -219,6 +243,9 @@ async fn perform_race(
     let race_deadline =
         Instant::now() + Duration::from_secs(state.config.carrier_race_timeout_secs);
     let old_active = *active;
+    let old_relay_id = old_active
+        .and_then(|carrier_id| carriers.get(&carrier_id))
+        .map(|carrier| carrier.relay_id.clone());
     let mut candidate_ids = HashSet::new();
     let mut opens = JoinSet::new();
     let candidates = relay_candidates(state).await;
@@ -233,6 +260,9 @@ async fn perform_race(
         "travel started carrier race"
     );
     for relay in candidates {
+        if old_relay_id.as_deref() == Some(relay.id.as_str()) {
+            continue;
+        }
         let state = state.clone();
         let service_id = mapping.service_id.clone();
         opens.spawn(async move {
@@ -248,6 +278,26 @@ async fn perform_race(
             .await;
             (relay.id, result)
         });
+    }
+    if let Some(carrier_id) = old_active {
+        debug!(
+            event = "active_carrier_race_sent",
+            %flow_id,
+            %race_id,
+            %carrier_id,
+            relay_id = old_relay_id.as_deref().unwrap_or("unknown"),
+            "sent periodic race on active carrier"
+        );
+        send_to(
+            carriers,
+            carrier_id,
+            DataFrame::Race {
+                flow_id,
+                race_id,
+                next_offset: transfer.send_acked,
+            },
+        )
+        .await;
     }
 
     let winner = loop {
@@ -304,7 +354,7 @@ async fn perform_race(
                             warn!(%flow_id, %relay_id, %error, "carrier race attempt failed");
                         }
                     }
-                    if opens.is_empty() && candidate_ids.is_empty() {
+                    if active.is_none() && opens.is_empty() && candidate_ids.is_empty() {
                         break None;
                     }
                 }
@@ -345,7 +395,7 @@ async fn perform_race(
                 }
                 if let Some(carrier_id) = closed_candidate {
                     candidate_ids.remove(&carrier_id);
-                    if opens.is_empty() && candidate_ids.is_empty() {
+                    if active.is_none() && opens.is_empty() && candidate_ids.is_empty() {
                         break None;
                     }
                 }
@@ -746,5 +796,33 @@ fn close_carrier(carriers: &mut HashMap<Uuid, CarrierHandle>, carrier_id: Uuid) 
 fn close_all(carriers: &mut HashMap<Uuid, CarrierHandle>) {
     for (_, carrier) in carriers.drain() {
         let _ = carrier.shutdown.send(true);
+    }
+}
+
+fn advance_reevaluation(
+    current_secs: u64,
+    initial_secs: u64,
+    maximum_secs: u64,
+    stable: bool,
+) -> (u64, u64) {
+    let delay_secs = if stable { current_secs } else { initial_secs };
+    (delay_secs, delay_secs.saturating_mul(2).min(maximum_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_reevaluation;
+
+    #[test]
+    fn stable_carrier_increases_reevaluation_to_cap() {
+        assert_eq!(advance_reevaluation(60, 60, 900, true), (60, 120));
+        assert_eq!(advance_reevaluation(120, 60, 900, true), (120, 240));
+        assert_eq!(advance_reevaluation(480, 60, 900, true), (480, 900));
+        assert_eq!(advance_reevaluation(900, 60, 900, true), (900, 900));
+    }
+
+    #[test]
+    fn unstable_carrier_result_resets_reevaluation() {
+        assert_eq!(advance_reevaluation(480, 60, 900, false), (60, 120));
     }
 }

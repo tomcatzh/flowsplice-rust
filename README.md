@@ -221,7 +221,7 @@ Linux artifacts are genuinely static. macOS does not support fully static linkag
 
 ## Current scope
 
-The current executable supports one active Home Agent, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race with configurable exponential spacing, capped by default at 15 minutes.
+The current executable supports one active Home Agent, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race, including the active Carrier in that race. The configurable interval doubles up to 15 minutes only when the active Carrier wins again; selecting a different Carrier or completing no race resets the interval to its initial value.
 
 Carrier EOF, reset, TLS/read/write failure, or heartbeat timeout causes immediate recompetition. Travel's recovery timeout is required to be shorter than Home's detach timeout. During that window both endpoints retain bounded unacknowledged data; Home keeps the target TCP connection and retransmits after reattachment. Docker E2E proves this behavior with two Relays and the same endpoint sockets while the active Relay is killed.
 

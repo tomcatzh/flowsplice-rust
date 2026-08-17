@@ -35,7 +35,9 @@ docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 for event in \
   'event="relay_directory_updated"' \
   'event="carrier_race_started"' \
-  'event="carrier_race_duplicate"' \
+  'event="active_carrier_race_sent"' \
+  'event="carrier_race_ack"' \
+  'event="carrier_reevaluation_scheduled"' \
   'event="flow_detached"' \
   'event="carrier_recovery_started"' \
   'event="tcp_retransmit"'; do
@@ -44,4 +46,8 @@ for event in \
     exit 1
   fi
 done
+if ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=false' "${log_file}"; then
+  echo 'missing stable active-Carrier reevaluation result' >&2
+  exit 1
+fi
 docker compose -f "${compose_file}" ps
