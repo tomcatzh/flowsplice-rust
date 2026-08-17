@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+
+. /lib/functions.sh
+gid="$(group_add_next flowsplice)"
+user_exists flowsplice || user_add flowsplice '' "$gid" FlowSplice /var/run/flowsplice /bin/false
+/etc/init.d/flowsplice enable
+rm -f /tmp/luci-indexcache
+/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+exit 0

@@ -36,16 +36,20 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "server.toml")]
     config: PathBuf,
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     id: String,
-    control_listen: String,
-    data_listen: String,
+    control_listens: Vec<String>,
+    data_listens: Vec<String>,
     relays: Vec<RelayEndpoint>,
     cert: PathBuf,
     key: PathBuf,
@@ -109,17 +113,58 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
-    validate_spki_pins(&config.home_spki_pins, "home")?;
-    validate_spki_pins(&config.relay_spki_pins, "relay")?;
-    validate_relays(&config.relays)?;
+    validate_config(&config)?;
+    if args.check_config {
+        info!(event = "config_validated", path = %args.config.display(), "server configuration is valid");
+        return Ok(());
+    }
     let state = Arc::new(State::default());
 
-    let control = run_home_listener(config.clone(), Arc::clone(&state));
-    let data = run_data_listener(config.clone(), Arc::clone(&state));
+    let control = run_home_listeners(config.clone(), Arc::clone(&state));
+    let data = run_data_listeners(config.clone(), Arc::clone(&state));
     let relay = run_relay_connectors(config, Arc::clone(&state));
     let cleanup = cleanup_pending(state);
 
     tokio::try_join!(control, data, relay, cleanup)?;
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    if config.id.is_empty() || config.home_id.is_empty() {
+        bail!("server and Home ids must be non-empty");
+    }
+    validate_listens(&config.control_listens, "control")?;
+    validate_listens(&config.data_listens, "data")?;
+    validate_spki_pins(&config.home_spki_pins, "home")?;
+    validate_spki_pins(&config.relay_spki_pins, "relay")?;
+    validate_relays(&config.relays)?;
+    if config.handshake_timeout_secs == 0
+        || config.work_ttl_secs == 0
+        || config.max_pending_work == 0
+    {
+        bail!("server timeout and pending-work limits must be positive");
+    }
+    let _ = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let _ = client_connector(&config.cert, &config.key, &config.management_ca)?;
+    for relay in &config.relays {
+        let _ = server_name(&relay.server_name)?;
+    }
+    Ok(())
+}
+
+fn validate_listens(listens: &[String], label: &str) -> Result<()> {
+    if listens.is_empty() {
+        bail!("at least one {label} listener is required");
+    }
+    let mut unique = std::collections::HashSet::new();
+    for address in listens {
+        if address.is_empty() || !unique.insert(address) {
+            bail!("{label} listener addresses must be non-empty and unique");
+        }
+        address
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid {label} listener {address}"))?;
+    }
     Ok(())
 }
 
@@ -140,12 +185,38 @@ fn validate_relays(relays: &[RelayEndpoint]) -> Result<()> {
     Ok(())
 }
 
-async fn run_home_listener(config: Config, state: Arc<State>) -> Result<()> {
-    let listener = TcpListener::bind(&config.control_listen)
-        .await
-        .with_context(|| format!("failed to bind home control {}", config.control_listen))?;
+async fn run_home_listeners(config: Config, state: Arc<State>) -> Result<()> {
     let acceptor = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
-    info!(address = %config.control_listen, "home control listener ready");
+    let mut listeners = Vec::with_capacity(config.control_listens.len());
+    for address in &config.control_listens {
+        let listener = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("failed to bind home control {address}"))?;
+        listeners.push((address.clone(), listener));
+    }
+    let mut tasks = JoinSet::new();
+    for (address, listener) in listeners {
+        let acceptor = acceptor.clone();
+        let config = config.clone();
+        let state = Arc::clone(&state);
+        tasks.spawn(async move {
+            run_home_accept_loop(listener, address, acceptor, config, state).await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result??;
+    }
+    bail!("all Home control listeners stopped")
+}
+
+async fn run_home_accept_loop(
+    listener: TcpListener,
+    address: String,
+    acceptor: tokio_rustls::TlsAcceptor,
+    config: Config,
+    state: Arc<State>,
+) -> Result<()> {
+    info!(%address, "home control listener ready");
     loop {
         let (socket, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
@@ -501,11 +572,31 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn run_data_listener(config: Config, state: Arc<State>) -> Result<()> {
-    let listener = TcpListener::bind(&config.data_listen)
-        .await
-        .with_context(|| format!("failed to bind data listener {}", config.data_listen))?;
-    info!(address = %config.data_listen, "data pairing listener ready");
+async fn run_data_listeners(config: Config, state: Arc<State>) -> Result<()> {
+    let mut listeners = Vec::with_capacity(config.data_listens.len());
+    for address in &config.data_listens {
+        let listener = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("failed to bind data listener {address}"))?;
+        listeners.push((address.clone(), listener));
+    }
+    let mut tasks = JoinSet::new();
+    for (address, listener) in listeners {
+        let state = Arc::clone(&state);
+        tasks.spawn(async move { run_data_accept_loop(listener, address, state).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result??;
+    }
+    bail!("all data listeners stopped")
+}
+
+async fn run_data_accept_loop(
+    listener: TcpListener,
+    address: String,
+    state: Arc<State>,
+) -> Result<()> {
+    info!(%address, "data pairing listener ready");
     loop {
         let (mut socket, peer) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -571,5 +662,29 @@ async fn cleanup_pending(state: Arc<State>) -> Result<()> {
             }
             keep
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_listens;
+
+    #[test]
+    fn accepts_distinct_ipv4_and_ipv6_listeners() {
+        let listens = vec!["192.0.2.1:7444".to_owned(), "[2001:db8::1]:7444".to_owned()];
+        assert!(validate_listens(&listens, "data").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_duplicate_and_malformed_listeners() {
+        assert!(validate_listens(&[], "data").is_err());
+        assert!(
+            validate_listens(
+                &["127.0.0.1:7444".to_owned(), "127.0.0.1:7444".to_owned()],
+                "data"
+            )
+            .is_err()
+        );
+        assert!(validate_listens(&["not-an-address".to_owned()], "data").is_err());
     }
 }

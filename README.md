@@ -30,6 +30,7 @@ travelagent/              independent travel agent + TypeScript UI
 tests/                    shared fixtures and Docker E2E suite
 docker/                   E2E and static-release builders
 scripts/                  release orchestration
+openwrt/                  UCI, procd, LuCI, and IPK package sources
 ```
 
 ## Security and cryptographic design
@@ -176,6 +177,7 @@ Requirements: stable Rust, Node.js/npm, CMake, Clang, and Perl. Docker is additi
 make check
 make test
 make e2e
+make openwrt-ipk
 ```
 
 `make e2e` generates two temporary test CAs, builds the Linux applications, starts two Relays plus Server, Home, Travel, and TCP/UDP echo targets, and validates:
@@ -192,9 +194,17 @@ The E2E suite enables component `DEBUG` logging, saves the combined log as the i
 
 Generated keys, E2E logs, web output, build targets, and release binaries are ignored by Git.
 
+`make openwrt-ipk` packages the prebuilt static Linux arm64 Server and Relay binaries with the
+generic OpenWrt integration. The package installs one disabled-by-default Server plus any number
+of named Relay instances managed by one procd service and one LuCI page. It does not contain
+deployment addresses, credentials, firewall policy, or private regression tooling, and it does not
+create firewall rules. See [OpenWrt integration](openwrt/README.md).
+
 ## Configuration
 
-Every executable accepts `--config <path>` or `FLOWSPLICE_CONFIG`. Example files live beside each application:
+Every executable accepts `--config <path>` or `FLOWSPLICE_CONFIG`. Server and Relay also accept
+`--check-config` for a side-effect-free configuration and credential validation. Example files live
+beside each application:
 
 - [server/config.example.toml](server/config.example.toml)
 - [relay/config.example.toml](relay/config.example.toml)
@@ -219,13 +229,18 @@ This produces four executables under each of:
 
 Linux artifacts are genuinely static. macOS does not support fully static linkage of Apple system libraries; the macOS deliverables are single executables with all FlowSplice code and web assets embedded.
 
+The deterministic IPK builder consumes the Linux arm64 Server and Relay executables rather than
+rebuilding them. `make openwrt-ipk` writes an `aarch64_generic` package below `dist/openwrt/`; use
+the explicit builder arguments documented in [openwrt/README.md](openwrt/README.md) for another
+OpenWrt package architecture or release number.
+
 ## Current scope
 
 The current executable supports one active Home Agent, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race, including the active Carrier in that race. The configurable interval doubles up to 15 minutes only when the active Carrier wins again; selecting a different Carrier or completing no race resets the interval to its initial value.
 
 Carrier EOF, reset, TLS/read/write failure, or heartbeat timeout causes immediate recompetition. Travel's recovery timeout is required to be shorter than Home's detach timeout. During that window both endpoints retain bounded unacknowledged data; Home keeps the target TCP connection and retransmits after reattachment. Docker E2E proves this behavior with two Relays and the same endpoint sockets while the active Relay is killed.
 
-This guarantee is in-memory and TCP-specific. Restarting Home destroys its target TCP sockets; restarting Travel destroys its local client sockets. UDP associations currently select the first usable Relay but do not migrate between Carriers. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, per-Travel service ACLs, OpenWrt packaging, and production service definitions remain later work.
+This guarantee is in-memory and TCP-specific. Restarting Home destroys its target TCP sockets; restarting Travel destroys its local client sockets. UDP associations currently select the first usable Relay but do not migrate between Carriers. Server can bind multiple explicit IPv4/IPv6 control and data listeners. The OpenWrt package supplies UCI, procd, and LuCI integration for one Server and multiple local Relay processes, including separate LAN and WAN6 Relay identities. Automated enrollment, certificate rotation/revocation, multi-home routing, cross-process session resume, per-Travel service ACLs, and private production deployment remain later work.
 
 ## License
 

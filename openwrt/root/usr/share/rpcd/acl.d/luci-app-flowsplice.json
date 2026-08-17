@@ -1,0 +1,20 @@
+{
+	"luci-app-flowsplice": {
+		"description": "Grant access to FlowSplice service management",
+		"read": {
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "flowsplice" ]
+		},
+		"write": {
+			"file": {
+				"/etc/init.d/flowsplice start": [ "exec" ],
+				"/etc/init.d/flowsplice stop": [ "exec" ],
+				"/etc/init.d/flowsplice restart": [ "exec" ],
+				"/etc/init.d/flowsplice validate": [ "exec" ]
+			},
+			"uci": [ "flowsplice" ]
+		}
+	}
+}

@@ -1,0 +1,14 @@
+{
+	"admin/services/flowsplice": {
+		"title": "FlowSplice",
+		"order": 85,
+		"action": {
+			"type": "view",
+			"path": "flowsplice"
+		},
+		"depends": {
+			"acl": [ "luci-app-flowsplice" ],
+			"uci": { "flowsplice": true }
+		}
+	}
+}

@@ -19,6 +19,10 @@ Home Agent --outbound mTLS--> Server                                  Travel Age
 
 Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog and complete Relay directory to each one, and each Relay fans changes out over authenticated Travel management sessions. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
 
+Server may bind multiple explicit IPv4 and IPv6 addresses for both Home control and Relay/Home data
+pairing. All configured listeners are bound before their accept loops start, so a partial bind failure
+fails startup instead of silently exposing an incomplete topology.
+
 ## Route and data setup
 
 1. An authenticated Travel control connection asks Relay for an opaque route. It does not reveal a service ID.
@@ -53,6 +57,12 @@ The Travel Agent mounts `/api/status`, `/api/catalog`, and `/api/relays` before 
 ## Portability
 
 Linux Relay builds use `tokio-splice` for the zero-copy steady state. macOS retains the identical opaque-forwarding and protocol behavior through a portable copying fallback. Linux release targets use musl and are static; the macOS arm64 release is one application executable per component.
+
+On OpenWrt, one package installs the Server and Relay executables, a UCI-to-TOML renderer, one procd
+service, and one LuCI page. procd runs one named Server instance and one named process per enabled
+Relay section. Separate LAN and WAN6 Relay identities therefore share binaries and administration
+without sharing listener configuration or lifecycle state. The package is inert by default and leaves
+firewall policy outside its authority.
 
 ## Process restart boundary
 

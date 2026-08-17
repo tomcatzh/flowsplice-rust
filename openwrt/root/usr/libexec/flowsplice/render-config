@@ -1,0 +1,163 @@
+#!/bin/sh
+set -e
+
+. /lib/functions.sh
+
+usage() {
+	echo "usage: $0 server OUTPUT | relay SECTION OUTPUT" >&2
+	exit 2
+}
+
+die() {
+	echo "flowsplice config: $*" >&2
+	exit 1
+}
+
+toml_escape() {
+	case "$1" in
+		*'
+'*) die 'multiline UCI values are not supported' ;;
+	esac
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_string() {
+	local key="$1" value="$2" output="$3"
+	printf '%s = "%s"\n' "$key" "$(toml_escape "$value")" >>"$output"
+}
+
+write_integer() {
+	local key="$1" value="$2" output="$3"
+	case "$value" in
+		''|*[!0-9]*) die "$key must be an unsigned integer" ;;
+	esac
+	printf '%s = %s\n' "$key" "$value" >>"$output"
+}
+
+LIST_OUTPUT=
+LIST_FIRST=1
+append_list_item() {
+	local value="$1"
+	[ "$LIST_FIRST" -eq 1 ] || printf ', ' >>"$LIST_OUTPUT"
+	printf '"%s"' "$(toml_escape "$value")" >>"$LIST_OUTPUT"
+	LIST_FIRST=0
+}
+
+write_list() {
+	local section="$1" option="$2" key="$3" output="$4"
+	LIST_OUTPUT="$output"
+	LIST_FIRST=1
+	printf '%s = [' "$key" >>"$output"
+	config_list_foreach "$section" "$option" append_list_item
+	printf ']\n' >>"$output"
+}
+
+require_option() {
+	local section="$1" option="$2" value
+	config_get value "$section" "$option"
+	[ -n "$value" ] || die "missing $section.$option"
+	printf '%s' "$value"
+}
+
+write_relay_endpoint() {
+	local section="$1" enabled id management_addr server_name
+	config_get_bool enabled "$section" enabled 1
+	[ "$enabled" -eq 1 ] || return 0
+	id="$(require_option "$section" id)"
+	management_addr="$(require_option "$section" management_addr)"
+	server_name="$(require_option "$section" server_name)"
+	printf '\n[[relays]]\n' >>"$RENDER_OUTPUT"
+	write_string id "$id" "$RENDER_OUTPUT"
+	write_string management_addr "$management_addr" "$RENDER_OUTPUT"
+	write_string server_name "$server_name" "$RENDER_OUTPUT"
+	RELAY_ENDPOINT_COUNT=$((RELAY_ENDPOINT_COUNT + 1))
+}
+
+render_server() {
+	local output="$1" tmp section=server
+	local id cert key management_ca home_id handshake work_ttl max_pending
+	tmp="${output}.tmp.$$"
+	trap 'rm -f "$tmp"' EXIT INT TERM
+	: >"$tmp"
+	id="$(require_option "$section" id)"
+	cert="$(require_option "$section" cert)"
+	key="$(require_option "$section" key)"
+	management_ca="$(require_option "$section" management_ca)"
+	home_id="$(require_option "$section" home_id)"
+	config_get handshake "$section" handshake_timeout_secs 10
+	config_get work_ttl "$section" work_ttl_secs 15
+	config_get max_pending "$section" max_pending_work 256
+	write_string id "$id" "$tmp"
+	write_list "$section" control_listen control_listens "$tmp"
+	write_list "$section" data_listen data_listens "$tmp"
+	write_string cert "$cert" "$tmp"
+	write_string key "$key" "$tmp"
+	write_string management_ca "$management_ca" "$tmp"
+	write_string home_id "$home_id" "$tmp"
+	write_list "$section" home_spki_pin home_spki_pins "$tmp"
+	write_list "$section" relay_spki_pin relay_spki_pins "$tmp"
+	write_integer handshake_timeout_secs "$handshake" "$tmp"
+	write_integer work_ttl_secs "$work_ttl" "$tmp"
+	write_integer max_pending_work "$max_pending" "$tmp"
+	RENDER_OUTPUT="$tmp"
+	RELAY_ENDPOINT_COUNT=0
+	config_foreach write_relay_endpoint relay_endpoint
+	[ "$RELAY_ENDPOINT_COUNT" -gt 0 ] || die 'an enabled Server requires at least one enabled relay_endpoint section'
+	mv "$tmp" "$output"
+	trap - EXIT INT TERM
+}
+
+render_relay() {
+	local section="$1" output="$2" tmp
+	local id management_listen data_listen data_public_addr server_data_addr
+	local server_id cert key management_ca handshake route_ttl max_pending
+	tmp="${output}.tmp.$$"
+	trap 'rm -f "$tmp"' EXIT INT TERM
+	: >"$tmp"
+	id="$(require_option "$section" id)"
+	management_listen="$(require_option "$section" management_listen)"
+	data_listen="$(require_option "$section" data_listen)"
+	data_public_addr="$(require_option "$section" data_public_addr)"
+	server_data_addr="$(require_option "$section" server_data_addr)"
+	server_id="$(require_option "$section" server_id)"
+	cert="$(require_option "$section" cert)"
+	key="$(require_option "$section" key)"
+	management_ca="$(require_option "$section" management_ca)"
+	config_get handshake "$section" handshake_timeout_secs 10
+	config_get route_ttl "$section" route_ttl_secs 15
+	config_get max_pending "$section" max_pending_routes 256
+	write_string id "$id" "$tmp"
+	write_string management_listen "$management_listen" "$tmp"
+	write_string data_listen "$data_listen" "$tmp"
+	write_string data_public_addr "$data_public_addr" "$tmp"
+	write_string server_data_addr "$server_data_addr" "$tmp"
+	write_string server_id "$server_id" "$tmp"
+	write_string cert "$cert" "$tmp"
+	write_string key "$key" "$tmp"
+	write_string management_ca "$management_ca" "$tmp"
+	write_list "$section" server_spki_pin server_spki_pins "$tmp"
+	write_list "$section" travel_spki_pin travel_spki_pins "$tmp"
+	write_integer handshake_timeout_secs "$handshake" "$tmp"
+	write_integer route_ttl_secs "$route_ttl" "$tmp"
+	write_integer max_pending_routes "$max_pending" "$tmp"
+	mv "$tmp" "$output"
+	trap - EXIT INT TERM
+}
+
+[ "$#" -ge 2 ] || usage
+umask 077
+config_load flowsplice
+
+case "$1" in
+	server)
+		[ "$#" -eq 2 ] || usage
+		mkdir -p "$(dirname "$2")"
+		render_server "$2"
+		;;
+	relay)
+		[ "$#" -eq 3 ] || usage
+		mkdir -p "$(dirname "$3")"
+		render_relay "$2" "$3"
+		;;
+	*) usage ;;
+esac

@@ -33,12 +33,16 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "relay.toml")]
     config: PathBuf,
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     id: String,
     management_listen: String,
@@ -126,14 +130,45 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
-    validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    validate_config(&config)?;
+    if args.check_config {
+        info!(event = "config_validated", path = %args.config.display(), "relay configuration is valid");
+        return Ok(());
+    }
     let state = Arc::new(State::new());
     tokio::try_join!(
         run_management(config.clone(), Arc::clone(&state)),
         run_data(config, Arc::clone(&state)),
         cleanup_routes(state),
     )?;
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    if config.id.is_empty()
+        || config.server_id.is_empty()
+        || config.data_public_addr.is_empty()
+        || config.server_data_addr.is_empty()
+    {
+        bail!("Relay ids and advertised/Server addresses must be non-empty");
+    }
+    for (label, address) in [
+        ("management", config.management_listen.as_str()),
+        ("data", config.data_listen.as_str()),
+    ] {
+        address
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid Relay {label} listener {address}"))?;
+    }
+    if config.handshake_timeout_secs == 0
+        || config.route_ttl_secs == 0
+        || config.max_pending_routes == 0
+    {
+        bail!("Relay timeout and pending-route limits must be positive");
+    }
+    validate_spki_pins(&config.server_spki_pins, "server")?;
+    validate_spki_pins(&config.travel_spki_pins, "travel")?;
+    let _ = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
     Ok(())
 }
 
