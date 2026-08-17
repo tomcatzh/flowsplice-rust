@@ -6,8 +6,10 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import struct
 import subprocess
 import time
+import uuid
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
 
@@ -150,6 +152,52 @@ def management_tls_context(version: ssl.TLSVersion) -> ssl.SSLContext:
     return context
 
 
+def write_control_frame(stream: ssl.SSLSocket, message: dict) -> None:
+    payload = json.dumps(message, separators=(",", ":")).encode()
+    stream.sendall(struct.pack("!I", len(payload)) + payload)
+
+
+def read_control_frame(stream: ssl.SSLSocket) -> dict:
+    prefix = bytearray()
+    while len(prefix) < 4:
+        chunk = stream.recv(4 - len(prefix))
+        if not chunk:
+            raise AssertionError("Relay closed before the control-frame length")
+        prefix.extend(chunk)
+    length = struct.unpack("!I", prefix)[0]
+    assert 0 < length <= 262_144, length
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = stream.recv(length - len(payload))
+        if not chunk:
+            raise AssertionError("Relay closed before the complete control frame")
+        payload.extend(chunk)
+    return json.loads(payload)
+
+
+def check_duplicate_travel_login_is_rejected() -> None:
+    context = management_tls_context(ssl.TLSVersion.TLSv1_3)
+    for port, server_name in [
+        (18443, "relay-1.flowsplice"),
+        (28443, "relay-2.flowsplice"),
+    ]:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+            with context.wrap_socket(raw, server_hostname=server_name) as stream:
+                stream.settimeout(5)
+                write_control_frame(
+                    stream,
+                    {
+                        "type": "travel_hello",
+                        "id": "travel-1",
+                        "session_id": str(uuid.uuid4()),
+                        "purpose": "catalog",
+                    },
+                )
+                response = read_control_frame(stream)
+                assert response["type"] == "travel_hello_denied", response
+                assert "already online" in response["reason"], response
+
+
 def check_tls_policy_and_slow_loris_deadline() -> None:
     tls12 = management_tls_context(ssl.TLSVersion.TLSv1_2)
     try:
@@ -180,6 +228,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 state = wait_ready()
 check_udp()
 check_embedded_spa()
+check_duplicate_travel_login_is_rejected()
 check_tls_policy_and_slow_loris_deadline()
 failed_relay, replacement_relay = check_tcp_relay_failover()
 checks = [
@@ -190,6 +239,7 @@ checks = [
     "embedded-spa",
     "tls13-only",
     "slow-frame-deadline",
+    "duplicate-travel-login-rejected-across-relays",
 ]
 print(
     json.dumps(

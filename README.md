@@ -61,7 +61,7 @@ FlowSplice does not attempt to hide IP addresses, connection timing, byte counts
 - SPKI pins are the lowercase hexadecimal SHA-256 digest of the peer leaf certificate's DER SubjectPublicKeyInfo. The comparison is case-insensitive; each configured value must decode to exactly 32 bytes.
 - Certificates are ordinary X.509 certificates validated through rustls/webpki. FlowSplice adds an application identity URI in Subject Alternative Name, whose general PKI form is defined by [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280).
 - PEM certificate and private-key loading uses `rustls-pki-types`; the runtime does not depend on the unmaintained `rustls-pemfile` crate.
-- UUIDs identify requests, routes, work items, and flows, but UUID secrecy is not a security boundary. Possession of the corresponding random HMAC secret or a valid mutually authenticated TLS identity is what grants admission.
+- UUIDs identify requests, routes, work items, and flows; those identifiers are not secret and possession does not grant admission. The Travel process-session UUID is a deliberate exception: it is generated from the operating system RNG at startup, kept out of logs and deployment files, and acts as a short-lived supplementary capability only after mutual TLS authenticates the same Travel identity.
 - FlowSplice does not implement a custom encryption algorithm, custom hash construction, or custom certificate-signature scheme. The `fips` feature is not enabled, so the project makes no FIPS claim.
 
 The disposable E2E certificate script uses the OpenSSL command-line tool to create short-lived P-256 test certificates. OpenSSL is test/build tooling only; it is not linked into or required by the runtime executables. Production certificates are not required to use the E2E script's key type, lifetime, names, or CA keys.
@@ -92,7 +92,7 @@ Successful TLS chain validation is necessary but not sufficient. FlowSplice appl
 
 1. rustls/webpki validates the configured trust root, certificate validity, signature chain, and the appropriate client/server extended-key usage. TLS clients also validate the configured server name against the certificate's DNS or IP identity.
 2. The application parses the peer leaf certificate and requires exactly one URI beginning `flowsplice://identity/`. The URI must contain a recognized role (`server`, `relay`, `home`, or `travel`) and a non-empty stable ID.
-3. The role and ID declared in the first `HELLO` control message must match the certificate-derived identity. A JSON field cannot promote a certificate into a different role.
+3. The role and ID declared in the first control message must match the certificate-derived identity. Travel also supplies a fresh process-session UUID and a catalog-or-route purpose; neither field can change the certificate-bound identity.
 4. Where configured, the SHA-256 SPKI digest must appear in the required allowlist. Empty or malformed required allowlists make the affected application fail at startup.
 
 Current SPKI coverage is directional and explicit:
@@ -105,13 +105,15 @@ Current SPKI coverage is directional and explicit:
 
 The single active Home session is explicit: a newly authenticated session for the configured Home identity supersedes the previous session, logs the takeover, and actively closes the old session. A different Home ID or a Home key outside Server's allowlist is rejected before registration.
 
+Travel uses a stricter first-wins rule. Each Travel process generates a random session UUID in memory at startup. Its long-lived catalog connection acquires and renews a 45-second Server-held lease through whichever Relay it reaches. Route connections through every Relay may use that same session UUID, preserving concurrent multi-Relay Carrier competition. A different session UUID presenting the same certificate-bound Travel ID is rejected globally by Server, including when it enters through another Relay, and cannot obtain a route. The active session is never displaced by a later login.
+
 An SPKI pin binds the public key rather than the full certificate. Renewing a certificate with the same key preserves the pin; rotating the key requires deploying an overlapping old/new allowlist before switching certificates. CA roots and pins serve different purposes: the CA establishes a valid credential domain, while a pin narrows which keys inside that domain are accepted.
 
 ### Route and work secrets
 
 Route allocation intentionally does not reveal the selected service to Relay or Server:
 
-1. An authenticated Travel management connection asks Relay for a route using a random request UUID and its certificate-bound Travel ID. No service ID is included.
+1. An authenticated Travel management connection asks Relay for a route using a random request UUID, its certificate-bound Travel ID, and its already admitted process-session UUID. No service ID is included.
 2. Relay forwards the request to Server over management mTLS.
 3. Server generates a random 32-byte work secret and work UUID. It sends the same secret to Home and Relay over their authenticated management links and keeps a short-lived in-memory pairing entry.
 4. Relay independently generates a random 32-byte route secret and route UUID, returns them to Travel over management mTLS, and keeps a short-lived in-memory route entry.
@@ -141,6 +143,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - TLS client/server configurations are built once at process startup and reused. Certificate and key changes therefore take effect after a deliberate process restart rather than being reparsed on every flow.
 - Production private keys and configuration files must be protected with filesystem ownership and permissions. The current loader does not provide encrypted-key prompting, an HSM abstraction, or an OS keychain integration.
 - Route and work secrets exist only in process memory, are independently generated, are bounded by TTL, and are not persisted across restart. Application logging intentionally records IDs and errors, not secret byte values.
+- The Travel process-session UUID is freshly generated at startup, exists only in memory, and is carried only inside authenticated management TLS. It is not packaged with the certificate and does not survive process restart.
 - Secret vectors may be cloned while being delivered to the required components and are not backed by a guaranteed zeroizing memory type. Process-memory compromise is outside the current protection boundary.
 - There is no automated enrollment, renewal, revocation, CRL, or OCSP workflow. Operators must issue certificates, overlap pins during rotation, remove revoked pins, and restart/reload components through an operational procedure.
 - The E2E generator creates unencrypted disposable private keys under the ignored `tests/e2e/generated/` directory. Those keys and CAs must never be reused in production.
@@ -152,6 +155,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Pending Server work and Relay routes default to 256 entries each; Home and Travel active-flow limits default to 128.
 - Route IDs are unknown after expiry, completed pairings are removed, duplicate sides are rejected, and a consumed Relay route cannot be reused.
 - Unexpected message types, identity disagreement, discontinuous TCP offsets, oversized payloads, and invalid route MACs close the affected connection.
+- Server atomically admits only the first live process-session UUID for each Travel ID. Catalog leases expire after 45 seconds without renewal; every route request is checked against the active lease before Server allocates work.
 - Travel keeps one long-lived catalog subscription. Server pushes catalog changes to Relay and Relay immediately fans them out to connected Travel sessions; this avoids periodic full mTLS polling.
 - Server maintains independent control sessions to every configured Relay and publishes the complete Relay directory through each one. Travel needs only one reachable seed to bootstrap the directory.
 - TCP Flows retain bounded unacknowledged data independently of a Carrier. Travel detects Carrier failure before Home's longer detach timeout, races replacement Carriers, and Home keeps the target TCP socket while waiting for reattachment.
@@ -163,6 +167,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Keep Travel UI and TCP/UDP mappings on loopback whenever possible. The UI server is HTTP, not HTTPS. A remotely bound UI requires a bearer token of at least 32 characters, but the application does not measure token entropy and the token is exposed to interception on an untrusted cleartext network unless an external secure tunnel or TLS reverse proxy is used. Generate a high-entropy random token.
 - Remotely bound TCP/UDP mappings do not gain bearer-token authentication. `allow_remote_listen = true` only permits the bind; network access must be restricted by a firewall, VPN, or an application-level protocol.
 - All business-authorized Travel keys in Home's pin list can request any published service. Per-Travel service ACLs are not implemented.
+- Copying a Travel package still copies usable private credentials. First-wins session exclusion prevents a later copy from logging in while the legitimate process keeps renewing its lease, but it does not identify which copy is legitimate. A thief who connects first after lease expiry or Server restart can deny the real device. Prompt pin removal and certificate/key replacement remain the revocation procedure.
 - Catalog and Relay-directory integrity are hop-by-hop through management TLS, not end-to-end signed. A compromised Server or Relay can falsify the control data shown to Travel, although Home still refuses an unknown or protocol-mismatched service ID and Travel still requires every contacted Relay to present an allowed certificate identity and key.
 - The system does not hide traffic metadata, resist endpoint compromise, guarantee availability against Relay/Server or network denial, provide durable replay state across restart, or claim protection after a CA/private key is stolen.
 - The project has not undergone a professional third-party security audit. Deployments should treat this release as an auditable implementation baseline, not as a certified security product.
@@ -188,6 +193,7 @@ make openwrt-ipk
 - mutual management TLS and separate Travel-to-Home business TLS;
 - single-use HMAC-authenticated route setup;
 - complete two-Relay discovery from one configured seed and concurrent full-path Carrier competition;
+- global rejection of a second process using the same Travel ID and certificates through either Relay;
 - survival of one established client TCP socket and one Home target TCP socket while the selected Relay is killed;
 - TLS-1.2 rejection, TLS-1.3 mutual authentication, and incomplete-control-frame expiry;
 - the embedded UI, gzip/Brotli selection, representation-specific ETags, and correct `404` boundaries.
@@ -246,7 +252,7 @@ OpenWrt package architecture or release number.
 
 ## Current scope
 
-The current executable supports one active Home Agent, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race, including the active Carrier in that race. The configurable interval doubles up to 15 minutes only when the active Carrier wins again; selecting a different Carrier or completing no race resets the interval to its initial value.
+The current executable supports one active Home Agent, one first-wins live process session per Travel ID, a canonical catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays. Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race, including the active Carrier in that race. The configurable interval doubles up to 15 minutes only when the active Carrier wins again; selecting a different Carrier or completing no race resets the interval to its initial value.
 
 Carrier EOF, reset, TLS/read/write failure, or heartbeat timeout causes immediate recompetition. Travel's recovery timeout is required to be shorter than Home's detach timeout. During that window both endpoints retain bounded unacknowledged data; Home keeps the target TCP connection and retransmits after reattachment. Docker E2E proves this behavior with two Relays and the same endpoint sockets while the active Relay is killed.
 

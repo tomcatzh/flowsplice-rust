@@ -29,6 +29,13 @@ pub enum ServiceProtocol {
     Udp,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TravelConnectionPurpose {
+    Catalog,
+    Route,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Service {
     pub id: String,
@@ -65,6 +72,17 @@ pub enum ControlMessage {
         role: Role,
         id: String,
     },
+    TravelHello {
+        id: String,
+        session_id: Uuid,
+        purpose: TravelConnectionPurpose,
+    },
+    TravelHelloAccepted {
+        relay_id: String,
+    },
+    TravelHelloDenied {
+        reason: String,
+    },
     Heartbeat {
         nonce: u64,
     },
@@ -83,6 +101,20 @@ pub enum ControlMessage {
     RouteRequest {
         request_id: Uuid,
         travel_id: String,
+        travel_session_id: Uuid,
+    },
+    TravelSessionAuthorize {
+        request_id: Uuid,
+        travel_id: String,
+        travel_session_id: Uuid,
+        lease_id: Option<Uuid>,
+    },
+    TravelSessionAccepted {
+        request_id: Uuid,
+    },
+    TravelSessionDenied {
+        request_id: Uuid,
+        reason: String,
     },
     ServerRouteGrant {
         request_id: Uuid,
@@ -185,7 +217,9 @@ pub enum DataFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlMessage, DataFrame, RelayDirectory, RelayEndpoint};
+    use super::{
+        ControlMessage, DataFrame, RelayDirectory, RelayEndpoint, TravelConnectionPurpose,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -235,6 +269,31 @@ mod tests {
                 assert_eq!(decoded_winner, winner_carrier_id);
             }
             _ => panic!("wrong data frame variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn travel_hello_carries_process_session_and_purpose() -> Result<(), serde_json::Error> {
+        let session_id = Uuid::new_v4();
+        let message = ControlMessage::TravelHello {
+            id: "travel-1".to_owned(),
+            session_id,
+            purpose: TravelConnectionPurpose::Catalog,
+        };
+        let encoded = serde_json::to_vec(&message)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        match decoded {
+            ControlMessage::TravelHello {
+                id,
+                session_id: decoded_session,
+                purpose,
+            } => {
+                assert_eq!(id, "travel-1");
+                assert_eq!(decoded_session, session_id);
+                assert_eq!(purpose, TravelConnectionPurpose::Catalog);
+            }
+            _ => panic!("wrong control message variant"),
         }
         Ok(())
     }

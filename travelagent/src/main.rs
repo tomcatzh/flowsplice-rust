@@ -28,6 +28,7 @@ use flowsplice_core::{
     init_crypto,
     protocol::{
         Catalog, ControlMessage, DataFrame, RelayDirectory, RelayEndpoint, Role, ServiceProtocol,
+        TravelConnectionPurpose,
     },
     route::{RouteSide, write_preface},
     tls::{client_connector, peer_identity, require_peer, server_name, validate_spki_pins},
@@ -155,6 +156,7 @@ const fn default_max_unacked_bytes() -> usize {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    session_id: Uuid,
     tls: Arc<TlsMaterial>,
     catalog: Arc<RwLock<Catalog>>,
     directory: Arc<RwLock<RelayDirectory>>,
@@ -216,6 +218,7 @@ async fn main() -> Result<()> {
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let state = AppState {
         config: Arc::new(config),
+        session_id: Uuid::new_v4(),
         tls,
         catalog: Arc::new(RwLock::new(Catalog::default())),
         directory: Arc::new(RwLock::new(RelayDirectory::default())),
@@ -300,7 +303,7 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
     loop {
         let mut connected = false;
         for relay in relay_candidates(&state).await {
-            match open_management(&state, &relay).await {
+            match open_management(&state, &relay, TravelConnectionPurpose::Catalog).await {
                 Ok((stream, directory, catalog)) => {
                     update_directory(&state, directory).await;
                     *state.catalog.write().await = catalog;
@@ -365,6 +368,7 @@ async fn run_catalog_session(
 async fn open_management(
     state: &AppState,
     relay: &RelayEndpoint,
+    purpose: TravelConnectionPurpose,
 ) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog)> {
     let config = &state.config;
     let socket = timeout(
@@ -392,9 +396,10 @@ async fn open_management(
     )?;
     write_json(
         &mut stream,
-        &ControlMessage::Hello {
-            role: Role::Travel,
+        &ControlMessage::TravelHello {
             id: config.id.clone(),
+            session_id: state.session_id,
+            purpose,
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -405,8 +410,11 @@ async fn open_management(
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Relay && id == relay.id => {}
-        _ => bail!("relay sent an invalid HELLO"),
+        ControlMessage::TravelHelloAccepted { relay_id } if relay_id == relay.id => {}
+        ControlMessage::TravelHelloDenied { reason } => {
+            bail!("Travel session rejected by Relay {}: {reason}", relay.id);
+        }
+        _ => bail!("relay sent an invalid Travel HELLO response"),
     }
     let mut directory = None;
     let mut catalog = None;
@@ -430,7 +438,8 @@ async fn open_management(
 
 async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteGrant> {
     let config = &state.config;
-    let (stream, directory, catalog) = open_management(state, relay).await?;
+    let (stream, directory, catalog) =
+        open_management(state, relay, TravelConnectionPurpose::Route).await?;
     update_directory(state, directory).await;
     *state.catalog.write().await = catalog;
     let (reader, mut writer) = tokio::io::split(stream);
@@ -441,6 +450,7 @@ async fn request_route(state: &AppState, relay: &RelayEndpoint) -> Result<RouteG
         &ControlMessage::RouteRequest {
             request_id,
             travel_id: config.id.clone(),
+            travel_session_id: state.session_id,
         },
         CONTROL_FRAME_LIMIT,
     )

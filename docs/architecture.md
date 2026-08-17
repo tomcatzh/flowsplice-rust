@@ -19,13 +19,15 @@ Home Agent --outbound mTLS--> Server                                  Travel Age
 
 Home publishes the canonical service catalog to Server. Server maintains an isolated reconnect loop and sender for every configured Relay, pushes the catalog and complete Relay directory to each one, and each Relay fans changes out over authenticated Travel management sessions. A Travel Agent needs one reachable configured seed; after bootstrap it uses the received directory for management reconnection and Carrier competition. Server and Relay keep control traffic separate from data sockets. Control setup frames have deadlines, and established links are reclaimed after three missed heartbeat intervals.
 
+At process startup Travel creates a random in-memory session UUID. The first catalog connection for a certificate-bound Travel ID acquires a 45-second renewable lease in Server through its Relay. Connections through other Relays are allowed only when they carry the same process-session UUID, which is required for multi-Relay route competition. A different process-session UUID for the same Travel ID is rejected globally and cannot displace the active session. Server prunes an unrenewed lease, allowing a later process to log in after the old process is no longer demonstrably online.
+
 Server may bind multiple explicit IPv4 and IPv6 addresses for both Home control and Relay/Home data
 pairing. All configured listeners are bound before their accept loops start, so a partial bind failure
 fails startup instead of silently exposing an incomplete topology.
 
 ## Route and data setup
 
-1. An authenticated Travel control connection asks Relay for an opaque route. It does not reveal a service ID.
+1. An authenticated Travel control connection presents its admitted process-session UUID and asks Relay for an opaque route. It does not reveal a service ID.
 2. Relay asks Server for work on behalf of the certificate-bound Travel identity.
 3. Server creates a random 32-byte work secret, records a short expiry, and asks Home to connect a work socket.
 4. Relay creates a separate random 32-byte single-use route secret for Travel.
@@ -67,3 +69,5 @@ firewall policy outside its authority.
 ## Process restart boundary
 
 No test or design claim may describe Home process restart as preserving an established TCP connection. Home owns the target TCP socket, so restarting Home destroys that socket. Relay handover is a different requirement: Home and Travel remain alive while only the replaceable Carrier changes.
+
+Restarting Travel also creates a new process-session UUID and destroys its local client sockets. The new process may have to wait up to the 45-second old-session lease before Server admits it. Restarting Server clears the in-memory Travel lease registry; after Server recovery the first process to reclaim each Travel ID wins, so duplicate-session exclusion is not a substitute for revoking a stolen certificate and key.

@@ -79,6 +79,8 @@ const fn default_max_pending_work() -> usize {
     256
 }
 
+const TRAVEL_SESSION_LEASE: Duration = Duration::from_secs(45);
+
 struct PendingWork {
     secret: Vec<u8>,
     expires: Instant,
@@ -92,11 +94,68 @@ struct HomeSession {
     shutdown: watch::Sender<bool>,
 }
 
+struct TravelSession {
+    session_id: Uuid,
+    leases: HashMap<Uuid, Instant>,
+}
+
+#[derive(Default)]
+struct TravelSessionRegistry {
+    sessions: HashMap<String, TravelSession>,
+}
+
+impl TravelSessionRegistry {
+    fn authorize(
+        &mut self,
+        travel_id: &str,
+        session_id: Uuid,
+        lease_id: Option<Uuid>,
+        now: Instant,
+    ) -> std::result::Result<(), String> {
+        self.prune(now);
+        if session_id.is_nil() {
+            return Err("Travel session id must not be nil".to_owned());
+        }
+        match self.sessions.get_mut(travel_id) {
+            Some(active) if active.session_id != session_id => {
+                Err("another session for this Travel ID is already online".to_owned())
+            }
+            Some(active) => {
+                if let Some(lease_id) = lease_id {
+                    active.leases.insert(lease_id, now + TRAVEL_SESSION_LEASE);
+                }
+                Ok(())
+            }
+            None => {
+                let Some(lease_id) = lease_id else {
+                    return Err("Travel has no active login session".to_owned());
+                };
+                self.sessions.insert(
+                    travel_id.to_owned(),
+                    TravelSession {
+                        session_id,
+                        leases: HashMap::from([(lease_id, now + TRAVEL_SESSION_LEASE)]),
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.sessions.retain(|_, session| {
+            session.leases.retain(|_, expires| *expires > now);
+            !session.leases.is_empty()
+        });
+    }
+}
+
 #[derive(Default)]
 struct State {
     catalog: RwLock<Catalog>,
     home_session: Mutex<Option<HomeSession>>,
     relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
+    travel_sessions: Mutex<TravelSessionRegistry>,
     pending: Mutex<HashMap<Uuid, PendingWork>>,
 }
 
@@ -418,6 +477,7 @@ async fn run_relay_connector(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_relay_session(
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     config: &Config,
@@ -479,8 +539,58 @@ async fn run_relay_session(
             incoming = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match incoming? {
-                    ControlMessage::RouteRequest { request_id, travel_id: _ } => {
-                        handle_route_request(request_id, config, state, &mut writer).await?;
+                    ControlMessage::TravelSessionAuthorize {
+                        request_id,
+                        travel_id,
+                        travel_session_id,
+                        lease_id,
+                    } => {
+                        let result = state.travel_sessions.lock().await.authorize(
+                            &travel_id,
+                            travel_session_id,
+                            lease_id,
+                            Instant::now(),
+                        );
+                        match result {
+                            Ok(()) => {
+                                write_json(
+                                    &mut writer,
+                                    &ControlMessage::TravelSessionAccepted { request_id },
+                                    CONTROL_FRAME_LIMIT,
+                                )
+                                .await?;
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    event = "travel_session_rejected",
+                                    relay_id = %relay.id,
+                                    %travel_id,
+                                    %reason,
+                                    "rejected concurrent Travel session"
+                                );
+                                write_json(
+                                    &mut writer,
+                                    &ControlMessage::TravelSessionDenied { request_id, reason },
+                                    CONTROL_FRAME_LIMIT,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    ControlMessage::RouteRequest {
+                        request_id,
+                        travel_id,
+                        travel_session_id,
+                    } => {
+                        handle_route_request(
+                            request_id,
+                            &travel_id,
+                            travel_session_id,
+                            config,
+                            state,
+                            &mut writer,
+                        )
+                        .await?;
                     }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -502,10 +612,26 @@ async fn run_relay_session(
 
 async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     request_id: Uuid,
+    travel_id: &str,
+    travel_session_id: Uuid,
     config: &Config,
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
+    if let Err(reason) = state.travel_sessions.lock().await.authorize(
+        travel_id,
+        travel_session_id,
+        None,
+        Instant::now(),
+    ) {
+        write_json(
+            writer,
+            &ControlMessage::RouteDenied { request_id, reason },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    }
     let home = state
         .home_session
         .lock()
@@ -662,12 +788,17 @@ async fn cleanup_pending(state: Arc<State>) -> Result<()> {
             }
             keep
         });
+        state.travel_sessions.lock().await.prune(now);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_listens;
+    use std::time::{Duration, Instant};
+
+    use uuid::Uuid;
+
+    use super::{TRAVEL_SESSION_LEASE, TravelSessionRegistry, validate_listens};
 
     #[test]
     fn accepts_distinct_ipv4_and_ipv6_listeners() {
@@ -686,5 +817,66 @@ mod tests {
             .is_err()
         );
         assert!(validate_listens(&["not-an-address".to_owned()], "data").is_err());
+    }
+
+    #[test]
+    fn first_travel_session_wins_and_same_process_routes_are_allowed() {
+        let now = Instant::now();
+        let first_session = Uuid::new_v4();
+        let later_session = Uuid::new_v4();
+        let mut registry = TravelSessionRegistry::default();
+
+        assert!(
+            registry
+                .authorize("travel-1", first_session, Some(Uuid::new_v4()), now)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .authorize("travel-1", first_session, None, now)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .authorize("travel-1", first_session, Some(Uuid::new_v4()), now)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .authorize("travel-1", later_session, Some(Uuid::new_v4()), now)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_travel_session_allows_a_new_process_to_login() {
+        let now = Instant::now();
+        let mut registry = TravelSessionRegistry::default();
+        assert!(
+            registry
+                .authorize("travel-1", Uuid::new_v4(), Some(Uuid::new_v4()), now)
+                .is_ok()
+        );
+
+        assert!(
+            registry
+                .authorize(
+                    "travel-1",
+                    Uuid::new_v4(),
+                    Some(Uuid::new_v4()),
+                    now + TRAVEL_SESSION_LEASE + Duration::from_millis(1),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn route_connection_cannot_create_a_travel_login() {
+        let mut registry = TravelSessionRegistry::default();
+        assert!(
+            registry
+                .authorize("travel-1", Uuid::new_v4(), None, Instant::now())
+                .is_err()
+        );
     }
 }

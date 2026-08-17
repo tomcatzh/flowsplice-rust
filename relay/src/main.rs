@@ -16,7 +16,7 @@ use flowsplice_core::{
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, RelayDirectory, Role},
+    protocol::{Catalog, ControlMessage, RelayDirectory, Role, TravelConnectionPurpose},
     route::{RouteSide, read_preface, verify_preface, write_preface},
     tls::{peer_identity, require_peer, server_acceptor, validate_spki_pins},
 };
@@ -100,6 +100,7 @@ struct State {
     catalog_tx: watch::Sender<Catalog>,
     directory_tx: watch::Sender<RelayDirectory>,
     requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
+    session_requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<(), String>>>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
 }
 
@@ -112,6 +113,7 @@ impl State {
             catalog_tx,
             directory_tx,
             requests: Mutex::new(HashMap::new()),
+            session_requests: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
         }
     }
@@ -301,6 +303,16 @@ async fn handle_server(
                                 let _ = waiter.send(Err(reason));
                             }
                         }
+                        ControlMessage::TravelSessionAccepted { request_id } => {
+                            if let Some(waiter) = state.session_requests.lock().await.remove(&request_id) {
+                                let _ = waiter.send(Ok(()));
+                            }
+                        }
+                        ControlMessage::TravelSessionDenied { request_id, reason } => {
+                            if let Some(waiter) = state.session_requests.lock().await.remove(&request_id) {
+                                let _ = waiter.send(Err(reason));
+                            }
+                        }
                         ControlMessage::Heartbeat { nonce } => {
                             write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
                         }
@@ -336,22 +348,47 @@ async fn handle_travel(
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
-    match reader
+    let (travel_session_id, purpose) = match reader
         .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Travel && id == travel_id => {}
+        ControlMessage::TravelHello {
+            id,
+            session_id,
+            purpose,
+        } if id == travel_id => (session_id, purpose),
         _ => bail!("travel HELLO does not match its certificate"),
+    };
+    let lease_id = (purpose == TravelConnectionPurpose::Catalog).then(Uuid::new_v4);
+    if let Err(error) =
+        authorize_travel_session(&travel_id, travel_session_id, lease_id, config, &state).await
+    {
+        let reason = error.clone();
+        write_json(
+            &mut writer,
+            &ControlMessage::TravelHelloDenied {
+                reason: reason.clone(),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        bail!(reason);
     }
     write_json(
         &mut writer,
-        &ControlMessage::Hello {
-            role: Role::Relay,
-            id: config.id.clone(),
+        &ControlMessage::TravelHelloAccepted {
+            relay_id: config.id.clone(),
         },
         CONTROL_FRAME_LIMIT,
     )
     .await?;
+    if purpose == TravelConnectionPurpose::Catalog {
+        info!(
+            event = "travel_session_accepted",
+            %travel_id,
+            "accepted primary Travel login session"
+        );
+    }
     let mut catalog_rx = state.catalog_tx.subscribe();
     let mut directory_rx = state.directory_tx.subscribe();
     let initial_directory = directory_rx.borrow().clone();
@@ -390,9 +427,19 @@ async fn handle_travel(
                     ControlMessage::RouteRequest {
                         request_id,
                         travel_id: declared_id,
-                    } if declared_id == travel_id => {
-                        handle_travel_route(request_id, &travel_id, config, &state, &mut writer)
-                            .await?;
+                        travel_session_id: declared_session,
+                    } if purpose == TravelConnectionPurpose::Route
+                        && declared_id == travel_id
+                        && declared_session == travel_session_id => {
+                        handle_travel_route(
+                            request_id,
+                            &travel_id,
+                            travel_session_id,
+                            config,
+                            &state,
+                            &mut writer,
+                        )
+                        .await?;
                     }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(
@@ -432,7 +479,58 @@ async fn handle_travel(
                 if last_received.elapsed() > Duration::from_secs(30) {
                     bail!("travel management heartbeat timed out");
                 }
+                if let Some(lease_id) = lease_id {
+                    authorize_travel_session(
+                        &travel_id,
+                        travel_session_id,
+                        Some(lease_id),
+                        config,
+                        &state,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                }
             }
+        }
+    }
+}
+
+async fn authorize_travel_session(
+    travel_id: &str,
+    travel_session_id: Uuid,
+    lease_id: Option<Uuid>,
+    config: &Config,
+    state: &Arc<State>,
+) -> Result<(), String> {
+    let server = state
+        .server_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| session.tx.clone())
+        .ok_or_else(|| "server is unavailable for Travel session authorization".to_owned())?;
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = oneshot::channel();
+    state.session_requests.lock().await.insert(request_id, tx);
+    if server
+        .send(ControlMessage::TravelSessionAuthorize {
+            request_id,
+            travel_id: travel_id.to_owned(),
+            travel_session_id,
+            lease_id,
+        })
+        .await
+        .is_err()
+    {
+        state.session_requests.lock().await.remove(&request_id);
+        return Err("server connection closed during Travel session authorization".to_owned());
+    }
+    match timeout(Duration::from_secs(config.handshake_timeout_secs), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Travel session response channel closed".to_owned()),
+        Err(_) => {
+            state.session_requests.lock().await.remove(&request_id);
+            Err("Travel session authorization timed out".to_owned())
         }
     }
 }
@@ -440,6 +538,7 @@ async fn handle_travel(
 async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
     request_id: Uuid,
     travel_id: &str,
+    travel_session_id: Uuid,
     config: &Config,
     state: &Arc<State>,
     writer: &mut W,
@@ -456,7 +555,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     }
-    match request_server_route(request_id, travel_id, state).await {
+    match request_server_route(request_id, travel_id, travel_session_id, state).await {
         Ok(grant) => {
             let route_id = Uuid::new_v4();
             let mut route_secret = vec![0_u8; 32];
@@ -499,6 +598,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
 async fn request_server_route(
     request_id: Uuid,
     travel_id: &str,
+    travel_session_id: Uuid,
     state: &Arc<State>,
 ) -> Result<ServerGrant, String> {
     let server = state
@@ -514,6 +614,7 @@ async fn request_server_route(
         .send(ControlMessage::RouteRequest {
             request_id,
             travel_id: travel_id.to_owned(),
+            travel_session_id,
         })
         .await
         .is_err()

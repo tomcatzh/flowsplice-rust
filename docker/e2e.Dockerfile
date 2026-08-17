@@ -15,6 +15,7 @@ COPY server/ server/
 COPY relay/ relay/
 COPY homeagent/ homeagent/
 COPY travelagent/ travelagent/
+COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
 COPY --from=web /src/travelagent/web/dist/ travelagent/web/dist/
 RUN cargo build --release \
