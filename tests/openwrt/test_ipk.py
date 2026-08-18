@@ -94,6 +94,15 @@ class IpkBuilderTest(unittest.TestCase):
                 self.assertEqual(data.getmember("./etc/init.d/flowsplice").mode, 0o755)
                 self.assertEqual(data.getmember("./usr/libexec/flowsplice/admin").mode, 0o755)
                 self.assertEqual(data.getmember("./etc/config/flowsplice").mode, 0o644)
+                packaged_config = open_member(data, "./etc/config/flowsplice").decode()
+                self.assertIn(
+                    "option travel_credentials '/etc/flowsplice/state/travel-credentials.json'",
+                    packaged_config,
+                )
+                self.assertNotIn(
+                    "option travel_credentials '/etc/flowsplice/travel-credentials.json'",
+                    packaged_config,
+                )
                 self.assertGreater(
                     len(open_member(data, "./usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo")),
                     100,
