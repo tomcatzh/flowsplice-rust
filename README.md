@@ -13,7 +13,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 
 ## Components
 
-| Package | Role |
+| Component | Role |
 | --- | --- |
 | `flowsplice-server` | Home-side controller, service-catalog and Relay-directory authority, and opaque work-socket coordinator. |
 | `flowsplice-relay` | Public management/data ingress and Linux `splice(2)` opaque forwarding. |
@@ -21,6 +21,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 | `flowsplice-travelagent` | Creates local TCP/UDP mappings, originates business TLS, and serves the embedded TypeScript UI. |
 | `flowsplice-foobar` | Low-rate single-TCP-connection loopback target and CLI continuity probe for deployment acceptance. |
 | `flowsplice-core` | Shared protocol framing, route-ticket authentication, TLS identity, and configuration support. |
+| `flowsplice-enrollment` | Device-local Travel enrollment, certificate issuance, signed grants, and import validation. |
 
 The management plane uses mutual TLS. Every leaf certificate contains exactly one FlowSplice URI SAN in the form `flowsplice://identity/<role>/<id>`. Management and business traffic use separate CA roots. Server, Relay, and Home relationships are narrowed with SHA-256 SPKI allowlists; each Travel installation instead requires at least one authority-signed grant binding its management/business SPKIs, scope, and validity to a revocable credential ID. Business TLS is terminated only by Travel and Home; Relay and Server forward its bytes without possessing the business private keys. Exact trust, visibility, and current limitations are documented below.
 
@@ -30,7 +31,7 @@ See [Security Audit Remediation — 2026-08-17](docs/security-audit-remediation-
 ## Repository layout
 
 ```text
-crates/flowsplice-core/   shared Rust crate
+crates/                   shared core and enrollment crates
 server/                   independent server application
 relay/                    independent relay application
 homeagent/                independent home agent application
@@ -62,7 +63,7 @@ FlowSplice does not attempt to hide IP addresses, connection timing, byte counts
 ### Cryptographic primitives and versions
 
 - TLS is implemented by [`rustls`](https://docs.rs/rustls/latest/rustls/) through `tokio-rustls`. Cargo disables rustls default features and explicitly enables only the `aws_lc_rs` and `std` features.
-- Every executable calls `rustls::crypto::aws_lc_rs::default_provider().install_default()` during startup. The resolved initial release uses rustls 0.23.43 and `aws-lc-rs` 1.18.0; `Cargo.lock` is the exact version authority.
+- Every executable installs the rustls AWS-LC provider during startup. The current lockfile resolves rustls 0.23.43 and `aws-lc-rs` 1.18.0; `Cargo.lock` is the exact version authority.
 - Every client and server configuration explicitly selects TLS 1.3 through rustls' protocol-version builder; TLS 1.2 code is not enabled. Cipher suites, key exchange, signature verification, and secure randomness come from the rustls AWS-LC provider. TLS 1.3 is standardized in [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446).
 - Route and work admission use HMAC-SHA256 from `aws-lc-rs`, following the standard HMAC construction defined by [RFC 2104](https://www.rfc-editor.org/rfc/rfc2104). Each HMAC key is an independent 32-byte value generated with AWS-LC `SystemRandom`.
 - Travel credentials use detached ECDSA P-256/SHA-256 signatures in ASN.1 DER form. Each trusted Home authority has its own signing key; an optional, separately configured global authority is a higher-privilege capability. Server and Relay receive only the uncompressed P-256 public keys.
@@ -121,45 +122,24 @@ An SPKI pin binds the public key rather than the full certificate. For non-Trave
 
 Each Travel installation generates two distinct P-256 keys locally and stores them as password-encrypted PKCS#8 files. `enroll-init` emits only a public enrollment request containing two proof-of-possession CSRs; no Travel private key leaves that device.
 
-Issuance belongs to Home, not Server. The Home Agent serves a separate loopback-only embedded SPA (default `127.0.0.1:9081`). An operator uploads the request, chooses a Global, Home, or exact `(home_id, service_id, protocol)` scope, selects a validity period (365 days by default), and enters the signing-key password. Home decrypts the management CA, business CA, and selected authority key only for that request, signs both certificates and the scoped authorization grant, returns the enrollment response, and publishes only the signed public grant to Server. The password is zeroized after use and is never stored by FlowSplice.
+Issuance belongs to Home, not Server. The Home Agent serves a separate loopback-only embedded SPA (the example configuration uses `127.0.0.1:9081`). An operator uploads the request, chooses a Global, Home, or exact `(home_id, service_id, protocol)` scope, selects a validity period (365 days by default), and enters the signing-key password. Home decrypts the management CA, business CA, and selected authority key only for that request, signs both certificates and the scoped authorization grant, returns the enrollment response, and publishes only the signed public grant to Server. The backend wraps the received password in zeroizing storage for the signing operation and does not persist it.
 
 A normal Home authority can sign only grants for its own Home and services. The optional global authority is a separate super-authority configured only on a designated Home; possessing a normal Home key cannot mint global access. Server authenticates the publishing Home against the configured authority owner, verifies the signature and scope, persists the add-only credential set, increments the authorization generation, and broadcasts it to every Relay and Home. Server and OpenWrt never hold the CA or authority private keys.
 
-```bash
-flowsplice-travelagent enroll-init \
-  --travel-id travel-laptop \
-  --output-dir ./travel-laptop
+Travel verifies the response against its original request, encrypted local keys, both CA roots, and the authority signature. The response-carried authority key provides an integrity check during import; runtime authorization independently requires that authority to be configured as trusted on Server, Relay, and Home. A corrupted, mismatched, expired, or wrong-password import fails closed. See [Enroll a new Travel device](#tutorial-enroll-a-new-travel-device) for the complete operator workflow.
 
-# Open the Home issuer UI, upload:
-#   ./travel-laptop/enrollment-request.json
-# Choose the scope and validity, enter the issuer-key password, then download the response.
-
-flowsplice-travelagent enroll-import \
-  --enrollment-dir ./travel-laptop \
-  --response ./travel-laptop-response.json \
-  --management-ca ./management-ca.crt \
-  --business-ca ./business-ca.crt
-```
-
-Travel verifies the response against its original request, encrypted local keys, both CA roots, and the authority public key carried by and cryptographically bound to the response. A corrupted, mismatched, expired, or wrong-password import fails closed.
-
-Revocation is initiated by the Home issuer UI/API. Server accepts it only from the authenticated Home that owns the credential's signing authority, durably appends the credential ID and reason, then publishes the new monotonic generation over existing control sessions. Every Relay and Home verifies signatures, rejects generation rollback or loss of a previously observed revocation, persists anti-rollback state, atomically applies the update, and acknowledges the generation. A revoked or expired credential cannot open new sessions or Carriers; state owned by that credential is closed without restarting Server, Relay, or Home. Revocation is irreversible, so replacement uses fresh keys, certificates, and a new credential ID.
+Revocation is initiated by the Home issuer UI/API. Server accepts it only from the authenticated Home that owns the credential's signing authority, durably appends the credential ID and reason, then publishes the new monotonic generation over existing control sessions. Relay and Home verify the update, reject rollback or loss of an observed revocation, persist anti-rollback state, and acknowledge the generation. A revoked or expired credential cannot open a new session or Carrier. Authorization-side state closes without restarting any component; an already-open Travel-side local TCP socket may remain in its normal Carrier-recovery loop until that shorter recovery deadline expires, but no revoked Carrier can reattach. Revocation is irreversible, so replacement uses fresh keys and a new credential ID.
 
 ### Route and work secrets
 
 Each Travel mapping identifies one logical business by `(home_id, service_id, protocol)` and binds it to one local listener. Route allocation reveals the selected Home ID so Server can choose the correct Home session, but it does not reveal the selected service ID to Relay or Server:
 
-1. An authenticated Travel management connection asks Relay for a route using a random request UUID, its certificate-bound Travel ID, its already admitted process-session UUID, and the mapping's Home ID. No service ID is included.
-2. Relay selects an active signed grant for that Travel identity which authorizes the requested Home, then forwards the request and selected credential ID to Server over management mTLS.
-3. Server selects exactly the requested configured Home, generates a random 32-byte work secret and work UUID, sends the same secret to that Home and Relay over their authenticated management links, and keeps a short-lived in-memory pairing entry.
-4. Relay independently generates a random 32-byte route secret and route UUID, returns them to Travel over management mTLS, and keeps a short-lived in-memory route entry.
-5. Travel opens the public Relay data socket and sends `FSLCRTE1 || side || route_uuid || HMAC-SHA256(route_secret, FSLCRTE1 || side || route_uuid)`.
-6. Relay atomically removes the route entry, verifies the MAC, then connects to Server and authenticates the Relay side with the work secret.
-7. Home independently connects to Server and authenticates the Home side with the same work secret.
-8. Server accepts at most one Relay side and one socket holding the selected Home's secret, removes the completed work entry, and forwards opaque bytes between them.
-9. Travel and Home perform business mTLS through that path. Only after the business handshake succeeds does Travel send the encrypted `OPEN` frame containing the selected service ID.
+1. Authenticated Travel asks a Relay for the selected Home. Relay chooses an active grant that covers that Home and asks Server to allocate work for exactly that Home session.
+2. Server creates a random 32-byte work secret for Relay/Home pairing; Relay independently creates a random 32-byte route secret for Travel/Relay admission. Both are delivered only over management mTLS.
+3. Travel authenticates the public data socket with `HMAC-SHA256(route_secret, fixed-preface)`. Relay and Home separately prove possession of the work secret to Server. Each route is short-lived and single-use.
+4. Travel and Home then perform business mTLS through the paired opaque path. Only the encrypted `OPEN` frame reveals the service ID to Home.
 
-Route and work entries default to a 15-second lifetime and disappear after use or expiry. Data-preface reads and TLS handshakes have deadlines. The HMAC authenticates the fixed side/UUID preface; it provides neither confidentiality nor a substitute for the inner business TLS. The random secret is never sent on the public data socket—only its HMAC result is.
+Route and work entries default to a 15-second lifetime and disappear after use or expiry. HMAC authenticates admission only; confidentiality and endpoint identity come from the inner business TLS. See [Architecture](docs/architecture.md) for the complete message sequence.
 
 ### Who can see what
 
@@ -175,29 +155,20 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 
 ### Secret storage and lifecycle
 
-- Runtime processes load leaf certificates, leaf private keys, and public CA certificates from configured PEM files. Travel requires both of its private keys to be password-encrypted; other ordinary runtime identities currently rely on filesystem-protected keys. A Home configured for issuance additionally holds password-encrypted management/business CA keys and one or more password-encrypted authority keys.
-- TLS client/server configurations are built once at process startup and reused. Certificate and key changes therefore take effect after a deliberate process restart rather than being reparsed on every flow.
-- Production private keys and configuration files must be protected with filesystem ownership and permissions. Travel prompts for its private-key password at enrollment, import, and process start. Home requires the issuer-key password for each signing request and does not persist it. HSM-backed signing and automatic keychain integration are not implemented.
-- Route and work secrets exist only in process memory, are independently generated, are bounded by TTL, and are not persisted across restart. Application logging intentionally records IDs and errors, not secret byte values.
-- The Travel process-session UUID is freshly generated at startup, exists only in memory, and is carried only inside authenticated management TLS. It is not packaged with the certificate and does not survive process restart.
-- Travel-authorization signing keys exist only on the Home instances explicitly configured to issue. Server persists the signed credential set and monotonic revocation generation; Relay and Home persist the highest generation and observed revoked credential IDs so rollback remains fail-closed across restart.
-- Secret vectors may be cloned while being delivered to the required components and are not backed by a guaranteed zeroizing memory type. Process-memory compromise is outside the current protection boundary.
-- Automatic unattended signing, key renewal, CRL, and OCSP are not implemented. Local key generation, CSR proof of possession, password-gated Home dual-CA issuance, scoped authority signatures, signed-response import, and live application-layer credential revocation are implemented; key replacement creates a new signed credential ID because revocation cannot be undone.
-- The E2E generator creates disposable identities under the ignored `tests/e2e/generated/` directory. Its disposable CA/authority keys and Travel keys are encrypted with a test-only password-file path; non-Travel disposable leaf keys remain unencrypted. None of this material may be reused in production.
+- Travel requires password-encrypted management and business keys. A Home issuer additionally holds password-encrypted management/business CA keys and Home authority keys; the optional global authority is a separate higher-privilege key. Other runtime leaf keys currently rely on filesystem protection.
+- TLS identities are loaded at startup, so certificate or leaf-key rotation requires a deliberate process restart. Signed Travel grants and revocations update live without restarting Server, Relay, or Home.
+- Travel prompts for its key password during enrollment, import, and startup. Home requires its issuer password for each signing request and does not persist it. HSM-backed signing, automatic keychain integration, renewal, CRL, and OCSP are not implemented.
+- Route/work secrets and the Travel process-session UUID are independently random, short-lived, memory-only values. Logs omit payloads, private keys, bearer tokens, and route/work secrets; process-memory compromise remains outside the protection boundary.
+- Test PKI under ignored `tests/e2e/generated/` is disposable and must never be reused in production.
 
 ### Fail-closed and resource boundaries
 
-- Control and data JSON frames are capped at 1 MiB; a single logical data payload is capped at 64 KiB. The stateful reader preserves partial-frame progress when a `select` branch is cancelled.
-- Public TLS handshakes, route-preface reads, control setup frames, route responses, and the business `OPEN` frame default to bounded deadlines. Established control links are disconnected after three missed 10-second heartbeat intervals.
-- Pending Server work and Relay routes default to 256 entries each; Home and Travel active-flow limits default to 128.
-- Route IDs are unknown after expiry, completed pairings are removed, duplicate sides are rejected, and a consumed Relay route cannot be reused.
-- Unexpected message types, identity disagreement, discontinuous TCP offsets, oversized payloads, and invalid route MACs close the affected connection.
-- Server atomically admits only the first live process-session UUID for each stable Travel ID. Catalog leases expire after 45 seconds without renewal; every route request is checked against that lease and a currently active grant for the requested Home before Server allocates work.
-- Travel keeps one long-lived catalog subscription. Server pushes catalog changes to Relay and Relay immediately fans them out to connected Travel sessions; this avoids periodic full mTLS polling.
-- Server maintains independent control sessions to every configured Relay and publishes the complete Relay directory through each one. Travel needs only one reachable seed to bootstrap the directory.
-- TCP Flows retain bounded unacknowledged data independently of a Carrier. Travel detects Carrier failure before Home's longer detach timeout, races replacement Carriers, and Home keeps the target TCP socket while waiting for reattachment.
-- UDP association ingress uses bounded non-blocking queues. A saturated association loses its current datagram, consistent with UDP semantics, without blocking unrelated peers.
-- Workspace Rust code forbids `unsafe`; this does not mean that every transitive dependency or the AWS-LC C implementation contains no unsafe/native code.
+- Control frames are capped at 1 MiB and logical data payloads at 64 KiB. Public setup, TLS handshakes, route prefaces, route responses, and business `OPEN` frames have deadlines.
+- Pending Server work and Relay routes default to 256 entries each; Home and Travel default to 128 active flows. Consumed or expired route IDs cannot be reused.
+- Identity mismatch, invalid pins/MACs, unexpected messages, discontinuous TCP offsets, or oversized payloads close the affected operation.
+- Server admits only the first process-session UUID for a stable Travel ID. Its 45-second renewable lease is checked together with an active scoped grant before work is allocated.
+- Any reachable seed returns the complete Server-authorized Relay directory. TCP Flow state and bounded retransmission buffers survive Carrier replacement while Home and Travel stay alive; UDP does not migrate.
+- Workspace Rust code forbids `unsafe`; that does not imply every dependency or the AWS-LC C implementation is free of unsafe/native code.
 
 ### Current security limits and operator obligations
 
@@ -205,13 +176,14 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 - Remotely bound TCP/UDP mappings do not gain bearer-token authentication. `allow_remote_listen = true` only permits the bind; network access must be restricted by a firewall, VPN, or an application-level protocol.
 - A Travel identity may hold several independently revocable grants. Global grants authorize every Home, Home grants authorize one Home, and Service grants authorize one exact `(home_id, service_id, protocol)` business. Relay selects a matching active grant for each route; grants never widen themselves or fall back to another Home.
 - Copying a Travel package still copies usable private credentials. First-wins session exclusion prevents a later copy from logging in while the legitimate process keeps renewing its lease, but it does not identify which copy is legitimate. A stolen Travel identity must have every active grant revoked; restoring the legitimate device requires new keys, certificates, and newly signed grants.
+- Revocation blocks new authorization immediately. A Travel-side local TCP socket that was already open may remain until its configured Carrier-recovery deadline expires, but a revoked Carrier cannot reattach or resume payload delivery.
 - Catalog and Relay-directory integrity are hop-by-hop through management TLS, not end-to-end signed. A compromised Server or Relay can falsify the control data shown to Travel, although Home still refuses an unknown or protocol-mismatched service ID and Travel still requires every contacted Relay to present an allowed certificate identity and key.
 - The system does not hide traffic metadata, resist endpoint compromise, guarantee availability against Relay/Server or network denial, provide durable replay state across restart, or claim protection after a CA/private key is stolen.
 - The project has not undergone a professional third-party security audit. Deployments should treat this release as an auditable implementation baseline, not as a certified security product.
 
 ### Frontend containment
 
-The Travel Agent UI is TypeScript built with Vite, precompressed at build time, and embedded with [embedded-spa v0.1.1](https://github.com/tomcatzh/embedded-spa/tree/v0.1.1) plus `rust-embed`. API routes are mounted before the SPA fallback; missing API routes and hashed assets return real `404` responses. Embedded frontend bytes are public client assets and must never contain private keys, route secrets, bearer tokens, or other confidential configuration.
+The Travel UI and Home issuer UI are TypeScript built with Vite, precompressed at build time, and embedded with [embedded-spa v0.1.1](https://github.com/tomcatzh/embedded-spa/tree/v0.1.1) plus `rust-embed`. API routes are mounted before the SPA fallback; missing API routes and hashed assets return real `404` responses. Embedded frontend bytes are public client assets and must never contain private keys, route secrets, bearer tokens, or confidential configuration.
 
 ## Build and check
 
@@ -226,17 +198,11 @@ make openwrt-ipk
 
 `make e2e` generates two temporary test CAs, builds the Linux applications, starts two Relays, two Home Agents, Server, Travel, and TCP/UDP echo targets, and validates:
 
-- password-encrypted Travel-local key generation, CSR proof of possession, password-gated Home dual-CA signing, Global/Home/Service scopes, response import, default one-year validity, and exact 30-minute test validity;
-- TCP and UDP data through the complete topology;
-- mutual management TLS and separate Travel-to-Home business TLS;
-- single-use HMAC-authenticated route setup;
-- complete two-Relay discovery from one configured seed and concurrent full-path Carrier competition;
-- a two-Home catalog, exact `(Home, service)` routing when both Homes publish the same service ID, no cross-Home fallback, isolated Home removal/rejoin, and continued availability of the other Home;
-- global rejection of a second process using the same Travel ID and certificates through either Relay;
-- survival of one established client TCP socket and one Home target TCP socket while the selected Relay is killed;
-- TLS-1.2 rejection, TLS-1.3 mutual authentication, and incomplete-control-frame expiry;
-- live add-only credential import and revocation, all-Relay/all-Home generation acknowledgements, existing-Flow termination on both Homes, both-Relay rejection, idempotency, and revocation persistence after Relay restart without authorization-induced process restarts;
-- the embedded UI, gzip/Brotli selection, representation-specific ETags, and correct `404` boundaries.
+- encrypted Travel-local enrollment, password-gated Home issuance, all three grant scopes, one-year and exact 30-minute validity, and live persistent revocation;
+- management and business mTLS, single-use HMAC route admission, TCP/UDP data, TLS-1.2 rejection, TLS-1.3 acceptance, and slow-frame deadlines;
+- exact two-Home logical-business routing, same-service-ID isolation, no cross-Home fallback, and independent Home removal/rejoin;
+- complete two-Relay discovery from one seed, concurrent Carrier competition, duplicate-process rejection, periodic reevaluation, and same-socket handover after killing the selected Relay;
+- both embedded SPAs, gzip/Brotli representations, ETags, cache behavior, and real API/asset `404` boundaries.
 
 The E2E suite enables component `DEBUG` logging, saves the combined log as the ignored `tests/e2e/generated/e2e.log`, and prints its last 300 lines automatically on failure. Production defaults to `INFO`; `RUST_LOG=flowsplice_travelagent=debug,info` (or the corresponding component target) enables per-offset ACK/DUP/retransmission diagnostics. Logs contain operational IDs, offsets, state transitions, and errors—not business payloads, route/work secrets, bearer tokens, or private keys.
 
@@ -290,8 +256,8 @@ On the Home machine, open the Home Agent issuer page:
 http://127.0.0.1:9081
 ```
 
-`9081` is the example and current deployment port; the authoritative value is `[issuer].listen` in
-the Home configuration. The listener is loopback-only by default. When administering another Home,
+`9081` is the example configuration's port; the authoritative value is `[issuer].listen` in the
+Home configuration. The listener is loopback-only by default. When administering another Home,
 use a trusted local tunnel rather than exposing this page directly to WAN.
 
 Upload `enrollment-request.json`, select the validity period, and choose the narrowest suitable
@@ -302,9 +268,9 @@ scope:
 - **Global super authorization** authorizes every Home and appears only on a designated Home that
   holds the separately configured global authority.
 
-Enter the **Home issuer-key password** and select **签发并下载结果 (Issue and download)**. This is the password that
-decrypts the Home's CA and authority keys; it is not the Travel private-key password and it is not a
-public key. FlowSplice uses it for that signing operation and does not store it.
+Enter the **Home issuer-key password** and select **签发并下载结果 (Issue and download)**. This
+password decrypts the Home's CA and authority keys; it is not the Travel private-key password or a
+public key. FlowSplice uses it for that signing operation and does not persist it.
 
 The browser downloads `flowsplice-travel-laptop-response.json`. Home also publishes the signed
 public grant to Server automatically, so Server, Relay, and the other Homes learn it without a
@@ -362,15 +328,16 @@ reconnecting.
 ### 5. Revoke access
 
 Return to the same Home issuer page, find the credential, and select **撤销 (Revoke)**. Revocation is
-irreversible and is distributed through Server without restarting Server, Relay, or Home. A stolen
-Travel identity may have several grants; revoke every active grant bound to that Travel ID, then
-generate fresh keys and a new enrollment instead of reusing the compromised directory.
+irreversible and is distributed through Server without restarting Server, Relay, or Home. It blocks
+new authorization immediately; an already-open local TCP socket closes by Travel's configured
+recovery deadline if no authorized Carrier can reattach. A stolen Travel identity may have several
+grants, so revoke every active grant bound to that ID and enroll fresh keys.
 
 ## Configuration
 
-Every executable accepts `--config <path>` or `FLOWSPLICE_CONFIG`. Server and Relay also accept
-`--check-config` for a side-effect-free configuration and credential validation. Example files live
-beside each application:
+Server, Relay, Home Agent, and Travel Agent accept `--config <path>` or `FLOWSPLICE_CONFIG`.
+Server and Relay also accept `--check-config` for side-effect-free configuration validation. Example
+files live beside each application:
 
 - [server/config.example.toml](server/config.example.toml)
 - [relay/config.example.toml](relay/config.example.toml)
@@ -400,13 +367,12 @@ rebuilding them. `make openwrt-ipk` writes an `aarch64_generic` package below `d
 the explicit builder arguments documented in [openwrt/README.md](openwrt/README.md) for another
 OpenWrt package architecture or release number.
 
-## Current scope
+## Current limits
 
-The current executable supports multiple simultaneously active Home Agents, one first-wins live process session per stable Travel identity, multiple scoped authority grants per Travel, password-gated Home issuance, live Home-originated revocation, an aggregated multi-Home catalog, a Server-published multi-Relay directory, resilient TCP Flows, and best-effort UDP associations. A logical business is the explicit `(home_id, service_id, protocol)` selected by a Travel mapping; a Flow never falls back to another Home. For each new TCP Flow, Travel concurrently opens complete end-to-end Carriers through all known Relays to that one Home. The selected Home ACKs the first race arrival and identifies later arrivals as duplicates; Travel keeps the winner and closes the other candidates. It periodically repeats the race, including the active Carrier in that race. The configurable interval doubles up to 15 minutes only when the active Carrier wins again; selecting a different Carrier or completing no race resets the interval to its initial value.
-
-Carrier EOF, reset, TLS/read/write failure, or heartbeat timeout causes immediate recompetition. Travel's recovery timeout is required to be shorter than Home's detach timeout. During that window both endpoints retain bounded unacknowledged data; Home keeps the target TCP connection and retransmits after reattachment. Docker E2E proves this behavior with two Relays and the same endpoint sockets while the active Relay is killed.
-
-This guarantee is in-memory and TCP-specific. Restarting the selected Home destroys its target TCP sockets; restarting Travel destroys its local client sockets. Other Home Agents are independent but are not failover substitutes for that logical business. UDP associations currently select the first usable Relay but do not migrate between Carriers. Server has one Home control listener shared by all configured Home identities and may bind multiple explicit IPv4/IPv6 data listeners. The OpenWrt package supplies UCI, procd, bilingual LuCI integration, trusted Home/authority lists, and one Server plus multiple local Relay processes, including separate LAN and WAN6 Relay identities. Unattended signing, certificate rotation, cross-process Flow resume, and GA compatibility guarantees remain later work.
+- TCP Carrier handover is in-memory and requires Home and Travel to stay alive. Restarting either endpoint destroys one endpoint socket and ends the Flow. UDP associations do not migrate.
+- Periodic Relay reevaluation backs off from 60 seconds to 15 minutes only while the current Carrier keeps winning. A different winner, timeout, reset, EOF, or TLS/I/O failure restarts competition at the initial interval.
+- Homes are independent logical businesses, not failover replicas. A Flow never changes its selected `(home_id, service_id, protocol)`.
+- Unattended signing, automated certificate rotation, CRL/OCSP, hardware-backed keys, cross-process Flow recovery, and GA compatibility guarantees are not implemented.
 
 ## License
 
