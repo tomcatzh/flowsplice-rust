@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use flowsplice_core::authorization::{
     SignedTravelCredential, TravelAuthorizationSnapshot, TravelCredentialBundle, TravelRevocation,
-    VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
-    validate_authority_public_key,
+    TrustedTravelAuthority, VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
+    validate_trusted_authorities,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ impl Default for RevocationState {
 }
 
 pub struct ServerAuthorization {
-    authority_public_key: String,
+    authorities: Vec<TrustedTravelAuthority>,
     credentials_path: PathBuf,
     revocations_path: PathBuf,
     snapshot: TravelAuthorizationSnapshot,
@@ -35,39 +35,28 @@ pub struct ServerAuthorization {
 
 impl ServerAuthorization {
     pub fn validate(
-        authority_public_key: String,
+        authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
     ) -> Result<()> {
-        Self::load_inner(
-            authority_public_key,
-            credentials_path,
-            revocations_path,
-            false,
-        )
-        .map(|_| ())
+        Self::load_inner(authorities, credentials_path, revocations_path, false).map(|_| ())
     }
 
     pub fn load(
-        authority_public_key: String,
+        authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
     ) -> Result<Self> {
-        Self::load_inner(
-            authority_public_key,
-            credentials_path,
-            revocations_path,
-            true,
-        )
+        Self::load_inner(authorities, credentials_path, revocations_path, true)
     }
 
     fn load_inner(
-        authority_public_key: String,
+        authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
         persist_initial: bool,
     ) -> Result<Self> {
-        validate_authority_public_key(&authority_public_key)?;
+        validate_trusted_authorities(&authorities)?;
         let bundle: TravelCredentialBundle = load_json(&credentials_path)?;
         let revocations = if revocations_path.exists() {
             load_json(&revocations_path)?
@@ -83,9 +72,9 @@ impl ServerAuthorization {
             credentials: bundle.credentials,
             revocations: revocations.revocations,
         };
-        let verified = VerifiedAuthorization::verify(&snapshot, &authority_public_key)?;
+        let verified = VerifiedAuthorization::verify(&snapshot, &authorities)?;
         Ok(Self {
-            authority_public_key,
+            authorities,
             credentials_path,
             revocations_path,
             snapshot,
@@ -101,13 +90,23 @@ impl ServerAuthorization {
         &self.verified
     }
 
-    pub fn authority_public_key(&self) -> &str {
-        &self.authority_public_key
-    }
-
-    pub fn revoke(&mut self, credential_id: Uuid, reason: String) -> Result<bool> {
-        if self.verified.credential(credential_id).is_none() {
-            bail!("unknown Travel credential {credential_id}");
+    pub fn revoke_from_home(
+        &mut self,
+        credential_id: Uuid,
+        reason: String,
+        publisher_home_id: &str,
+    ) -> Result<bool> {
+        let credential = self
+            .verified
+            .credential(credential_id)
+            .ok_or_else(|| anyhow!("unknown Travel credential {credential_id}"))?;
+        let authority = self
+            .authorities
+            .iter()
+            .find(|authority| authority.id() == credential.authority_id)
+            .ok_or_else(|| anyhow!("Travel credential references an unknown authority"))?;
+        if authority.home_id() != Some(publisher_home_id) {
+            bail!("Travel credential was not issued by this Home");
         }
         if self
             .snapshot
@@ -129,50 +128,33 @@ impl ServerAuthorization {
             revoked_at_unix_secs: unix_time_secs()?,
             reason,
         });
-        let verified = VerifiedAuthorization::verify(&proposed, &self.authority_public_key)?;
+        let verified = VerifiedAuthorization::verify(&proposed, &self.authorities)?;
         self.persist_revocations(&proposed)?;
         self.snapshot = proposed;
         self.verified = verified;
         Ok(true)
     }
 
-    pub fn reload_credentials(&mut self) -> Result<bool> {
-        let bundle: TravelCredentialBundle = load_json(&self.credentials_path)?;
-        if bundle.credentials == self.snapshot.credentials {
-            return Ok(false);
+    pub fn import_credential(
+        &mut self,
+        signed: SignedTravelCredential,
+        publisher_home_id: &str,
+    ) -> Result<bool> {
+        let authority = self
+            .authorities
+            .iter()
+            .find(|authority| authority.id() == signed.authority_id)
+            .ok_or_else(|| anyhow!("unknown Travel authority {}", signed.authority_id))?;
+        if authority.home_id() != Some(publisher_home_id) {
+            bail!("Travel authority is not assigned to the publishing Home");
         }
-        for existing in &self.snapshot.credentials {
-            if !bundle
-                .credentials
-                .iter()
-                .any(|candidate| candidate.payload_hex == existing.payload_hex)
-            {
-                bail!("Travel credential reload must be add-only");
-            }
-        }
-        let generation = self
-            .snapshot
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("Travel authorization generation exhausted"))?;
-        let proposed = TravelAuthorizationSnapshot {
-            generation,
-            credentials: bundle.credentials,
-            revocations: self.snapshot.revocations.clone(),
-        };
-        let verified = VerifiedAuthorization::verify(&proposed, &self.authority_public_key)?;
-        self.persist_revocations(&proposed)?;
-        self.snapshot = proposed;
-        self.verified = verified;
-        Ok(true)
-    }
-
-    pub fn import_credential(&mut self, signed: SignedTravelCredential) -> Result<bool> {
-        let credential = signed.verify(&self.authority_public_key)?;
+        let credential = signed.verify(authority)?;
         if let Some(existing) = self.snapshot.credentials.iter().find(|existing| {
-            existing
-                .verify(&self.authority_public_key)
-                .is_ok_and(|value| value.credential_id == credential.credential_id)
+            self.authorities
+                .iter()
+                .find(|authority| authority.id() == existing.authority_id)
+                .and_then(|authority| existing.verify(authority).ok())
+                .is_some_and(|value| value.credential_id == credential.credential_id)
         }) {
             if existing.payload_hex == signed.payload_hex {
                 return Ok(false);
@@ -190,7 +172,7 @@ impl ServerAuthorization {
         let mut proposed = self.snapshot.clone();
         proposed.generation = generation;
         proposed.credentials.push(signed);
-        let verified = VerifiedAuthorization::verify(&proposed, &self.authority_public_key)?;
+        let verified = VerifiedAuthorization::verify(&proposed, &self.authorities)?;
         store_json_atomic(
             &self.credentials_path,
             &TravelCredentialBundle {
@@ -224,7 +206,8 @@ mod tests {
         signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
     };
     use flowsplice_core::authorization::{
-        SignedTravelCredential, TravelCredential, TravelCredentialBundle, store_json_atomic,
+        SignedTravelCredential, TravelCredential, TravelCredentialBundle, TravelCredentialScope,
+        TrustedTravelAuthority, store_json_atomic,
     };
 
     use super::*;
@@ -235,9 +218,33 @@ mod tests {
             .sign(&SystemRandom::new(), &payload)
             .map_err(|_| anyhow!("failed to sign fixture"))?;
         Ok(SignedTravelCredential {
+            authority_id: credential.authority_id.clone(),
             payload_hex: hex::encode(payload),
             signature_hex: hex::encode(signature.as_ref()),
         })
+    }
+
+    fn authorities(key: &EcdsaKeyPair) -> Vec<TrustedTravelAuthority> {
+        vec![TrustedTravelAuthority::Home {
+            id: "home-1-authority".to_owned(),
+            home_id: "home-1".to_owned(),
+            public_key: hex::encode(key.public_key().as_ref()),
+        }]
+    }
+
+    fn fixture_credential(travel_id: &str, management: &str, business: &str) -> TravelCredential {
+        TravelCredential {
+            credential_id: Uuid::new_v4(),
+            authority_id: "home-1-authority".to_owned(),
+            travel_id: travel_id.to_owned(),
+            management_spki_sha256: management.repeat(32),
+            business_spki_sha256: business.repeat(32),
+            scope: TravelCredentialScope::Home {
+                home_id: "home-1".to_owned(),
+            },
+            not_before_unix_secs: 1,
+            not_after_unix_secs: u64::MAX,
+        }
     }
 
     #[test]
@@ -248,33 +255,34 @@ mod tests {
         let revocations_path = directory.join("revocations.json");
         let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
             .map_err(|_| anyhow!("failed to generate fixture key"))?;
-        let credential = TravelCredential {
-            credential_id: Uuid::new_v4(),
-            travel_id: "travel-1".to_owned(),
-            management_spki_sha256: "11".repeat(32),
-            business_spki_sha256: "22".repeat(32),
-            not_before_unix_secs: 1,
-            not_after_unix_secs: u64::MAX,
-        };
+        let credential = fixture_credential("travel-1", "11", "22");
         store_json_atomic(
             &credentials_path,
             &TravelCredentialBundle {
                 credentials: vec![signed(&key, &credential)?],
             },
         )?;
-        let public_key = hex::encode(key.public_key().as_ref());
+        let authorities = authorities(&key);
         let mut authorization = ServerAuthorization::load(
-            public_key.clone(),
+            authorities.clone(),
             credentials_path.clone(),
             revocations_path.clone(),
         )?;
-        assert!(authorization.revoke(credential.credential_id, "stolen".to_owned())?);
-        assert!(!authorization.revoke(credential.credential_id, "again".to_owned())?);
+        assert!(authorization.revoke_from_home(
+            credential.credential_id,
+            "stolen".to_owned(),
+            "home-1"
+        )?);
+        assert!(!authorization.revoke_from_home(
+            credential.credential_id,
+            "again".to_owned(),
+            "home-1"
+        )?);
         assert_eq!(authorization.snapshot().generation, 2);
         assert_eq!(authorization.snapshot().revocations.len(), 1);
 
         let reloaded = ServerAuthorization::load(
-            public_key,
+            authorities,
             credentials_path.clone(),
             revocations_path.clone(),
         )?;
@@ -282,30 +290,8 @@ mod tests {
         let persisted: RevocationState = load_json(&revocations_path)?;
         assert_eq!(persisted.generation, 2);
 
-        store_json_atomic(
-            &credentials_path,
-            &TravelCredentialBundle {
-                credentials: vec![],
-            },
-        )?;
-        assert!(authorization.reload_credentials().is_err());
-        assert_eq!(authorization.snapshot().generation, 2);
-
-        let second = TravelCredential {
-            credential_id: Uuid::new_v4(),
-            travel_id: "travel-2".to_owned(),
-            management_spki_sha256: "33".repeat(32),
-            business_spki_sha256: "44".repeat(32),
-            not_before_unix_secs: 1,
-            not_after_unix_secs: u64::MAX,
-        };
-        store_json_atomic(
-            &credentials_path,
-            &TravelCredentialBundle {
-                credentials: vec![signed(&key, &credential)?, signed(&key, &second)?],
-            },
-        )?;
-        assert!(authorization.reload_credentials()?);
+        let second = fixture_credential("travel-2", "33", "44");
+        assert!(authorization.import_credential(signed(&key, &second)?, "home-1")?);
         assert_eq!(authorization.snapshot().generation, 3);
         assert!(
             authorization
@@ -315,7 +301,7 @@ mod tests {
         );
         assert!(
             authorization
-                .revoke(Uuid::new_v4(), "unknown".to_owned())
+                .revoke_from_home(Uuid::new_v4(), "unknown".to_owned(), "home-1")
                 .is_err()
         );
         fs::remove_dir_all(&directory)
@@ -337,29 +323,26 @@ mod tests {
                 credentials: Vec::new(),
             },
         )?;
-        let public_key = hex::encode(key.public_key().as_ref());
+        let authorities = authorities(&key);
         let mut authorization = ServerAuthorization::load(
-            public_key.clone(),
+            authorities.clone(),
             credentials_path.clone(),
             revocations_path.clone(),
         )?;
-        let credential = TravelCredential {
-            credential_id: Uuid::new_v4(),
-            travel_id: "travel-new".to_owned(),
-            management_spki_sha256: "55".repeat(32),
-            business_spki_sha256: "66".repeat(32),
-            not_before_unix_secs: 1,
-            not_after_unix_secs: u64::MAX,
-        };
+        let credential = fixture_credential("travel-new", "55", "66");
         let first_signature = signed(&key, &credential)?;
-        assert!(authorization.import_credential(first_signature.clone())?);
+        assert!(authorization.import_credential(first_signature.clone(), "home-1")?);
         assert_eq!(authorization.snapshot().generation, 2);
-        assert!(!authorization.import_credential(first_signature)?);
-        assert!(!authorization.import_credential(signed(&key, &credential)?)?);
+        assert!(!authorization.import_credential(first_signature, "home-1")?);
+        assert!(!authorization.import_credential(signed(&key, &credential)?, "home-1")?);
         assert_eq!(authorization.snapshot().generation, 2);
 
-        assert!(authorization.revoke(credential.credential_id, "lost".to_owned())?);
-        assert!(!authorization.import_credential(signed(&key, &credential)?)?);
+        assert!(authorization.revoke_from_home(
+            credential.credential_id,
+            "lost".to_owned(),
+            "home-1"
+        )?);
+        assert!(!authorization.import_credential(signed(&key, &credential)?, "home-1")?);
         assert!(
             authorization
                 .verified()
@@ -371,10 +354,10 @@ mod tests {
         conflicting.travel_id = "travel-conflict".to_owned();
         assert!(
             authorization
-                .import_credential(signed(&key, &conflicting)?)
+                .import_credential(signed(&key, &conflicting)?, "home-1")
                 .is_err()
         );
-        let reloaded = ServerAuthorization::load(public_key, credentials_path, revocations_path)?;
+        let reloaded = ServerAuthorization::load(authorities, credentials_path, revocations_path)?;
         assert_eq!(reloaded.snapshot(), authorization.snapshot());
         fs::remove_dir_all(directory).ok();
         Ok(())

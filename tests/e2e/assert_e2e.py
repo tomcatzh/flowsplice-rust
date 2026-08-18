@@ -9,6 +9,7 @@ import subprocess
 import time
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
+ISSUER_AUTHORIZATION = "Bearer flowsplice-e2e-home-issuer-administrator-token"
 COMPOSE_FILE = Path(__file__).resolve().parent / "compose.yaml"
 
 
@@ -22,6 +23,46 @@ def http_get(path: str, headers: dict[str, str] | None = None):
     result = response.status, {key.lower(): value for key, value in response.getheaders()}, body
     conn.close()
     return result
+
+
+def issuer_get(path: str, headers: dict[str, str] | None = None):
+    request_headers = {"Authorization": ISSUER_AUTHORIZATION}
+    request_headers.update(headers or {})
+    connection = http.client.HTTPConnection("127.0.0.1", 19081, timeout=3)
+    connection.request("GET", path, headers=request_headers)
+    response = connection.getresponse()
+    body = response.read()
+    result = (
+        response.status,
+        {key.lower(): value for key, value in response.getheaders()},
+        body,
+    )
+    connection.close()
+    return result
+
+
+def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    encoded = None if body is None else json.dumps(body).encode()
+    connection.request(
+        method,
+        path,
+        body=encoded,
+        headers={
+            "Authorization": ISSUER_AUTHORIZATION,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    connection.close()
+    decoded = json.loads(raw or b"{}")
+    if expect_ok:
+        assert response.status < 400, (response.status, decoded)
+    else:
+        assert response.status >= 400, (response.status, decoded)
+    return decoded
 
 
 def wait_ready() -> dict:
@@ -208,6 +249,36 @@ def check_embedded_spa() -> None:
     assert api_status == 404
     assert asset_status == 404
 
+    issuer_status, issuer_headers, issuer_body = issuer_get(
+        "/", {"Accept": "text/html", "Accept-Encoding": "gzip"}
+    )
+    assert issuer_status == 200
+    if issuer_headers.get("content-encoding") == "gzip":
+        issuer_body = gzip.decompress(issuer_body)
+    assert "FlowSplice · 旅行端签发".encode() in issuer_body
+
+    issuer_asset_match = re.search(
+        rb'(?:src|href)="(/assets/[^"]+\.(?:js|css))"', issuer_body
+    )
+    assert issuer_asset_match, issuer_body[:200]
+    issuer_asset = issuer_asset_match.group(1).decode()
+    issuer_asset_status, issuer_asset_headers, issuer_asset_body = issuer_get(
+        issuer_asset, {"Accept-Encoding": "gzip"}
+    )
+    assert issuer_asset_status == 200
+    assert issuer_asset_headers.get("content-encoding") == "gzip"
+    if issuer_asset.endswith(".js"):
+        assert "旅行端凭据签发".encode() in gzip.decompress(issuer_asset_body)
+
+    issuer_api_status, _, _ = issuer_get(
+        "/api/not-a-route", {"Accept": "text/html"}
+    )
+    issuer_missing_asset_status, _, _ = issuer_get(
+        "/assets/not-a-real-hash.js", {"Accept": "text/html"}
+    )
+    assert issuer_api_status == 404
+    assert issuer_missing_asset_status == 404
+
 
 def check_duplicate_travel_login_is_rejected() -> None:
     generated_dir = Path(__file__).resolve().parent / "generated"
@@ -238,26 +309,42 @@ def check_duplicate_travel_login_is_rejected() -> None:
         )
 
 
-def server_admin(*arguments: str) -> dict:
-    result = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(COMPOSE_FILE),
-            "exec",
-            "-T",
-            "server",
-            "/usr/local/bin/flowsplice-server",
-            "--config",
-            "/config/server.toml",
-            *arguments,
-        ],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
+def issue_scope(
+    port: int, scope: dict, *, valid_minutes: int | None = None
+) -> tuple[str, int]:
+    generated = Path(__file__).resolve().parent / "generated"
+    validity = {"valid_days": 365}
+    if valid_minutes is not None:
+        validity = {"valid_minutes": valid_minutes}
+    result = issuer_request(
+        port,
+        "POST",
+        "/api/issue",
+        {
+            "request": json.loads((generated / "travel/enrollment-request.json").read_text()),
+            **validity,
+            "scope": scope,
+            "password": (generated / "offline/test-password.txt").read_text().strip(),
+        },
     )
-    return json.loads(result.stdout.strip().splitlines()[-1])
+    if valid_minutes is not None:
+        remaining = result["enrollment"]["approval"]["not_after_unix_secs"] - int(time.time())
+        assert valid_minutes * 60 - 5 <= remaining <= valid_minutes * 60 + 5, remaining
+    return result["enrollment"]["approval"]["credential_id"], result["generation"]
+
+
+def revoke_from_home(port: int, credential_id: str, expect_ok=True) -> dict:
+    return issuer_request(
+        port,
+        "POST",
+        "/api/revoke",
+        {"credential_id": credential_id, "reason": "E2E revocation"},
+        expect_ok=expect_ok,
+    )
+
+
+def issued_credentials(port: int) -> list[dict]:
+    return issuer_request(port, "GET", "/api/credentials")
 
 
 def container_pid(service: str) -> int:
@@ -278,39 +365,17 @@ def container_pid(service: str) -> int:
     )
 
 
-def wait_authorization_acks(generation: int) -> dict:
-    expected = {"home:home-1", "home:home-2", "relay:relay-1", "relay:relay-2"}
-    deadline = time.monotonic() + 30
-    last = None
-    while time.monotonic() < deadline:
-        last = server_admin("--travel-authorization-status")
-        acknowledgements = last["acknowledgements"]
-        if all(acknowledgements.get(node) == generation for node in expected):
-            return last
-        time.sleep(0.5)
-    raise AssertionError(f"authorization generation {generation} was not acknowledged: {last}")
-
-
-def check_enrollment_import() -> tuple[str, int]:
-    status = server_admin("--travel-authorization-status")
+def check_home_issued_enrollment() -> str:
     credentials = [
-        credential
-        for credential in status["credentials"]
-        if credential["travel_id"] == "travel-1"
+        credential for credential in issued_credentials(19081)
+        if credential["travel_id"] == "travel-1" and credential["scope"]["kind"] == "global"
     ]
-    assert len(credentials) == 1, status
+    assert len(credentials) == 1, credentials
     credential = credentials[0]
     remaining = credential["not_after_unix_secs"] - int(time.time())
     assert 364 * 86400 <= remaining <= 366 * 86400, remaining
     assert credential["active"] and not credential["revoked"], credential
-    duplicate = server_admin(
-        "--import-travel-enrollment",
-        "/authorization/enrollment-response.json",
-    )
-    assert duplicate["ok"] and not duplicate["changed"], duplicate
-    assert duplicate["generation"] == status["generation"], duplicate
-    wait_authorization_acks(status["generation"])
-    return credential["credential_id"], status["generation"]
+    return credential["credential_id"]
 
 
 def assert_revoked_management_certificate_rejected(relay: str, server_name: str) -> None:
@@ -362,15 +427,31 @@ def wait_local_flow_closed(stream: socket.socket) -> None:
     raise AssertionError("revoked Travel flow remained open past recovery timeout")
 
 
-def check_live_revocation(
-    failed_relay: str, credential_id: str, imported_generation: int
+def wait_scoped_catalog(expected: dict[str, set[str]]) -> None:
+    deadline = time.monotonic() + 35
+    last = None
+    while time.monotonic() < deadline:
+        status, _, body = http_get("/api/catalog", {"Accept": "application/json"})
+        if status == 200:
+            catalog = json.loads(body)
+            last = {
+                home["home_id"]: {service["id"] for service in home["services"]}
+                for home in catalog["homes"]
+            }
+            if last == expected:
+                return
+        time.sleep(0.25)
+    raise AssertionError(f"scoped catalog did not converge: {last}")
+
+
+def check_scoped_authorization_and_home_revocation(
+    failed_relay: str, global_credential_id: str
 ) -> None:
     service = {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay]
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", service],
         check=True,
     )
-    wait_authorization_acks(imported_generation)
     pids = {
         service_name: container_pid(service_name)
         for service_name in ("server", "relay1", "relay2", "homeagent", "homeagent2")
@@ -384,33 +465,55 @@ def check_live_revocation(
         home_two.settimeout(10)
         exchange_line(home_one, b"before-live-revocation-home-one")
         exchange_line(home_two, b"before-live-revocation-home-two", b"home-2")
-        response = server_admin(
-            "--revoke-travel-credential",
-            credential_id,
-            "--revocation-reason",
-            "E2E revocation",
+
+        # These established flows are bound to the global credential. Publish narrower
+        # replacement grants only after they exist, then prove revoking the original grant
+        # closes its flows while the replacement grants remain usable for new flows.
+        home_one_credential, _ = issue_scope(
+            19081,
+            {
+                "kind": "service",
+                "home_id": "home-1",
+                "service_id": "tcp-echo",
+                "protocol": "tcp",
+            },
+            valid_minutes=30,
         )
-        revoked_generation = imported_generation + 1
-        assert (
-            response["ok"]
-            and response["changed"]
-            and response["generation"] == revoked_generation
-        ), response
-        wait_authorization_acks(revoked_generation)
+        home_two_credential, _ = issue_scope(
+            29081, {"kind": "home", "home_id": "home-2"}
+        )
+        revoke_from_home(29081, global_credential_id, expect_ok=False)
+        revoke_from_home(19081, global_credential_id)
         wait_local_flow_closed(home_one)
         wait_local_flow_closed(home_two)
 
-    duplicate = server_admin(
-        "--revoke-travel-credential",
-        credential_id,
-        "--revocation-reason",
-        "idempotency check",
+    wait_scoped_catalog(
+        {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo"}}
     )
-    assert (
-        duplicate["ok"]
-        and not duplicate["changed"]
-        and duplicate["generation"] == revoked_generation
-    )
+    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+        home_one.settimeout(15)
+        exchange_line(home_one, b"home-one-service-scope")
+    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+        home_two.settimeout(15)
+        exchange_line(home_two, b"home-two-home-scope", b"home-2")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+        datagram.settimeout(4)
+        datagram.sendto(b"must-not-pass-service-scope", ("127.0.0.1", 11081))
+        try:
+            received, _ = datagram.recvfrom(65535)
+        except socket.timeout:
+            pass
+        else:
+            raise AssertionError(f"service-scoped credential exposed UDP: {received!r}")
+
+    revoke_from_home(29081, home_one_credential, expect_ok=False)
+    revoke_from_home(19081, home_one_credential)
+    revoke_from_home(19081, home_one_credential)
+    wait_scoped_catalog({"home-2": {"tcp-echo"}})
+    expect_mapping_unavailable_without_cross_home_fallback(11080)
+
+    revoke_from_home(29081, home_two_credential)
+    wait_scoped_catalog({})
     assert_revoked_management_certificate_rejected("relay1", "relay-1.flowsplice")
     assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
     assert pids == {
@@ -421,7 +524,7 @@ def check_live_revocation(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "relay2"],
         check=True,
     )
-    wait_authorization_acks(revoked_generation)
+    time.sleep(3)
     assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
 
 
@@ -465,7 +568,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 
 
 state = wait_ready()
-credential_id, imported_generation = check_enrollment_import()
+credential_id = check_home_issued_enrollment()
 check_udp()
 check_multi_home_business_routing()
 check_home_lifecycle_is_isolated()
@@ -473,7 +576,7 @@ check_embedded_spa()
 check_duplicate_travel_login_is_rejected()
 check_tls_policy_and_slow_loris_deadline()
 failed_relay, replacement_relay = check_tcp_relay_failover()
-check_live_revocation(failed_relay, credential_id, imported_generation)
+check_scoped_authorization_and_home_revocation(failed_relay, credential_id)
 checks = [
     "two-relay-directory",
     "two-home-catalog",
@@ -490,15 +593,19 @@ checks = [
     "slow-frame-deadline",
     "duplicate-travel-login-rejected-across-relays",
     "encrypted-local-travel-enrollment",
-    "offline-dual-ca-issuance",
+    "home-embedded-issuer-ui",
+    "home-dual-ca-issuance",
     "default-one-year-validity",
-    "live-add-only-credential-import",
-    "duplicate-credential-import-idempotent",
-    "live-revocation-four-node-ack",
+    "global-super-authorization",
+    "home-scoped-authorization",
+    "service-scoped-authorization",
+    "catalog-filtered-by-signed-scope",
+    "cross-home-revocation-rejected",
+    "home-originated-live-revocation",
     "live-revocation-closes-flows-on-both-homes",
     "revoked-certificate-rejected-by-both-relays",
     "revocation-without-process-restart",
-    "duplicate-revocation-idempotent",
+    "home-revocation-idempotent",
     "restarted-relay-retains-revocation",
 ]
 print(

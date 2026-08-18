@@ -1,8 +1,16 @@
-FROM node:24-alpine AS web
+FROM node:24-alpine AS travel-web
 WORKDIR /src/travelagent/web
 COPY travelagent/web/package.json travelagent/web/package-lock.json ./
 RUN npm ci
 COPY travelagent/web/ ./
+COPY tools/precompress.mjs /src/tools/precompress.mjs
+RUN npm run build
+
+FROM node:24-alpine AS home-web
+WORKDIR /src/homeagent/web
+COPY homeagent/web/package.json homeagent/web/package-lock.json ./
+RUN npm ci
+COPY homeagent/web/ ./
 COPY tools/precompress.mjs /src/tools/precompress.mjs
 RUN npm run build
 
@@ -15,16 +23,15 @@ COPY server/ server/
 COPY relay/ relay/
 COPY homeagent/ homeagent/
 COPY travelagent/ travelagent/
-COPY issuer/ issuer/
 COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
-COPY --from=web /src/travelagent/web/dist/ travelagent/web/dist/
+COPY --from=travel-web /src/travelagent/web/dist/ travelagent/web/dist/
+COPY --from=home-web /src/homeagent/web/dist/ homeagent/web/dist/
 RUN cargo build --release \
     -p flowsplice-server \
     -p flowsplice-relay \
     -p flowsplice-homeagent \
     -p flowsplice-travelagent \
-    -p flowsplice-issuer \
     -p flowsplice-echo
 RUN cargo build --release -p flowsplice-echo --bin travel-login-probe
 
@@ -34,7 +41,6 @@ COPY --from=build /src/target/release/flowsplice-server /usr/local/bin/
 COPY --from=build /src/target/release/flowsplice-relay /usr/local/bin/
 COPY --from=build /src/target/release/flowsplice-homeagent /usr/local/bin/
 COPY --from=build /src/target/release/flowsplice-travelagent /usr/local/bin/
-COPY --from=build /src/target/release/flowsplice-issuer /usr/local/bin/
 COPY --from=build /src/target/release/flowsplice-echo /usr/local/bin/
 COPY --from=build /src/target/release/travel-login-probe /usr/local/bin/flowsplice-travel-login-probe
 USER flowsplice

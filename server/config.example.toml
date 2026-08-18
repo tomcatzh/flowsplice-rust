@@ -5,14 +5,23 @@ cert = "/etc/flowsplice/server.crt"
 key = "/etc/flowsplice/server.key"
 management_ca = "/etc/flowsplice/management-ca.crt"
 relay_spki_pins = ["replace-with-relay-spki-sha256-hex"]
-travel_authority_public_key = "replace-with-uncompressed-p256-public-key-hex"
 travel_credentials = "/etc/flowsplice/travel-credentials.json"
 travel_revocations = "/var/lib/flowsplice/travel-revocations.json"
-admin_socket = "/var/run/flowsplice/server-admin.sock"
-travel_valid_days = 365
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 max_pending_work = 256
+
+[[travel_authorities]]
+kind = "home"
+id = "home-1-authority"
+home_id = "home-1"
+public_key = "replace-with-uncompressed-p256-public-key-hex"
+
+[[travel_authorities]]
+kind = "global"
+id = "operator-global-authority"
+home_id = "home-1"
+public_key = "replace-with-global-uncompressed-p256-public-key-hex"
 
 [[homes]]
 id = "home-1"

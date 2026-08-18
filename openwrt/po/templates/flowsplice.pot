@@ -4,13 +4,13 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-msgid "A revocation reason is required."
+msgid "Add Home Agent"
 msgstr ""
 
-msgid "Action"
+msgid "Add Relay instance"
 msgstr ""
 
-msgid "Active"
+msgid "Add Travel authority"
 msgstr ""
 
 msgid "Add directory entry"
@@ -19,25 +19,22 @@ msgstr ""
 msgid "Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
 msgstr ""
 
-msgid "Add Home Agent"
-msgstr ""
-
-msgid "Add Relay instance"
-msgstr ""
-
 msgid "Advertised data address"
 msgstr ""
 
 msgid "All enabled FlowSplice instances are valid."
 msgstr ""
 
-msgid "armed"
+msgid "Authority ID"
+msgstr ""
+
+msgid "Authority type"
+msgstr ""
+
+msgid "Authorization public key"
 msgstr ""
 
 msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
-msgstr ""
-
-msgid "Credential ID"
 msgstr ""
 
 msgid "Data listen"
@@ -46,13 +43,7 @@ msgstr ""
 msgid "Data listeners"
 msgstr ""
 
-msgid "Default Travel validity (days)"
-msgstr ""
-
 msgid "Enabled"
-msgstr ""
-
-msgid "Expires"
 msgstr ""
 
 msgid "Firewall exposure is intentionally managed separately. Installing or starting FlowSplice does not create WAN rules."
@@ -67,13 +58,16 @@ msgstr ""
 msgid "Global settings"
 msgstr ""
 
-msgid "Handshake timeout (seconds)"
+msgid "Global super-authority"
 msgstr ""
 
 msgid "Handshake timeout"
 msgstr ""
 
-msgid "Home control listener"
+msgid "Handshake timeout (seconds)"
+msgstr ""
+
+msgid "Home"
 msgstr ""
 
 msgid "Home ID"
@@ -82,19 +76,16 @@ msgstr ""
 msgid "Home SPKI pins"
 msgstr ""
 
-msgid "Inactive"
+msgid "Home authorities may sign only their assigned Home. Global authorities are separate super-authorities and should exist only on a designated Home."
+msgstr ""
+
+msgid "Home control listener"
 msgstr ""
 
 msgid "Instance"
 msgstr ""
 
-msgid "Issued Travel credentials"
-msgstr ""
-
 msgid "Limits"
-msgstr ""
-
-msgid "Local administration socket"
 msgstr ""
 
 msgid "Local Relay instances"
@@ -106,10 +97,10 @@ msgstr ""
 msgid "Manage the OpenWrt Server and multiple logical Relay instances from one page. Use separate LAN and WAN6 Relay identities even though both use the same installed binary."
 msgstr ""
 
-msgid "Management address"
+msgid "Management CA"
 msgstr ""
 
-msgid "Management CA"
+msgid "Management address"
 msgstr ""
 
 msgid "Management certificate"
@@ -133,22 +124,22 @@ msgstr ""
 msgid "No instances configured."
 msgstr ""
 
-msgid "No Travel credentials have been issued."
+msgid "PID"
 msgstr ""
 
 msgid "Pending work TTL (seconds)"
 msgstr ""
 
-msgid "Persistent revocation cache"
-msgstr ""
-
 msgid "Persistent Travel revocations"
 msgstr ""
 
-msgid "PID"
+msgid "Persistent revocation cache"
 msgstr ""
 
-msgid "Refresh"
+msgid "Publishing Home ID"
+msgstr ""
+
+msgid "RUNNING"
 msgstr ""
 
 msgid "Relay ID"
@@ -157,6 +148,7 @@ msgstr ""
 msgid "Relay SPKI pins"
 msgstr ""
 
+#, javascript-format
 msgid "Relay: %s"
 msgstr ""
 
@@ -166,31 +158,16 @@ msgstr ""
 msgid "Restart"
 msgstr ""
 
-msgid "Revocation reason for %s"
-msgstr ""
-
-msgid "Revoke"
-msgstr ""
-
-msgid "Revoked"
-msgstr ""
-
 msgid "Route TTL"
-msgstr ""
-
-msgid "RUNNING"
 msgstr ""
 
 msgid "Runtime status"
 msgstr ""
 
-msgid "Select the enrollment-request.json generated on the Travel machine."
+msgid "STOPPED"
 msgstr ""
 
-msgid "Select the signed enrollment response returned by the offline issuer."
-msgstr ""
-
-msgid "Server data address"
+msgid "Server"
 msgstr ""
 
 msgid "Server ID"
@@ -202,7 +179,7 @@ msgstr ""
 msgid "Server SPKI pins"
 msgstr ""
 
-msgid "Server"
+msgid "Server data address"
 msgstr ""
 
 msgid "Service action failed"
@@ -217,74 +194,32 @@ msgstr ""
 msgid "State"
 msgstr ""
 
-msgid "Status"
-msgstr ""
-
 msgid "Stop"
-msgstr ""
-
-msgid "STOPPED"
-msgstr ""
-
-msgid "The approval file is ready. Move it to the offline issuer; no signing private key is stored on this router."
-msgstr ""
-
-msgid "The file must be readable by the flowsplice service user."
-msgstr ""
-
-msgid "The Server administration interface is unavailable."
-msgstr ""
-
-msgid "The Server returned an invalid administration response."
-msgstr ""
-
-msgid "The Travel credential was imported successfully."
-msgstr ""
-
-msgid "The Travel credential was revoked immediately."
-msgstr ""
-
-msgid "The Travel machine creates encrypted private keys locally. This page approves the requested validity period and imports the offline-signed result; the signing private keys remain offline."
-msgstr ""
-
-msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
 msgstr ""
 
 msgid "TLS server name"
 msgstr ""
 
-msgid "Travel administration failed"
+msgid "The file must be readable by the flowsplice service user."
 msgstr ""
 
-msgid "Travel authorization public key"
-msgstr ""
-
-msgid "Travel credential issuance"
-msgstr ""
-
-msgid "Travel ID"
-msgstr ""
-
-msgid "Trusted Home Agents"
+msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
 msgstr ""
 
 msgid "Trust and identity"
 msgstr ""
 
-msgid "Uncompressed P-256 public key in hexadecimal. The matching offline private key must never be installed on this router."
+msgid "Trusted Home Agents"
 msgstr ""
 
-msgid "Upload and import signed result"
-msgstr ""
-
-msgid "Upload request and download approval"
+msgid "Trusted Travel authorities"
 msgstr ""
 
 msgid "Use LAN addresses only; do not expose the Server control listener to WAN."
 msgstr ""
 
-msgid "Used when preparing a new Travel enrollment approval."
+msgid "Validate"
 msgstr ""
 
-msgid "Validate"
+msgid "armed"
 msgstr ""

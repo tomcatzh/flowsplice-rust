@@ -8,7 +8,24 @@ cert = "/certs/relay2.crt"
 key = "/certs/relay2.key"
 management_ca = "/certs/management-ca.crt"
 server_spki_pins = ["__SERVER_PIN__"]
-travel_authority_public_key = "__TRAVEL_AUTHORITY_PUBLIC_KEY__"
 travel_authorization_cache = "/state/relay2-authorization-cache.json"
 handshake_timeout_secs = 10
 route_ttl_secs = 15
+
+[[travel_authorities]]
+kind = "home"
+id = "home-1-authority"
+home_id = "home-1"
+public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
+
+[[travel_authorities]]
+kind = "home"
+id = "home-2-authority"
+home_id = "home-2"
+public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
+
+[[travel_authorities]]
+kind = "global"
+id = "operator-global-authority"
+home_id = "home-1"
+public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"

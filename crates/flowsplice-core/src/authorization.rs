@@ -10,15 +10,49 @@ use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::tls::{PeerIdentity, validate_spki_pin};
+use crate::{
+    protocol::ServiceProtocol,
+    tls::{PeerIdentity, validate_spki_pin},
+};
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TravelCredentialScope {
+    Global,
+    Home {
+        home_id: String,
+    },
+    Service {
+        home_id: String,
+        service_id: String,
+        protocol: ServiceProtocol,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedTravelAuthority {
+    Global {
+        id: String,
+        home_id: String,
+        public_key: String,
+    },
+    Home {
+        id: String,
+        home_id: String,
+        public_key: String,
+    },
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TravelCredential {
     pub credential_id: Uuid,
+    pub authority_id: String,
     pub travel_id: String,
     pub management_spki_sha256: String,
     pub business_spki_sha256: String,
+    pub scope: TravelCredentialScope,
     pub not_before_unix_secs: u64,
     pub not_after_unix_secs: u64,
 }
@@ -26,6 +60,7 @@ pub struct TravelCredential {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedTravelCredential {
+    pub authority_id: String,
     pub payload_hex: String,
     pub signature_hex: String,
 }
@@ -63,18 +98,38 @@ pub struct AuthorizationCache {
 pub struct VerifiedAuthorization {
     generation: u64,
     credentials: HashMap<Uuid, TravelCredential>,
-    management_index: HashMap<(String, String), Uuid>,
-    business_index: HashMap<(String, String), Uuid>,
+    management_index: HashMap<(String, String), Vec<Uuid>>,
+    business_index: HashMap<(String, String), Vec<Uuid>>,
     revoked_credentials: HashSet<Uuid>,
 }
 
 impl SignedTravelCredential {
-    /// Verifies the detached offline signature and decodes the exact signed payload.
+    /// Verifies the detached signature against one configured authority.
     ///
     /// # Errors
     ///
     /// Returns an error when the public key, payload, signature, or credential is invalid.
-    pub fn verify(&self, authority_public_key_hex: &str) -> Result<TravelCredential> {
+    pub fn verify(&self, authority: &TrustedTravelAuthority) -> Result<TravelCredential> {
+        if self.authority_id != authority.id() {
+            bail!("signed Travel credential authority does not match the selected authority");
+        }
+        let credential = self.verify_public_key(authority.public_key())?;
+        if credential.authority_id != self.authority_id {
+            bail!("signed Travel credential payload has a different authority id");
+        }
+        authority.validate_scope(&credential.scope)?;
+        Ok(credential)
+    }
+
+    /// Verifies the signature with an explicitly supplied P-256 public key.
+    ///
+    /// This is used by the enrolling Travel device to detect a corrupt response. Runtime access
+    /// decisions must instead use [`Self::verify`] with a configured trusted authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key, payload, signature, or credential is invalid.
+    pub fn verify_public_key(&self, authority_public_key_hex: &str) -> Result<TravelCredential> {
         let public_key = decode_authority_public_key(authority_public_key_hex)?;
         let payload = hex::decode(&self.payload_hex)
             .context("signed Travel credential payload must be hexadecimal")?;
@@ -88,6 +143,74 @@ impl SignedTravelCredential {
         credential.validate()?;
         Ok(credential)
     }
+}
+
+impl TrustedTravelAuthority {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Global { id, .. } | Self::Home { id, .. } => id,
+        }
+    }
+
+    #[must_use]
+    pub fn public_key(&self) -> &str {
+        match self {
+            Self::Global { public_key, .. } | Self::Home { public_key, .. } => public_key,
+        }
+    }
+
+    #[must_use]
+    pub fn home_id(&self) -> Option<&str> {
+        match self {
+            Self::Global { home_id, .. } | Self::Home { home_id, .. } => Some(home_id),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.id().is_empty() {
+            bail!("Travel authority id must be non-empty");
+        }
+        if self.home_id().is_some_and(str::is_empty) {
+            bail!("Travel authority must name its publishing Home id");
+        }
+        validate_authority_public_key(self.public_key())
+    }
+
+    fn validate_scope(&self, scope: &TravelCredentialScope) -> Result<()> {
+        match self {
+            Self::Global { .. } => Ok(()),
+            Self::Home { home_id, .. }
+                if scope
+                    .home_id()
+                    .is_some_and(|scope_home| scope_home == home_id) =>
+            {
+                Ok(())
+            }
+            Self::Home { .. } => {
+                bail!("Home Travel authority attempted to sign outside its own Home")
+            }
+        }
+    }
+}
+
+/// Validates that configured Travel authorities are usable and uniquely named.
+///
+/// # Errors
+///
+/// Returns an error for an empty set, malformed authority, or duplicate authority id.
+pub fn validate_trusted_authorities(authorities: &[TrustedTravelAuthority]) -> Result<()> {
+    if authorities.is_empty() {
+        bail!("at least one trusted Travel authority is required");
+    }
+    let mut ids = HashSet::new();
+    for authority in authorities {
+        authority.validate()?;
+        if !ids.insert(authority.id()) {
+            bail!("duplicate Travel authority id {}", authority.id());
+        }
+    }
+    Ok(())
 }
 
 /// Validates a raw uncompressed P-256 Travel-authorization public key.
@@ -110,9 +233,11 @@ fn decode_authority_public_key(authority_public_key_hex: &str) -> Result<Vec<u8>
 
 impl TravelCredential {
     fn validate(&self) -> Result<()> {
-        if self.credential_id.is_nil() || self.travel_id.is_empty() {
-            bail!("Travel credential id and Travel id must be non-empty");
+        if self.credential_id.is_nil() || self.authority_id.is_empty() || self.travel_id.is_empty()
+        {
+            bail!("Travel credential id, authority id, and Travel id must be non-empty");
         }
+        self.scope.validate()?;
         validate_spki_pin(&self.management_spki_sha256, "Travel management")?;
         validate_spki_pin(&self.business_spki_sha256, "Travel business")?;
         if self.not_before_unix_secs >= self.not_after_unix_secs {
@@ -125,6 +250,85 @@ impl TravelCredential {
     pub const fn active_at(&self, unix_secs: u64) -> bool {
         unix_secs >= self.not_before_unix_secs && unix_secs < self.not_after_unix_secs
     }
+
+    #[must_use]
+    pub fn allows_home(&self, home_id: &str) -> bool {
+        self.scope.allows_home(home_id)
+    }
+
+    #[must_use]
+    pub fn allows_service(
+        &self,
+        home_id: &str,
+        service_id: &str,
+        protocol: ServiceProtocol,
+    ) -> bool {
+        self.scope.allows_service(home_id, service_id, protocol)
+    }
+}
+
+impl TravelCredentialScope {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Global => Ok(()),
+            Self::Home { home_id } if !home_id.is_empty() => Ok(()),
+            Self::Service {
+                home_id,
+                service_id,
+                ..
+            } if !home_id.is_empty() && !service_id.is_empty() => Ok(()),
+            Self::Home { .. } => bail!("Home-scoped Travel credential has an empty Home id"),
+            Self::Service { .. } => {
+                bail!("service-scoped Travel credential has an empty Home or service id")
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn home_id(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::Home { home_id } | Self::Service { home_id, .. } => Some(home_id),
+        }
+    }
+
+    #[must_use]
+    pub fn allows_home(&self, home_id: &str) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Home {
+                home_id: allowed_home,
+            }
+            | Self::Service {
+                home_id: allowed_home,
+                ..
+            } => allowed_home == home_id,
+        }
+    }
+
+    #[must_use]
+    pub fn allows_service(
+        &self,
+        home_id: &str,
+        service_id: &str,
+        protocol: ServiceProtocol,
+    ) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Home {
+                home_id: allowed_home,
+            } => allowed_home == home_id,
+            Self::Service {
+                home_id: allowed_home,
+                service_id: allowed_service,
+                protocol: allowed_protocol,
+            } => {
+                allowed_home == home_id
+                    && allowed_service == service_id
+                    && *allowed_protocol == protocol
+            }
+        }
+    }
 }
 
 impl VerifiedAuthorization {
@@ -135,16 +339,24 @@ impl VerifiedAuthorization {
     /// Returns an error for invalid signatures, duplicate identities, or invalid revocations.
     pub fn verify(
         snapshot: &TravelAuthorizationSnapshot,
-        authority_public_key_hex: &str,
+        authorities: &[TrustedTravelAuthority],
     ) -> Result<Self> {
         if snapshot.generation == 0 {
             bail!("Travel authorization generation must be positive");
         }
+        validate_trusted_authorities(authorities)?;
+        let authorities_by_id = authorities
+            .iter()
+            .map(|authority| (authority.id(), authority))
+            .collect::<HashMap<_, _>>();
         let mut credentials = HashMap::new();
         let mut management_index = HashMap::new();
         let mut business_index = HashMap::new();
         for signed in &snapshot.credentials {
-            let credential = signed.verify(authority_public_key_hex)?;
+            let authority = authorities_by_id
+                .get(signed.authority_id.as_str())
+                .ok_or_else(|| anyhow!("unknown Travel authority {}", signed.authority_id))?;
+            let credential = signed.verify(authority)?;
             let credential_id = credential.credential_id;
             if credentials
                 .insert(credential_id, credential.clone())
@@ -156,19 +368,18 @@ impl VerifiedAuthorization {
                 credential.travel_id.clone(),
                 credential.management_spki_sha256.to_ascii_lowercase(),
             );
-            if management_index
-                .insert(management_key, credential_id)
-                .is_some()
-            {
-                bail!("a Travel management identity is assigned to multiple credentials");
-            }
+            management_index
+                .entry(management_key)
+                .or_insert_with(Vec::new)
+                .push(credential_id);
             let business_key = (
                 credential.travel_id.clone(),
                 credential.business_spki_sha256.to_ascii_lowercase(),
             );
-            if business_index.insert(business_key, credential_id).is_some() {
-                bail!("a Travel business identity is assigned to multiple credentials");
-            }
+            business_index
+                .entry(business_key)
+                .or_insert_with(Vec::new)
+                .push(credential_id);
         }
         let mut revoked_credentials = HashSet::new();
         for revocation in &snapshot.revocations {
@@ -209,6 +420,10 @@ impl VerifiedAuthorization {
         self.credentials.get(&credential_id)
     }
 
+    pub fn credentials(&self) -> impl Iterator<Item = &TravelCredential> {
+        self.credentials.values()
+    }
+
     #[must_use]
     pub fn is_active(&self, credential_id: Uuid, unix_secs: u64) -> bool {
         self.credentials
@@ -229,7 +444,41 @@ impl VerifiedAuthorization {
         identity: &PeerIdentity,
         unix_secs: u64,
     ) -> Result<&TravelCredential> {
-        self.authorize(identity, unix_secs, &self.management_index)
+        self.authorize_all(identity, unix_secs, &self.management_index)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Travel certificate is not covered by an active credential"))
+    }
+
+    /// Resolves a management TLS identity to every active signed credential for that identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no active credential binds the Travel identity and SPKI.
+    pub fn authorize_management_all(
+        &self,
+        identity: &PeerIdentity,
+        unix_secs: u64,
+    ) -> Result<Vec<&TravelCredential>> {
+        self.authorize_all(identity, unix_secs, &self.management_index)
+    }
+
+    /// Selects one active management credential that permits routing to `home_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity has no active authorization for the Home.
+    pub fn authorize_management_for_home(
+        &self,
+        identity: &PeerIdentity,
+        home_id: &str,
+        unix_secs: u64,
+    ) -> Result<&TravelCredential> {
+        self.authorize_management_all(identity, unix_secs)?
+            .into_iter()
+            .filter(|credential| credential.allows_home(home_id))
+            .max_by_key(|credential| credential.not_after_unix_secs)
+            .ok_or_else(|| anyhow!("Travel identity is not authorized for Home {home_id}"))
     }
 
     /// Resolves a business TLS identity to one active signed credential.
@@ -242,32 +491,60 @@ impl VerifiedAuthorization {
         identity: &PeerIdentity,
         unix_secs: u64,
     ) -> Result<&TravelCredential> {
-        self.authorize(identity, unix_secs, &self.business_index)
+        self.authorize_all(identity, unix_secs, &self.business_index)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Travel certificate is not covered by an active credential"))
     }
 
-    fn authorize<'a>(
+    /// Resolves a business identity against the exact credential selected for a route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected credential is inactive or does not bind the identity.
+    pub fn authorize_business_credential(
+        &self,
+        identity: &PeerIdentity,
+        credential_id: Uuid,
+        unix_secs: u64,
+    ) -> Result<&TravelCredential> {
+        self.authorize_all(identity, unix_secs, &self.business_index)?
+            .into_iter()
+            .find(|credential| credential.credential_id == credential_id)
+            .ok_or_else(|| {
+                anyhow!("business certificate does not match the routed Travel credential")
+            })
+    }
+
+    fn authorize_all<'a>(
         &'a self,
         identity: &PeerIdentity,
         unix_secs: u64,
-        index: &HashMap<(String, String), Uuid>,
-    ) -> Result<&'a TravelCredential> {
+        index: &HashMap<(String, String), Vec<Uuid>>,
+    ) -> Result<Vec<&'a TravelCredential>> {
         let key = (
             identity.id.clone(),
             identity.spki_sha256.to_ascii_lowercase(),
         );
-        let credential_id = index
+        let credential_ids = index
             .get(&key)
-            .copied()
             .ok_or_else(|| anyhow!("Travel certificate is not covered by a signed credential"))?;
         if !identity.active_at(unix_secs) {
             bail!("Travel certificate is expired or not yet valid");
         }
-        if !self.is_active(credential_id, unix_secs) {
+        let active = credential_ids
+            .iter()
+            .filter(|credential_id| self.is_active(**credential_id, unix_secs))
+            .map(|credential_id| {
+                self.credentials
+                    .get(credential_id)
+                    .ok_or_else(|| anyhow!("Travel credential index is inconsistent"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if active.is_empty() {
             bail!("Travel credential is revoked, expired, or not yet valid");
         }
-        self.credentials
-            .get(&credential_id)
-            .ok_or_else(|| anyhow!("Travel credential index is inconsistent"))
+        Ok(active)
     }
 }
 
@@ -372,35 +649,52 @@ mod tests {
             .sign(&SystemRandom::new(), &payload)
             .map_err(|_| anyhow!("failed to sign test credential"))?;
         Ok(SignedTravelCredential {
+            authority_id: credential.authority_id.clone(),
             payload_hex: hex::encode(payload),
             signature_hex: hex::encode(signature.as_ref()),
         })
     }
 
-    fn fixture() -> Result<(String, TravelCredential, SignedTravelCredential)> {
+    fn fixture() -> Result<(
+        TrustedTravelAuthority,
+        TravelCredential,
+        SignedTravelCredential,
+    )> {
         let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
             .map_err(|_| anyhow!("failed to generate test key"))?;
         let credential = TravelCredential {
             credential_id: Uuid::new_v4(),
+            authority_id: "home-1-authority".to_owned(),
             travel_id: "travel-1".to_owned(),
             management_spki_sha256: "11".repeat(32),
             business_spki_sha256: "22".repeat(32),
+            scope: TravelCredentialScope::Home {
+                home_id: "home-1".to_owned(),
+            },
             not_before_unix_secs: 100,
             not_after_unix_secs: 200,
         };
         let signed = signed(&key, &credential)?;
-        Ok((hex::encode(key.public_key().as_ref()), credential, signed))
+        Ok((
+            TrustedTravelAuthority::Home {
+                id: "home-1-authority".to_owned(),
+                home_id: "home-1".to_owned(),
+                public_key: hex::encode(key.public_key().as_ref()),
+            },
+            credential,
+            signed,
+        ))
     }
 
     #[test]
     fn signed_credentials_bind_both_tls_identities_and_validity() -> Result<()> {
-        let (public_key, credential, signed) = fixture()?;
+        let (authority, credential, signed) = fixture()?;
         let snapshot = TravelAuthorizationSnapshot {
             generation: 1,
             credentials: vec![signed],
             revocations: vec![],
         };
-        let authorization = VerifiedAuthorization::verify(&snapshot, &public_key)?;
+        let authorization = VerifiedAuthorization::verify(&snapshot, &[authority])?;
         let management = PeerIdentity {
             role: Role::Travel,
             id: credential.travel_id.clone(),
@@ -434,9 +728,9 @@ mod tests {
 
     #[test]
     fn tampering_revocation_and_rollback_fail_closed() -> Result<()> {
-        let (public_key, credential, mut signed) = fixture()?;
+        let (authority, credential, mut signed) = fixture()?;
         signed.payload_hex.replace_range(0..2, "00");
-        assert!(signed.verify(&public_key).is_err());
+        assert!(signed.verify(&authority).is_err());
 
         let (_, _, valid) = fixture()?;
         let wrong_revocation = TravelRevocation {
@@ -451,12 +745,12 @@ mod tests {
                     credentials: vec![valid],
                     revocations: vec![wrong_revocation],
                 },
-                &public_key,
+                &[authority],
             )
             .is_err()
         );
 
-        let (public_key, credential, valid) = fixture()?;
+        let (authority, credential, valid) = fixture()?;
         let revoked = VerifiedAuthorization::verify(
             &TravelAuthorizationSnapshot {
                 generation: 3,
@@ -467,7 +761,7 @@ mod tests {
                     reason: "stolen".to_owned(),
                 }],
             },
-            &public_key,
+            std::slice::from_ref(&authority),
         )?;
         let cache = AuthorizationCache::default().accept(&revoked)?;
         let rollback = VerifiedAuthorization::verify(
@@ -476,7 +770,7 @@ mod tests {
                 credentials: vec![valid],
                 revocations: vec![],
             },
-            &public_key,
+            &[authority],
         )?;
         assert!(cache.accept(&rollback).is_err());
         Ok(())

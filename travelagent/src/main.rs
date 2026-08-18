@@ -86,8 +86,6 @@ struct EnrollInitArgs {
     #[arg(long)]
     travel_id: String,
     #[arg(long)]
-    authority_public_key: String,
-    #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, hide = true)]
     test_password_file: Option<PathBuf>,
@@ -313,7 +311,6 @@ fn run_command(command: Command) -> Result<()> {
             }
             let request = create_enrollment_request(
                 &args.travel_id,
-                &args.authority_public_key,
                 password.as_bytes(),
                 &args.output_dir,
                 unix_time_secs()?,
@@ -501,7 +498,7 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
         let mut connected = false;
         for relay in relay_candidates(&state).await {
             match open_management(&state, &relay, TravelConnectionPurpose::Catalog).await {
-                Ok((stream, directory, catalog, _credential_id)) => {
+                Ok((stream, directory, catalog)) => {
                     update_directory(&state, directory).await;
                     *state.catalog.write().await = catalog;
                     info!(relay_id = %relay.id, relay = %relay.management_addr, "catalog subscription connected");
@@ -566,7 +563,7 @@ async fn open_management(
     state: &AppState,
     relay: &RelayEndpoint,
     purpose: TravelConnectionPurpose,
-) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog, Uuid)> {
+) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog)> {
     let config = &state.config;
     let socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
@@ -603,19 +600,16 @@ async fn open_management(
     .await?;
     let mut reader = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT);
     let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
-    let credential_id = match reader
+    match reader
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::TravelHelloAccepted {
-            relay_id,
-            credential_id,
-        } if relay_id == relay.id => credential_id,
+        ControlMessage::TravelHelloAccepted { relay_id } if relay_id == relay.id => {}
         ControlMessage::TravelHelloDenied { reason } => {
             bail!("Travel session rejected by Relay {}: {reason}", relay.id);
         }
         _ => bail!("relay sent an invalid Travel HELLO response"),
-    };
+    }
     let mut directory = None;
     let mut catalog = None;
     while directory.is_none() || catalog.is_none() {
@@ -633,7 +627,6 @@ async fn open_management(
         stream,
         directory.ok_or_else(|| anyhow::anyhow!("missing relay directory"))?,
         catalog.ok_or_else(|| anyhow::anyhow!("missing catalog"))?,
-        credential_id,
     ))
 }
 
@@ -643,7 +636,7 @@ async fn request_route(
     home_id: &str,
 ) -> Result<RouteGrant> {
     let config = &state.config;
-    let (stream, directory, catalog, credential_id) =
+    let (stream, directory, catalog) =
         open_management(state, relay, TravelConnectionPurpose::Route).await?;
     update_directory(state, directory).await;
     *state.catalog.write().await = catalog;
@@ -652,11 +645,10 @@ async fn request_route(
     let request_id = Uuid::new_v4();
     write_json(
         &mut writer,
-        &ControlMessage::RouteRequest {
+        &ControlMessage::TravelRouteRequest {
             request_id,
             travel_id: config.id.clone(),
             travel_session_id: state.session_id,
-            credential_id,
             home_id: home_id.to_owned(),
         },
         CONTROL_FRAME_LIMIT,

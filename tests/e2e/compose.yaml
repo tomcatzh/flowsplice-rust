@@ -66,6 +66,9 @@ services:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
+      - ./generated/offline:/issuer:ro
+    ports:
+      - "127.0.0.1:19081:9081"
     networks: [flowsplice]
 
   homeagent2:
@@ -79,6 +82,9 @@ services:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
+      - ./generated/offline:/issuer:ro
+    ports:
+      - "127.0.0.1:29081:9081"
     networks: [flowsplice]
 
   travelagent:

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::authorization::TravelAuthorizationSnapshot;
+use crate::authorization::{SignedTravelCredential, TravelAuthorizationSnapshot};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,7 +86,6 @@ pub enum ControlMessage {
     },
     TravelHelloAccepted {
         relay_id: String,
-        credential_id: Uuid,
     },
     TravelHelloDenied {
         reason: String,
@@ -111,6 +110,12 @@ pub enum ControlMessage {
         travel_id: String,
         travel_session_id: Uuid,
         credential_id: Uuid,
+        home_id: String,
+    },
+    TravelRouteRequest {
+        request_id: Uuid,
+        travel_id: String,
+        travel_session_id: Uuid,
         home_id: String,
     },
     TravelSessionAuthorize {
@@ -154,6 +159,27 @@ pub enum ControlMessage {
     },
     TravelAuthorizationAck {
         generation: u64,
+    },
+    PublishTravelCredential {
+        request_id: Uuid,
+        credential: SignedTravelCredential,
+    },
+    PublishTravelCredentialResult {
+        request_id: Uuid,
+        accepted: bool,
+        generation: u64,
+        error: Option<String>,
+    },
+    RevokeTravelCredential {
+        request_id: Uuid,
+        credential_id: Uuid,
+        reason: String,
+    },
+    RevokeTravelCredentialResult {
+        request_id: Uuid,
+        accepted: bool,
+        generation: u64,
+        error: Option<String>,
     },
     Error {
         code: String,

@@ -8,8 +8,19 @@ cert = "/etc/flowsplice/relay.crt"
 key = "/etc/flowsplice/relay.key"
 management_ca = "/etc/flowsplice/management-ca.crt"
 server_spki_pins = ["replace-with-server-spki-sha256-hex"]
-travel_authority_public_key = "replace-with-uncompressed-p256-public-key-hex"
 travel_authorization_cache = "/var/lib/flowsplice/relay-authorization-cache.json"
 handshake_timeout_secs = 10
 route_ttl_secs = 15
 max_pending_routes = 256
+
+[[travel_authorities]]
+kind = "home"
+id = "home-1-authority"
+home_id = "home-1"
+public_key = "replace-with-uncompressed-p256-public-key-hex"
+
+[[travel_authorities]]
+kind = "global"
+id = "operator-global-authority"
+home_id = "home-1"
+public_key = "replace-with-global-uncompressed-p256-public-key-hex"

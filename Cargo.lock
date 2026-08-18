@@ -593,24 +593,20 @@ name = "flowsplice-homeagent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
+ "axum",
  "clap",
+ "embedded-spa",
  "flowsplice-core",
+ "flowsplice-enrollment",
+ "rust-embed",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "flowsplice-issuer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "flowsplice-enrollment",
- "rpassword",
  "zeroize",
 ]
 

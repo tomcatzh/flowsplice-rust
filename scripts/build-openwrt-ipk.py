@@ -18,7 +18,6 @@ from po2lmo import compile_po
 PACKAGE = "flowsplice-openwrt"
 EXECUTABLE_PATHS = {
     "etc/init.d/flowsplice",
-    "usr/libexec/flowsplice/admin",
     "usr/libexec/flowsplice/render-config",
 }
 

@@ -5,14 +5,14 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-msgid "A revocation reason is required."
-msgstr "必须填写撤销原因。"
+msgid "Add Home Agent"
+msgstr "添加家庭端"
 
-msgid "Action"
-msgstr "操作"
+msgid "Add Relay instance"
+msgstr "添加中继实例"
 
-msgid "Active"
-msgstr "有效"
+msgid "Add Travel authority"
+msgstr "添加旅行端签发方"
 
 msgid "Add directory entry"
 msgstr "添加目录项"
@@ -20,26 +20,23 @@ msgstr "添加目录项"
 msgid "Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
 msgstr "请添加所有可能承载逻辑业务的家庭端。每条旅行端映射会选择一个家庭端 ID 和一个服务，绝不会自动切换到其他家庭端。"
 
-msgid "Add Home Agent"
-msgstr "添加家庭端"
-
-msgid "Add Relay instance"
-msgstr "添加中继实例"
-
 msgid "Advertised data address"
 msgstr "对外发布的数据地址"
 
 msgid "All enabled FlowSplice instances are valid."
 msgstr "所有已启用的 FlowSplice 实例配置均有效。"
 
-msgid "armed"
-msgstr "已启用"
+msgid "Authority ID"
+msgstr "签发方 ID"
+
+msgid "Authority type"
+msgstr "签发方类型"
+
+msgid "Authorization public key"
+msgstr "授权公钥"
 
 msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
 msgstr "请为局域网和 WAN IPv6 分别创建具名中继实例。每个实例都有独立的身份、监听地址、对外发布地址、日志和 procd 生命周期。"
-
-msgid "Credential ID"
-msgstr "凭据 ID"
 
 msgid "Data listen"
 msgstr "数据监听地址"
@@ -47,17 +44,14 @@ msgstr "数据监听地址"
 msgid "Data listeners"
 msgstr "数据监听地址"
 
-msgid "Default Travel validity (days)"
-msgstr "旅行端默认有效期（天）"
-
 msgid "Enabled"
 msgstr "启用"
 
-msgid "Expires"
-msgstr "到期时间"
-
 msgid "Firewall exposure is intentionally managed separately. Installing or starting FlowSplice does not create WAN rules."
 msgstr "防火墙暴露策略需单独管理。安装或启动 FlowSplice 不会自动创建 WAN 放行规则。"
+
+msgid "FlowSplice"
+msgstr ""
 
 msgid "General"
 msgstr "常规"
@@ -65,14 +59,17 @@ msgstr "常规"
 msgid "Global settings"
 msgstr "全局设置"
 
-msgid "Handshake timeout (seconds)"
-msgstr "握手超时（秒）"
+msgid "Global super-authority"
+msgstr "全局超级签发方"
 
 msgid "Handshake timeout"
 msgstr "握手超时"
 
-msgid "Home control listener"
-msgstr "家庭端控制监听地址"
+msgid "Handshake timeout (seconds)"
+msgstr "握手超时（秒）"
+
+msgid "Home"
+msgstr "家庭端"
 
 msgid "Home ID"
 msgstr "家庭端 ID"
@@ -80,20 +77,17 @@ msgstr "家庭端 ID"
 msgid "Home SPKI pins"
 msgstr "家庭端 SPKI 指纹"
 
-msgid "Inactive"
-msgstr "未生效"
+msgid "Home authorities may sign only their assigned Home. Global authorities are separate super-authorities and should exist only on a designated Home."
+msgstr "家庭端签发方只能签发分配给自己的家庭端权限。全局签发方是独立的超级权限，只应配置在指定的家庭端。"
+
+msgid "Home control listener"
+msgstr "家庭端控制监听地址"
 
 msgid "Instance"
 msgstr "实例"
 
-msgid "Issued Travel credentials"
-msgstr "已签发的旅行端凭据"
-
 msgid "Limits"
 msgstr "限制"
-
-msgid "Local administration socket"
-msgstr "本地管理套接字"
 
 msgid "Local Relay instances"
 msgstr "本机中继实例"
@@ -104,11 +98,11 @@ msgstr "日志级别"
 msgid "Manage the OpenWrt Server and multiple logical Relay instances from one page. Use separate LAN and WAN6 Relay identities even though both use the same installed binary."
 msgstr "在同一页面管理 OpenWrt 上的服务端和多个逻辑中继实例。局域网与 WAN IPv6 中继共用同一个可执行文件，但应使用不同身份。"
 
-msgid "Management address"
-msgstr "管理地址"
-
 msgid "Management CA"
 msgstr "管理 CA"
+
+msgid "Management address"
+msgstr "管理地址"
 
 msgid "Management certificate"
 msgstr "管理证书"
@@ -131,20 +125,23 @@ msgstr "可以同时填写明确的局域网 IPv4 和 WAN IPv6 套接字地址�
 msgid "No instances configured."
 msgstr "尚未配置实例。"
 
-msgid "No Travel credentials have been issued."
-msgstr "尚未签发旅行端凭据。"
+msgid "PID"
+msgstr ""
 
 msgid "Pending work TTL (seconds)"
 msgstr "待处理任务有效期（秒）"
 
-msgid "Persistent revocation cache"
-msgstr "持久化撤销缓存"
-
 msgid "Persistent Travel revocations"
 msgstr "持久化旅行端撤销记录"
 
-msgid "Refresh"
-msgstr "刷新"
+msgid "Persistent revocation cache"
+msgstr "持久化撤销缓存"
+
+msgid "Publishing Home ID"
+msgstr "发布签发结果的家庭端 ID"
+
+msgid "RUNNING"
+msgstr "运行中"
 
 msgid "Relay ID"
 msgstr "中继 ID"
@@ -152,6 +149,7 @@ msgstr "中继 ID"
 msgid "Relay SPKI pins"
 msgstr "中继 SPKI 指纹"
 
+#, javascript-format
 msgid "Relay: %s"
 msgstr "中继：%s"
 
@@ -161,32 +159,17 @@ msgstr "自动重启"
 msgid "Restart"
 msgstr "重启"
 
-msgid "Revocation reason for %s"
-msgstr "撤销 %s 的原因"
-
-msgid "Revoke"
-msgstr "撤销"
-
-msgid "Revoked"
-msgstr "已撤销"
-
 msgid "Route TTL"
 msgstr "路由有效期"
-
-msgid "RUNNING"
-msgstr "运行中"
 
 msgid "Runtime status"
 msgstr "运行状态"
 
-msgid "Select the enrollment-request.json generated on the Travel machine."
-msgstr "请选择在旅行端设备上生成的 enrollment-request.json。"
+msgid "STOPPED"
+msgstr "已停止"
 
-msgid "Select the signed enrollment response returned by the offline issuer."
-msgstr "请选择离线签发工具返回的签发结果文件。"
-
-msgid "Server data address"
-msgstr "服务端数据地址"
+msgid "Server"
+msgstr "服务端"
 
 msgid "Server ID"
 msgstr "服务端 ID"
@@ -197,8 +180,8 @@ msgstr "服务端中继目录"
 msgid "Server SPKI pins"
 msgstr "服务端 SPKI 指纹"
 
-msgid "Server"
-msgstr "服务端"
+msgid "Server data address"
+msgstr "服务端数据地址"
 
 msgid "Service action failed"
 msgstr "服务操作失败"
@@ -212,74 +195,32 @@ msgstr "启动"
 msgid "State"
 msgstr "状态"
 
-msgid "Status"
-msgstr "状态"
-
 msgid "Stop"
 msgstr "停止"
-
-msgid "STOPPED"
-msgstr "已停止"
-
-msgid "The approval file is ready. Move it to the offline issuer; no signing private key is stored on this router."
-msgstr "批准文件已生成。请将它交给离线签发工具；路由器不会保存任何签名私钥。"
-
-msgid "The file must be readable by the flowsplice service user."
-msgstr "flowsplice 服务用户必须能够读取此文件。"
-
-msgid "The Server administration interface is unavailable."
-msgstr "服务端管理接口当前不可用。"
-
-msgid "The Server returned an invalid administration response."
-msgstr "服务端返回了无效的管理响应。"
-
-msgid "The Travel credential was imported successfully."
-msgstr "旅行端凭据已成功导入。"
-
-msgid "The Travel credential was revoked immediately."
-msgstr "旅行端凭据已立即撤销。"
-
-msgid "The Travel machine creates encrypted private keys locally. This page approves the requested validity period and imports the offline-signed result; the signing private keys remain offline."
-msgstr "旅行端设备会在本地生成并加密私钥。本页面只负责批准有效期和导入离线签发结果；签名私钥始终保留在离线环境。"
-
-msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
-msgstr "这些条目会发布给旅行端。请添加所有本地和 VPS 中继，并为每个中继使用不同的 ID。"
 
 msgid "TLS server name"
 msgstr "TLS 服务端名称"
 
-msgid "Travel administration failed"
-msgstr "旅行端管理操作失败"
+msgid "The file must be readable by the flowsplice service user."
+msgstr "flowsplice 服务用户必须能够读取此文件。"
 
-msgid "Travel authorization public key"
-msgstr "旅行端授权公钥"
-
-msgid "Travel credential issuance"
-msgstr "旅行端凭据签发"
-
-msgid "Travel ID"
-msgstr "旅行端 ID"
-
-msgid "Trusted Home Agents"
-msgstr "受信任的家庭端"
+msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
+msgstr "这些条目会发布给旅行端。请添加所有本地和 VPS 中继，并为每个中继使用不同的 ID。"
 
 msgid "Trust and identity"
 msgstr "信任与身份"
 
-msgid "Uncompressed P-256 public key in hexadecimal. The matching offline private key must never be installed on this router."
-msgstr "请填写十六进制的未压缩 P-256 公钥。与其匹配的离线私钥绝不能安装到此路由器。"
+msgid "Trusted Home Agents"
+msgstr "受信任的家庭端"
 
-msgid "Upload and import signed result"
-msgstr "上传并导入签发结果"
-
-msgid "Upload request and download approval"
-msgstr "上传申请并下载批准文件"
+msgid "Trusted Travel authorities"
+msgstr "可信旅行端签发方"
 
 msgid "Use LAN addresses only; do not expose the Server control listener to WAN."
 msgstr "只能使用局域网地址；不要把服务端控制监听暴露到 WAN。"
 
-msgid "Used when preparing a new Travel enrollment approval."
-msgstr "生成新的旅行端注册批准文件时使用。"
-
 msgid "Validate"
-msgstr "验证配置"
+msgstr "验证"
+
+msgid "armed"
+msgstr "已启用"

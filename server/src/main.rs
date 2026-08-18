@@ -2,9 +2,7 @@
 
 use std::{
     collections::HashMap,
-    fs,
     io::{self, IsTerminal},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,7 +13,7 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
-    authorization::{TravelAuthorizationSnapshot, unix_time_secs},
+    authorization::{TravelAuthorizationSnapshot, TrustedTravelAuthority, unix_time_secs},
     config::load_toml,
     frame::{JsonFrameReader, write_json},
     init_crypto,
@@ -26,15 +24,10 @@ use flowsplice_core::{
         validate_spki_pins,
     },
 };
-use flowsplice_enrollment::{
-    DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentApproval, TravelEnrollmentRequest,
-    TravelEnrollmentResponse, load_json as load_enrollment_json, prepare_enrollment_approval,
-    validate_enrollment_response, write_json_private,
-};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::{
     io::copy_bidirectional,
-    net::{TcpListener, TcpStream, UnixListener, UnixStream},
+    net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, mpsc, watch},
     task::JoinSet,
     time::{interval, sleep, timeout},
@@ -54,22 +47,6 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     check_config: bool,
-    #[arg(long)]
-    revoke_travel_credential: Option<Uuid>,
-    #[arg(long)]
-    revocation_reason: Option<String>,
-    #[arg(long)]
-    reload_travel_credentials: bool,
-    #[arg(long)]
-    travel_authorization_status: bool,
-    #[arg(long)]
-    prepare_travel_enrollment: Option<PathBuf>,
-    #[arg(long)]
-    import_travel_enrollment: Option<PathBuf>,
-    #[arg(long)]
-    travel_valid_days: Option<u32>,
-    #[arg(long)]
-    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -85,12 +62,9 @@ struct Config {
     homes: Vec<ConfiguredHome>,
     #[serde(default)]
     relay_spki_pins: Vec<String>,
-    travel_authority_public_key: String,
+    travel_authorities: Vec<TrustedTravelAuthority>,
     travel_credentials: PathBuf,
     travel_revocations: PathBuf,
-    admin_socket: PathBuf,
-    #[serde(default = "default_travel_valid_days")]
-    travel_valid_days: u32,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
     #[serde(default = "default_work_ttl")]
@@ -117,10 +91,6 @@ const fn default_work_ttl() -> u64 {
 
 const fn default_max_pending_work() -> usize {
     256
-}
-
-const fn default_travel_valid_days() -> u32 {
-    DEFAULT_VALID_DAYS
 }
 
 const TRAVEL_SESSION_LEASE: Duration = Duration::from_secs(45);
@@ -227,20 +197,18 @@ impl HomeRegistry {
 }
 
 struct TravelSession {
-    travel_id: String,
     session_id: Uuid,
     leases: HashMap<Uuid, Instant>,
 }
 
 #[derive(Default)]
 struct TravelSessionRegistry {
-    sessions: HashMap<Uuid, TravelSession>,
+    sessions: HashMap<String, TravelSession>,
 }
 
 impl TravelSessionRegistry {
     fn authorize(
         &mut self,
-        credential_id: Uuid,
         travel_id: &str,
         session_id: Uuid,
         lease_id: Option<Uuid>,
@@ -250,10 +218,7 @@ impl TravelSessionRegistry {
         if session_id.is_nil() {
             return Err("Travel session id must not be nil".to_owned());
         }
-        match self.sessions.get_mut(&credential_id) {
-            Some(active) if active.travel_id != travel_id => {
-                Err("Travel credential identity does not match".to_owned())
-            }
+        match self.sessions.get_mut(travel_id) {
             Some(active) if active.session_id != session_id => {
                 Err("another session for this Travel credential is already online".to_owned())
             }
@@ -268,9 +233,8 @@ impl TravelSessionRegistry {
                     return Err("Travel has no active login session".to_owned());
                 };
                 self.sessions.insert(
-                    credential_id,
+                    travel_id.to_owned(),
                     TravelSession {
-                        travel_id: travel_id.to_owned(),
                         session_id,
                         leases: HashMap::from([(lease_id, now + TRAVEL_SESSION_LEASE)]),
                     },
@@ -286,10 +250,6 @@ impl TravelSessionRegistry {
             !session.leases.is_empty()
         });
     }
-
-    fn revoke(&mut self, credential_id: Uuid) {
-        self.sessions.remove(&credential_id);
-    }
 }
 
 struct State {
@@ -300,11 +260,10 @@ struct State {
     authorization: RwLock<ServerAuthorization>,
     authorization_acks: Mutex<HashMap<String, u64>>,
     authorization_tx: watch::Sender<u64>,
-    default_travel_valid_days: u32,
 }
 
 impl State {
-    fn new(authorization: ServerAuthorization, default_travel_valid_days: u32) -> Self {
+    fn new(authorization: ServerAuthorization) -> Self {
         let (authorization_tx, _) = watch::channel(authorization.snapshot().generation);
         Self {
             homes: Mutex::new(HomeRegistry::default()),
@@ -314,50 +273,9 @@ impl State {
             authorization: RwLock::new(authorization),
             authorization_acks: Mutex::new(HashMap::new()),
             authorization_tx,
-            default_travel_valid_days,
         }
     }
 }
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum AdminRequest {
-    Revoke {
-        credential_id: Uuid,
-        reason: String,
-    },
-    ReloadCredentials,
-    PrepareEnrollment {
-        request: TravelEnrollmentRequest,
-        valid_days: Option<u32>,
-    },
-    ImportEnrollment {
-        response: TravelEnrollmentResponse,
-    },
-    Status,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-struct TravelCredentialStatus {
-    credential_id: Uuid,
-    travel_id: String,
-    not_after_unix_secs: u64,
-    revoked: bool,
-    active: bool,
-}
-
-#[derive(Deserialize, Serialize)]
-struct AdminResponse {
-    ok: bool,
-    changed: bool,
-    generation: u64,
-    acknowledgements: HashMap<String, u64>,
-    approval: Option<TravelEnrollmentApproval>,
-    credentials: Vec<TravelCredentialStatus>,
-    error: Option<String>,
-}
-
-const ADMIN_FRAME_LIMIT: usize = 512 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -373,43 +291,22 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
     validate_config(&config)?;
-    let admin_request = admin_request_from_args(&args)?;
-    if let Some(request) = admin_request {
-        let response = run_admin_client(&config.admin_socket, request).await?;
-        if !response.ok {
-            bail!(
-                "admin request failed: {}",
-                response.error.as_deref().unwrap_or("unknown error")
-            );
-        }
-        if let Some(output) = &args.output {
-            let approval = response
-                .approval
-                .as_ref()
-                .ok_or_else(|| anyhow!("admin response did not contain an enrollment approval"))?;
-            write_json_private(output, approval)?;
-        }
-        println!("{}", serde_json::to_string(&response)?);
-        return Ok(());
-    }
     if args.check_config {
         info!(event = "config_validated", path = %args.config.display(), "server configuration is valid");
         return Ok(());
     }
     let authorization = ServerAuthorization::load(
-        config.travel_authority_public_key.clone(),
+        config.travel_authorities.clone(),
         config.travel_credentials.clone(),
         config.travel_revocations.clone(),
     )?;
-    let state = Arc::new(State::new(authorization, config.travel_valid_days));
+    let state = Arc::new(State::new(authorization));
 
     let control = run_home_listeners(config.clone(), Arc::clone(&state));
     let data = run_data_listeners(config.clone(), Arc::clone(&state));
     let relay = run_relay_connectors(config.clone(), Arc::clone(&state));
     let cleanup = cleanup_pending(Arc::clone(&state));
-    let admin = run_admin(config.clone(), Arc::clone(&state));
-
-    tokio::try_join!(control, data, relay, cleanup, admin)?;
+    tokio::try_join!(control, data, relay, cleanup)?;
     Ok(())
 }
 
@@ -421,14 +318,8 @@ fn validate_config(config: &Config) -> Result<()> {
     validate_listens(&config.data_listens, "data")?;
     validate_homes(&config.homes)?;
     validate_spki_pins(&config.relay_spki_pins, "relay")?;
-    if config.admin_socket.as_os_str().is_empty() {
-        bail!("server admin_socket must not be empty");
-    }
-    if config.travel_valid_days == 0 || config.travel_valid_days > MAX_VALID_DAYS {
-        bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
-    }
     ServerAuthorization::validate(
-        config.travel_authority_public_key.clone(),
+        config.travel_authorities.clone(),
         config.travel_credentials.clone(),
         config.travel_revocations.clone(),
     )?;
@@ -459,68 +350,6 @@ fn validate_homes(homes: &[ConfiguredHome]) -> Result<()> {
         validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
     }
     Ok(())
-}
-
-fn admin_request_from_args(args: &Args) -> Result<Option<AdminRequest>> {
-    if args.travel_valid_days.is_some() && args.prepare_travel_enrollment.is_none() {
-        bail!("--travel-valid-days requires --prepare-travel-enrollment");
-    }
-    if args.output.is_some() && args.prepare_travel_enrollment.is_none() {
-        bail!("--output requires --prepare-travel-enrollment");
-    }
-    let selected = usize::from(args.revoke_travel_credential.is_some())
-        + usize::from(args.reload_travel_credentials)
-        + usize::from(args.travel_authorization_status)
-        + usize::from(args.prepare_travel_enrollment.is_some())
-        + usize::from(args.import_travel_enrollment.is_some());
-    if selected > 1 || (selected != 0 && args.check_config) {
-        bail!("select exactly one admin action, without --check-config");
-    }
-    if let Some(credential_id) = args.revoke_travel_credential {
-        let reason = args
-            .revocation_reason
-            .clone()
-            .ok_or_else(|| anyhow!("--revocation-reason is required for revocation"))?;
-        return Ok(Some(AdminRequest::Revoke {
-            credential_id,
-            reason,
-        }));
-    }
-    if args.revocation_reason.is_some() {
-        bail!("--revocation-reason requires --revoke-travel-credential");
-    }
-    if args.reload_travel_credentials {
-        return Ok(Some(AdminRequest::ReloadCredentials));
-    }
-    if args.travel_authorization_status {
-        return Ok(Some(AdminRequest::Status));
-    }
-    if let Some(path) = &args.prepare_travel_enrollment {
-        if args.output.is_none() {
-            bail!("--output is required with --prepare-travel-enrollment");
-        }
-        return Ok(Some(AdminRequest::PrepareEnrollment {
-            request: load_enrollment_json(path)?,
-            valid_days: args.travel_valid_days,
-        }));
-    }
-    if let Some(path) = &args.import_travel_enrollment {
-        return Ok(Some(AdminRequest::ImportEnrollment {
-            response: load_enrollment_json(path)?,
-        }));
-    }
-    Ok(None)
-}
-
-async fn run_admin_client(socket: &PathBuf, request: AdminRequest) -> Result<AdminResponse> {
-    let mut stream = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("failed to connect admin socket {}", socket.display()))?;
-    write_json(&mut stream, &request, ADMIN_FRAME_LIMIT).await?;
-    JsonFrameReader::new(&mut stream, ADMIN_FRAME_LIMIT)
-        .read_with_timeout::<AdminResponse>(Duration::from_secs(5))
-        .await
-        .map_err(Into::into)
 }
 
 fn validate_listens(listens: &[String], label: &str) -> Result<()> {
@@ -736,6 +565,48 @@ async fn handle_home(
                         ControlMessage::TravelAuthorizationAck { generation } => {
                             record_authorization_ack(&state, format!("home:{}", identity.id), generation).await;
                         }
+                        ControlMessage::PublishTravelCredential { request_id, credential } => {
+                            let result = import_home_credential(&state, &identity.id, credential).await;
+                            let (accepted, generation, error) = match result {
+                                Ok((_changed, generation)) => (true, generation, None),
+                                Err(error) => (
+                                    false,
+                                    state.authorization.read().await.snapshot().generation,
+                                    Some(error.to_string()),
+                                ),
+                            };
+                            tx.send(ControlMessage::PublishTravelCredentialResult {
+                                request_id,
+                                accepted,
+                                generation,
+                                error,
+                            })
+                            .await?;
+                        }
+                        ControlMessage::RevokeTravelCredential { request_id, credential_id, reason } => {
+                            let result = revoke_home_credential(
+                                &state,
+                                &identity.id,
+                                credential_id,
+                                &reason,
+                            )
+                            .await;
+                            let (accepted, generation, error) = match result {
+                                Ok((_changed, generation)) => (true, generation, None),
+                                Err(error) => (
+                                    false,
+                                    state.authorization.read().await.snapshot().generation,
+                                    Some(error.to_string()),
+                                ),
+                            };
+                            tx.send(ControlMessage::RevokeTravelCredentialResult {
+                                request_id,
+                                accepted,
+                                generation,
+                                error,
+                            })
+                            .await?;
+                        }
                         _ => bail!("unexpected message from home agent"),
                     }
                     if writer_task.is_finished() {
@@ -749,6 +620,63 @@ async fn handle_home(
     writer_task.abort();
     clear_home_session(&state, session_id, &identity.id).await;
     result
+}
+
+async fn import_home_credential(
+    state: &Arc<State>,
+    home_id: &str,
+    credential: flowsplice_core::authorization::SignedTravelCredential,
+) -> Result<(bool, u64)> {
+    let (changed, snapshot) = {
+        let mut authorization = state.authorization.write().await;
+        let changed = authorization.import_credential(credential, home_id)?;
+        (changed, authorization.snapshot())
+    };
+    if changed {
+        broadcast_authorization(state, snapshot.clone()).await;
+    }
+    info!(
+        event = "travel_credential_published_by_home",
+        %home_id,
+        generation = snapshot.generation,
+        changed,
+        "Home published a signed Travel credential"
+    );
+    Ok((changed, snapshot.generation))
+}
+
+async fn revoke_home_credential(
+    state: &Arc<State>,
+    home_id: &str,
+    credential_id: Uuid,
+    reason: &str,
+) -> Result<(bool, u64)> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.len() > 256 {
+        bail!("revocation reason must contain 1 to 256 bytes");
+    }
+    let (changed, snapshot) = {
+        let mut authorization = state.authorization.write().await;
+        let changed = authorization.revoke_from_home(credential_id, reason.to_owned(), home_id)?;
+        (changed, authorization.snapshot())
+    };
+    if changed {
+        state
+            .pending
+            .lock()
+            .await
+            .retain(|_, work| work.credential_id != credential_id);
+        broadcast_authorization(state, snapshot.clone()).await;
+    }
+    info!(
+        event = "travel_credential_revoked_by_home",
+        %home_id,
+        %credential_id,
+        generation = snapshot.generation,
+        changed,
+        "Home revoked a Travel credential"
+    );
+    Ok((changed, snapshot.generation))
 }
 
 async fn clear_home_session(state: &Arc<State>, session_id: Uuid, home_id: &str) {
@@ -936,6 +864,7 @@ async fn run_relay_session(
                             &travel_id,
                             travel_session_id,
                             lease_id,
+                            None,
                         ).await;
                         match result {
                             Ok(()) => {
@@ -1017,6 +946,7 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
         &request.travel,
         request.travel_session,
         None,
+        Some(&request.home),
     )
     .await
     {
@@ -1206,6 +1136,7 @@ async fn authorize_travel(
     travel_id: &str,
     travel_session_id: Uuid,
     lease_id: Option<Uuid>,
+    home_id: Option<&str>,
 ) -> std::result::Result<(), String> {
     let now = unix_time_secs().map_err(|error| error.to_string())?;
     {
@@ -1220,9 +1151,11 @@ async fn authorize_travel(
         if !authorization.verified().is_active(credential_id, now) {
             return Err("Travel credential is revoked, expired, or not yet valid".to_owned());
         }
+        if home_id.is_some_and(|home_id| !credential.allows_home(home_id)) {
+            return Err("Travel credential is not authorized for the requested Home".to_owned());
+        }
     }
     state.travel_sessions.lock().await.authorize(
-        credential_id,
         travel_id,
         travel_session_id,
         lease_id,
@@ -1289,160 +1222,6 @@ async fn wait_until_credential_inactive(state: &Arc<State>, credential_id: Uuid)
             () = sleep(remaining) => return,
         }
     }
-}
-
-async fn run_admin(config: Config, state: Arc<State>) -> Result<()> {
-    if let Some(parent) = config.admin_socket.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    match fs::symlink_metadata(&config.admin_socket) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            fs::remove_file(&config.admin_socket).with_context(|| {
-                format!(
-                    "failed to remove stale socket {}",
-                    config.admin_socket.display()
-                )
-            })?;
-        }
-        Ok(_) => bail!(
-            "refusing to replace non-socket admin path {}",
-            config.admin_socket.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let listener = UnixListener::bind(&config.admin_socket)
-        .with_context(|| format!("failed to bind {}", config.admin_socket.display()))?;
-    fs::set_permissions(&config.admin_socket, fs::Permissions::from_mode(0o600))?;
-    info!(path = %config.admin_socket.display(), "server local admin socket ready");
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_admin(stream, state).await {
-                warn!(%error, "server admin request failed");
-            }
-        });
-    }
-}
-
-async fn handle_admin(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
-    let request = JsonFrameReader::new(&mut stream, ADMIN_FRAME_LIMIT)
-        .read_with_timeout::<AdminRequest>(Duration::from_secs(5))
-        .await?;
-    let response = match handle_admin_request(&state, request).await {
-        Ok((changed, generation, approval)) => AdminResponse {
-            ok: true,
-            changed,
-            generation,
-            acknowledgements: state.authorization_acks.lock().await.clone(),
-            approval,
-            credentials: credential_statuses(&state).await,
-            error: None,
-        },
-        Err(error) => AdminResponse {
-            ok: false,
-            changed: false,
-            generation: state.authorization.read().await.snapshot().generation,
-            acknowledgements: state.authorization_acks.lock().await.clone(),
-            approval: None,
-            credentials: credential_statuses(&state).await,
-            error: Some(error.to_string()),
-        },
-    };
-    write_json(&mut stream, &response, ADMIN_FRAME_LIMIT).await?;
-    Ok(())
-}
-
-async fn handle_admin_request(
-    state: &Arc<State>,
-    request: AdminRequest,
-) -> Result<(bool, u64, Option<TravelEnrollmentApproval>)> {
-    let (changed, revoked_id, snapshot, approval) = {
-        let mut authorization = state.authorization.write().await;
-        match request {
-            AdminRequest::Revoke {
-                credential_id,
-                reason,
-            } => {
-                let reason = reason.trim();
-                if reason.is_empty() || reason.len() > 256 {
-                    bail!("revocation reason must contain 1 to 256 bytes");
-                }
-                let changed = authorization.revoke(credential_id, reason.to_owned())?;
-                (
-                    changed,
-                    changed.then_some(credential_id),
-                    authorization.snapshot(),
-                    None,
-                )
-            }
-            AdminRequest::ReloadCredentials => {
-                let changed = authorization.reload_credentials()?;
-                (changed, None, authorization.snapshot(), None)
-            }
-            AdminRequest::PrepareEnrollment {
-                request,
-                valid_days,
-            } => {
-                let approval = prepare_enrollment_approval(
-                    request,
-                    valid_days.unwrap_or(state.default_travel_valid_days),
-                    unix_time_secs()?,
-                )?;
-                (false, None, authorization.snapshot(), Some(approval))
-            }
-            AdminRequest::ImportEnrollment { response } => {
-                let _ = validate_enrollment_response(
-                    &response,
-                    authorization.authority_public_key(),
-                    unix_time_secs()?,
-                )?;
-                let changed = authorization.import_credential(response.signed_credential)?;
-                (changed, None, authorization.snapshot(), None)
-            }
-            AdminRequest::Status => (false, None, authorization.snapshot(), None),
-        }
-    };
-    if let Some(credential_id) = revoked_id {
-        state.travel_sessions.lock().await.revoke(credential_id);
-        state
-            .pending
-            .lock()
-            .await
-            .retain(|_, work| work.credential_id != credential_id);
-        info!(event = "travel_credential_revoked", %credential_id, generation = snapshot.generation, "revoked Travel credential without restarting nodes");
-    }
-    if changed {
-        broadcast_authorization(state, snapshot.clone()).await;
-    }
-    Ok((changed, snapshot.generation, approval))
-}
-
-async fn credential_statuses(state: &Arc<State>) -> Vec<TravelCredentialStatus> {
-    let now = unix_time_secs().unwrap_or_default();
-    let authorization = state.authorization.read().await;
-    let snapshot = authorization.snapshot();
-    snapshot
-        .credentials
-        .iter()
-        .filter_map(|signed| signed.verify(authorization.authority_public_key()).ok())
-        .map(|credential| TravelCredentialStatus {
-            credential_id: credential.credential_id,
-            travel_id: credential.travel_id,
-            not_after_unix_secs: credential.not_after_unix_secs,
-            revoked: snapshot
-                .revocations
-                .iter()
-                .any(|item| item.credential_id == credential.credential_id),
-            active: authorization
-                .verified()
-                .is_active(credential.credential_id, now),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1584,45 +1363,26 @@ mod tests {
         let now = Instant::now();
         let first_session = Uuid::new_v4();
         let later_session = Uuid::new_v4();
-        let credential_id = Uuid::new_v4();
         let mut registry = TravelSessionRegistry::default();
 
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    first_session,
-                    Some(Uuid::new_v4()),
-                    now
-                )
+                .authorize("travel-1", first_session, Some(Uuid::new_v4()), now)
                 .is_ok()
         );
         assert!(
             registry
-                .authorize(credential_id, "travel-1", first_session, None, now)
+                .authorize("travel-1", first_session, None, now)
                 .is_ok()
         );
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    first_session,
-                    Some(Uuid::new_v4()),
-                    now
-                )
+                .authorize("travel-1", first_session, Some(Uuid::new_v4()), now)
                 .is_ok()
         );
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    later_session,
-                    Some(Uuid::new_v4()),
-                    now
-                )
+                .authorize("travel-1", later_session, Some(Uuid::new_v4()), now)
                 .is_err()
         );
     }
@@ -1630,24 +1390,16 @@ mod tests {
     #[test]
     fn expired_travel_session_allows_a_new_process_to_login() {
         let now = Instant::now();
-        let credential_id = Uuid::new_v4();
         let mut registry = TravelSessionRegistry::default();
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    Uuid::new_v4(),
-                    Some(Uuid::new_v4()),
-                    now
-                )
+                .authorize("travel-1", Uuid::new_v4(), Some(Uuid::new_v4()), now)
                 .is_ok()
         );
 
         assert!(
             registry
                 .authorize(
-                    credential_id,
                     "travel-1",
                     Uuid::new_v4(),
                     Some(Uuid::new_v4()),
@@ -1660,37 +1412,28 @@ mod tests {
     #[test]
     fn route_connection_cannot_create_a_travel_login() {
         let mut registry = TravelSessionRegistry::default();
-        let credential_id = Uuid::new_v4();
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    Uuid::new_v4(),
-                    None,
-                    Instant::now()
-                )
+                .authorize("travel-1", Uuid::new_v4(), None, Instant::now())
                 .is_err()
         );
     }
 
     #[test]
-    fn revocation_immediately_releases_the_login_slot() {
+    fn session_registry_is_keyed_by_travel_identity_not_one_grant() {
         let now = Instant::now();
-        let credential_id = Uuid::new_v4();
         let mut registry = TravelSessionRegistry::default();
+        let session_id = Uuid::new_v4();
         assert!(
             registry
-                .authorize(
-                    credential_id,
-                    "travel-1",
-                    Uuid::new_v4(),
-                    Some(Uuid::new_v4()),
-                    now,
-                )
+                .authorize("travel-1", session_id, Some(Uuid::new_v4()), now,)
                 .is_ok()
         );
-        registry.revoke(credential_id);
-        assert!(registry.sessions.is_empty());
+        assert!(
+            registry
+                .authorize("travel-1", session_id, None, now)
+                .is_ok()
+        );
+        assert_eq!(registry.sessions.len(), 1);
     }
 }

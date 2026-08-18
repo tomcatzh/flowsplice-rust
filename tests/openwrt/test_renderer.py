@@ -24,16 +24,17 @@ config_get() {
 		server.cert) resolved='/etc/flowsplice/server.crt' ;;
 		server.key) resolved='/etc/flowsplice/server.key' ;;
 		server.management_ca) resolved='/etc/flowsplice/management-ca.crt' ;;
-		server.travel_authority_public_key) resolved='04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
 		server.travel_credentials) resolved='/etc/flowsplice/credentials.json' ;;
 		server.travel_revocations) resolved='/etc/flowsplice/revocations.json' ;;
-		server.admin_socket) resolved='/var/run/flowsplice/server-admin.sock' ;;
-		server.travel_valid_days) resolved='365' ;;
 		server.handshake_timeout_secs) resolved='10' ;;
 		server.work_ttl_secs) resolved='15' ;;
 		server.max_pending_work) resolved='256' ;;
 		home_1.id) resolved='home-1' ;;
 		home_2.id) resolved='home-2' ;;
+		authority_1.kind) resolved='home' ;;
+		authority_1.id) resolved='home-1-authority' ;;
+		authority_1.home_id) resolved='home-1' ;;
+		authority_1.public_key) resolved='04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
 		relay_1.id) resolved='relay-1' ;;
 		relay_1.management_addr) resolved='relay-1.example:8443' ;;
 		relay_1.server_name) resolved='relay-1.example' ;;
@@ -73,6 +74,9 @@ config_foreach() {
 		relay_endpoint)
 			"$callback" relay_1
 			"$callback" relay_2
+			;;
+		travel_authority)
+			"$callback" authority_1
 			;;
 	esac
 }
@@ -117,6 +121,7 @@ class RendererTest(unittest.TestCase):
             ],
         )
         self.assertEqual([relay["id"] for relay in config["relays"]], ["relay-1", "relay-2"])
+        self.assertEqual(config["travel_authorities"][0]["home_id"], "home-1")
 
     def test_server_render_fails_without_a_home(self) -> None:
         result = self.run_renderer(no_homes=True)

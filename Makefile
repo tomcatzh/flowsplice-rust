@@ -2,6 +2,7 @@
 
 web:
 	cd travelagent/web && npm ci && npm run build
+	cd homeagent/web && npm ci && npm run build
 
 fmt:
 	cargo fmt --all

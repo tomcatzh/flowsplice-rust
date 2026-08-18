@@ -90,9 +90,7 @@ class IpkBuilderTest(unittest.TestCase):
                 self.assertIn("./etc/init.d/flowsplice", names)
                 self.assertIn("./www/luci-static/resources/view/flowsplice.js", names)
                 self.assertIn("./usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo", names)
-                self.assertIn("./usr/libexec/flowsplice/admin", names)
                 self.assertEqual(data.getmember("./etc/init.d/flowsplice").mode, 0o755)
-                self.assertEqual(data.getmember("./usr/libexec/flowsplice/admin").mode, 0o755)
                 self.assertEqual(data.getmember("./etc/config/flowsplice").mode, 0o644)
                 packaged_config = open_member(data, "./etc/config/flowsplice").decode()
                 self.assertIn(
@@ -103,6 +101,7 @@ class IpkBuilderTest(unittest.TestCase):
                     "option travel_credentials '/etc/flowsplice/travel-credentials.json'",
                     packaged_config,
                 )
+                self.assertNotIn("option admin_socket", packaged_config)
                 self.assertGreater(
                     len(open_member(data, "./usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo")),
                     100,

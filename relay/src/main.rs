@@ -14,8 +14,9 @@ use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
     authorization::{
-        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization, load_json,
-        store_json_atomic, unix_time_secs, validate_authority_public_key,
+        AuthorizationCache, TravelAuthorizationSnapshot, TrustedTravelAuthority,
+        VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
+        validate_trusted_authorities,
     },
     config::load_toml,
     frame::{JsonFrameReader, write_json},
@@ -59,7 +60,7 @@ struct Config {
     management_ca: PathBuf,
     #[serde(default)]
     server_spki_pins: Vec<String>,
-    travel_authority_public_key: String,
+    travel_authorities: Vec<TrustedTravelAuthority>,
     travel_authorization_cache: PathBuf,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
@@ -195,7 +196,7 @@ fn validate_config(config: &Config) -> Result<()> {
         bail!("Relay timeout and pending-route limits must be positive");
     }
     validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_authority_public_key(&config.travel_authority_public_key)?;
+    validate_trusted_authorities(&config.travel_authorities)?;
     if config.travel_authorization_cache.exists() {
         let _: AuthorizationCache = load_json(&config.travel_authorization_cache)?;
     }
@@ -236,18 +237,7 @@ async fn run_management(config: Config, state: Arc<State>) -> Result<()> {
                     Role::Travel => {
                         require_peer(&identity, Role::Travel, None, &[])?;
                         let authorization_rx = state.authorization_tx.subscribe();
-                        let (credential_id, not_after_unix_secs) =
-                            authorize_management_identity(&identity, &authorization_rx)?;
-                        handle_travel(
-                            stream,
-                            identity.id,
-                            credential_id,
-                            not_after_unix_secs,
-                            authorization_rx,
-                            &config,
-                            state,
-                        )
-                        .await
+                        handle_travel(stream, identity, authorization_rx, &config, state).await
                     }
                     _ => bail!("unsupported management peer role"),
                 }
@@ -392,13 +382,13 @@ async fn handle_server(
 #[allow(clippy::too_many_lines)]
 async fn handle_travel(
     stream: TlsStream<TcpStream>,
-    travel_id: String,
-    credential_id: Uuid,
-    not_after_unix_secs: u64,
+    identity: PeerIdentity,
     mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
     config: &Config,
     state: Arc<State>,
 ) -> Result<()> {
+    let travel_id = identity.id.clone();
+    let mut session_credential_id = authorize_management_identity(&identity, &authorization_rx)?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let (travel_session_id, purpose) = match reader
@@ -414,7 +404,7 @@ async fn handle_travel(
     };
     let lease_id = (purpose == TravelConnectionPurpose::Catalog).then(Uuid::new_v4);
     if let Err(error) = authorize_travel_session(
-        credential_id,
+        session_credential_id,
         &travel_id,
         travel_session_id,
         lease_id,
@@ -438,7 +428,6 @@ async fn handle_travel(
         &mut writer,
         &ControlMessage::TravelHelloAccepted {
             relay_id: config.id.clone(),
-            credential_id,
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -468,7 +457,8 @@ async fn handle_travel(
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    let initial_catalog = catalog_rx.borrow().clone();
+    let initial_catalog =
+        authorized_catalog(&catalog_rx.borrow().clone(), &identity, &authorization_rx)?;
     write_json(
         &mut writer,
         &ControlMessage::Catalog {
@@ -485,16 +475,19 @@ async fn handle_travel(
             message = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match message? {
-                    ControlMessage::RouteRequest {
+                    ControlMessage::TravelRouteRequest {
                         request_id,
                         travel_id: declared_id,
                         travel_session_id: declared_session,
-                        credential_id: declared_credential,
                         home_id,
                     } if purpose == TravelConnectionPurpose::Route
                         && declared_id == travel_id
-                        && declared_session == travel_session_id
-                        && declared_credential == credential_id => {
+                        && declared_session == travel_session_id => {
+                        let credential_id = authorize_management_for_home(
+                            &identity,
+                            &authorization_rx,
+                            &home_id,
+                        )?;
                         handle_travel_route(
                             TravelRouteContext {
                                 request: request_id,
@@ -524,6 +517,7 @@ async fn handle_travel(
             changed = catalog_rx.changed() => {
                 changed.map_err(|_| anyhow!("catalog publisher closed"))?;
                 let catalog = catalog_rx.borrow_and_update().clone();
+                let catalog = authorized_catalog(&catalog, &identity, &authorization_rx)?;
                 write_json(
                     &mut writer,
                     &ControlMessage::Catalog {
@@ -545,18 +539,62 @@ async fn handle_travel(
             }
             changed = authorization_rx.changed() => {
                 changed.map_err(|_| anyhow!("Travel authorization publisher closed"))?;
-                ensure_credential_active(&authorization_rx, credential_id)?;
-            }
-            () = sleep_until_unix(not_after_unix_secs) => {
-                bail!("Travel credential expired");
+                let catalog = catalog_rx.borrow().clone();
+                let selected_credential =
+                    match authorize_management_identity(&identity, &authorization_rx) {
+                        Ok(credential_id) => credential_id,
+                        Err(error) => {
+                            // Publish the effective empty view before closing a session that lost
+                            // its final grant. Otherwise Travel retains a stale, unusable catalog.
+                            write_json(
+                                &mut writer,
+                                &ControlMessage::Catalog {
+                                    catalog: Catalog {
+                                        generation: catalog.generation,
+                                        homes: Vec::new(),
+                                    },
+                                },
+                                CONTROL_FRAME_LIMIT,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    };
+                session_credential_id = selected_credential;
+                if let Some(lease_id) = lease_id {
+                    authorize_travel_session(
+                        session_credential_id,
+                        &travel_id,
+                        travel_session_id,
+                        Some(lease_id),
+                        config,
+                        &state,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                }
+                let catalog = authorized_catalog(&catalog, &identity, &authorization_rx)?;
+                write_json(
+                    &mut writer,
+                    &ControlMessage::Catalog { catalog },
+                    CONTROL_FRAME_LIMIT,
+                )
+                .await?;
             }
             _ = liveness.tick() => {
                 if last_received.elapsed() > Duration::from_secs(30) {
                     bail!("travel management heartbeat timed out");
                 }
                 if let Some(lease_id) = lease_id {
+                    // Credentials can expire without producing a new authorization snapshot.
+                    // Re-select on every lease renewal so another active grant for the same
+                    // Travel identity can take over without forcing a login interruption.
+                    session_credential_id = authorize_management_identity(
+                        &identity,
+                        &authorization_rx,
+                    )?;
                     authorize_travel_session(
-                        credential_id,
+                        session_credential_id,
                         &travel_id,
                         travel_session_id,
                         Some(lease_id),
@@ -807,19 +845,71 @@ async fn cleanup_routes(state: Arc<State>) -> Result<()> {
 fn authorize_management_identity(
     identity: &PeerIdentity,
     authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
-) -> Result<(Uuid, u64)> {
+) -> Result<Uuid> {
     let now = unix_time_secs()?;
     let authorization = authorization_rx
         .borrow()
         .clone()
         .ok_or_else(|| anyhow!("Travel authorization has not synchronized from Server"))?;
-    let credential = authorization.authorize_management(identity, now)?;
-    Ok((
-        credential.credential_id,
-        credential
-            .not_after_unix_secs
-            .min(identity.not_after_unix_secs),
-    ))
+    authorization
+        .authorize_management_all(identity, now)?
+        .into_iter()
+        .max_by_key(|credential| credential.not_after_unix_secs)
+        .map(|credential| credential.credential_id)
+        .ok_or_else(|| anyhow!("Travel identity has no active credential"))
+}
+
+fn authorize_management_for_home(
+    identity: &PeerIdentity,
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+    home_id: &str,
+) -> Result<Uuid> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("Travel authorization has not synchronized from Server"))?;
+    Ok(authorization
+        .authorize_management_for_home(identity, home_id, now)?
+        .credential_id)
+}
+
+fn authorized_catalog(
+    catalog: &Catalog,
+    identity: &PeerIdentity,
+    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
+) -> Result<Catalog> {
+    let now = unix_time_secs()?;
+    let authorization = authorization_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("Travel authorization has not synchronized from Server"))?;
+    let credentials = authorization.authorize_management_all(identity, now)?;
+    let homes = catalog
+        .homes
+        .iter()
+        .filter_map(|home| {
+            let services = home
+                .services
+                .iter()
+                .filter(|service| {
+                    credentials.iter().any(|credential| {
+                        credential.allows_service(&home.home_id, &service.id, service.protocol)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!services.is_empty()).then(|| flowsplice_core::protocol::HomeCatalog {
+                home_id: home.home_id.clone(),
+                home_alias: home.home_alias.clone(),
+                services,
+            })
+        })
+        .collect();
+    Ok(Catalog {
+        generation: catalog.generation,
+        homes,
+    })
 }
 
 fn ensure_credential_active(
@@ -869,8 +959,7 @@ async fn apply_authorization_snapshot(
     config: &Config,
     snapshot: TravelAuthorizationSnapshot,
 ) -> Result<u64> {
-    let authorization =
-        VerifiedAuthorization::verify(&snapshot, &config.travel_authority_public_key)?;
+    let authorization = VerifiedAuthorization::verify(&snapshot, &config.travel_authorities)?;
     let mut cache = state.authorization_cache.lock().await;
     let proposed_cache = cache.accept(&authorization)?;
     if proposed_cache != *cache {

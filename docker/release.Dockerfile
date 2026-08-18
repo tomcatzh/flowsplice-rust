@@ -1,8 +1,16 @@
-FROM node:24-alpine AS web
+FROM node:24-alpine AS travel-web
 WORKDIR /src/travelagent/web
 COPY travelagent/web/package.json travelagent/web/package-lock.json ./
 RUN npm ci
 COPY travelagent/web/ ./
+COPY tools/precompress.mjs /src/tools/precompress.mjs
+RUN npm run build
+
+FROM node:24-alpine AS home-web
+WORKDIR /src/homeagent/web
+COPY homeagent/web/package.json homeagent/web/package-lock.json ./
+RUN npm ci
+COPY homeagent/web/ ./
 COPY tools/precompress.mjs /src/tools/precompress.mjs
 RUN npm run build
 
@@ -17,23 +25,21 @@ COPY server/ server/
 COPY relay/ relay/
 COPY homeagent/ homeagent/
 COPY travelagent/ travelagent/
-COPY issuer/ issuer/
 COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
-COPY --from=web /src/travelagent/web/dist/ travelagent/web/dist/
+COPY --from=travel-web /src/travelagent/web/dist/ travelagent/web/dist/
+COPY --from=home-web /src/homeagent/web/dist/ homeagent/web/dist/
 RUN cargo build --locked --release --target "${RUST_TARGET}" \
     -p flowsplice-server \
     -p flowsplice-relay \
     -p flowsplice-homeagent \
     -p flowsplice-travelagent \
-    -p flowsplice-issuer \
     -p flowsplice-foobar
 RUN mkdir /out && \
     cp "target/${RUST_TARGET}/release/flowsplice-server" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-relay" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-homeagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-travelagent" /out/ && \
-    cp "target/${RUST_TARGET}/release/flowsplice-issuer" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-foobar" /out/ && \
     file /out/*
 

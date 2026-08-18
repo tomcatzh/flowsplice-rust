@@ -67,9 +67,15 @@ issue home-management home home-1 home-management.flowsplice clientAuth manageme
 issue home-business home home-1 home-1.flowsplice serverAuth business-ca
 issue home2-management home home-2 home2-management.flowsplice clientAuth management-ca
 issue home2-business home home-2 home-2.flowsplice serverAuth business-ca
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-  -aes-256-cbc -pass "file:${password_file}" \
-  -out "${offline_dir}/travel-authority.key" >/dev/null 2>&1
+for authority in home1-authority home2-authority global-authority; do
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    -aes-256-cbc -pass "file:${password_file}" \
+    -out "${offline_dir}/${authority}.key" >/dev/null 2>&1
+  python3 "${script_dir}/authority-public-key.py" \
+    --authority-key "${offline_dir}/${authority}.key" \
+    --password-file "${password_file}" \
+    --output "${authorization_dir}/${authority}-public-key.txt"
+done
 
 find "${cert_dir}" -maxdepth 1 \( -name '*.csr' -o -name '*.ext' -o -name '*.srl' \) -delete
 chmod 600 "${cert_dir}"/*.key
@@ -90,11 +96,9 @@ home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
 home2_management_pin="$(spki_pin home2-management)"
 home2_business_pin="$(spki_pin home2-business)"
-python3 "${script_dir}/authority-public-key.py" \
-  --authority-key "${offline_dir}/travel-authority.key" \
-  --password-file "${password_file}" \
-  --output "${authorization_dir}/authority-public-key.txt"
-travel_authority_public_key="$(tr -d '\n' <"${authorization_dir}/authority-public-key.txt")"
+home1_authority_public_key="$(tr -d '\n' <"${authorization_dir}/home1-authority-public-key.txt")"
+home2_authority_public_key="$(tr -d '\n' <"${authorization_dir}/home2-authority-public-key.txt")"
+global_authority_public_key="$(tr -d '\n' <"${authorization_dir}/global-authority-public-key.txt")"
 printf '{"credentials":[]}\n' >"${authorization_dir}/credentials.json"
 
 docker run --rm \
@@ -104,7 +108,6 @@ docker run --rm \
   flowsplice-e2e:local \
   /usr/local/bin/flowsplice-travelagent enroll-init \
   --travel-id travel-1 \
-  --authority-public-key "${travel_authority_public_key}" \
   --output-dir /generated/travel \
   --test-password-file /generated/offline/test-password.txt
 cp "${password_file}" "${travel_dir}/test-password.txt"
@@ -121,7 +124,9 @@ for template in "${script_dir}"/config/*.toml; do
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
     -e "s/__HOME2_MANAGEMENT_PIN__/${home2_management_pin}/g" \
     -e "s/__HOME2_BUSINESS_PIN__/${home2_business_pin}/g" \
-    -e "s/__TRAVEL_AUTHORITY_PUBLIC_KEY__/${travel_authority_public_key}/g" \
+    -e "s/__HOME1_AUTHORITY_PUBLIC_KEY__/${home1_authority_public_key}/g" \
+    -e "s/__HOME2_AUTHORITY_PUBLIC_KEY__/${home2_authority_public_key}/g" \
+    -e "s/__GLOBAL_AUTHORITY_PUBLIC_KEY__/${global_authority_public_key}/g" \
     "${template}" >"${output}"
 done
 printf 'Generated E2E certificates in %s\n' "${cert_dir}"

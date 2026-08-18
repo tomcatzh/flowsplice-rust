@@ -7,7 +7,6 @@ members = [
     "relay",
     "homeagent",
     "travelagent",
-    "issuer",
     "foobar",
     "tests/fixtures/echo",
 ]

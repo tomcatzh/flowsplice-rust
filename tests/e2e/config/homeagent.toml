@@ -11,7 +11,6 @@ business_cert = "/certs/home-business.crt"
 business_key = "/certs/home-business.key"
 business_ca = "/certs/business-ca.crt"
 server_spki_pins = ["__SERVER_PIN__"]
-travel_authority_public_key = "__TRAVEL_AUTHORITY_PUBLIC_KEY__"
 travel_authorization_cache = "/state/home-authorization-cache.json"
 handshake_timeout_secs = 10
 udp_idle_secs = 10
@@ -19,6 +18,44 @@ carrier_heartbeat_secs = 2
 carrier_timeout_secs = 15
 flow_detach_timeout_secs = 60
 max_unacked_bytes = 1048576
+
+[[travel_authorities]]
+kind = "home"
+id = "home-1-authority"
+home_id = "home-1"
+public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
+
+[[travel_authorities]]
+kind = "home"
+id = "home-2-authority"
+home_id = "home-2"
+public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
+
+[[travel_authorities]]
+kind = "global"
+id = "operator-global-authority"
+home_id = "home-1"
+public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"
+
+[issuer]
+listen = "0.0.0.0:9081"
+management_ca_cert = "/certs/management-ca.crt"
+management_ca_key = "/issuer/management-ca.key"
+business_ca_cert = "/certs/business-ca.crt"
+business_ca_key = "/issuer/business-ca.key"
+default_valid_days = 365
+allow_remote_listen = true
+admin_token = "flowsplice-e2e-home-issuer-administrator-token"
+
+[issuer.home_authority]
+id = "home-1-authority"
+public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
+private_key = "/issuer/home1-authority.key"
+
+[issuer.global_authority]
+id = "operator-global-authority"
+public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"
+private_key = "/issuer/global-authority.key"
 
 [[services]]
 id = "tcp-echo"

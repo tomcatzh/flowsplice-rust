@@ -12,14 +12,7 @@
 				"/etc/init.d/flowsplice start": [ "exec" ],
 				"/etc/init.d/flowsplice stop": [ "exec" ],
 				"/etc/init.d/flowsplice restart": [ "exec" ],
-				"/etc/init.d/flowsplice validate": [ "exec" ],
-				"/usr/libexec/flowsplice/admin status": [ "exec" ],
-				"/usr/libexec/flowsplice/admin prepare": [ "exec" ],
-				"/usr/libexec/flowsplice/admin import": [ "exec" ],
-				"/usr/libexec/flowsplice/admin revoke": [ "exec" ],
-				"/var/run/flowsplice/luci-enrollment-request.json": [ "write" ],
-				"/var/run/flowsplice/luci-enrollment-response.json": [ "write" ],
-				"/var/run/flowsplice/luci-revocation.json": [ "write" ]
+				"/etc/init.d/flowsplice validate": [ "exec" ]
 			},
 			"uci": [ "flowsplice" ]
 		}

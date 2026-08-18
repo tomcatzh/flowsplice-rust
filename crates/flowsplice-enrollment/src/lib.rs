@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
 use flowsplice_core::authorization::{
-    SignedTravelCredential, TravelCredential, validate_authority_public_key,
+    SignedTravelCredential, TravelCredential, TravelCredentialScope,
 };
 use flowsplice_core::{
     protocol::Role,
@@ -59,6 +59,8 @@ pub struct TravelEnrollmentRequest {
 pub struct TravelEnrollmentApproval {
     pub version: u32,
     pub credential_id: Uuid,
+    pub authority_id: String,
+    pub scope: TravelCredentialScope,
     pub request: TravelEnrollmentRequest,
     pub not_before_unix_secs: u64,
     pub not_after_unix_secs: u64,
@@ -69,6 +71,7 @@ pub struct TravelEnrollmentApproval {
 pub struct TravelEnrollmentResponse {
     pub version: u32,
     pub approval: TravelEnrollmentApproval,
+    pub authority_public_key: String,
     pub management_certificate_pem: String,
     pub business_certificate_pem: String,
     pub signed_credential: SignedTravelCredential,
@@ -80,7 +83,6 @@ pub struct EnrollmentState {
     pub version: u32,
     pub request_id: Uuid,
     pub travel_id: String,
-    pub authority_public_key: String,
     pub management_spki_sha256: String,
     pub business_spki_sha256: String,
 }
@@ -98,13 +100,11 @@ pub struct ParsedEnrollmentRequest {
 /// generation and durable file creation.
 pub fn create_enrollment_request(
     travel_id: &str,
-    authority_public_key: &str,
     password: &[u8],
     output_dir: &Path,
     now: u64,
 ) -> Result<TravelEnrollmentRequest> {
     validate_travel_id(travel_id)?;
-    validate_authority_public_key(authority_public_key)?;
     if output_dir.exists() {
         bail!(
             "enrollment output path already exists: {}",
@@ -133,7 +133,6 @@ pub fn create_enrollment_request(
         version: ENROLLMENT_VERSION,
         request_id: request.request_id,
         travel_id: travel_id.to_owned(),
-        authority_public_key: authority_public_key.to_ascii_lowercase(),
         management_spki_sha256: spki_pin(&management.key_pair),
         business_spki_sha256: spki_pin(&business.key_pair),
     };
@@ -193,20 +192,28 @@ pub fn parse_enrollment_request(
 /// Returns an error when the request or validity is invalid.
 pub fn prepare_enrollment_approval(
     request: TravelEnrollmentRequest,
-    valid_days: u32,
+    valid_for_secs: u64,
+    authority_id: String,
+    scope: TravelCredentialScope,
     now: u64,
 ) -> Result<TravelEnrollmentApproval> {
     let _ = parse_enrollment_request(&request, now)?;
-    if valid_days == 0 || valid_days > MAX_VALID_DAYS {
-        bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
+    if authority_id.is_empty() {
+        bail!("Travel authority id must be non-empty");
+    }
+    let max_valid_secs = u64::from(MAX_VALID_DAYS) * 24 * 60 * 60;
+    if valid_for_secs == 0 || valid_for_secs > max_valid_secs {
+        bail!("Travel validity must be between 1 second and {MAX_VALID_DAYS} days");
     }
     Ok(TravelEnrollmentApproval {
         version: ENROLLMENT_VERSION,
         credential_id: Uuid::new_v4(),
+        authority_id,
+        scope,
         request,
         not_before_unix_secs: now.saturating_sub(300),
         not_after_unix_secs: now
-            .checked_add(u64::from(valid_days) * 24 * 60 * 60)
+            .checked_add(valid_for_secs)
             .ok_or_else(|| anyhow!("Travel validity overflow"))?,
     })
 }
@@ -219,10 +226,8 @@ pub fn prepare_enrollment_approval(
 /// public keys, or authorization signatures.
 pub fn validate_enrollment_response(
     response: &TravelEnrollmentResponse,
-    authority_public_key: &str,
     now: u64,
 ) -> Result<TravelCredential> {
-    validate_authority_public_key(authority_public_key)?;
     if response.version != ENROLLMENT_VERSION
         || response.approval.version != ENROLLMENT_VERSION
         || response.approval.credential_id.is_nil()
@@ -242,7 +247,12 @@ pub fn validate_enrollment_response(
         spki_pin(&parsed.management.public_key),
         spki_pin(&parsed.business.public_key),
     );
-    let actual = response.signed_credential.verify(authority_public_key)?;
+    if response.signed_credential.authority_id != response.approval.authority_id {
+        bail!("signed Travel credential has the wrong authority id");
+    }
+    let actual = response
+        .signed_credential
+        .verify_public_key(&response.authority_public_key)?;
     if actual != expected {
         bail!("signed Travel credential does not match the approved request");
     }
@@ -287,7 +297,7 @@ pub fn install_enrollment_response(
     {
         bail!("enrollment response does not match the local enrollment request");
     }
-    let credential = validate_enrollment_response(response, &state.authority_public_key, now)?;
+    let credential = validate_enrollment_response(response, now)?;
     let (management_key_path, business_key_path, management_cert_path, business_cert_path) =
         enrollment_paths(enrollment_directory);
     validate_local_key(
@@ -401,7 +411,10 @@ pub(crate) fn spki_pin(key: &impl PublicKeyData) -> String {
 }
 
 pub(crate) fn validate_approval(approval: &TravelEnrollmentApproval, now: u64) -> Result<()> {
-    if approval.version != ENROLLMENT_VERSION || approval.credential_id.is_nil() {
+    if approval.version != ENROLLMENT_VERSION
+        || approval.credential_id.is_nil()
+        || approval.authority_id.is_empty()
+    {
         bail!("unsupported or invalid enrollment approval");
     }
     let _ = parse_enrollment_request(&approval.request, now)?;
@@ -427,9 +440,11 @@ pub(crate) fn expected_credential(
 ) -> TravelCredential {
     TravelCredential {
         credential_id: approval.credential_id,
+        authority_id: approval.authority_id.clone(),
         travel_id: approval.request.travel_id.clone(),
         management_spki_sha256,
         business_spki_sha256,
+        scope: approval.scope.clone(),
         not_before_unix_secs: approval.not_before_unix_secs,
         not_after_unix_secs: approval.not_after_unix_secs,
     }
@@ -557,21 +572,6 @@ pub fn enrollment_paths(directory: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::{rand::SystemRandom, signature};
-    use signature::KeyPair as _;
-
-    fn authority_public_key() -> Result<String> {
-        let rng = SystemRandom::new();
-        let key = signature::EcdsaKeyPair::from_pkcs8(
-            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            signature::EcdsaKeyPair::generate_pkcs8(
-                &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-                &rng,
-            )?
-            .as_ref(),
-        )?;
-        Ok(hex::encode(key.public_key().as_ref()))
-    }
 
     #[test]
     fn request_has_distinct_proven_p256_keys_and_default_one_year_approval() -> Result<()> {
@@ -579,7 +579,6 @@ mod tests {
         let directory = temporary_directory.path().join("enrollment");
         let request = create_enrollment_request(
             "macbook-travel",
-            &authority_public_key()?,
             b"long test password",
             &directory,
             1_800_000_000,
@@ -589,12 +588,53 @@ mod tests {
             parsed.management.public_key.subject_public_key_info(),
             parsed.business.public_key.subject_public_key_info()
         );
-        let approval = prepare_enrollment_approval(request, DEFAULT_VALID_DAYS, 1_800_000_001)?;
+        let approval = prepare_enrollment_approval(
+            request,
+            u64::from(DEFAULT_VALID_DAYS) * 24 * 60 * 60,
+            "home-1-authority".to_owned(),
+            TravelCredentialScope::Home {
+                home_id: "home-1".to_owned(),
+            },
+            1_800_000_001,
+        )?;
         assert_eq!(
             approval.not_after_unix_secs - 1_800_000_001,
             365 * 24 * 60 * 60
         );
-        assert!(prepare_enrollment_approval(approval.request, 0, 1_800_000_001).is_err());
+        assert!(
+            prepare_enrollment_approval(
+                approval.request,
+                0,
+                "home-1-authority".to_owned(),
+                TravelCredentialScope::Home {
+                    home_id: "home-1".to_owned(),
+                },
+                1_800_000_001,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approval_accepts_an_exact_thirty_minute_test_window() -> Result<()> {
+        let temporary_directory = tempfile::tempdir()?;
+        let request = create_enrollment_request(
+            "short-lived-travel",
+            b"long test password",
+            &temporary_directory.path().join("enrollment"),
+            1_800_000_000,
+        )?;
+        let approval = prepare_enrollment_approval(
+            request,
+            30 * 60,
+            "home-1-authority".to_owned(),
+            TravelCredentialScope::Home {
+                home_id: "home-1".to_owned(),
+            },
+            1_800_000_001,
+        )?;
+        assert_eq!(approval.not_after_unix_secs - 1_800_000_001, 30 * 60);
         Ok(())
     }
 }

@@ -22,7 +22,7 @@ pub struct ProtectedKey<'a> {
     pub allow_unencrypted: bool,
 }
 
-pub struct OfflineIssuerMaterial<'a> {
+pub struct IssuerMaterial<'a> {
     pub management_ca_certificate: &'a Path,
     pub management_ca_key: ProtectedKey<'a>,
     pub business_ca_certificate: &'a Path,
@@ -42,7 +42,7 @@ pub struct OfflineIssuerMaterial<'a> {
 /// an unexpected authorization key, or signing failures.
 pub fn issue_enrollment(
     approval: TravelEnrollmentApproval,
-    material: &OfflineIssuerMaterial<'_>,
+    material: &IssuerMaterial<'_>,
     now: u64,
 ) -> Result<TravelEnrollmentResponse> {
     validate_approval(&approval, now)?;
@@ -101,6 +101,7 @@ pub fn issue_enrollment(
         .sign(&SystemRandom::new(), &payload)
         .map_err(|_| anyhow!("failed to sign Travel authorization credential"))?;
     let signed_credential = SignedTravelCredential {
+        authority_id: credential.authority_id.clone(),
         payload_hex: hex::encode(payload),
         signature_hex: hex::encode(signature.as_ref()),
     };
@@ -108,6 +109,7 @@ pub fn issue_enrollment(
     Ok(TravelEnrollmentResponse {
         version: crate::ENROLLMENT_VERSION,
         approval,
+        authority_public_key: actual_public_key,
         management_certificate_pem: management_certificate.pem(),
         business_certificate_pem: business_certificate.pem(),
         signed_credential,
@@ -160,6 +162,7 @@ mod tests {
         BUSINESS_CERT_FILE, DEFAULT_VALID_DAYS, MANAGEMENT_CERT_FILE, create_enrollment_request,
         install_enrollment_response, prepare_enrollment_approval, validate_enrollment_response,
     };
+    use flowsplice_core::authorization::TravelCredentialScope;
 
     struct TestCa {
         certificate: PathBuf,
@@ -204,13 +207,20 @@ mod tests {
         let now = 1_800_000_000;
         let request = create_enrollment_request(
             "travel-test",
-            &authority_public_key,
             b"correct horse battery staple",
             &enrollment_directory,
             now,
         )?;
-        let approval = prepare_enrollment_approval(request, DEFAULT_VALID_DAYS, now + 1)?;
-        let material = OfflineIssuerMaterial {
+        let approval = prepare_enrollment_approval(
+            request,
+            u64::from(DEFAULT_VALID_DAYS) * 24 * 60 * 60,
+            "home-1-authority".to_owned(),
+            TravelCredentialScope::Home {
+                home_id: "home-1".to_owned(),
+            },
+            now + 1,
+        )?;
+        let material = IssuerMaterial {
             management_ca_certificate: &management_ca.certificate,
             management_ca_key: ProtectedKey {
                 path: &management_ca.key,
@@ -231,7 +241,7 @@ mod tests {
             expected_travel_authority_public_key: &authority_public_key,
         };
         let response = issue_enrollment(approval, &material, now + 2)?;
-        let expected = validate_enrollment_response(&response, &authority_public_key, now + 2)?;
+        let expected = validate_enrollment_response(&response, now + 2)?;
         let installed = install_enrollment_response(
             &enrollment_directory,
             &response,
@@ -270,7 +280,7 @@ mod tests {
             .signed_credential
             .signature_hex
             .replace_range(0..2, "00");
-        assert!(validate_enrollment_response(&tampered, &authority_public_key, now + 2).is_err());
+        assert!(validate_enrollment_response(&tampered, now + 2).is_err());
         Ok(())
     }
 }

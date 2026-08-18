@@ -5,7 +5,6 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 sh -n "${repo_root}/openwrt/root/etc/init.d/flowsplice"
 sh -n "${repo_root}/openwrt/root/usr/libexec/flowsplice/render-config"
-sh -n "${repo_root}/openwrt/root/usr/libexec/flowsplice/admin"
 sh -n "${repo_root}/openwrt/control/postinst"
 sh -n "${repo_root}/openwrt/control/prerm"
 python3 -m json.tool "${repo_root}/openwrt/root/usr/share/luci/menu.d/luci-app-flowsplice.json" >/dev/null
