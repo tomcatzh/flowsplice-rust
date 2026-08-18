@@ -7,6 +7,10 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 > [!WARNING]
 > FlowSplice is under active development and is not yet generally available. Non-GA releases may change configuration, protocols, persisted state, and deployment artifacts without backward compatibility.
 
+## How it works
+
+![How FlowSplice works](docs/flowsplice-how-it-works.en.svg)
+
 ## Components
 
 | Package | Role |
