@@ -1,0 +1,299 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+  <title id="title">FlowSplice 工作原理</title>
+  <desc id="desc">Travel Agent 与 Home Agent 都主动向 VPS Relay 和家庭网络内的本地 Relay 发起连接。橙色单向箭头表示连接建立，蓝绿色实线表示竞速胜出后的双向 Business Flow。灰色虚线表示 Server 分别经过两个 Relay 向 Travel 提供控制面。Server 不经过业务流量。</desc>
+
+  <defs>
+    <linearGradient id="pageBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#F4F7F8"/>
+    </linearGradient>
+    <linearGradient id="travelBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#EEF4FF"/>
+      <stop offset="1" stop-color="#F8FAFF"/>
+    </linearGradient>
+    <linearGradient id="relayBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F4F1FF"/>
+      <stop offset="1" stop-color="#FBFAFF"/>
+    </linearGradient>
+    <linearGradient id="homeBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ECFBF7"/>
+      <stop offset="1" stop-color="#F8FCFA"/>
+    </linearGradient>
+    <linearGradient id="securePath" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3177F6"/>
+      <stop offset="0.55" stop-color="#5369E8"/>
+      <stop offset="1" stop-color="#00A88F"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#102B3E" flood-opacity="0.09"/>
+    </filter>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#102B3E" flood-opacity="0.08"/>
+    </filter>
+    <pattern id="dotPattern" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.25" fill="#AEBBC5" opacity="0.24"/>
+    </pattern>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3.2" markerHeight="3.2" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4B6FE8"/>
+    </marker>
+    <marker id="arrowTeal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3.2" markerHeight="3.2" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#00A88F"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="2.8" markerHeight="2.8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7B8B99"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3.2" markerHeight="3.2" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#E8792D"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #173042; }
+      .label { font-size: 18px; font-weight: 600; }
+      .small { font-size: 15px; fill: #607181; }
+      .tiny { font-size: 13px; fill: #6B7C89; }
+      .zone-title { font-size: 22px; font-weight: 700; }
+      .node-title { font-size: 20px; font-weight: 700; }
+      .step-title { font-size: 18px; font-weight: 700; }
+      .step-copy { font-size: 14px; fill: #5D6F7D; }
+      .tag { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1040" fill="url(#pageBg)"/>
+  <rect width="1600" height="1040" fill="url(#dotPattern)"/>
+
+  <!-- Header -->
+  <g>
+    <text x="64" y="78" font-size="42" font-weight="750" letter-spacing="-1">FlowSplice 如何工作</text>
+    <g transform="translate(1124 53)">
+      <rect width="412" height="56" rx="28" fill="#E3F7F2" stroke="#B7E8DD"/>
+      <circle cx="31" cy="28" r="16" fill="#00A88F"/>
+      <path d="M25 28v-4a6 6 0 0 1 12 0v4M23 28h16v11H23z" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="58" y="35" font-size="17" font-weight="700" fill="#126D61">业务明文只在 Travel 与 Home 出现</text>
+    </g>
+  </g>
+
+  <!-- End-to-end TLS bracket -->
+  <g>
+    <path d="M176 172 C176 149 194 142 217 142 H1388 C1411 142 1429 149 1429 172" fill="none" stroke="url(#securePath)" stroke-width="4" stroke-linecap="round"/>
+    <rect x="620" y="128" width="365" height="30" rx="15" fill="#F7F9FC"/>
+    <circle cx="646" cy="143" r="11" fill="#00A88F"/>
+    <path d="M642 143v-3a4 4 0 0 1 8 0v3M641 143h10v7h-10z" fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round"/>
+    <text x="665" y="149" font-size="15" font-weight="700" fill="#287166">端到端 Business mTLS：Relay 只见密文</text>
+  </g>
+
+  <!-- Three zones -->
+  <g filter="url(#shadow)">
+    <rect x="56" y="184" width="346" height="536" rx="28" fill="url(#travelBg)" stroke="#CEDCF7"/>
+    <rect x="468" y="184" width="286" height="536" rx="28" fill="url(#relayBg)" stroke="#DCD4F6"/>
+    <rect x="818" y="184" width="726" height="536" rx="28" fill="url(#homeBg)" stroke="#C5E6DC"/>
+  </g>
+
+  <!-- Travel zone -->
+  <g>
+    <circle cx="88" cy="224" r="17" fill="#3177F6"/>
+    <path d="M79 216h18v13H79zM76 233h24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="zone-title" x="116" y="232">Travel（旅行设备）</text>
+    <text class="small" x="84" y="263">把远端服务变成本机端口</text>
+
+    <g filter="url(#softShadow)">
+      <rect x="84" y="292" width="290" height="102" rx="18" fill="#FFFFFF" stroke="#DDE6F4"/>
+      <circle cx="119" cy="343" r="23" fill="#E8F0FF"/>
+      <path d="M108 334h22v16h-22zM105 354h28" fill="none" stroke="#3177F6" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="label" x="156" y="332">浏览器 / SSH / App</text>
+      <text class="small" x="156" y="359">只连接本机监听端口</text>
+      <text class="tiny" x="156" y="380">例如 127.0.0.1:8443</text>
+    </g>
+
+    <path d="M229 394 V421" fill="none" stroke="#3177F6" stroke-width="3" marker-end="url(#arrowBlue)"/>
+
+    <g filter="url(#softShadow)">
+      <rect x="84" y="428" width="290" height="218" rx="20" fill="#FFFFFF" stroke="#9FBDF7" stroke-width="1.5"/>
+      <rect x="84" y="428" width="290" height="52" rx="20" fill="#3177F6"/>
+      <rect x="84" y="460" width="290" height="20" fill="#3177F6"/>
+      <circle cx="113" cy="454" r="13" fill="#FFFFFF" opacity="0.18"/>
+      <path d="M107 454h12M113 448v12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+      <text x="137" y="462" font-size="20" font-weight="700" fill="#FFFFFF">Travel Agent</text>
+      <text class="small" x="108" y="515">① 读取 Home 的服务目录</text>
+      <text class="small" x="108" y="550">② 按 home_id 请求路由</text>
+      <text class="small" x="108" y="585">③ 向两个 Relay 同时建链</text>
+      <rect x="108" y="606" width="228" height="25" rx="12.5" fill="#E8F0FF"/>
+      <text class="tag" x="222" y="623" text-anchor="middle" fill="#2C65C9">映射：home-1 / photos / TCP</text>
+    </g>
+
+    <rect x="108" y="674" width="240" height="25" rx="12.5" fill="#DDEAFF"/>
+    <text class="tag" x="228" y="691" text-anchor="middle" fill="#2C65C9">本机应用无需感知远端网络</text>
+  </g>
+
+  <!-- Public VPS Relay zone -->
+  <g>
+    <circle cx="500" cy="224" r="17" fill="#7457D9"/>
+    <path d="M491 225h18M500 216l9 9-9 9" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="zone-title" x="528" y="232">公网路径</text>
+    <text class="small" x="496" y="263">候选 Carrier A</text>
+
+    <g filter="url(#softShadow)">
+      <rect x="498" y="304" width="226" height="218" rx="20" fill="#FFFFFF" stroke="#C8BBEF"/>
+      <circle cx="611" cy="352" r="30" fill="#F0ECFF"/>
+      <path d="M595 357h32c6 0 9-3 9-8 0-5-5-9-10-9-2-8-10-13-18-10-5 2-8 6-9 10-6 0-11 4-11 9 0 5 3 8 7 8z" fill="none" stroke="#7457D9" stroke-width="2.3" stroke-linejoin="round"/>
+      <text class="node-title" x="611" y="405" text-anchor="middle">VPS Relay</text>
+      <text class="small" x="611" y="431" text-anchor="middle">公网入口</text>
+      <rect x="522" y="455" width="178" height="27" rx="13.5" fill="#F0ECFF"/>
+      <text class="tag" x="611" y="473" text-anchor="middle" fill="#6045BF">HMAC 单次接入</text>
+      <rect x="522" y="489" width="178" height="27" rx="13.5" fill="#E7F7F4"/>
+      <text class="tag" x="611" y="507" text-anchor="middle" fill="#148271">只转发 TLS 密文</text>
+    </g>
+
+    <rect x="500" y="666" width="222" height="28" rx="14" fill="#ECE8FA"/>
+    <text class="tag" x="611" y="685" text-anchor="middle" fill="#6045BF">不持有 Business TLS 私钥</text>
+    <rect x="522" y="610" width="178" height="28" rx="14" fill="#E7F7F4"/>
+    <text class="tag" x="611" y="629" text-anchor="middle" fill="#147766">示意：本轮 Flow Winner</text>
+  </g>
+
+  <!-- Home zone -->
+  <g>
+    <circle cx="850" cy="224" r="17" fill="#00A88F"/>
+    <path d="M839 225l11-9 11 9v11h-22zM846 236v-7h8v7" fill="none" stroke="#FFFFFF" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="zone-title" x="878" y="232">Home（家庭网络）</text>
+    <text class="small" x="846" y="263">本地 Relay、控制面 Server、Home Agent 与真实服务都在家庭侧</text>
+
+    <g filter="url(#softShadow)">
+      <rect x="850" y="478" width="230" height="160" rx="20" fill="#FFFFFF" stroke="#C8BBEF"/>
+      <circle cx="886" cy="518" r="24" fill="#F0ECFF"/>
+      <path d="M874 524v-16l12-8 12 8v16M879 524v-10h14v10M871 524h30" fill="none" stroke="#7457D9" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="node-title" x="922" y="514">本地 Relay</text>
+      <text class="tiny" x="922" y="538">家庭网络 / OpenWrt</text>
+      <rect x="874" y="558" width="182" height="27" rx="13.5" fill="#F0ECFF"/>
+      <text class="tag" x="965" y="576" text-anchor="middle" fill="#6045BF">HMAC 单次接入</text>
+      <rect x="874" y="592" width="182" height="27" rx="13.5" fill="#E7F7F4"/>
+      <text class="tag" x="965" y="610" text-anchor="middle" fill="#148271">只转发 TLS 密文</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="1120" y="300" width="190" height="224" rx="20" fill="#FFFFFF" stroke="#B5DED4"/>
+      <circle cx="1154" cy="342" r="22" fill="#E3F7F2"/>
+      <path d="M1144 334h20v16h-20zM1149 339h2M1155 339h2M1161 339h2M1149 345h2M1155 345h2M1161 345h2" fill="none" stroke="#00A88F" stroke-width="1.9" stroke-linecap="round"/>
+      <text class="node-title" x="1186" y="338">Server</text>
+      <text class="tiny" x="1186" y="359">仅控制面</text>
+      <line x1="1144" y1="383" x2="1286" y2="383" stroke="#DCE9E5"/>
+      <text class="small" x="1144" y="414">• 服务目录与身份</text>
+      <text class="small" x="1144" y="446">• 按 home_id 协调路由</text>
+      <text class="small" x="1144" y="478">• 发布 Relay 目录</text>
+      <text class="tiny" x="1144" y="505">不转发业务数据</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="1330" y="300" width="186" height="224" rx="20" fill="#FFFFFF" stroke="#75CCBA" stroke-width="1.5"/>
+      <rect x="1330" y="300" width="186" height="52" rx="20" fill="#00A88F"/>
+      <rect x="1330" y="332" width="186" height="20" fill="#00A88F"/>
+      <circle cx="1357" cy="326" r="13" fill="#FFFFFF" opacity="0.18"/>
+      <path d="M1351 326h12M1357 320v12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+      <text x="1380" y="334" font-size="19" font-weight="700" fill="#FFFFFF">Home Agent</text>
+      <text class="small" x="1353" y="392">① 验证 Travel</text>
+      <text class="small" x="1353" y="425">② 结束 Business TLS</text>
+      <text class="small" x="1353" y="458">③ 解出 service_id</text>
+      <text class="small" x="1353" y="491">④ 连接本地目标</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="1120" y="570" width="396" height="105" rx="18" fill="#FFFFFF" stroke="#C5E6DC"/>
+      <circle cx="1162" cy="622" r="24" fill="#E3F7F2"/>
+      <path d="M1150 614h24v18h-24zM1155 619h14M1155 625h9" fill="none" stroke="#00A88F" stroke-width="2.2" stroke-linecap="round"/>
+      <text class="label" x="1202" y="612">真实家庭服务</text>
+      <text class="small" x="1202" y="638">NAS / SSH / Web / UDP</text>
+      <text class="tiny" x="1202" y="658">例如 192.168.1.20:443</text>
+    </g>
+
+    <rect x="1116" y="687" width="404" height="25" rx="12.5" fill="#DDF4EE"/>
+    <text class="tag" x="1318" y="704" text-anchor="middle" fill="#147766">service_id 只在加密隧道内发送</text>
+  </g>
+
+  <!-- The selected bidirectional Business Flow, shown through the VPS winner -->
+  <g fill="none" stroke="url(#securePath)" stroke-width="5" stroke-linecap="round">
+    <path d="M374 495 C420 495 430 400 498 400"/>
+    <path d="M724 400 C850 400 900 282 1080 282 H1300 Q1320 282 1320 310 V350 H1330"/>
+  </g>
+  <!-- Both endpoints actively establish outbound connections to each Relay -->
+  <g fill="none" stroke="#E8792D" stroke-width="2.5" stroke-dasharray="7 6" stroke-linecap="round" marker-end="url(#arrowOrange)">
+    <path d="M374 520 C420 520 430 426 498 426"/>
+    <path d="M374 565 C520 565 650 558 850 558"/>
+    <path d="M1330 370 H1316 V315 Q1316 302 1300 302 H1080 C900 302 850 426 724 426"/>
+    <path d="M1330 455 Q1318 455 1318 480 V530 Q1318 558 1290 558 H1080"/>
+  </g>
+  <!-- Server coordinates only; dashed lines are control traffic -->
+  <g fill="none" stroke="#7B8B99" stroke-width="2" stroke-dasharray="5 7" stroke-linecap="round" marker-end="url(#arrowGray)">
+    <path d="M1310 390 H1330"/>
+    <path d="M1120 470 C1100 470 1097 518 1080 518"/>
+    <path d="M1120 398 C980 398 860 454 724 454"/>
+    <path d="M498 454 C442 454 424 540 374 540"/>
+    <path d="M850 600 C680 600 520 610 374 610"/>
+  </g>
+  <g fill="none" stroke="#00A88F" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowTeal)">
+    <path d="M1423 524 V570"/>
+  </g>
+
+  <!-- Line legend -->
+  <g>
+    <line x1="76" y1="746" x2="126" y2="746" stroke="#E8792D" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrowOrange)"/>
+    <text class="tiny" x="140" y="751">主动发起连接（单向：端点 → Relay）</text>
+    <line x1="513" y1="746" x2="567" y2="746" stroke="#5369E8" stroke-width="5" stroke-linecap="round"/>
+    <text class="tiny" x="582" y="751">Business Flow（双向，Winner）</text>
+    <line x1="935" y1="746" x2="985" y2="746" stroke="#7B8B99" stroke-width="2" stroke-dasharray="5 7" marker-end="url(#arrowGray)"/>
+    <text class="tiny" x="999" y="751">控制面：Server → Relay → Travel</text>
+  </g>
+
+  <!-- Bottom step cards -->
+  <g>
+    <text x="64" y="778" font-size="22" font-weight="700">一次连接，只要四步</text>
+
+    <g filter="url(#softShadow)">
+      <rect x="56" y="804" width="350" height="160" rx="20" fill="#FFFFFF" stroke="#DCE4EA"/>
+      <circle cx="92" cy="841" r="20" fill="#E8F0FF"/>
+      <text x="92" y="848" text-anchor="middle" font-size="17" font-weight="800" fill="#3177F6">1</text>
+      <text class="step-title" x="124" y="847">发现服务</text>
+      <text class="step-copy" x="82" y="882">Home 发布目录，Travel 选择明确的</text>
+      <text class="step-copy" x="82" y="905">home_id + service_id + 协议映射。</text>
+      <rect x="82" y="925" width="225" height="24" rx="12" fill="#F1F5FB"/>
+      <text class="tag" x="194" y="942" text-anchor="middle" fill="#4E6373">本机端口 → 远端逻辑服务</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="426" y="804" width="350" height="160" rx="20" fill="#FFFFFF" stroke="#DCE4EA"/>
+      <circle cx="462" cy="841" r="20" fill="#F0ECFF"/>
+      <text x="462" y="848" text-anchor="middle" font-size="17" font-weight="800" fill="#7457D9">2</text>
+      <text class="step-title" x="494" y="847">竞速建链</text>
+      <text class="step-copy" x="452" y="882">Travel 与 Home Agent 都主动向 Relay</text>
+      <text class="step-copy" x="452" y="905">建链，Home 接受第一条有效 Carrier。</text>
+      <rect x="452" y="925" width="221" height="24" rx="12" fill="#F4F1FD"/>
+      <text class="tag" x="562" y="942" text-anchor="middle" fill="#6045BF">短期密钥 · HMAC 准入</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="796" y="804" width="350" height="160" rx="20" fill="#FFFFFF" stroke="#DCE4EA"/>
+      <circle cx="832" cy="841" r="20" fill="#E3F7F2"/>
+      <text x="832" y="848" text-anchor="middle" font-size="17" font-weight="800" fill="#00A88F">3</text>
+      <text class="step-title" x="864" y="847">加密传输</text>
+      <text class="step-copy" x="822" y="882">Travel ↔ Home 完成独立的双向 TLS；</text>
+      <text class="step-copy" x="822" y="905">Relay 只转发密文；Server 不经过流量。</text>
+      <rect x="822" y="925" width="232" height="24" rx="12" fill="#E9F8F4"/>
+      <text class="tag" x="938" y="942" text-anchor="middle" fill="#147766">service_id 也在隧道里面</text>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <rect x="1166" y="804" width="378" height="160" rx="20" fill="#FFFFFF" stroke="#DCE4EA"/>
+      <circle cx="1202" cy="841" r="20" fill="#FFF1E8"/>
+      <text x="1202" y="848" text-anchor="middle" font-size="17" font-weight="800" fill="#E8792D">4</text>
+      <text class="step-title" x="1234" y="847">故障切换（TCP）</text>
+      <text class="step-copy" x="1192" y="882">当前 Relay 断开时重新竞速；Travel 与</text>
+      <text class="step-copy" x="1192" y="905">Home 仍在线即可续传未确认的数据。</text>
+      <rect x="1192" y="925" width="253" height="24" rx="12" fill="#FFF3EB"/>
+      <text class="tag" x="1318" y="942" text-anchor="middle" fill="#B75E22">逻辑 Flow 与 Carrier 分离</text>
+    </g>
+  </g>
+
+  <!-- Footer takeaway -->
+  <g>
+    <line x1="64" y1="996" x2="1536" y2="996" stroke="#D7E0E6"/>
+    <circle cx="84" cy="1018" r="7" fill="#00A88F"/>
+    <text x="103" y="1024" font-size="16" font-weight="650" fill="#425765">一句话：Travel 把家庭服务变成本机端口；两个 Relay 负责找最快的密文通道，真正的业务 TLS 只在 Travel 和 Home 之间终止。</text>
+  </g>
+</svg>

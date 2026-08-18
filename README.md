@@ -11,6 +11,8 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 
 ![How FlowSplice works](docs/flowsplice-how-it-works.en.svg)
 
+[中文图示](docs/flowsplice-how-it-works.svg)
+
 ## Components
 
 | Component | Role |
