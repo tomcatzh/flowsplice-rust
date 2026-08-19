@@ -41,6 +41,10 @@ use flowsplice_core::{
 use flowsplice_enrollment::{
     DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentRequest, TravelEnrollmentResponse,
     issuer::{IssuerMaterial, ProtectedKey, issue_enrollment},
+    key::{
+        MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget,
+        recover_private_key_password_rotation, rotate_private_key_passwords,
+    },
     prepare_enrollment_approval,
 };
 use rust_embed::RustEmbed;
@@ -212,6 +216,7 @@ struct IssuerAppState {
     config: Arc<Config>,
     authorization: Arc<TravelAuthorizationState>,
     control_tx: mpsc::Sender<IssuerControlRequest>,
+    key_operation: Arc<Mutex<()>>,
 }
 
 #[derive(Deserialize)]
@@ -237,12 +242,25 @@ struct RevokeRequest {
     reason: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotatePrivateKeyPasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+struct RotatePrivateKeyPasswordResponse {
+    rotated_keys: usize,
+}
+
 #[derive(Serialize)]
 struct IssuerStatus {
     home_id: String,
     home_alias: String,
     default_valid_days: u32,
     global_authority_available: bool,
+    private_key_password_rotation_available: bool,
     services: Vec<Service>,
 }
 
@@ -280,6 +298,11 @@ async fn main() -> Result<()> {
     validate_spki_pins(&config.server_spki_pins, "server")?;
     validate_trusted_authorities(&config.travel_authorities)?;
     validate_issuer_config(&config)?;
+    if !config.issuer.allow_unencrypted_test_keys
+        && recover_private_key_password_rotation(&issuer_key_targets(&config))?
+    {
+        info!("completed interrupted Home issuer private-key password rotation");
+    }
     if config.carrier_heartbeat_secs == 0
         || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
         || config.flow_detach_timeout_secs <= config.carrier_timeout_secs
@@ -319,6 +342,7 @@ async fn main() -> Result<()> {
         config: Arc::clone(&config),
         authorization: Arc::clone(&authorization),
         control_tx: issuer_control_tx,
+        key_operation: Arc::new(Mutex::new(())),
     };
     let control = run_control_loop(
         Arc::clone(&config),
@@ -418,6 +442,30 @@ fn validate_signing_authority(
         );
     }
     Ok(())
+}
+
+fn issuer_key_targets(config: &Config) -> Vec<PrivateKeyRotationTarget<'_>> {
+    let mut targets = vec![
+        PrivateKeyRotationTarget {
+            label: "management CA",
+            path: &config.issuer.management_ca_key,
+        },
+        PrivateKeyRotationTarget {
+            label: "business CA",
+            path: &config.issuer.business_ca_key,
+        },
+        PrivateKeyRotationTarget {
+            label: "Home authorization",
+            path: &config.issuer.home_authority.private_key,
+        },
+    ];
+    if let Some(authority) = &config.issuer.global_authority {
+        targets.push(PrivateKeyRotationTarget {
+            label: "global authorization",
+            path: &authority.private_key,
+        });
+    }
+    targets
 }
 
 fn validate_services(services: &[Service]) -> Result<()> {
@@ -825,6 +873,10 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
         .route("/credentials", get(api_issued_credentials))
         .route("/issue", post(api_issue))
         .route("/revoke", post(api_revoke))
+        .route(
+            "/private-key-password",
+            post(api_rotate_private_key_password),
+        )
         .fallback(|| async { StatusCode::NOT_FOUND });
     let app = Router::new()
         .nest("/api", api)
@@ -843,6 +895,7 @@ async fn api_issuer_status(State(state): State<IssuerAppState>) -> Json<IssuerSt
         home_alias: state.config.alias.clone(),
         default_valid_days: state.config.issuer.default_valid_days,
         global_authority_available: state.config.issuer.global_authority.is_some(),
+        private_key_password_rotation_available: issuer_password_rotation_is_local(&state.config),
         services: state.config.services.clone(),
     })
 }
@@ -941,7 +994,10 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         travel_authority_key: protected(&authority.private_key),
         expected_travel_authority_public_key: &authority.public_key,
     };
+    let key_operation = state.key_operation.lock().await;
+    recover_private_key_password_rotation(&issuer_key_targets(&state.config))?;
     let enrollment = issue_enrollment(approval, &material, unix_time_secs()?)?;
+    drop(key_operation);
     let (response_tx, response_rx) = oneshot::channel();
     state
         .control_tx
@@ -960,6 +1016,60 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         generation,
         enrollment,
     })
+}
+
+async fn api_rotate_private_key_password(
+    State(state): State<IssuerAppState>,
+    Json(request): Json<RotatePrivateKeyPasswordRequest>,
+) -> ApiResult<RotatePrivateKeyPasswordResponse> {
+    rotate_issuer_private_key_password(&state, request)
+        .await
+        .map(Json)
+        .map_err(api_error)
+}
+
+async fn rotate_issuer_private_key_password(
+    state: &IssuerAppState,
+    request: RotatePrivateKeyPasswordRequest,
+) -> Result<RotatePrivateKeyPasswordResponse> {
+    if !issuer_password_rotation_is_local(&state.config) {
+        bail!("Home private-key password rotation is available only on a loopback issuer UI");
+    }
+    if state.config.issuer.allow_unencrypted_test_keys {
+        bail!("password rotation is unavailable for unencrypted test issuer keys");
+    }
+    let current_password = Zeroizing::new(request.current_password);
+    let new_password = Zeroizing::new(request.new_password);
+    if new_password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
+        bail!(
+            "new private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
+        );
+    }
+    let rotated_keys = issuer_key_targets(&state.config).len();
+    let config = Arc::clone(&state.config);
+    let key_operation = state.key_operation.lock().await;
+    tokio::task::spawn_blocking(move || {
+        rotate_private_key_passwords(
+            &issuer_key_targets(&config),
+            current_password.as_str(),
+            new_password.as_str(),
+        )
+    })
+    .await
+    .context("Home issuer private-key password rotation task failed")??;
+    drop(key_operation);
+    info!(rotated_keys, "rotated Home issuer private-key password");
+    Ok(RotatePrivateKeyPasswordResponse { rotated_keys })
+}
+
+fn issuer_password_rotation_is_local(config: &Config) -> bool {
+    config
+        .issuer
+        .listen
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback())
+        || std::env::var("FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY").as_deref()
+            == Ok("1")
 }
 
 fn requested_validity_secs(

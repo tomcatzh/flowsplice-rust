@@ -42,7 +42,7 @@ def issuer_get(path: str, headers: dict[str, str] | None = None):
 
 
 def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
     connection.request(
         method,
@@ -50,6 +50,30 @@ def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True)
         body=encoded,
         headers={
             "Authorization": ISSUER_AUTHORIZATION,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    connection.close()
+    decoded = json.loads(raw or b"{}")
+    if expect_ok:
+        assert response.status < 400, (response.status, decoded)
+    else:
+        assert response.status >= 400, (response.status, decoded)
+    return decoded
+
+
+def travel_request(method: str, path: str, body=None, expect_ok=True):
+    connection = http.client.HTTPConnection("127.0.0.1", 19080, timeout=180)
+    encoded = None if body is None else json.dumps(body).encode()
+    connection.request(
+        method,
+        path,
+        body=encoded,
+        headers={
+            "Authorization": AUTHORIZATION,
             "Accept": "application/json",
             "Content-Type": "application/json",
         },
@@ -96,6 +120,20 @@ def wait_ready() -> dict:
             last_error = error
         time.sleep(1)
     raise AssertionError(f"Travel Agent did not become ready: {last_error}")
+
+
+def wait_issuer_ready(port: int) -> None:
+    deadline = time.monotonic() + 90
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            response = issuer_request(port, "GET", "/api/status")
+            if response["home_id"] == "home-1":
+                return
+        except Exception as error:
+            last_error = error
+        time.sleep(1)
+    raise AssertionError(f"Home issuer did not become ready: {last_error}")
 
 
 def read_line(stream: socket.socket) -> bytes:
@@ -240,7 +278,10 @@ def check_embedded_spa() -> None:
     assert gzip_headers.get("content-encoding") == "gzip"
     assert br_headers.get("content-encoding") == "br"
     assert gzip_headers.get("etag") != br_headers.get("etag")
-    assert gzip.decompress(gzip_body)
+    travel_asset_body = gzip.decompress(gzip_body)
+    assert travel_asset_body
+    if asset.endswith(".js"):
+        assert b"Travel private-key password" in travel_asset_body
     assert br_body
     assert identity_headers.get("cache-control")
 
@@ -268,7 +309,9 @@ def check_embedded_spa() -> None:
     assert issuer_asset_status == 200
     assert issuer_asset_headers.get("content-encoding") == "gzip"
     if issuer_asset.endswith(".js"):
-        assert "旅行端凭据签发".encode() in gzip.decompress(issuer_asset_body)
+        issuer_javascript = gzip.decompress(issuer_asset_body)
+        assert "旅行端凭据签发".encode() in issuer_javascript
+        assert "更改 Home 签发密码".encode() in issuer_javascript
 
     issuer_api_status, _, _ = issuer_get(
         "/api/not-a-route", {"Accept": "text/html"}
@@ -313,6 +356,7 @@ def issue_scope(
     port: int, scope: dict, *, valid_minutes: int | None = None
 ) -> tuple[str, int]:
     generated = Path(__file__).resolve().parent / "generated"
+    issuer_directory = "offline-home2" if port == 29081 else "offline"
     validity = {"valid_days": 365}
     if valid_minutes is not None:
         validity = {"valid_minutes": valid_minutes}
@@ -324,7 +368,7 @@ def issue_scope(
             "request": json.loads((generated / "travel/enrollment-request.json").read_text()),
             **validity,
             "scope": scope,
-            "password": (generated / "offline/test-password.txt").read_text().strip(),
+            "password": (generated / issuer_directory / "test-password.txt").read_text().strip(),
         },
     )
     if valid_minutes is not None:
@@ -376,6 +420,67 @@ def check_home_issued_enrollment() -> str:
     assert 364 * 86400 <= remaining <= 366 * 86400, remaining
     assert credential["active"] and not credential["revoked"], credential
     return credential["credential_id"]
+
+
+def check_private_key_password_rotation() -> dict:
+    generated = Path(__file__).resolve().parent / "generated"
+    old_password = (generated / "offline/test-password.txt").read_text().strip()
+    new_password = "flowsplice-e2e-rotated-private-key-password"
+    wrong_password = "flowsplice-e2e-wrong-private-key-password"
+
+    issuer_request(
+        19081,
+        "POST",
+        "/api/private-key-password",
+        {"current_password": wrong_password, "new_password": new_password},
+        expect_ok=False,
+    )
+    travel_request(
+        "POST",
+        "/api/private-key-password",
+        {"current_password": wrong_password, "new_password": new_password},
+        expect_ok=False,
+    )
+    home_result = issuer_request(
+        19081,
+        "POST",
+        "/api/private-key-password",
+        {"current_password": old_password, "new_password": new_password},
+    )
+    travel_result = travel_request(
+        "POST",
+        "/api/private-key-password",
+        {"current_password": old_password, "new_password": new_password},
+    )
+    assert home_result["rotated_keys"] == 4, home_result
+    assert travel_result["rotated_keys"] == 2, travel_result
+
+    issuer_request(
+        19081,
+        "POST",
+        "/api/private-key-password",
+        {"current_password": old_password, "new_password": wrong_password},
+        expect_ok=False,
+    )
+    travel_request(
+        "POST",
+        "/api/private-key-password",
+        {"current_password": old_password, "new_password": wrong_password},
+        expect_ok=False,
+    )
+
+    for path in [
+        generated / "offline/test-password.txt",
+        generated / "travel/test-password.txt",
+    ]:
+        path.write_text(new_password + "\n")
+        path.chmod(0o600)
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent", "travelagent"],
+        check=True,
+    )
+    wait_issuer_ready(19081)
+    return wait_ready()
 
 
 def assert_revoked_management_certificate_rejected(relay: str, server_name: str) -> None:
@@ -569,6 +674,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 
 state = wait_ready()
 credential_id = check_home_issued_enrollment()
+state = check_private_key_password_rotation()
 check_udp()
 check_multi_home_business_routing()
 check_home_lifecycle_is_isolated()
@@ -595,6 +701,9 @@ checks = [
     "encrypted-local-travel-enrollment",
     "home-embedded-issuer-ui",
     "home-dual-ca-issuance",
+    "home-private-key-password-rotation",
+    "travel-private-key-password-rotation",
+    "password-rotation-survives-restart",
     "default-one-year-validity",
     "global-super-authorization",
     "home-scoped-authorization",

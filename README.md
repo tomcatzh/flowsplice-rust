@@ -19,7 +19,7 @@ This repository is the Rust implementation. It is one Cargo workspace and one Gi
 | --- | --- |
 | `flowsplice-server` | Home-side controller, service-catalog and Relay-directory authority, and opaque work-socket coordinator. |
 | `flowsplice-relay` | Public management/data ingress and Linux `splice(2)` opaque forwarding. |
-| `flowsplice-homeagent` | Publishes configured services, terminates business TLS, connects flows to home targets, and serves the password-gated Travel issuer/revocation UI. |
+| `flowsplice-homeagent` | Publishes configured services, terminates business TLS, connects flows to home targets, and serves the password-gated Travel issuer/revocation/key-maintenance UI. |
 | `flowsplice-travelagent` | Creates local TCP/UDP mappings, originates business TLS, and serves the embedded TypeScript UI. |
 | `flowsplice-foobar` | Low-rate single-TCP-connection loopback target and CLI continuity probe for deployment acceptance. |
 | `flowsplice-core` | Shared protocol framing, route-ticket authentication, TLS identity, and configuration support. |
@@ -159,7 +159,7 @@ Relay and Server can drop, delay, duplicate, reorder, or modify forwarded bytes 
 
 - Travel requires password-encrypted management and business keys. A Home issuer additionally holds password-encrypted management/business CA keys and Home authority keys; the optional global authority is a separate higher-privilege key. Other runtime leaf keys currently rely on filesystem protection.
 - TLS identities are loaded at startup, so certificate or leaf-key rotation requires a deliberate process restart. Signed Travel grants and revocations update live without restarting Server, Relay, or Home.
-- Travel prompts for its key password during enrollment, import, and startup. Home requires its issuer password for each signing request and does not persist it. HSM-backed signing, automatic keychain integration, renewal, CRL, and OCSP are not implemented.
+- Travel prompts for its key password during enrollment, import, and startup. Home requires its issuer password for each signing request and does not persist it. The loopback-only Home and Travel UIs can re-encrypt all keys in their respective password groups after verifying the current password; neither component stores passwords or integrates with the system keychain. HSM-backed signing, renewal, CRL, and OCSP are not implemented.
 - Route/work secrets and the Travel process-session UUID are independently random, short-lived, memory-only values. Logs omit payloads, private keys, bearer tokens, and route/work secrets; process-memory compromise remains outside the protection boundary.
 - Test PKI under ignored `tests/e2e/generated/` is disposable and must never be reused in production.
 
@@ -200,7 +200,7 @@ make openwrt-ipk
 
 `make e2e` generates two temporary test CAs, builds the Linux applications, starts two Relays, two Home Agents, Server, Travel, and TCP/UDP echo targets, and validates:
 
-- encrypted Travel-local enrollment, password-gated Home issuance, all three grant scopes, one-year and exact 30-minute validity, and live persistent revocation;
+- encrypted Travel-local enrollment, password-gated Home issuance, transactional Home/Travel private-key password rotation, all three grant scopes, one-year and exact 30-minute validity, and live persistent revocation;
 - management and business mTLS, single-use HMAC route admission, TCP/UDP data, TLS-1.2 rejection, TLS-1.3 acceptance, and slow-frame deadlines;
 - exact two-Home logical-business routing, same-service-ID isolation, no cross-Home fallback, and independent Home removal/rejoin;
 - complete two-Relay discovery from one seed, concurrent Carrier competition, duplicate-process rejection, periodic reevaluation, and same-socket handover after killing the selected Relay;
@@ -327,7 +327,30 @@ flowsplice-foobar probe --addr 127.0.0.1:10080 --count 5
 It sends one exact record every five seconds over one TCP connection and fails rather than silently
 reconnecting.
 
-### 5. Revoke access
+### 5. Rotate private-key passwords
+
+Both password-rotation controls are available only when the corresponding UI listener is bound to
+loopback. They are deliberately unavailable through a remotely bound HTTP UI, even when that UI has
+an administrator bearer token.
+
+On Home, open `http://127.0.0.1:9081`, select **更改密码 (Change password)** under **Home 签发密码
+(Home issuer password)**, then enter the current password and the new password twice. One operation
+re-encrypts the management CA key, business CA key, Home authority key, and configured global
+authority key. It does not change their public keys, certificates, signed grants, or running business
+flows.
+
+On Travel, open its local UI (the example uses `http://127.0.0.1:9080`) and select **Change password**
+under **Travel private-key password**. One operation re-encrypts both Travel private keys. The running
+process and existing flows continue using the already loaded key material; enter the new password the
+next time Travel Agent starts.
+
+FlowSplice never writes either password to macOS Keychain or another password store. Save the new
+password separately before confirming. Every key is decrypted and verified before replacement. New
+encrypted files are staged in the same directory and switched by atomic rename. A password-free
+recovery journal containing only file names and encrypted-file hashes lets the next process finish
+an interrupted multi-file switch.
+
+### 6. Revoke access
 
 Return to the same Home issuer page, find the credential, and select **撤销 (Revoke)**. Revocation is
 irreversible and is distributed through Server without restarting Server, Relay, or Home. It blocks
@@ -348,7 +371,7 @@ files live beside each application:
 
 The E2E certificate generator is disposable test tooling only. Production Travel identities use `flowsplice-travelagent enroll-init` and `enroll-import`; issuance and revocation are performed through the selected Home Agent's separate local UI/API. Operators must provision and protect the Home issuer's encrypted management/business CA keys, Home authority key, optional global authority key, non-Travel leaf keys, renewal process, and SPKI allowlists. Server, Relay, and OpenWrt configs contain only the trusted authority records and public keys. Startup fails when required trust or authorization state is missing or malformed.
 
-The Travel UI and local mappings bind to loopback by default. A non-loopback UI requires `allow_remote_listen = true` and an administrator bearer token of at least 32 characters.
+The Travel UI and local mappings bind to loopback by default. A non-loopback UI requires `allow_remote_listen = true` and an administrator bearer token of at least 32 characters. Private-key password rotation remains disabled on non-loopback UI listeners because the built-in UI uses HTTP.
 
 ## Release artifacts
 

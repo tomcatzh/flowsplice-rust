@@ -82,11 +82,14 @@ pub fn issue_enrollment(
         spki_pin(&parsed.management.public_key),
         spki_pin(&parsed.business.public_key),
     );
-    let authority_private_key = Zeroizing::new(key::load_private_key(
-        material.travel_authority_key.path,
-        material.travel_authority_key.password,
-        material.travel_authority_key.allow_unencrypted,
-    )?);
+    let authority_private_key = Zeroizing::new(
+        key::load_private_key(
+            material.travel_authority_key.path,
+            material.travel_authority_key.password,
+            material.travel_authority_key.allow_unencrypted,
+        )
+        .context("failed to load Travel authorization private key")?,
+    );
     let authority_key = EcdsaKeyPair::from_pkcs8(
         &ECDSA_P256_SHA256_ASN1_SIGNING,
         authority_private_key.secret_der(),
@@ -126,11 +129,14 @@ fn load_ca_issuer(
     let certificate = first_certificate(certificate_path, label)?;
     let (_, parsed) = parse_x509_certificate(certificate.as_ref())
         .map_err(|error| anyhow!("failed to parse {label} CA certificate: {error}"))?;
-    let private_key = Zeroizing::new(key::load_private_key(
-        protected_key.path,
-        protected_key.password,
-        protected_key.allow_unencrypted,
-    )?);
+    let private_key = Zeroizing::new(
+        key::load_private_key(
+            protected_key.path,
+            protected_key.password,
+            protected_key.allow_unencrypted,
+        )
+        .with_context(|| format!("failed to load {label} CA private key"))?,
+    );
     let key_pair = KeyPair::try_from(&*private_key)
         .with_context(|| format!("failed to parse {label} CA private key"))?;
     if parsed.public_key().raw != key_pair.subject_public_key_info() {
@@ -281,6 +287,30 @@ mod tests {
             .signature_hex
             .replace_range(0..2, "00");
         assert!(validate_enrollment_response(&tampered, now + 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn private_key_errors_identify_the_issuer_role() -> Result<()> {
+        flowsplice_core::init_crypto();
+        let temporary = tempfile::tempdir()?;
+        let management_ca = create_test_ca(temporary.path(), "management")?;
+        let encrypted = key::generate_encrypted_private_key(b"correct issuer password")?;
+        let encrypted_path = temporary.path().join("encrypted-management-ca.key");
+        fs::write(&encrypted_path, encrypted.encrypted_pem.as_bytes())?;
+        let protected = ProtectedKey {
+            path: &encrypted_path,
+            password: Some(b"wrong issuer password"),
+            allow_unencrypted: false,
+        };
+        let Err(error) = load_ca_issuer(&management_ca.certificate, &protected, "management")
+        else {
+            bail!("wrong issuer password unexpectedly succeeded");
+        };
+        assert_eq!(
+            error.to_string(),
+            "failed to load management CA private key"
+        );
         Ok(())
     }
 }

@@ -12,6 +12,7 @@ interface Status {
   home_alias: string;
   default_valid_days: number;
   global_authority_available: boolean;
+  private_key_password_rotation_available: boolean;
   services: Service[];
 }
 interface Credential {
@@ -24,6 +25,7 @@ interface Credential {
   active: boolean;
 }
 interface IssueResult { generation: number; enrollment: unknown }
+interface RotatePasswordResult { rotated_keys: number }
 
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("Missing #app root");
@@ -70,6 +72,32 @@ function flash(message: string, error = false): void {
   node.className = error ? "notice error" : "notice success";
 }
 
+function friendlyError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("failed to load management CA private key")) {
+    return "无法解密 Home 的管理 CA 私钥。请输入 Home 签发密钥密码，不是生成 Travel 申请时使用的密码。";
+  }
+  if (message.includes("failed to load business CA private key")) {
+    return "无法解密 Home 的业务 CA 私钥。请检查 Home 签发密钥密码及密钥配置。";
+  }
+  if (message.includes("failed to load Travel authorization private key")) {
+    return "无法解密 Home 的授权签名私钥。请检查 Home 签发密钥密码及所选授权范围。";
+  }
+  if (message.includes("failed to decrypt management CA private key")) {
+    return "当前密码无法解密 Home 的管理 CA 私钥。";
+  }
+  if (message.includes("failed to decrypt business CA private key")) {
+    return "当前密码无法解密 Home 的业务 CA 私钥。";
+  }
+  if (message.includes("failed to decrypt Home authorization private key")) {
+    return "当前密码无法解密 Home 授权签名私钥。";
+  }
+  if (message.includes("failed to decrypt global authorization private key")) {
+    return "当前密码无法解密全局授权签名私钥。";
+  }
+  return message.replace(/^Error:\s*/, "");
+}
+
 function selectedScope(): Scope {
   const kind = document.querySelector<HTMLInputElement>('input[name="scope"]:checked')?.value;
   if (kind === "global") return { kind: "global" };
@@ -79,6 +107,16 @@ function selectedScope(): Scope {
     return { kind: "service", home_id: status.home_id, service_id: value[0], protocol: value[1] as Protocol };
   }
   return { kind: "home", home_id: status.home_id };
+}
+
+function updateServiceField(): void {
+  const serviceSelected = document.querySelector<HTMLInputElement>('input[name="scope"]:checked')?.value === "service";
+  const field = document.querySelector<HTMLElement>("#service-field");
+  const select = document.querySelector<HTMLSelectElement>("#service");
+  if (!field || !select) return;
+  select.disabled = !serviceSelected;
+  field.classList.toggle("disabled", !serviceSelected);
+  field.setAttribute("aria-disabled", String(!serviceSelected));
 }
 
 async function issue(): Promise<void> {
@@ -103,6 +141,48 @@ async function revoke(credentialId: string): Promise<void> {
   await json("/api/revoke", { method: "POST", body: JSON.stringify({ credential_id: credentialId, reason }) });
   flash("撤销已同步到 Server、Relay 和 Home。现有连接会被关闭。");
   await renderCredentials();
+}
+
+function clearPasswordDialog(): void {
+  ["#current-key-password", "#new-key-password", "#confirm-key-password"].forEach((selector) => {
+    const input = document.querySelector<HTMLInputElement>(selector);
+    if (input) input.value = "";
+  });
+  const saved = document.querySelector<HTMLInputElement>("#password-saved");
+  if (saved) saved.checked = false;
+  const notice = document.querySelector<HTMLElement>("#password-dialog-notice");
+  if (notice) notice.textContent = "";
+}
+
+async function rotatePrivateKeyPassword(): Promise<void> {
+  const currentPassword = document.querySelector<HTMLInputElement>("#current-key-password")?.value ?? "";
+  const newPassword = document.querySelector<HTMLInputElement>("#new-key-password")?.value ?? "";
+  const confirmation = document.querySelector<HTMLInputElement>("#confirm-key-password")?.value ?? "";
+  const saved = document.querySelector<HTMLInputElement>("#password-saved")?.checked ?? false;
+  if (!currentPassword) throw new Error("请输入当前 Home 签发密钥密码");
+  if ([...newPassword].length < 12) throw new Error("新密码至少需要 12 个字符");
+  if (newPassword !== confirmation) throw new Error("两次输入的新密码不一致");
+  if (newPassword === currentPassword) throw new Error("新密码必须与当前密码不同");
+  if (!saved) throw new Error("请先确认新密码已经另行保存");
+  const button = document.querySelector<HTMLButtonElement>("#rotate-password");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在验证并轮换…";
+  }
+  try {
+    const result = await json<RotatePasswordResult>("/api/private-key-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    });
+    document.querySelector<HTMLDialogElement>("#password-dialog")?.close();
+    clearPasswordDialog();
+    flash(`密码轮换成功：${result.rotated_keys} 把 Home 签发私钥已使用新密码重新加密。`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "确认轮换";
+    }
+  }
 }
 
 async function renderCredentials(): Promise<void> {
@@ -136,15 +216,26 @@ async function render(): Promise<void> {
     </div>
     <div class="form-grid">
       <label>旅行端申请文件<input id="request" type="file" accept="application/json,.json"><small id="request-name">尚未选择</small></label>
-      <label>指定业务<select id="service">${serviceOptions}</select></label>
+      <label id="service-field" class="conditional-field disabled" aria-disabled="true">指定业务<select id="service" disabled>${serviceOptions}</select></label>
       <label>有效期（天）<input id="days" type="number" min="1" max="3650" value="${status.default_valid_days}"></label>
-      <label>签名私钥密码<input id="password" type="password" autocomplete="current-password" placeholder="只用于本次签名"></label>
+      <label>Home 签发密钥密码<input id="password" type="password" autocomplete="current-password" placeholder="不是 Travel 私钥密码"><small>用于解密此 Home 的 CA 与授权签名私钥</small></label>
     </div>
     <div class="actions"><p>旅行端私钥从不上传；Home 只读取申请中的公钥，并把签名授权同步给 Server。</p><button id="issue">签发并下载结果</button></div>
   </section>
   <section class="panel"><div class="panel-title"><div><p class="eyebrow">已签发凭据</p><h2>撤销与状态</h2></div><button id="refresh" class="secondary">刷新</button></div>
     <div class="table-wrap"><table><thead><tr><th>旅行端</th><th>授权范围</th><th>到期日</th><th>状态</th><th></th></tr></thead><tbody id="credentials"></tbody></table></div>
   </section>
+  ${status.private_key_password_rotation_available ? `<section class="panel maintenance-panel"><div class="panel-title"><div><p class="eyebrow">本机密钥维护</p><h2>Home 签发密码</h2></div><button id="open-password-dialog" class="secondary">更改密码</button></div>
+    <div class="maintenance-copy"><p>同时重新加密管理 CA、业务 CA、Home 授权${status.global_authority_available ? "和全局授权" : ""}私钥。运行中的业务连接不受影响。</p><p>FlowSplice 不保存旧密码或新密码，也不会写入 macOS 钥匙串。</p></div>
+  </section>` : ""}
+  <dialog id="password-dialog"><form id="password-form" autocomplete="off"><div class="dialog-title"><p class="eyebrow">本机操作</p><h2>更改 Home 签发密码</h2><p>全部私钥验证成功后才会切换。中断时，Home 会在下次启动继续完成同一轮切换。</p></div>
+    <div id="password-dialog-notice" class="dialog-notice"></div>
+    <label>当前密码<input id="current-key-password" type="password" autocomplete="current-password"></label>
+    <label>新密码<input id="new-key-password" type="password" autocomplete="new-password"><small>至少 12 个字符</small></label>
+    <label>确认新密码<input id="confirm-key-password" type="password" autocomplete="new-password"></label>
+    <label class="saved-confirmation"><input id="password-saved" type="checkbox">我已将新密码保存在自己的密码管理工具中</label>
+    <div class="dialog-actions"><button id="close-password-dialog" type="button" class="secondary">取消</button><button id="rotate-password" type="submit">确认轮换</button></div>
+  </form></dialog>
   <footer>普通 Home 签名密钥只能签发本 Home 范围；全局超级签名密钥是独立配置的更高权限能力。</footer>`;
   document.querySelector<HTMLInputElement>("#request")?.addEventListener("change", async (event) => {
     const file = (event.target as HTMLInputElement).files?.[0];
@@ -156,8 +247,26 @@ async function render(): Promise<void> {
       flash("申请文件已读取，签发前请确认授权范围。 ");
     } catch { flash("申请文件不是有效 JSON。", true); }
   });
-  document.querySelector<HTMLButtonElement>("#issue")?.addEventListener("click", () => void issue().catch((error) => flash(String(error), true)));
-  document.querySelector<HTMLButtonElement>("#refresh")?.addEventListener("click", () => void renderCredentials().catch((error) => flash(String(error), true)));
+  document.querySelector<HTMLButtonElement>("#issue")?.addEventListener("click", () => void issue().catch((error) => flash(friendlyError(error), true)));
+  document.querySelector<HTMLButtonElement>("#refresh")?.addEventListener("click", () => void renderCredentials().catch((error) => flash(friendlyError(error), true)));
+  const passwordDialog = document.querySelector<HTMLDialogElement>("#password-dialog");
+  document.querySelector<HTMLButtonElement>("#open-password-dialog")?.addEventListener("click", () => {
+    clearPasswordDialog();
+    passwordDialog?.showModal();
+  });
+  document.querySelector<HTMLButtonElement>("#close-password-dialog")?.addEventListener("click", () => passwordDialog?.close());
+  passwordDialog?.addEventListener("close", clearPasswordDialog);
+  document.querySelector<HTMLFormElement>("#password-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void rotatePrivateKeyPassword().catch((error) => {
+      const notice = document.querySelector<HTMLElement>("#password-dialog-notice");
+      if (notice) notice.textContent = friendlyError(error);
+    });
+  });
+  document.querySelectorAll<HTMLInputElement>('input[name="scope"]').forEach((input) => {
+    input.addEventListener("change", updateServiceField);
+  });
+  updateServiceField();
   await renderCredentials();
 }
 

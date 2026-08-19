@@ -7,18 +7,21 @@ config_dir="${script_dir}/generated/config"
 authorization_dir="${script_dir}/generated/authorization"
 state_dir="${script_dir}/generated/state"
 offline_dir="${script_dir}/generated/offline"
+offline_home2_dir="${script_dir}/generated/offline-home2"
 travel_dir="${script_dir}/generated/travel"
 mkdir -p "${cert_dir}"
 mkdir -p "${config_dir}"
 mkdir -p "${authorization_dir}"
 mkdir -p "${state_dir}"
 mkdir -p "${offline_dir}"
+mkdir -p "${offline_home2_dir}"
 rm -rf "${travel_dir}"
 find "${cert_dir}" -maxdepth 1 -type f -delete
 find "${config_dir}" -maxdepth 1 -type f -delete
 find "${authorization_dir}" -maxdepth 1 -type f -delete
 find "${state_dir}" -maxdepth 1 -type f -delete
 find "${offline_dir}" -maxdepth 1 -type f -delete
+find "${offline_home2_dir}" -maxdepth 1 -type f -delete
 password_file="${offline_dir}/test-password.txt"
 printf '%s\n' 'flowsplice-e2e-private-key-password' >"${password_file}"
 chmod 600 "${password_file}"
@@ -77,9 +80,18 @@ for authority in home1-authority home2-authority global-authority; do
     --output "${authorization_dir}/${authority}-public-key.txt"
 done
 
+# Each Home owns a separate writable issuer directory. Copy the shared CA keys
+# into Home 2's test-only directory so rotating one Home cannot mutate another
+# Home's local key files.
+cp "${offline_dir}/management-ca.key" "${offline_home2_dir}/management-ca.key"
+cp "${offline_dir}/business-ca.key" "${offline_home2_dir}/business-ca.key"
+cp "${offline_dir}/home2-authority.key" "${offline_home2_dir}/home2-authority.key"
+cp "${password_file}" "${offline_home2_dir}/test-password.txt"
+
 find "${cert_dir}" -maxdepth 1 \( -name '*.csr' -o -name '*.ext' -o -name '*.srl' \) -delete
 chmod 600 "${cert_dir}"/*.key
 chmod 600 "${offline_dir}"/*.key
+chmod 600 "${offline_home2_dir}"/*.key "${offline_home2_dir}/test-password.txt"
 chmod 644 "${cert_dir}"/*.crt
 
 spki_pin() {

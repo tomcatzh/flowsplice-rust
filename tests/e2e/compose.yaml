@@ -61,12 +61,13 @@ services:
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent.toml"]
     environment:
       RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
     depends_on: [server, echo]
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
-      - ./generated/offline:/issuer:ro
+      - ./generated/offline:/issuer
     ports:
       - "127.0.0.1:19081:9081"
     networks: [flowsplice]
@@ -77,12 +78,13 @@ services:
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent2.toml"]
     environment:
       RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
     depends_on: [server, echo2]
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
-      - ./generated/offline:/issuer:ro
+      - ./generated/offline-home2:/issuer
     ports:
       - "127.0.0.1:29081:9081"
     networks: [flowsplice]
@@ -95,6 +97,7 @@ services:
       RUST_LOG: flowsplice_travelagent=debug,info
       FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /travel/test-password.txt
+      FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
     depends_on: [relay1, relay2, homeagent, homeagent2]
     ports:
       - "127.0.0.1:19080:9080"
@@ -105,7 +108,7 @@ services:
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
-      - ./generated/travel:/travel:ro
+      - ./generated/travel:/travel
     networks: [flowsplice]
 
 networks:

@@ -18,7 +18,7 @@ use axum::{
     http::StatusCode,
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
@@ -40,7 +40,10 @@ use flowsplice_core::{
 };
 use flowsplice_enrollment::{
     TravelEnrollmentResponse, create_enrollment_request, install_enrollment_response,
-    key::{is_encrypted_private_key, load_private_key},
+    key::{
+        MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget, is_encrypted_private_key,
+        load_private_key, recover_private_key_password_rotation, rotate_private_key_passwords,
+    },
     load_json,
 };
 use rust_embed::RustEmbed;
@@ -214,6 +217,7 @@ struct AppState {
     active_flows: Arc<std::sync::atomic::AtomicUsize>,
     permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
+    key_operation: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -232,7 +236,27 @@ struct StatusResponse {
     relay_directory_generation: u64,
     active_relays: Vec<String>,
     mappings: Vec<Mapping>,
+    private_key_password_rotation_available: bool,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotatePrivateKeyPasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+struct RotatePrivateKeyPasswordResponse {
+    rotated_keys: usize,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    error: String,
+}
+
+type ApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 struct RouteGrant {
     route_id: Uuid,
@@ -256,6 +280,9 @@ async fn main() -> Result<()> {
     }
     let config: Config = load_toml(&cli.config)?;
     validate_config(&config)?;
+    if recover_private_key_password_rotation(&travel_key_targets(&config))? {
+        info!("completed interrupted Travel private-key password rotation");
+    }
     let (management_key, business_key) = load_runtime_private_keys(&config)?;
     let tls = Arc::new(TlsMaterial {
         management_connector: client_connector_with_private_key(
@@ -280,6 +307,7 @@ async fn main() -> Result<()> {
         active_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
+        key_operation: Arc::new(Mutex::new(())),
     };
 
     let mut tasks = JoinSet::new();
@@ -388,6 +416,19 @@ fn load_runtime_private_keys(
         load_private_key(&config.management_key, Some(password.as_bytes()), false)?,
         load_private_key(&config.business_key, Some(password.as_bytes()), false)?,
     ))
+}
+
+fn travel_key_targets(config: &Config) -> [PrivateKeyRotationTarget<'_>; 2] {
+    [
+        PrivateKeyRotationTarget {
+            label: "Travel management",
+            path: &config.management_key,
+        },
+        PrivateKeyRotationTarget {
+            label: "Travel business",
+            path: &config.business_key,
+        },
+    ]
 }
 
 fn runtime_password() -> Result<Zeroizing<String>> {
@@ -958,6 +999,10 @@ async fn run_ui(state: AppState) -> Result<()> {
         .route("/status", get(api_status))
         .route("/catalog", get(api_catalog))
         .route("/relays", get(api_relays))
+        .route(
+            "/private-key-password",
+            post(api_rotate_private_key_password),
+        )
         .fallback(|| async { StatusCode::NOT_FOUND });
     let app = Router::new()
         .nest("/api", api)
@@ -986,6 +1031,7 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
         relay_directory_generation: directory_generation,
         active_relays,
         mappings: state.config.mappings.clone(),
+        private_key_password_rotation_available: travel_password_rotation_is_local(&state.config),
     })
 }
 
@@ -995,6 +1041,70 @@ async fn api_catalog(State(state): State<AppState>) -> Json<Catalog> {
 
 async fn api_relays(State(state): State<AppState>) -> Json<RelayDirectory> {
     Json(state.directory.read().await.clone())
+}
+
+async fn api_rotate_private_key_password(
+    State(state): State<AppState>,
+    Json(request): Json<RotatePrivateKeyPasswordRequest>,
+) -> ApiResult<RotatePrivateKeyPasswordResponse> {
+    rotate_travel_private_key_password(&state, request)
+        .await
+        .map(Json)
+        .map_err(api_error)
+}
+
+async fn rotate_travel_private_key_password(
+    state: &AppState,
+    request: RotatePrivateKeyPasswordRequest,
+) -> Result<RotatePrivateKeyPasswordResponse> {
+    if !travel_password_rotation_is_local(&state.config) {
+        bail!("Travel private-key password rotation is available only on a loopback UI");
+    }
+    if !is_encrypted_private_key(&state.config.management_key)?
+        || !is_encrypted_private_key(&state.config.business_key)?
+    {
+        bail!("password rotation is unavailable for unencrypted test Travel keys");
+    }
+    let current_password = Zeroizing::new(request.current_password);
+    let new_password = Zeroizing::new(request.new_password);
+    if new_password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
+        bail!(
+            "new private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
+        );
+    }
+    let config = Arc::clone(&state.config);
+    let key_operation = state.key_operation.lock().await;
+    tokio::task::spawn_blocking(move || {
+        rotate_private_key_passwords(
+            &travel_key_targets(&config),
+            current_password.as_str(),
+            new_password.as_str(),
+        )
+    })
+    .await
+    .context("Travel private-key password rotation task failed")??;
+    drop(key_operation);
+    info!(rotated_keys = 2, "rotated Travel private-key password");
+    Ok(RotatePrivateKeyPasswordResponse { rotated_keys: 2 })
+}
+
+fn travel_password_rotation_is_local(config: &Config) -> bool {
+    config
+        .ui_listen
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback())
+        || std::env::var("FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY").as_deref()
+            == Ok("1")
+}
+
+fn api_error(error: impl Into<anyhow::Error>) -> (StatusCode, Json<ApiError>) {
+    let error = error.into();
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: error.to_string(),
+        }),
+    )
 }
 
 async fn serve_spa(request: Request) -> Response {
