@@ -21,7 +21,6 @@ config server 'server'
 
 config home 'home_1'
 	option id 'home-1'
-	list spki_pin 'replace-with-home-spki-sha256-hex'
 
 config relay 'relay_lan'
 	option enabled '0'

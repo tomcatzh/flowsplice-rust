@@ -33,7 +33,7 @@ use flowsplice_core::{
     route::{RouteSide, read_preface, verify_preface},
     tls::{
         identity_client_connector, identity_server_name, peer_identity, require_peer,
-        server_acceptor, validate_spki_pins,
+        server_acceptor,
     },
 };
 use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
@@ -99,8 +99,6 @@ struct ConfiguredRelay {
 #[serde(deny_unknown_fields)]
 struct ConfiguredHome {
     id: String,
-    #[serde(default)]
-    spki_pins: Vec<String>,
 }
 
 const fn default_handshake_timeout() -> u64 {
@@ -525,26 +523,16 @@ fn validate_homes(homes: &[ConfiguredHome], trust: &DeploymentTrust) -> Result<(
         if home.id.is_empty() || !ids.insert(&home.id) {
             bail!("Home ids must be non-empty and unique");
         }
-        validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
-        let trusted = trust.home_endpoint(&home.id)?;
-        let configured = home
-            .spki_pins
-            .iter()
-            .map(|pin| pin.to_ascii_lowercase())
-            .collect::<std::collections::HashSet<_>>();
-        let root_bound = trusted
-            .management_spki_pins
-            .iter()
-            .map(|pin| pin.to_ascii_lowercase())
-            .collect::<std::collections::HashSet<_>>();
-        if configured != root_bound {
-            bail!(
-                "Home {} management pins do not match deployment trust",
-                home.id
-            );
-        }
+        trust.home_endpoint(&home.id)?;
     }
     Ok(())
+}
+
+fn trusted_home_management_pins<'a>(
+    trust: &'a DeploymentTrust,
+    home_id: &str,
+) -> Result<&'a [String]> {
+    Ok(&trust.home_endpoint(home_id)?.management_spki_pins)
 }
 
 fn validate_listens(listens: &[String], label: &str) -> Result<()> {
@@ -636,11 +624,13 @@ async fn handle_home(
         .iter()
         .find(|home| home.id == identity.id)
         .ok_or_else(|| anyhow!("Home {} is not configured", identity.id))?;
+    let trusted_home_pins =
+        trusted_home_management_pins(&state.control_signer.trust, &configured_home.id)?;
     require_peer(
         &identity,
         Role::Home,
         Some(&configured_home.id),
-        &configured_home.spki_pins,
+        trusted_home_pins,
     )?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -1490,7 +1480,7 @@ mod tests {
 
     use super::{
         ConfiguredHome, HomeRegistry, HomeSession, RelayDirectoryRegistry, TRAVEL_SESSION_LEASE,
-        TravelSessionRegistry, validate_homes, validate_listens,
+        TravelSessionRegistry, trusted_home_management_pins, validate_homes, validate_listens,
     };
 
     fn home_session(session_id: Uuid) -> HomeSession {
@@ -1562,36 +1552,50 @@ mod tests {
     }
 
     #[test]
-    fn configured_homes_require_unique_ids_and_independent_pins() {
-        let pin = "11".repeat(32);
+    fn configured_homes_require_unique_deployment_trusted_ids() {
         let homes = vec![
             ConfiguredHome {
                 id: "home-1".to_owned(),
-                spki_pins: vec![pin.clone()],
             },
             ConfiguredHome {
                 id: "home-2".to_owned(),
-                spki_pins: vec!["22".repeat(32)],
             },
         ];
         let trust = deployment_trust();
         assert!(validate_homes(&homes, &trust).is_ok());
         assert!(validate_homes(&[], &trust).is_err());
+        assert!(validate_homes(&[ConfiguredHome { id: String::new() }], &trust).is_err());
         assert!(
             validate_homes(
                 &[
                     ConfiguredHome {
                         id: "home-1".to_owned(),
-                        spki_pins: vec![pin.clone()],
                     },
                     ConfiguredHome {
                         id: "home-1".to_owned(),
-                        spki_pins: vec![pin],
                     },
                 ],
                 &trust
             )
             .is_err()
+        );
+        assert!(
+            validate_homes(
+                &[ConfiguredHome {
+                    id: "home-3".to_owned(),
+                }],
+                &trust
+            )
+            .is_err()
+        );
+        assert_eq!(
+            trusted_home_management_pins(&trust, "home-1").unwrap_or_default(),
+            &["11".repeat(32)]
+        );
+        assert!(trusted_home_management_pins(&trust, "home-3").is_err());
+        assert!(
+            serde_json::from_str::<ConfiguredHome>(r#"{"id":"home-1","spki_pins":["obsolete"]}"#)
+                .is_err()
         );
     }
 

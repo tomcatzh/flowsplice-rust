@@ -17,7 +17,7 @@ Home Agent A --outbound mTLS--┐       ┌--outbound mTLS--> Relay A <--mTLS--�
 Home Agent B --outbound mTLS--┘       └--outbound mTLS--> Relay B <--mTLS--┘
 ```
 
-Each Home publishes its own catalog. Server authenticates each configured Home ID against that Home's management SPKI pins, keeps one replaceable session per Home ID, and builds a sorted aggregate catalog. Reconnecting one Home supersedes only that ID's old session; disconnecting it removes only its catalog. Server also maintains an isolated reconnect loop and sender for every configured Relay. After a configured Relay address passes management-CA and expected URI role/ID checks, Server extracts its authenticated SPKI and updates the memory-only directory; Relay SPKIs are not duplicated in Server configuration.
+Each Home publishes its own catalog. Server keeps an explicit configured set of permitted Home IDs, derives each Home's management SPKI key set from the verified deployment trust, keeps one replaceable session per Home ID, and builds a sorted aggregate catalog. Reconnecting one Home supersedes only that ID's old session; disconnecting it removes only its catalog. Server also maintains an isolated reconnect loop and sender for every configured Relay. After a configured Relay address passes management-CA and expected URI role/ID checks, Server extracts its authenticated SPKI and updates the memory-only directory; Relay SPKIs are not duplicated in Server configuration.
 
 Home-issued credential and revocation snapshots are distributed to Relay and Home; both derive the verifying authority set from the root-signed deployment trust, durably apply anti-rollback state, and acknowledge the initial generation before their control session becomes available. Travel-visible state uses a separate end-to-end envelope: for each admitted Travel identity, Server filters the aggregate Catalog by all active grants and signs the complete `RelayDirectory + Catalog + generation + issued_at + expires_at` with a control key certified by the deployment root. Relay forwards this opaque signed snapshot and cannot edit either half or manufacture a new generation.
 
@@ -40,7 +40,7 @@ Server binds exactly one explicit Home-control address shared by all configured 
 7. Home independently authenticates its work connection with the same secret.
 8. Server pairs the Home and Relay sockets. Relay enters Linux `splice(2)` forwarding.
 9. Travel and Home complete a separate mutual TLS handshake through both opaque forwarders.
-10. Travel verifies the selected Home's exact URI identity and SPKI pins. Only inside that business TLS connection does it name and open a service.
+10. Travel verifies the selected Home's exact URI identity and the business SPKI key set taken from the verified deployment trust. Only inside that business TLS connection does it name and open a service.
 
 The selected credential ID is carried through route authorization and `OPEN_WORK`, then Home requires the business certificate to resolve to that exact grant and the encrypted `OPEN` to match its scope. A management certificate from one Travel identity therefore cannot be paired with another identity's business certificate, and a Home-scoped or Service-scoped grant cannot be widened by choosing a different mapping.
 

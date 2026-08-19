@@ -188,13 +188,11 @@ return view.extend({
 		o.default = '120';
 
 		s = m.section(form.GridSection, 'home', _('Trusted Home Agents'),
-			_('Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home.'));
+			_('Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home.'));
 		s.addremove = true;
 		s.nodescriptions = true;
 		s.addbtntitle = _('Add Home Agent');
 		required(s.option(form.Value, 'id', _('Home ID')));
-		o = required(s.option(form.DynamicList, 'spki_pin', _('Home SPKI pins')));
-		o.modalonly = true;
 
 		s = m.section(form.GridSection, 'relay', _('Local Relay instances'),
 			_('Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle.'));

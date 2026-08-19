@@ -52,8 +52,6 @@ config_list_foreach() {
 	local section="$1" option="$2" callback="$3" value
 	case "$section.$option" in
 		server.data_listen) set -- '192.0.2.1:7444' '[2001:db8::1]:7444' ;;
-		home_1.spki_pin) set -- '1111111111111111111111111111111111111111111111111111111111111111' ;;
-		home_2.spki_pin) set -- '2222222222222222222222222222222222222222222222222222222222222222' ;;
 		*) set -- ;;
 	esac
 	for value in "$@"; do "$callback" "$value"; done
@@ -107,13 +105,8 @@ class RendererTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         output = result.output_path  # type: ignore[attr-defined]
         config = tomllib.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(
-            [(home["id"], home["spki_pins"][0]) for home in config["homes"]],
-            [
-                ("home-1", "1" * 64),
-                ("home-2", "2" * 64),
-            ],
-        )
+        self.assertEqual([home["id"] for home in config["homes"]], ["home-1", "home-2"])
+        self.assertTrue(all(set(home) == {"id"} for home in config["homes"]))
         self.assertEqual([relay["id"] for relay in config["relays"]], ["relay-1", "relay-2"])
         self.assertNotIn("travel_authorities", config)
         self.assertEqual(config["control_snapshot_ttl_secs"], 120)

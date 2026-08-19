@@ -111,11 +111,11 @@ Successful TLS chain validation is necessary but not sufficient. FlowSplice appl
 Current SPKI coverage is directional and explicit:
 
 - Server connects only to configured Relay addresses and requires the management-CA certificate's Relay role and expected stable ID. It records the authenticated key's SPKI in the signed Relay directory instead of duplicating Relay pins in configuration.
-- Server has an explicit allowlist of Home IDs and pins the management key set for each Home independently.
+- Server has an explicit allowlist of Home IDs and derives each Home's management key set from the verified deployment trust.
 - Relay pins its Server and resolves Travel management certificates through the synchronized signed-credential set.
 - Home pins its Server and resolves Travel business certificates through the same credential ID.
 - Server extracts each authenticated Relay's management SPKI and includes it in the signed Relay directory. Travel treats a configured seed as an untrusted transport address: it accepts control state only after verifying the embedded deployment root, the certified Server signature, freshness/generation, and that the connected Relay's certificate ID and SPKI occur in that signed directory.
-- Travel independently pins each configured Home ID and business certificate key set; the Home ID in the certificate URI is the endpoint identity.
+- Travel independently selects each permitted Home ID and derives its business certificate key set from the verified deployment trust; the Home ID in the certificate URI is the endpoint identity.
 
 Home sessions are isolated by stable Home ID. A newly authenticated session supersedes and closes only the previous session for that same Home ID. Other configured Homes remain online; an unknown Home ID or a key outside that Home's allowlist is rejected before registration.
 
@@ -323,7 +323,7 @@ Start from [travelagent/config.example.toml](travelagent/config.example.toml). A
 - point the management/business certificate and key paths at the imported enrollment directory;
 - point the management/business CA paths at the two roots installed from the response;
 - configure one or more reachable Seed Relay addresses; their IDs and SPKIs are not trust inputs and are learned from the Server-signed snapshot;
-- configure every permitted Home ID and Home business SPKI pin;
+- configure every permitted Home ID; its business SPKI key set is read from the verified deployment trust;
 - add a loopback mapping for the intended `(home_id, service_id, protocol)`.
 
 Then start the process:
@@ -387,7 +387,7 @@ files live beside each application:
 - [homeagent/config.example.toml](homeagent/config.example.toml)
 - [travelagent/config.example.toml](travelagent/config.example.toml)
 
-The E2E certificate generator is disposable test tooling only. Production Travel identities use `flowsplice-travelagent enroll-init` and `enroll-import`; issuance and revocation are performed through the selected Home Agent's separate local UI/API. Operators must provision and protect the offline deployment-root key, Home issuer's encrypted management/business CA keys, Home authority key, optional global authority key, non-Travel leaf keys, renewal process, and SPKI allowlists. Server, Relay, Home, and OpenWrt receive the root public key plus the root-signed deployment trust; authority records are not repeated in their runtime configuration. Startup fails when required trust or authorization state is missing or malformed.
+The E2E certificate generator is disposable test tooling only. Production Travel identities use `flowsplice-travelagent enroll-init` and `enroll-import`; issuance and revocation are performed through the selected Home Agent's separate local UI/API. Operators must provision and protect the offline deployment-root key, Home issuer's encrypted management/business CA keys, Home authority key, optional global authority key, non-Travel leaf keys, renewal process, the root-bound Home endpoint key sets, and any remaining explicitly configured peer pins. Server, Relay, Home, and OpenWrt receive the root public key plus the root-signed deployment trust; Home SPKI key sets and authority records are not repeated in Server or Travel runtime configuration. Startup fails when required trust or authorization state is missing or malformed.
 
 The Travel UI and local mappings bind to loopback by default. A non-loopback UI requires `allow_remote_listen = true` and an administrator bearer token of at least 32 characters. Private-key password rotation remains disabled on non-loopback UI listeners because the built-in UI uses HTTP.
 

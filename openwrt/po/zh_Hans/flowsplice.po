@@ -14,8 +14,8 @@ msgstr "添加中继实例"
 msgid "Add directory entry"
 msgstr "添加目录项"
 
-msgid "Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
-msgstr "请添加所有可能承载逻辑业务的家庭端。每条旅行端映射会选择一个家庭端 ID 和一个服务，绝不会自动切换到其他家庭端。"
+msgid "Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
+msgstr "请添加所有可能承载逻辑业务的家庭端，其 SPKI 密钥集合会自动从已签名的部署信任中读取。每条旅行端映射会选择一个家庭端 ID 和一个服务，绝不会自动切换到其他家庭端。"
 
 msgid "Advertised data address"
 msgstr "对外发布的数据地址"
@@ -55,9 +55,6 @@ msgstr "握手超时（秒）"
 
 msgid "Home ID"
 msgstr "家庭端 ID"
-
-msgid "Home SPKI pins"
-msgstr "家庭端 SPKI 指纹"
 
 msgid "Home control listener"
 msgstr "家庭端控制监听地址"

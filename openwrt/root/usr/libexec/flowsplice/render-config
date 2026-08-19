@@ -76,7 +76,6 @@ write_home() {
 	id="$(require_option "$section" id)"
 	printf '\n[[homes]]\n' >>"$RENDER_OUTPUT"
 	write_string id "$id" "$RENDER_OUTPUT"
-	write_list "$section" spki_pin spki_pins "$RENDER_OUTPUT"
 	HOME_COUNT=$((HOME_COUNT + 1))
 }
 

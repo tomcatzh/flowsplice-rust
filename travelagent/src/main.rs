@@ -38,7 +38,7 @@ use flowsplice_core::{
     route::{RouteSide, write_preface},
     tls::{
         identity_client_connector_with_private_key, identity_server_name, peer_identity,
-        require_peer, validate_spki_pins,
+        require_peer,
     },
 };
 use flowsplice_enrollment::{
@@ -171,8 +171,6 @@ impl RelayCandidate {
 #[serde(deny_unknown_fields)]
 struct ConfiguredHome {
     id: String,
-    #[serde(default)]
-    spki_pins: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -324,6 +322,7 @@ struct AppState {
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
     key_operation: Arc<Mutex<()>>,
     deployment_root_public_key: Arc<String>,
+    deployment_trust: Arc<RwLock<DeploymentTrust>>,
     management_spki_sha256: Arc<String>,
     control_trust_state_path: Arc<PathBuf>,
     control_trust_state: Arc<Mutex<ControlTrustState>>,
@@ -394,12 +393,13 @@ async fn main() -> Result<()> {
     require_peer(&management_identity, Role::Travel, Some(&config.id), &[])?;
     let control_trust_state_path =
         enrollment_sibling(&config.management_cert, CONTROL_TRUST_STATE_FILE);
-    let (control_trust_state, cached_control_snapshot) = load_initial_control_trust_state(
-        &config,
-        &deployment_root_public_key,
-        &control_trust_state_path,
-        &management_identity.spki_sha256,
-    )?;
+    let (control_trust_state, deployment_trust, cached_control_snapshot) =
+        load_initial_control_trust_state(
+            &config,
+            &deployment_root_public_key,
+            &control_trust_state_path,
+            &management_identity.spki_sha256,
+        )?;
     if recover_private_key_password_rotation(&travel_key_targets(&config))? {
         info!("completed interrupted Travel private-key password rotation");
     }
@@ -441,6 +441,7 @@ async fn main() -> Result<()> {
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
         key_operation: Arc::new(Mutex::new(())),
         deployment_root_public_key: Arc::new(deployment_root_public_key),
+        deployment_trust: Arc::new(RwLock::new(deployment_trust)),
         management_spki_sha256: Arc::new(management_identity.spki_sha256),
         control_trust_state_path: Arc::new(control_trust_state_path),
         control_trust_state: Arc::new(Mutex::new(control_trust_state)),
@@ -567,7 +568,11 @@ fn load_initial_control_trust_state(
     deployment_root_public_key: &str,
     state_path: &Path,
     management_spki_sha256: &str,
-) -> Result<(ControlTrustState, Option<VerifiedControlSnapshot>)> {
+) -> Result<(
+    ControlTrustState,
+    DeploymentTrust,
+    Option<VerifiedControlSnapshot>,
+)> {
     let trust_path = enrollment_sibling(&config.management_cert, DEPLOYMENT_TRUST_FILE);
     let signed: SignedDeploymentTrust = load_json(&trust_path)?;
     let now = unix_time_secs()?;
@@ -593,7 +598,7 @@ fn load_initial_control_trust_state(
         bail!("installed deployment trust conflicts with the durable trust high-water mark");
     }
     if trust.generation > state.trust_generation || state.deployment_id.is_none() {
-        state.deployment_id = Some(trust.deployment_id);
+        state.deployment_id = Some(trust.deployment_id.clone());
         state.trust_generation = trust.generation;
         state.trust_digest_sha256 = Some(trust_digest);
         flowsplice_core::authorization::store_json_atomic(state_path, &state)?;
@@ -608,7 +613,6 @@ fn load_initial_control_trust_state(
                     management_spki_sha256,
                 )
                 .is_ok()
-                    && configured_homes_match_trust(config, &verified.trust).is_ok()
                     && verified.trust.generation == state.trust_generation
                     && verified.trust_digest_sha256
                         == state.trust_digest_sha256.as_deref().unwrap_or_default()
@@ -629,7 +633,11 @@ fn load_initial_control_trust_state(
             }
         }
     });
-    Ok((state, cached))
+    let runtime_trust = cached
+        .as_ref()
+        .map_or(trust, |snapshot| snapshot.trust.clone());
+    configured_homes_are_trusted(&config.homes, &runtime_trust)?;
+    Ok((state, runtime_trust, cached))
 }
 
 fn local_certificate_identity(path: &Path) -> Result<flowsplice_core::tls::PeerIdentity> {
@@ -730,16 +738,7 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    let mut home_ids = HashSet::new();
-    for home in &config.homes {
-        if home.id.is_empty() || !home_ids.insert(home.id.as_str()) {
-            bail!("Home ids must be non-empty and unique");
-        }
-        validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
-    }
-    if config.homes.is_empty() {
-        bail!("at least one Home Agent is required");
-    }
+    let home_ids = configured_home_ids(&config.homes)?;
     if config.seed_relays.is_empty() {
         bail!("at least one seed relay is required");
     }
@@ -789,6 +788,19 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn configured_home_ids(homes: &[ConfiguredHome]) -> Result<HashSet<&str>> {
+    if homes.is_empty() {
+        bail!("at least one Home Agent is required");
+    }
+    let mut home_ids = HashSet::new();
+    for home in homes {
+        if home.id.is_empty() || !home_ids.insert(home.id.as_str()) {
+            bail!("Home ids must be non-empty and unique");
+        }
+    }
+    Ok(home_ids)
 }
 
 async fn run_catalog_subscription(state: AppState) -> Result<()> {
@@ -1005,6 +1017,10 @@ async fn open_business_on(
         .iter()
         .find(|home| home.id == home_id)
         .ok_or_else(|| anyhow!("Home {home_id} is not configured"))?;
+    let home_spki_pins = {
+        let trust = state.deployment_trust.read().await;
+        trusted_home_business_pins(&trust, &home.id)?.to_vec()
+    };
     let (grant, relay_id) = request_route(state, relay, home_id).await?;
     let mut socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
@@ -1030,7 +1046,7 @@ async fn open_business_on(
     .await
     .context("business TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Home, Some(&home.id), &home.spki_pins)?;
+    require_peer(&identity, Role::Home, Some(&home.id), &home_spki_pins)?;
     write_json(
         &mut stream,
         &DataFrame::Open {
@@ -1109,7 +1125,7 @@ async fn apply_control_snapshot(
 ) -> Result<()> {
     let verified = snapshot.verify(&state.deployment_root_public_key, unix_time_secs()?)?;
     require_control_snapshot_subject(&verified, &state.config.id, &state.management_spki_sha256)?;
-    configured_homes_match_trust(&state.config, &verified.trust)?;
+    configured_homes_are_trusted(&state.config.homes, &verified.trust)?;
     require_authenticated_relay_in_snapshot(
         &verified,
         authenticated_relay_id,
@@ -1130,6 +1146,7 @@ async fn apply_control_snapshot(
     if !changed {
         return Ok(());
     }
+    *state.deployment_trust.write().await = verified.trust;
     let directory = verified.payload.relay_directory;
     let catalog = verified.payload.catalog;
     let relay_ids: Vec<_> = directory
@@ -1165,27 +1182,18 @@ fn require_control_snapshot_subject(
     Ok(())
 }
 
-fn configured_homes_match_trust(config: &Config, trust: &DeploymentTrust) -> Result<()> {
-    for home in &config.homes {
-        let trusted = trust.home_endpoint(&home.id)?;
-        let configured = home
-            .spki_pins
-            .iter()
-            .map(|pin| pin.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let root_bound = trusted
-            .business_spki_pins
-            .iter()
-            .map(|pin| pin.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if configured != root_bound {
-            bail!(
-                "Home {} business pins do not match deployment trust",
-                home.id
-            );
-        }
+fn configured_homes_are_trusted(homes: &[ConfiguredHome], trust: &DeploymentTrust) -> Result<()> {
+    for home in homes {
+        trust.home_endpoint(&home.id)?;
     }
     Ok(())
+}
+
+fn trusted_home_business_pins<'a>(
+    trust: &'a DeploymentTrust,
+    home_id: &str,
+) -> Result<&'a [String]> {
+    Ok(&trust.home_endpoint(home_id)?.business_spki_pins)
 }
 
 fn require_authenticated_relay_in_snapshot(
@@ -1518,13 +1526,16 @@ impl Drop for FlowGuard {
 mod tests {
     use flowsplice_core::{
         authorization::TrustedTravelAuthority,
-        deployment::{ControlSnapshotPayload, DeploymentTrust, VerifiedControlSnapshot},
+        deployment::{
+            ControlSnapshotPayload, DeploymentTrust, HomeEndpointTrust, VerifiedControlSnapshot,
+        },
         protocol::{Catalog, RelayDirectory, RelayEndpoint},
     };
 
     use super::{
-        ControlTrustState, require_authenticated_relay_in_snapshot,
-        require_control_snapshot_subject,
+        ConfiguredHome, ControlTrustState, configured_home_ids, configured_homes_are_trusted,
+        require_authenticated_relay_in_snapshot, require_control_snapshot_subject,
+        trusted_home_business_pins,
     };
 
     fn verified(trust_generation: u64, generation: u64, digest: &str) -> VerifiedControlSnapshot {
@@ -1604,5 +1615,59 @@ mod tests {
         );
         assert!(require_control_snapshot_subject(&snapshot, "travel-1", &"33".repeat(32)).is_ok());
         assert!(require_control_snapshot_subject(&snapshot, "travel-2", &"33".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn configured_homes_are_resolved_from_deployment_trust() {
+        let mut snapshot = verified(1, 1, "aa");
+        snapshot.trust.home_endpoints = vec![HomeEndpointTrust {
+            home_id: "home-1".to_owned(),
+            management_spki_pins: vec!["11".repeat(32)],
+            business_spki_pins: vec!["22".repeat(32)],
+        }];
+        assert!(
+            configured_homes_are_trusted(
+                &[ConfiguredHome {
+                    id: "home-1".to_owned(),
+                }],
+                &snapshot.trust
+            )
+            .is_ok()
+        );
+        assert!(
+            configured_homes_are_trusted(
+                &[ConfiguredHome {
+                    id: "home-2".to_owned(),
+                }],
+                &snapshot.trust
+            )
+            .is_err()
+        );
+        assert_eq!(
+            trusted_home_business_pins(&snapshot.trust, "home-1").unwrap_or_default(),
+            &["22".repeat(32)]
+        );
+        assert!(trusted_home_business_pins(&snapshot.trust, "home-2").is_err());
+    }
+
+    #[test]
+    fn configured_home_ids_reject_empty_duplicate_and_legacy_pin_fields() {
+        assert!(configured_home_ids(&[]).is_err());
+        assert!(configured_home_ids(&[ConfiguredHome { id: String::new() }]).is_err());
+        assert!(
+            configured_home_ids(&[
+                ConfiguredHome {
+                    id: "home-1".to_owned(),
+                },
+                ConfiguredHome {
+                    id: "home-1".to_owned(),
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ConfiguredHome>(r#"{"id":"home-1","spki_pins":["obsolete"]}"#)
+                .is_err()
+        );
     }
 }

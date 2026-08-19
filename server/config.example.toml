@@ -16,11 +16,9 @@ control_snapshot_ttl_secs = 120
 
 [[homes]]
 id = "home-1"
-spki_pins = ["replace-with-home-management-spki-sha256-hex"]
 
 [[homes]]
 id = "home-2"
-spki_pins = ["replace-with-second-home-management-spki-sha256-hex"]
 
 [[relays]]
 id = "relay-1"

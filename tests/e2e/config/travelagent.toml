@@ -21,11 +21,9 @@ max_unacked_bytes = 1048576
 
 [[homes]]
 id = "home-1"
-spki_pins = ["__HOME_BUSINESS_PIN__"]
 
 [[homes]]
 id = "home-2"
-spki_pins = ["__HOME2_BUSINESS_PIN__"]
 
 [[seed_relays]]
 management_addr = "relay1:8443"

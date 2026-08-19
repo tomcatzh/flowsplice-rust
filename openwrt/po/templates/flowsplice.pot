@@ -13,7 +13,7 @@ msgstr ""
 msgid "Add directory entry"
 msgstr ""
 
-msgid "Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
+msgid "Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
 msgstr ""
 
 msgid "Advertised data address"
@@ -53,9 +53,6 @@ msgid "Handshake timeout (seconds)"
 msgstr ""
 
 msgid "Home ID"
-msgstr ""
-
-msgid "Home SPKI pins"
 msgstr ""
 
 msgid "Home control listener"

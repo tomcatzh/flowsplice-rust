@@ -150,10 +150,6 @@ chmod 644 "${cert_dir}"/*.crt
 server_pin="$(spki_pin server)"
 relay1_pin="$(spki_pin relay1)"
 relay2_pin="$(spki_pin relay2)"
-home_management_pin="$(spki_pin home-management)"
-home_business_pin="$(spki_pin home-business)"
-home2_management_pin="$(spki_pin home2-management)"
-home2_business_pin="$(spki_pin home2-business)"
 printf '{"credentials":[]}\n' >"${authorization_dir}/credentials.json"
 printf '{"relay-1":"%s","relay-2":"%s"}\n' \
   "${relay1_pin}" "${relay2_pin}" >"${state_dir}/relay-pins.json"
@@ -162,10 +158,6 @@ for template in "${script_dir}"/config/*.toml; do
   output="${config_dir}/$(basename -- "${template}")"
   sed \
     -e "s/__SERVER_PIN__/${server_pin}/g" \
-    -e "s/__HOME_MANAGEMENT_PIN__/${home_management_pin}/g" \
-    -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
-    -e "s/__HOME2_MANAGEMENT_PIN__/${home2_management_pin}/g" \
-    -e "s/__HOME2_BUSINESS_PIN__/${home2_business_pin}/g" \
     "${template}" >"${output}"
 done
 printf 'Generated E2E certificates in %s\n' "${cert_dir}"

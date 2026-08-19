@@ -20,11 +20,9 @@ max_unacked_bytes = 1048576
 
 [[homes]]
 id = "home-1"
-spki_pins = ["replace-with-home-spki-sha256-hex"]
 
 [[homes]]
 id = "home-2"
-spki_pins = ["replace-with-second-home-spki-sha256-hex"]
 
 [[seed_relays]]
 management_addr = "relay-1.example.net:8443"
