@@ -7,6 +7,7 @@ import re
 import socket
 import subprocess
 import time
+import uuid
 
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
 ISSUER_AUTHORIZATION = "Bearer flowsplice-e2e-home-issuer-administrator-token"
@@ -92,6 +93,9 @@ def travel_request(method: str, path: str, body=None, expect_ok=True):
 def wait_ready() -> dict:
     deadline = time.monotonic() + 90
     last_error = None
+    expected_relay_pins = json.loads(
+        (Path(__file__).resolve().parent / "generated/state/relay-pins.json").read_text()
+    )
     while time.monotonic() < deadline:
         try:
             status, _, body = http_get("/api/status", {"Accept": "application/json"})
@@ -112,14 +116,31 @@ def wait_ready() -> dict:
                     and {service["id"] for service in homes["home-2"]["services"]}
                     == {"tcp-echo"}
                     and directory["generation"] >= 1
-                    and {relay["id"] for relay in directory["relays"]}
-                    == {"relay-1", "relay-2"}
+                    and {
+                        relay["id"]: relay["management_spki_sha256"]
+                        for relay in directory["relays"]
+                    }
+                    == expected_relay_pins
                 ):
                     return state
         except Exception as error:  # startup polling deliberately records all transport failures
             last_error = error
         time.sleep(1)
     raise AssertionError(f"Travel Agent did not become ready: {last_error}")
+
+
+def read_control_high_water() -> dict:
+    path = Path(__file__).resolve().parent / "generated/travel/control-trust-state.json"
+    state = json.loads(path.read_text())
+    assert state["object_type"] == "flowsplice.travel_control_high_water", state
+    assert state["deployment_id"] == "flowsplice-e2e", state
+    assert state["trust_generation"] >= 1, state
+    assert len(state["trust_digest_sha256"]) == 64, state
+    assert state["signer_epoch"] >= 1, state
+    assert state["snapshot_generation"] >= 1, state
+    assert len(state["snapshot_digest_sha256"]) == 64, state
+    assert state["cached_snapshot"], state
+    return state
 
 
 def wait_issuer_ready(port: int) -> None:
@@ -312,6 +333,7 @@ def check_embedded_spa() -> None:
         issuer_javascript = gzip.decompress(issuer_asset_body)
         assert "旅行端凭据签发".encode() in issuer_javascript
         assert "更改 Home 签发密码".encode() in issuer_javascript
+        assert "此前已经签发".encode() in issuer_javascript
 
     issuer_api_status, _, _ = issuer_get(
         "/api/not-a-route", {"Accept": "text/html"}
@@ -326,9 +348,9 @@ def check_embedded_spa() -> None:
 def check_duplicate_travel_login_is_rejected() -> None:
     generated_dir = Path(__file__).resolve().parent / "generated"
     network = "e2e_flowsplice"
-    for relay_addr, server_name, relay_id in [
-        ("relay1:8443", "relay-1.flowsplice", "relay-1"),
-        ("relay2:8443", "relay-2.flowsplice", "relay-2"),
+    for relay_addr, relay_id in [
+        ("relay1:8443", "relay-1"),
+        ("relay2:8443", "relay-2"),
     ]:
         subprocess.run(
             [
@@ -345,7 +367,6 @@ def check_duplicate_travel_login_is_rejected() -> None:
                 "/usr/local/bin/flowsplice-travel-login-probe",
                 "duplicate",
                 relay_addr,
-                server_name,
                 relay_id,
             ],
             check=True,
@@ -360,12 +381,15 @@ def issue_scope(
     validity = {"valid_days": 365}
     if valid_minutes is not None:
         validity = {"valid_minutes": valid_minutes}
+    request = json.loads((generated / "travel/enrollment-request.json").read_text())
+    request["request_id"] = str(uuid.uuid4())
+    request["created_at_unix_secs"] = int(time.time())
     result = issuer_request(
         port,
         "POST",
         "/api/issue",
         {
-            "request": json.loads((generated / "travel/enrollment-request.json").read_text()),
+            "request": request,
             **validity,
             "scope": scope,
             "password": (generated / issuer_directory / "test-password.txt").read_text().strip(),
@@ -410,6 +434,43 @@ def container_pid(service: str) -> int:
 
 
 def check_home_issued_enrollment() -> str:
+    generated = Path(__file__).resolve().parent / "generated"
+    response = json.loads(
+        (generated / "authorization/enrollment-response.json").read_text()
+    )
+    assert "authority_public_key" not in response
+    assert "management_ca_certificate_pem" not in response
+    trust = json.loads(bytes.fromhex(response["deployment_trust"]["payload_hex"]))
+    credential_payload = json.loads(
+        bytes.fromhex(response["signed_credential"]["payload_hex"])
+    )
+    assert credential_payload["object_type"] == "flowsplice.travel_credential"
+    assert credential_payload["deployment_id"] == trust["deployment_id"]
+    assert credential_payload["enrollment_request_id"] == response["approval"]["request"]["request_id"]
+    assert credential_payload["enrollment_nonce"] == response["approval"]["request"]["nonce"]
+    assert len(credential_payload["enrollment_nonce"]) == 64
+    assert credential_payload["authority_epoch"] == 1
+    for name in (
+        "deployment_trust_sha256",
+        "enrollment_request_sha256",
+        "management_ca_sha256",
+        "business_ca_sha256",
+        "management_certificate_sha256",
+        "business_certificate_sha256",
+    ):
+        assert len(credential_payload[name]) == 64, name
+    assert trust["management_ca_certificate_pem"].startswith(
+        "-----BEGIN CERTIFICATE-----"
+    )
+    assert trust["business_ca_certificate_pem"].startswith(
+        "-----BEGIN CERTIFICATE-----"
+    )
+    assert (generated / "travel/management-ca.crt").read_text() == trust[
+        "management_ca_certificate_pem"
+    ]
+    assert (generated / "travel/business-ca.crt").read_text() == trust[
+        "business_ca_certificate_pem"
+    ]
     credentials = [
         credential for credential in issued_credentials(19081)
         if credential["travel_id"] == "travel-1" and credential["scope"]["kind"] == "global"
@@ -422,10 +483,58 @@ def check_home_issued_enrollment() -> str:
     return credential["credential_id"]
 
 
-def check_private_key_password_rotation() -> dict:
+def check_duplicate_enrollment_issue_is_idempotent(
+    credential_id: str, expected_generation: int | None = None
+) -> int:
+    generated = Path(__file__).resolve().parent / "generated"
+    before = issued_credentials(19081)
+    result = issuer_request(
+        19081,
+        "POST",
+        "/api/issue",
+        {
+            "request": json.loads(
+                (generated / "travel/enrollment-request.json").read_text()
+            ),
+            "valid_days": 365,
+            "scope": {"kind": "global"},
+            "password": "deliberately-not-the-issuer-password",
+        },
+    )
+    assert result["reused"] is True, result
+    assert result["enrollment"]["approval"]["credential_id"] == credential_id, result
+    if expected_generation is not None:
+        assert result["generation"] == expected_generation, result
+    after = issued_credentials(19081)
+    assert after == before, (before, after)
+
+    changed_scope = issuer_request(
+        19081,
+        "POST",
+        "/api/issue",
+        {
+            "request": json.loads(
+                (generated / "travel/enrollment-request.json").read_text()
+            ),
+            "valid_days": 365,
+            "scope": {"kind": "home", "home_id": "home-1"},
+            "password": "password-must-not-change-a-used-request",
+        },
+        expect_ok=False,
+    )
+    assert "already used for a different authorization" in changed_scope["error"], changed_scope
+    assert issued_credentials(19081) == before
+    return result["generation"]
+
+
+def check_private_key_password_rotation(
+    credential_id: str, issuance_generation: int
+) -> dict:
     generated = Path(__file__).resolve().parent / "generated"
     old_password = (generated / "offline/test-password.txt").read_text().strip()
     new_password = "flowsplice-e2e-rotated-private-key-password"
+    if new_password == old_password:
+        new_password = "flowsplice-e2e-rotated-private-key-password-again"
     wrong_password = "flowsplice-e2e-wrong-private-key-password"
 
     issuer_request(
@@ -475,15 +584,25 @@ def check_private_key_password_rotation() -> dict:
     ]:
         path.write_text(new_password + "\n")
         path.chmod(0o600)
+    before_restart = read_control_high_water()
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent", "travelagent"],
         check=True,
     )
     wait_issuer_ready(19081)
-    return wait_ready()
+    check_duplicate_enrollment_issue_is_idempotent(
+        credential_id, issuance_generation
+    )
+    ready = wait_ready()
+    after_restart = read_control_high_water()
+    assert after_restart["trust_generation"] >= before_restart["trust_generation"]
+    assert after_restart["signer_epoch"] >= before_restart["signer_epoch"]
+    if after_restart["signer_epoch"] == before_restart["signer_epoch"]:
+        assert after_restart["snapshot_generation"] >= before_restart["snapshot_generation"]
+    return ready
 
 
-def assert_revoked_management_certificate_rejected(relay: str, server_name: str) -> None:
+def assert_revoked_management_certificate_rejected(relay: str) -> None:
     generated_dir = Path(__file__).resolve().parent / "generated"
     result = subprocess.run(
         [
@@ -500,7 +619,6 @@ def assert_revoked_management_certificate_rejected(relay: str, server_name: str)
             "/usr/local/bin/flowsplice-travel-login-probe",
             "duplicate",
             f"{relay}:8443",
-            server_name,
             relay.replace("relay", "relay-"),
         ],
         text=True,
@@ -592,6 +710,23 @@ def check_scoped_authorization_and_home_revocation(
         wait_local_flow_closed(home_one)
         wait_local_flow_closed(home_two)
 
+    generated = Path(__file__).resolve().parent / "generated"
+    revoked_retry = issuer_request(
+        19081,
+        "POST",
+        "/api/issue",
+        {
+            "request": json.loads(
+                (generated / "travel/enrollment-request.json").read_text()
+            ),
+            "valid_days": 365,
+            "scope": {"kind": "global"},
+            "password": "password-must-not-reactivate-a-revoked-intent",
+        },
+        expect_ok=False,
+    )
+    assert "no longer active" in revoked_retry["error"], revoked_retry
+
     wait_scoped_catalog(
         {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo"}}
     )
@@ -619,8 +754,8 @@ def check_scoped_authorization_and_home_revocation(
 
     revoke_from_home(29081, home_two_credential)
     wait_scoped_catalog({})
-    assert_revoked_management_certificate_rejected("relay1", "relay-1.flowsplice")
-    assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
+    assert_revoked_management_certificate_rejected("relay1")
+    assert_revoked_management_certificate_rejected("relay2")
     assert pids == {
         service_name: container_pid(service_name)
         for service_name in ("server", "relay1", "relay2", "homeagent", "homeagent2")
@@ -630,7 +765,7 @@ def check_scoped_authorization_and_home_revocation(
         check=True,
     )
     time.sleep(3)
-    assert_revoked_management_certificate_rejected("relay2", "relay-2.flowsplice")
+    assert_revoked_management_certificate_rejected("relay2")
 
 
 def check_tls_policy_and_slow_loris_deadline() -> None:
@@ -665,7 +800,6 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
             "/usr/local/bin/flowsplice-travel-login-probe",
             "slow-frame",
             "relay1:8443",
-            "relay-1.flowsplice",
             "relay-1",
         ],
         check=True,
@@ -674,7 +808,8 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
 
 state = wait_ready()
 credential_id = check_home_issued_enrollment()
-state = check_private_key_password_rotation()
+issuance_generation = check_duplicate_enrollment_issue_is_idempotent(credential_id)
+state = check_private_key_password_rotation(credential_id, issuance_generation)
 check_udp()
 check_multi_home_business_routing()
 check_home_lifecycle_is_isolated()
@@ -684,7 +819,7 @@ check_tls_policy_and_slow_loris_deadline()
 failed_relay, replacement_relay = check_tcp_relay_failover()
 check_scoped_authorization_and_home_revocation(failed_relay, credential_id)
 checks = [
-    "two-relay-directory",
+    "server-downlinked-two-relay-spki-directory",
     "two-home-catalog",
     "same-service-id-isolated-by-home",
     "logical-business-selects-exact-home",
@@ -699,11 +834,20 @@ checks = [
     "slow-frame-deadline",
     "duplicate-travel-login-rejected-across-relays",
     "encrypted-local-travel-enrollment",
+    "tampered-enrollment-trust-rejected",
+    "cross-request-and-certificate-splicing-rejected",
+    "independent-enrollment-nonce-bound",
+    "single-file-enrollment-response-includes-ca-roots",
     "home-embedded-issuer-ui",
     "home-dual-ca-issuance",
+    "duplicate-enrollment-issue-is-idempotent",
+    "enrollment-request-is-single-use",
+    "issuance-ledger-survives-home-restart",
     "home-private-key-password-rotation",
     "travel-private-key-password-rotation",
     "password-rotation-survives-restart",
+    "deployment-root-private-key-not-mounted-in-home",
+    "durable-control-high-water-survives-restart",
     "default-one-year-validity",
     "global-super-authorization",
     "home-scoped-authorization",
@@ -711,6 +855,7 @@ checks = [
     "catalog-filtered-by-signed-scope",
     "cross-home-revocation-rejected",
     "home-originated-live-revocation",
+    "duplicate-issuance-cannot-reactivate-revoked-grant",
     "live-revocation-closes-flows-on-both-homes",
     "revoked-certificate-rejected-by-both-relays",
     "revocation-without-process-restart",

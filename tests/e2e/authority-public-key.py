@@ -7,21 +7,22 @@ import subprocess
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--authority-key", required=True, type=Path)
-    parser.add_argument("--password-file", required=True, type=Path)
+    parser.add_argument("--password-file", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    public_der = subprocess.run(
-        [
+    command = [
             "openssl",
             "pkey",
             "-in",
             str(args.authority_key),
-            "-passin",
-            f"file:{args.password_file}",
             "-pubout",
             "-outform",
             "DER",
-        ],
+        ]
+    if args.password_file is not None:
+        command[4:4] = ["-passin", f"file:{args.password_file}"]
+    public_der = subprocess.run(
+        command,
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

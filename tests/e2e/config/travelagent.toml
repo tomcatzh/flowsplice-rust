@@ -1,11 +1,10 @@
 id = "travel-1"
 management_cert = "/travel/travel-management.crt"
 management_key = "/travel/travel-management.key"
-management_ca = "/certs/management-ca.crt"
+management_ca = "/travel/management-ca.crt"
 business_cert = "/travel/travel-business.crt"
 business_key = "/travel/travel-business.key"
-business_ca = "/certs/business-ca.crt"
-relay_spki_pins = ["__RELAY1_PIN__", "__RELAY2_PIN__"]
+business_ca = "/travel/business-ca.crt"
 ui_listen = "0.0.0.0:9080"
 allow_remote_listen = true
 admin_token = "flowsplice-e2e-administrator-token"
@@ -22,18 +21,14 @@ max_unacked_bytes = 1048576
 
 [[homes]]
 id = "home-1"
-server_name = "home-1.flowsplice"
 spki_pins = ["__HOME_BUSINESS_PIN__"]
 
 [[homes]]
 id = "home-2"
-server_name = "home-2.flowsplice"
 spki_pins = ["__HOME2_BUSINESS_PIN__"]
 
 [[seed_relays]]
-id = "relay-1"
 management_addr = "relay1:8443"
-server_name = "relay-1.flowsplice"
 
 [[mappings]]
 home_id = "home-1"

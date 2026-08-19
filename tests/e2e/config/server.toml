@@ -4,29 +4,14 @@ data_listens = ["0.0.0.0:7444"]
 cert = "/certs/server.crt"
 key = "/certs/server.key"
 management_ca = "/certs/management-ca.crt"
-relay_spki_pins = ["__RELAY1_PIN__", "__RELAY2_PIN__"]
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
+control_signing_key = "/authorization/server-control.key"
 travel_credentials = "/authorization/credentials.json"
 travel_revocations = "/state/server-revocations.json"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
-
-[[travel_authorities]]
-kind = "home"
-id = "home-1-authority"
-home_id = "home-1"
-public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "home"
-id = "home-2-authority"
-home_id = "home-2"
-public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "global"
-id = "operator-global-authority"
-home_id = "home-1"
-public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"
+control_snapshot_ttl_secs = 120
 
 [[homes]]
 id = "home-1"
@@ -39,9 +24,7 @@ spki_pins = ["__HOME2_MANAGEMENT_PIN__"]
 [[relays]]
 id = "relay-1"
 management_addr = "relay1:8443"
-server_name = "relay-1.flowsplice"
 
 [[relays]]
 id = "relay-2"
 management_addr = "relay2:8443"
-server_name = "relay-2.flowsplice"

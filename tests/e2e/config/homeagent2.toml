@@ -19,26 +19,10 @@ carrier_timeout_secs = 15
 flow_detach_timeout_secs = 60
 max_unacked_bytes = 1048576
 
-[[travel_authorities]]
-kind = "home"
-id = "home-1-authority"
-home_id = "home-1"
-public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "home"
-id = "home-2-authority"
-home_id = "home-2"
-public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "global"
-id = "operator-global-authority"
-home_id = "home-1"
-public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"
-
 [issuer]
 listen = "0.0.0.0:9081"
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
 management_ca_cert = "/certs/management-ca.crt"
 management_ca_key = "/issuer/management-ca.key"
 business_ca_cert = "/certs/business-ca.crt"
@@ -49,7 +33,6 @@ admin_token = "flowsplice-e2e-home-issuer-administrator-token"
 
 [issuer.home_authority]
 id = "home-2-authority"
-public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
 private_key = "/issuer/home2-authority.key"
 
 [[services]]

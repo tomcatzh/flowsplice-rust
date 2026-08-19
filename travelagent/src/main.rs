@@ -26,20 +26,24 @@ use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::unix_time_secs,
     config::load_toml,
+    deployment::{
+        DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust, VerifiedControlSnapshot,
+    },
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{
-        Catalog, ControlMessage, DataFrame, RelayDirectory, RelayEndpoint, Role, ServiceProtocol,
+        Catalog, ControlMessage, DataFrame, RelayDirectory, Role, ServiceProtocol,
         TravelConnectionPurpose,
     },
     route::{RouteSide, write_preface},
     tls::{
-        client_connector_with_private_key, peer_identity, require_peer, server_name,
-        validate_spki_pins,
+        identity_client_connector_with_private_key, identity_server_name, peer_identity,
+        require_peer, validate_spki_pins,
     },
 };
 use flowsplice_enrollment::{
-    TravelEnrollmentResponse, create_enrollment_request, install_enrollment_response,
+    DEPLOYMENT_TRUST_FILE, TravelEnrollmentResponse, create_enrollment_request,
+    install_enrollment_response,
     key::{
         MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget, is_encrypted_private_key,
         load_private_key, recover_private_key_password_rotation, rotate_private_key_passwords,
@@ -47,6 +51,7 @@ use flowsplice_enrollment::{
     load_json,
 };
 use rust_embed::RustEmbed;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
@@ -89,7 +94,7 @@ struct EnrollInitArgs {
     #[arg(long)]
     travel_id: String,
     #[arg(long)]
-    output_dir: PathBuf,
+    enrollment_dir: PathBuf,
     #[arg(long, hide = true)]
     test_password_file: Option<PathBuf>,
 }
@@ -100,10 +105,6 @@ struct EnrollImportArgs {
     enrollment_dir: PathBuf,
     #[arg(long)]
     response: PathBuf,
-    #[arg(long)]
-    management_ca: PathBuf,
-    #[arg(long)]
-    business_ca: PathBuf,
     #[arg(long, hide = true)]
     test_password_file: Option<PathBuf>,
 }
@@ -111,7 +112,7 @@ struct EnrollImportArgs {
 #[derive(Clone, Deserialize)]
 struct Config {
     id: String,
-    seed_relays: Vec<RelayEndpoint>,
+    seed_relays: Vec<SeedRelay>,
     homes: Vec<ConfiguredHome>,
     management_cert: PathBuf,
     management_key: PathBuf,
@@ -120,8 +121,6 @@ struct Config {
     business_key: PathBuf,
     business_ca: PathBuf,
     ui_listen: String,
-    #[serde(default)]
-    relay_spki_pins: Vec<String>,
     #[serde(default)]
     allow_remote_listen: bool,
     #[serde(default)]
@@ -151,9 +150,27 @@ struct Config {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SeedRelay {
+    management_addr: String,
+}
+
+#[derive(Clone)]
+struct RelayCandidate {
+    expected_id: Option<String>,
+    management_addr: String,
+    management_spki_sha256: Option<String>,
+}
+
+impl RelayCandidate {
+    fn label(&self) -> &str {
+        self.expected_id.as_deref().unwrap_or(&self.management_addr)
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfiguredHome {
     id: String,
-    server_name: String,
     #[serde(default)]
     spki_pins: Vec<String>,
 }
@@ -206,6 +223,94 @@ const fn default_max_unacked_bytes() -> usize {
     1_048_576
 }
 
+const CONTROL_TRUST_STATE_FILE: &str = "control-trust-state.json";
+const CONTROL_TRUST_STATE_OBJECT_TYPE: &str = "flowsplice.travel_control_high_water";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControlTrustState {
+    object_type: String,
+    deployment_id: Option<String>,
+    trust_generation: u64,
+    trust_digest_sha256: Option<String>,
+    signer_epoch: u64,
+    snapshot_generation: u64,
+    snapshot_digest_sha256: Option<String>,
+    cached_snapshot: Option<SignedControlSnapshot>,
+}
+
+impl ControlTrustState {
+    fn new() -> Self {
+        Self {
+            object_type: CONTROL_TRUST_STATE_OBJECT_TYPE.to_owned(),
+            deployment_id: None,
+            trust_generation: 0,
+            trust_digest_sha256: None,
+            signer_epoch: 0,
+            snapshot_generation: 0,
+            snapshot_digest_sha256: None,
+            cached_snapshot: None,
+        }
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        if self.object_type != CONTROL_TRUST_STATE_OBJECT_TYPE {
+            bail!("unsupported Travel control high-water state");
+        }
+        if self.snapshot_generation == 0
+            && (self.signer_epoch != 0
+                || self.snapshot_digest_sha256.is_some()
+                || self.cached_snapshot.is_some())
+        {
+            bail!("Travel control high-water state is inconsistent");
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, snapshot: &VerifiedControlSnapshot) -> Result<bool> {
+        self.validate_shape()?;
+        if self
+            .deployment_id
+            .as_deref()
+            .is_some_and(|deployment_id| deployment_id != snapshot.trust.deployment_id)
+        {
+            bail!("control snapshot belongs to a different deployment");
+        }
+        if snapshot.trust.generation < self.trust_generation {
+            bail!("deployment trust generation rollback detected");
+        }
+        if snapshot.trust.generation == self.trust_generation
+            && self.trust_digest_sha256.is_some()
+            && self.trust_digest_sha256.as_deref() != Some(&snapshot.trust_digest_sha256)
+        {
+            bail!("conflicting deployment trust documents use the same generation");
+        }
+        if snapshot.payload.signer_epoch < self.signer_epoch {
+            bail!("Server control signer epoch rollback detected");
+        }
+        if snapshot.payload.signer_epoch == self.signer_epoch
+            && snapshot.payload.generation < self.snapshot_generation
+        {
+            return Ok(false);
+        }
+        if snapshot.payload.signer_epoch == self.signer_epoch
+            && snapshot.payload.generation == self.snapshot_generation
+        {
+            if self.snapshot_digest_sha256.as_deref() != Some(&snapshot.digest_sha256) {
+                bail!("conflicting control snapshots use the same generation");
+            }
+            return Ok(false);
+        }
+        self.deployment_id = Some(snapshot.trust.deployment_id.clone());
+        self.trust_generation = snapshot.trust.generation;
+        self.trust_digest_sha256 = Some(snapshot.trust_digest_sha256.clone());
+        self.signer_epoch = snapshot.payload.signer_epoch;
+        self.snapshot_generation = snapshot.payload.generation;
+        self.snapshot_digest_sha256 = Some(snapshot.digest_sha256.clone());
+        Ok(true)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
@@ -218,6 +323,10 @@ struct AppState {
     permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
     key_operation: Arc<Mutex<()>>,
+    deployment_root_public_key: Arc<String>,
+    management_spki_sha256: Arc<String>,
+    control_trust_state_path: Arc<PathBuf>,
+    control_trust_state: Arc<Mutex<ControlTrustState>>,
 }
 
 #[derive(Clone)]
@@ -280,17 +389,28 @@ async fn main() -> Result<()> {
     }
     let config: Config = load_toml(&cli.config)?;
     validate_config(&config)?;
+    let deployment_root_public_key = embedded_deployment_root_public_key()?.to_owned();
+    let management_identity = local_certificate_identity(&config.management_cert)?;
+    require_peer(&management_identity, Role::Travel, Some(&config.id), &[])?;
+    let control_trust_state_path =
+        enrollment_sibling(&config.management_cert, CONTROL_TRUST_STATE_FILE);
+    let (control_trust_state, cached_control_snapshot) = load_initial_control_trust_state(
+        &config,
+        &deployment_root_public_key,
+        &control_trust_state_path,
+        &management_identity.spki_sha256,
+    )?;
     if recover_private_key_password_rotation(&travel_key_targets(&config))? {
         info!("completed interrupted Travel private-key password rotation");
     }
     let (management_key, business_key) = load_runtime_private_keys(&config)?;
     let tls = Arc::new(TlsMaterial {
-        management_connector: client_connector_with_private_key(
+        management_connector: identity_client_connector_with_private_key(
             &config.management_cert,
             management_key,
             &config.management_ca,
         )?,
-        business_connector: client_connector_with_private_key(
+        business_connector: identity_client_connector_with_private_key(
             &config.business_cert,
             business_key,
             &config.business_ca,
@@ -301,13 +421,29 @@ async fn main() -> Result<()> {
         config: Arc::new(config),
         session_id: Uuid::new_v4(),
         tls,
-        catalog: Arc::new(RwLock::new(Catalog::default())),
-        directory: Arc::new(RwLock::new(RelayDirectory::default())),
+        catalog: Arc::new(RwLock::new(
+            cached_control_snapshot
+                .as_ref()
+                .map_or_else(Catalog::default, |snapshot| {
+                    snapshot.payload.catalog.clone()
+                }),
+        )),
+        directory: Arc::new(RwLock::new(
+            cached_control_snapshot
+                .as_ref()
+                .map_or_else(RelayDirectory::default, |snapshot| {
+                    snapshot.payload.relay_directory.clone()
+                }),
+        )),
         started: Instant::now(),
         active_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
         key_operation: Arc::new(Mutex::new(())),
+        deployment_root_public_key: Arc::new(deployment_root_public_key),
+        management_spki_sha256: Arc::new(management_identity.spki_sha256),
+        control_trust_state_path: Arc::new(control_trust_state_path),
+        control_trust_state: Arc::new(Mutex::new(control_trust_state)),
     };
 
     let mut tasks = JoinSet::new();
@@ -340,17 +476,18 @@ fn run_command(command: Command) -> Result<()> {
             let request = create_enrollment_request(
                 &args.travel_id,
                 password.as_bytes(),
-                &args.output_dir,
+                &args.enrollment_dir,
                 unix_time_secs()?,
             )?;
             println!(
                 "created Travel enrollment request {} ({})",
                 request.request_id,
-                args.output_dir.display()
+                args.enrollment_dir.display()
             );
             Ok(())
         }
         Command::EnrollImport(args) => {
+            let deployment_root_public_key = embedded_deployment_root_public_key()?;
             let password = if let Some(path) = args.test_password_file.as_deref() {
                 test_password(path)?
             } else {
@@ -360,13 +497,46 @@ fn run_command(command: Command) -> Result<()> {
                 bail!("private-key password must not be empty");
             }
             let response: TravelEnrollmentResponse = load_json(&args.response)?;
+            let trust = response
+                .deployment_trust
+                .verify(deployment_root_public_key, unix_time_secs()?)?;
+            let control_trust_state_path = args.enrollment_dir.join(CONTROL_TRUST_STATE_FILE);
+            let mut control_trust_state = if control_trust_state_path.exists() {
+                flowsplice_core::authorization::load_json(&control_trust_state_path)?
+            } else {
+                ControlTrustState::new()
+            };
+            control_trust_state.validate_shape()?;
+            if control_trust_state
+                .deployment_id
+                .as_deref()
+                .is_some_and(|deployment_id| deployment_id != trust.deployment_id)
+            {
+                bail!("Enrollment Response belongs to a different deployment");
+            }
+            if trust.generation < control_trust_state.trust_generation {
+                bail!("Enrollment Response would roll back deployment trust");
+            }
+            let trust_digest_sha256 = response.deployment_trust.payload_digest_sha256()?;
+            if trust.generation == control_trust_state.trust_generation
+                && control_trust_state.trust_digest_sha256.is_some()
+                && control_trust_state.trust_digest_sha256.as_deref() != Some(&trust_digest_sha256)
+            {
+                bail!("Enrollment Response conflicts with installed deployment trust");
+            }
             let credential = install_enrollment_response(
                 &args.enrollment_dir,
                 &response,
-                &args.management_ca,
-                &args.business_ca,
+                deployment_root_public_key,
                 password.as_bytes(),
                 unix_time_secs()?,
+            )?;
+            control_trust_state.deployment_id = Some(trust.deployment_id);
+            control_trust_state.trust_generation = trust.generation;
+            control_trust_state.trust_digest_sha256 = Some(trust_digest_sha256);
+            flowsplice_core::authorization::store_json_atomic(
+                &control_trust_state_path,
+                &control_trust_state,
             )?;
             println!(
                 "installed Travel credential {} for {}",
@@ -375,6 +545,99 @@ fn run_command(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn embedded_deployment_root_public_key() -> Result<&'static str> {
+    option_env!("FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("this Travel binary has no embedded deployment root public key"))
+}
+
+fn enrollment_sibling(certificate: &Path, file_name: &str) -> PathBuf {
+    certificate
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(file_name)
+}
+
+fn load_initial_control_trust_state(
+    config: &Config,
+    deployment_root_public_key: &str,
+    state_path: &Path,
+    management_spki_sha256: &str,
+) -> Result<(ControlTrustState, Option<VerifiedControlSnapshot>)> {
+    let trust_path = enrollment_sibling(&config.management_cert, DEPLOYMENT_TRUST_FILE);
+    let signed: SignedDeploymentTrust = load_json(&trust_path)?;
+    let now = unix_time_secs()?;
+    let trust = signed.verify(deployment_root_public_key, now)?;
+    let trust_digest = signed.payload_digest_sha256()?;
+    let mut state = if state_path.exists() {
+        flowsplice_core::authorization::load_json(state_path)?
+    } else {
+        ControlTrustState::new()
+    };
+    state.validate_shape()?;
+    if state
+        .deployment_id
+        .as_deref()
+        .is_some_and(|deployment_id| deployment_id != trust.deployment_id)
+    {
+        bail!("installed deployment trust belongs to a different deployment");
+    }
+    if trust.generation == state.trust_generation
+        && state.trust_digest_sha256.is_some()
+        && state.trust_digest_sha256.as_deref() != Some(&trust_digest)
+    {
+        bail!("installed deployment trust conflicts with the durable trust high-water mark");
+    }
+    if trust.generation > state.trust_generation || state.deployment_id.is_none() {
+        state.deployment_id = Some(trust.deployment_id);
+        state.trust_generation = trust.generation;
+        state.trust_digest_sha256 = Some(trust_digest);
+        flowsplice_core::authorization::store_json_atomic(state_path, &state)?;
+    }
+
+    let cached = state.cached_snapshot.as_ref().and_then(|snapshot| {
+        match snapshot.verify(deployment_root_public_key, now) {
+            Ok(verified)
+                if require_control_snapshot_subject(
+                    &verified,
+                    &config.id,
+                    management_spki_sha256,
+                )
+                .is_ok()
+                    && configured_homes_match_trust(config, &verified.trust).is_ok()
+                    && verified.trust.generation == state.trust_generation
+                    && verified.trust_digest_sha256
+                        == state.trust_digest_sha256.as_deref().unwrap_or_default()
+                    && verified.payload.signer_epoch == state.signer_epoch
+                    && verified.payload.generation == state.snapshot_generation
+                    && verified.digest_sha256
+                        == state.snapshot_digest_sha256.as_deref().unwrap_or_default() =>
+            {
+                Some(verified)
+            }
+            Ok(_) => {
+                warn!("ignored cached control snapshot inconsistent with its durable high-water mark");
+                None
+            }
+            Err(error) => {
+                warn!(%error, "cached control snapshot is unusable; waiting for a fresh signed state");
+                None
+            }
+        }
+    });
+    Ok((state, cached))
+}
+
+fn local_certificate_identity(path: &Path) -> Result<flowsplice_core::tls::PeerIdentity> {
+    let certificates = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("failed to open certificate {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse certificate {}", path.display()))?;
+    peer_identity(Some(&certificates))
 }
 
 fn prompt_new_private_key_password() -> Result<Zeroizing<String>> {
@@ -467,14 +730,12 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    validate_spki_pins(&config.relay_spki_pins, "relay")?;
     let mut home_ids = HashSet::new();
     for home in &config.homes {
-        if home.id.is_empty() || home.server_name.is_empty() || !home_ids.insert(home.id.as_str()) {
-            bail!("Home ids must be non-empty and unique, with non-empty TLS server names");
+        if home.id.is_empty() || !home_ids.insert(home.id.as_str()) {
+            bail!("Home ids must be non-empty and unique");
         }
         validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
-        let _ = server_name(&home.server_name)?;
     }
     if config.homes.is_empty() {
         bail!("at least one Home Agent is required");
@@ -482,14 +743,10 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.seed_relays.is_empty() {
         bail!("at least one seed relay is required");
     }
-    let mut relay_ids = HashSet::new();
+    let mut seed_relays = HashSet::new();
     for relay in &config.seed_relays {
-        if relay.id.is_empty()
-            || relay.management_addr.is_empty()
-            || relay.server_name.is_empty()
-            || !relay_ids.insert(&relay.id)
-        {
-            bail!("seed relay ids must be non-empty and unique");
+        if relay.management_addr.is_empty() || !seed_relays.insert(&relay.management_addr) {
+            bail!("seed Relay addresses must be non-empty and unique");
         }
     }
     if config.carrier_heartbeat_secs == 0
@@ -539,18 +796,18 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
         let mut connected = false;
         for relay in relay_candidates(&state).await {
             match open_management(&state, &relay, TravelConnectionPurpose::Catalog).await {
-                Ok((stream, directory, catalog)) => {
-                    update_directory(&state, directory).await;
-                    *state.catalog.write().await = catalog;
-                    info!(relay_id = %relay.id, relay = %relay.management_addr, "catalog subscription connected");
+                Ok((stream, relay_id, relay_spki)) => {
+                    info!(%relay_id, relay = %relay.management_addr, "catalog subscription connected");
                     connected = true;
-                    if let Err(error) = run_catalog_session(&state, &relay, stream).await {
-                        warn!(relay_id = %relay.id, %error, "catalog subscription disconnected");
+                    if let Err(error) =
+                        run_catalog_session(&state, &relay_id, &relay_spki, stream).await
+                    {
+                        warn!(%relay_id, %error, "catalog subscription disconnected");
                     }
                     break;
                 }
                 Err(error) => {
-                    warn!(relay_id = %relay.id, %error, "catalog subscription attempt failed");
+                    warn!(relay = relay.label(), %error, "catalog subscription attempt failed");
                 }
             }
         }
@@ -563,7 +820,8 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
 
 async fn run_catalog_session(
     state: &AppState,
-    relay: &RelayEndpoint,
+    relay_id: &str,
+    relay_spki: &str,
     stream: TlsStream<TcpStream>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -576,11 +834,8 @@ async fn run_catalog_session(
             message = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match message? {
-                    ControlMessage::Catalog { catalog } => {
-                        *state.catalog.write().await = catalog;
-                    }
-                    ControlMessage::RelayDirectory { directory } => {
-                        update_directory(state, directory).await;
+                    ControlMessage::ControlSnapshot { snapshot } => {
+                        apply_control_snapshot(state, snapshot, relay_id, relay_spki).await?;
                     }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -591,7 +846,7 @@ async fn run_catalog_session(
             }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > Duration::from_secs(30) {
-                    bail!("relay {} catalog heartbeat timed out", relay.id);
+                    bail!("relay {relay_id} catalog heartbeat timed out");
                 }
                 nonce = nonce.wrapping_add(1);
                 write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -602,9 +857,9 @@ async fn run_catalog_session(
 
 async fn open_management(
     state: &AppState,
-    relay: &RelayEndpoint,
+    relay: &RelayCandidate,
     purpose: TravelConnectionPurpose,
-) -> Result<(TlsStream<TcpStream>, RelayDirectory, Catalog)> {
+) -> Result<(TlsStream<TcpStream>, String, String)> {
     let config = &state.config;
     let socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
@@ -618,16 +873,17 @@ async fn open_management(
         state
             .tls
             .management_connector
-            .connect(server_name(&relay.server_name)?, socket),
+            .connect(identity_server_name()?, socket),
     )
     .await
     .context("relay TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    let allowed_spki = relay.management_spki_sha256.as_slice();
     require_peer(
         &identity,
         Role::Relay,
-        Some(&relay.id),
-        &config.relay_spki_pins,
+        relay.expected_id.as_deref(),
+        allowed_spki,
     )?;
     write_json(
         &mut stream,
@@ -645,42 +901,31 @@ async fn open_management(
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::TravelHelloAccepted { relay_id } if relay_id == relay.id => {}
+        ControlMessage::TravelHelloAccepted { relay_id } if relay_id == identity.id => {}
         ControlMessage::TravelHelloDenied { reason } => {
-            bail!("Travel session rejected by Relay {}: {reason}", relay.id);
+            bail!("Travel session rejected by Relay {}: {reason}", identity.id);
         }
         _ => bail!("relay sent an invalid Travel HELLO response"),
     }
-    let mut directory = None;
-    let mut catalog = None;
-    while directory.is_none() || catalog.is_none() {
-        match reader
-            .read_with_timeout::<ControlMessage>(setup_timeout)
-            .await?
-        {
-            ControlMessage::RelayDirectory { directory: value } => directory = Some(value),
-            ControlMessage::Catalog { catalog: value } => catalog = Some(value),
-            _ => bail!("relay did not send initial directory and catalog"),
-        }
-    }
+    let ControlMessage::ControlSnapshot { snapshot } = reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    else {
+        bail!("relay did not send an initial signed control snapshot");
+    };
     drop(reader);
-    Ok((
-        stream,
-        directory.ok_or_else(|| anyhow::anyhow!("missing relay directory"))?,
-        catalog.ok_or_else(|| anyhow::anyhow!("missing catalog"))?,
-    ))
+    apply_control_snapshot(state, snapshot, &identity.id, &identity.spki_sha256).await?;
+    Ok((stream, identity.id, identity.spki_sha256))
 }
 
 async fn request_route(
     state: &AppState,
-    relay: &RelayEndpoint,
+    relay: &RelayCandidate,
     home_id: &str,
-) -> Result<RouteGrant> {
+) -> Result<(RouteGrant, String)> {
     let config = &state.config;
-    let (stream, directory, catalog) =
+    let (stream, relay_id, relay_spki) =
         open_management(state, relay, TravelConnectionPurpose::Route).await?;
-    update_directory(state, directory).await;
-    *state.catalog.write().await = catalog;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let request_id = Uuid::new_v4();
@@ -704,21 +949,21 @@ async fn request_route(
                     route_secret,
                     data_addr,
                 } if response_id == request_id => {
-                    return Ok(RouteGrant {
-                        route_id,
-                        route_secret,
-                        data_addr,
-                    });
+                    return Ok((
+                        RouteGrant {
+                            route_id,
+                            route_secret,
+                            data_addr,
+                        },
+                        relay_id,
+                    ));
                 }
                 ControlMessage::RouteDenied {
                     request_id: response_id,
                     reason,
                 } if response_id == request_id => bail!("route denied: {reason}"),
-                ControlMessage::Catalog { catalog } => {
-                    *state.catalog.write().await = catalog;
-                }
-                ControlMessage::RelayDirectory { directory } => {
-                    update_directory(state, directory).await;
+                ControlMessage::ControlSnapshot { snapshot } => {
+                    apply_control_snapshot(state, snapshot, &relay_id, &relay_spki).await?;
                 }
                 ControlMessage::Heartbeat { nonce } => {
                     write_json(
@@ -747,7 +992,7 @@ struct BusinessCarrier {
 
 async fn open_business_on(
     state: &AppState,
-    relay: &RelayEndpoint,
+    relay: &RelayCandidate,
     flow_id: Uuid,
     carrier_id: Uuid,
     service_id: &str,
@@ -760,7 +1005,7 @@ async fn open_business_on(
         .iter()
         .find(|home| home.id == home_id)
         .ok_or_else(|| anyhow!("Home {home_id} is not configured"))?;
-    let grant = request_route(state, relay, home_id).await?;
+    let (grant, relay_id) = request_route(state, relay, home_id).await?;
     let mut socket = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         TcpStream::connect(&grant.data_addr),
@@ -780,7 +1025,7 @@ async fn open_business_on(
         state
             .tls
             .business_connector
-            .connect(server_name(&home.server_name)?, socket),
+            .connect(identity_server_name()?, socket),
     )
     .await
     .context("business TLS handshake timed out")??;
@@ -808,7 +1053,7 @@ async fn open_business_on(
             send_offset,
         } if response_flow == flow_id && response_carrier == carrier_id => Ok(BusinessCarrier {
             carrier_id,
-            relay_id: relay.id.clone(),
+            relay_id,
             stream,
             home_receive_offset: receive_offset,
             home_send_offset: send_offset,
@@ -818,39 +1063,150 @@ async fn open_business_on(
     }
 }
 
-async fn relay_candidates(state: &AppState) -> Vec<RelayEndpoint> {
+async fn relay_candidates(state: &AppState) -> Vec<RelayCandidate> {
     let directory = state.directory.read().await.clone();
     let source = if directory.relays.is_empty() {
-        state.config.seed_relays.clone()
+        state
+            .config
+            .seed_relays
+            .iter()
+            .map(|relay| RelayCandidate {
+                expected_id: None,
+                management_addr: relay.management_addr.clone(),
+                management_spki_sha256: None,
+            })
+            .collect::<Vec<_>>()
     } else {
-        directory.relays
+        directory
+            .relays
+            .into_iter()
+            .map(|relay| RelayCandidate {
+                expected_id: Some(relay.id),
+                management_addr: relay.management_addr,
+                management_spki_sha256: Some(relay.management_spki_sha256),
+            })
+            .collect()
     };
     let mut seen = HashSet::new();
     source
         .into_iter()
-        .filter(|relay| seen.insert(relay.id.clone()))
+        .filter(|relay| {
+            seen.insert(
+                relay
+                    .expected_id
+                    .clone()
+                    .unwrap_or_else(|| relay.management_addr.clone()),
+            )
+        })
         .collect()
 }
 
-async fn update_directory(state: &AppState, directory: RelayDirectory) {
-    let mut current = state.directory.write().await;
-    if directory.generation >= current.generation && !directory.relays.is_empty() {
-        if *current != directory {
-            let relay_ids: Vec<_> = directory
-                .relays
-                .iter()
-                .map(|relay| relay.id.as_str())
-                .collect();
-            info!(
-                event = "relay_directory_updated",
-                generation = directory.generation,
-                relay_count = directory.relays.len(),
-                ?relay_ids,
-                "travel updated relay directory"
+async fn apply_control_snapshot(
+    state: &AppState,
+    snapshot: SignedControlSnapshot,
+    authenticated_relay_id: &str,
+    authenticated_relay_spki: &str,
+) -> Result<()> {
+    let verified = snapshot.verify(&state.deployment_root_public_key, unix_time_secs()?)?;
+    require_control_snapshot_subject(&verified, &state.config.id, &state.management_spki_sha256)?;
+    configured_homes_match_trust(&state.config, &verified.trust)?;
+    require_authenticated_relay_in_snapshot(
+        &verified,
+        authenticated_relay_id,
+        authenticated_relay_spki,
+    )?;
+    let mut acceptance = state.control_trust_state.lock().await;
+    let mut proposed = acceptance.clone();
+    let changed = proposed.accept(&verified)?;
+    if changed {
+        proposed.cached_snapshot = Some(snapshot);
+        flowsplice_core::authorization::store_json_atomic(
+            &state.control_trust_state_path,
+            &proposed,
+        )?;
+        *acceptance = proposed;
+    }
+    drop(acceptance);
+    if !changed {
+        return Ok(());
+    }
+    let directory = verified.payload.relay_directory;
+    let catalog = verified.payload.catalog;
+    let relay_ids: Vec<_> = directory
+        .relays
+        .iter()
+        .map(|relay| relay.id.as_str())
+        .collect();
+    info!(
+        event = "relay_directory_updated",
+        generation = directory.generation,
+        relay_count = directory.relays.len(),
+        ?relay_ids,
+        "travel updated authenticated Relay directory"
+    );
+    *state.directory.write().await = directory;
+    *state.catalog.write().await = catalog;
+    Ok(())
+}
+
+fn require_control_snapshot_subject(
+    verified: &VerifiedControlSnapshot,
+    travel_id: &str,
+    management_spki_sha256: &str,
+) -> Result<()> {
+    if verified.payload.travel_id != travel_id
+        || !verified
+            .payload
+            .travel_management_spki_sha256
+            .eq_ignore_ascii_case(management_spki_sha256)
+    {
+        bail!("control snapshot is bound to a different Travel identity");
+    }
+    Ok(())
+}
+
+fn configured_homes_match_trust(config: &Config, trust: &DeploymentTrust) -> Result<()> {
+    for home in &config.homes {
+        let trusted = trust.home_endpoint(&home.id)?;
+        let configured = home
+            .spki_pins
+            .iter()
+            .map(|pin| pin.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let root_bound = trusted
+            .business_spki_pins
+            .iter()
+            .map(|pin| pin.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if configured != root_bound {
+            bail!(
+                "Home {} business pins do not match deployment trust",
+                home.id
             );
         }
-        *current = directory;
     }
+    Ok(())
+}
+
+fn require_authenticated_relay_in_snapshot(
+    verified: &VerifiedControlSnapshot,
+    authenticated_relay_id: &str,
+    authenticated_relay_spki: &str,
+) -> Result<()> {
+    let authenticated_endpoint = verified
+        .payload
+        .relay_directory
+        .relays
+        .iter()
+        .find(|endpoint| endpoint.id == authenticated_relay_id)
+        .ok_or_else(|| anyhow!("authenticated Relay is absent from the signed Server directory"))?;
+    if !authenticated_endpoint
+        .management_spki_sha256
+        .eq_ignore_ascii_case(authenticated_relay_spki)
+    {
+        bail!("authenticated Relay SPKI conflicts with the signed Server directory");
+    }
+    Ok(())
 }
 
 async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
@@ -963,7 +1319,7 @@ async fn run_udp_association(
                 opened = Some(carrier.stream);
                 break;
             }
-            Err(error) => warn!(relay_id = %relay.id, %error, "UDP carrier attempt failed"),
+            Err(error) => warn!(relay = relay.label(), %error, "UDP carrier attempt failed"),
         }
     }
     let business = opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))?;
@@ -1155,5 +1511,98 @@ impl Drop for FlowGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flowsplice_core::{
+        authorization::TrustedTravelAuthority,
+        deployment::{ControlSnapshotPayload, DeploymentTrust, VerifiedControlSnapshot},
+        protocol::{Catalog, RelayDirectory, RelayEndpoint},
+    };
+
+    use super::{
+        ControlTrustState, require_authenticated_relay_in_snapshot,
+        require_control_snapshot_subject,
+    };
+
+    fn verified(trust_generation: u64, generation: u64, digest: &str) -> VerifiedControlSnapshot {
+        VerifiedControlSnapshot {
+            trust: DeploymentTrust {
+                version: 1,
+                deployment_id: "deployment-1".to_owned(),
+                generation: trust_generation,
+                not_before_unix_secs: 1,
+                not_after_unix_secs: u64::MAX,
+                management_ca_certificate_pem: String::new(),
+                business_ca_certificate_pem: String::new(),
+                server_control_keys: Vec::new(),
+                home_endpoints: Vec::new(),
+                travel_authorities: Vec::<TrustedTravelAuthority>::new(),
+            },
+            trust_digest_sha256: format!("trust-{trust_generation}"),
+            payload: ControlSnapshotPayload {
+                version: 1,
+                object_type: flowsplice_core::deployment::CONTROL_SNAPSHOT_OBJECT_TYPE.to_owned(),
+                deployment_id: "deployment-1".to_owned(),
+                server_id: "server-1".to_owned(),
+                signer_epoch: 1,
+                travel_id: "travel-1".to_owned(),
+                travel_management_spki_sha256: "33".repeat(32),
+                generation,
+                issued_at_unix_secs: 1,
+                expires_at_unix_secs: 2,
+                relay_directory: RelayDirectory::default(),
+                catalog: Catalog::default(),
+            },
+            digest_sha256: digest.to_owned(),
+        }
+    }
+
+    #[test]
+    fn control_trust_state_rejects_rollback_and_same_generation_conflicts() -> anyhow::Result<()> {
+        let mut state = ControlTrustState::new();
+        assert!(state.accept(&verified(3, 10, "aa")).unwrap_or(false));
+        assert!(!state.accept(&verified(3, 10, "aa")).unwrap_or(true));
+        assert!(state.accept(&verified(3, 10, "bb")).is_err());
+        assert!(state.accept(&verified(2, 11, "cc")).is_err());
+        assert!(!state.accept(&verified(4, 9, "dd")).unwrap_or(true));
+        assert!(state.accept(&verified(4, 12, "ee")).unwrap_or(false));
+
+        let encoded = serde_json::to_vec(&state)?;
+        let mut restarted: ControlTrustState = serde_json::from_slice(&encoded)?;
+        assert!(!restarted.accept(&verified(4, 11, "ff")).unwrap_or(true));
+        let mut rotated = verified(5, 1, "gg");
+        rotated.payload.signer_epoch = 2;
+        assert!(restarted.accept(&rotated).unwrap_or(false));
+        let mut downgraded = verified(6, 99, "hh");
+        downgraded.payload.signer_epoch = 1;
+        assert!(restarted.accept(&downgraded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn seed_must_match_the_server_signed_relay_directory() {
+        let mut snapshot = verified(1, 1, "aa");
+        snapshot.payload.relay_directory.relays = vec![RelayEndpoint {
+            id: "relay-1".to_owned(),
+            management_addr: "relay.example:8443".to_owned(),
+            management_spki_sha256: "11".repeat(32),
+        }];
+
+        assert!(
+            require_authenticated_relay_in_snapshot(&snapshot, "relay-1", &"11".repeat(32)).is_ok()
+        );
+        assert!(
+            require_authenticated_relay_in_snapshot(&snapshot, "relay-attacker", &"22".repeat(32))
+                .is_err()
+        );
+        assert!(
+            require_authenticated_relay_in_snapshot(&snapshot, "relay-1", &"22".repeat(32))
+                .is_err()
+        );
+        assert!(require_control_snapshot_subject(&snapshot, "travel-1", &"33".repeat(32)).is_ok());
+        assert!(require_control_snapshot_subject(&snapshot, "travel-2", &"33".repeat(32)).is_err());
     }
 }

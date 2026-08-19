@@ -4,24 +4,15 @@ data_listens = ["192.0.2.10:7444", "[2001:db8::10]:7444"]
 cert = "/etc/flowsplice/server.crt"
 key = "/etc/flowsplice/server.key"
 management_ca = "/etc/flowsplice/management-ca.crt"
-relay_spki_pins = ["replace-with-relay-spki-sha256-hex"]
+deployment_root_public_key = "/etc/flowsplice/deployment-root.pub"
+deployment_trust = "/etc/flowsplice/deployment-trust.json"
+control_signing_key = "/etc/flowsplice/server-control.key"
 travel_credentials = "/etc/flowsplice/travel-credentials.json"
 travel_revocations = "/var/lib/flowsplice/travel-revocations.json"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 max_pending_work = 256
-
-[[travel_authorities]]
-kind = "home"
-id = "home-1-authority"
-home_id = "home-1"
-public_key = "replace-with-uncompressed-p256-public-key-hex"
-
-[[travel_authorities]]
-kind = "global"
-id = "operator-global-authority"
-home_id = "home-1"
-public_key = "replace-with-global-uncompressed-p256-public-key-hex"
+control_snapshot_ttl_secs = 120
 
 [[homes]]
 id = "home-1"
@@ -34,9 +25,7 @@ spki_pins = ["replace-with-second-home-management-spki-sha256-hex"]
 [[relays]]
 id = "relay-1"
 management_addr = "relay-1.example.net:8443"
-server_name = "relay-1.example.net"
 
 [[relays]]
 id = "relay-2"
 management_addr = "relay-2.example.net:8443"
-server_name = "relay-2.example.net"

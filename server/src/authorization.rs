@@ -26,6 +26,7 @@ impl Default for RevocationState {
 }
 
 pub struct ServerAuthorization {
+    deployment_id: String,
     authorities: Vec<TrustedTravelAuthority>,
     credentials_path: PathBuf,
     revocations_path: PathBuf,
@@ -35,22 +36,38 @@ pub struct ServerAuthorization {
 
 impl ServerAuthorization {
     pub fn validate(
+        deployment_id: String,
         authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
     ) -> Result<()> {
-        Self::load_inner(authorities, credentials_path, revocations_path, false).map(|_| ())
+        Self::load_inner(
+            deployment_id,
+            authorities,
+            credentials_path,
+            revocations_path,
+            false,
+        )
+        .map(|_| ())
     }
 
     pub fn load(
+        deployment_id: String,
         authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
     ) -> Result<Self> {
-        Self::load_inner(authorities, credentials_path, revocations_path, true)
+        Self::load_inner(
+            deployment_id,
+            authorities,
+            credentials_path,
+            revocations_path,
+            true,
+        )
     }
 
     fn load_inner(
+        deployment_id: String,
         authorities: Vec<TrustedTravelAuthority>,
         credentials_path: PathBuf,
         revocations_path: PathBuf,
@@ -72,8 +89,9 @@ impl ServerAuthorization {
             credentials: bundle.credentials,
             revocations: revocations.revocations,
         };
-        let verified = VerifiedAuthorization::verify(&snapshot, &authorities)?;
+        let verified = VerifiedAuthorization::verify(&snapshot, &authorities, &deployment_id)?;
         Ok(Self {
+            deployment_id,
             authorities,
             credentials_path,
             revocations_path,
@@ -128,7 +146,8 @@ impl ServerAuthorization {
             revoked_at_unix_secs: unix_time_secs()?,
             reason,
         });
-        let verified = VerifiedAuthorization::verify(&proposed, &self.authorities)?;
+        let verified =
+            VerifiedAuthorization::verify(&proposed, &self.authorities, &self.deployment_id)?;
         self.persist_revocations(&proposed)?;
         self.snapshot = proposed;
         self.verified = verified;
@@ -172,7 +191,8 @@ impl ServerAuthorization {
         let mut proposed = self.snapshot.clone();
         proposed.generation = generation;
         proposed.credentials.push(signed);
-        let verified = VerifiedAuthorization::verify(&proposed, &self.authorities)?;
+        let verified =
+            VerifiedAuthorization::verify(&proposed, &self.authorities, &self.deployment_id)?;
         store_json_atomic(
             &self.credentials_path,
             &TravelCredentialBundle {
@@ -227,6 +247,7 @@ mod tests {
     fn authorities(key: &EcdsaKeyPair) -> Vec<TrustedTravelAuthority> {
         vec![TrustedTravelAuthority::Home {
             id: "home-1-authority".to_owned(),
+            epoch: 1,
             home_id: "home-1".to_owned(),
             public_key: hex::encode(key.public_key().as_ref()),
         }]
@@ -234,11 +255,23 @@ mod tests {
 
     fn fixture_credential(travel_id: &str, management: &str, business: &str) -> TravelCredential {
         TravelCredential {
+            version: flowsplice_core::authorization::TRAVEL_CREDENTIAL_VERSION,
+            object_type: flowsplice_core::authorization::TRAVEL_CREDENTIAL_OBJECT_TYPE.to_owned(),
+            deployment_id: "deployment-1".to_owned(),
+            deployment_trust_sha256: "aa".repeat(32),
             credential_id: Uuid::new_v4(),
             authority_id: "home-1-authority".to_owned(),
+            authority_epoch: 1,
+            enrollment_request_id: Uuid::new_v4(),
+            enrollment_nonce: "aa".repeat(32),
+            enrollment_request_sha256: "bb".repeat(32),
             travel_id: travel_id.to_owned(),
             management_spki_sha256: management.repeat(32),
             business_spki_sha256: business.repeat(32),
+            management_ca_sha256: "cc".repeat(32),
+            business_ca_sha256: "dd".repeat(32),
+            management_certificate_sha256: "ee".repeat(32),
+            business_certificate_sha256: "ff".repeat(32),
             scope: TravelCredentialScope::Home {
                 home_id: "home-1".to_owned(),
             },
@@ -264,6 +297,7 @@ mod tests {
         )?;
         let authorities = authorities(&key);
         let mut authorization = ServerAuthorization::load(
+            "deployment-1".to_owned(),
             authorities.clone(),
             credentials_path.clone(),
             revocations_path.clone(),
@@ -282,6 +316,7 @@ mod tests {
         assert_eq!(authorization.snapshot().revocations.len(), 1);
 
         let reloaded = ServerAuthorization::load(
+            "deployment-1".to_owned(),
             authorities,
             credentials_path.clone(),
             revocations_path.clone(),
@@ -325,6 +360,7 @@ mod tests {
         )?;
         let authorities = authorities(&key);
         let mut authorization = ServerAuthorization::load(
+            "deployment-1".to_owned(),
             authorities.clone(),
             credentials_path.clone(),
             revocations_path.clone(),
@@ -357,7 +393,12 @@ mod tests {
                 .import_credential(signed(&key, &conflicting)?, "home-1")
                 .is_err()
         );
-        let reloaded = ServerAuthorization::load(authorities, credentials_path, revocations_path)?;
+        let reloaded = ServerAuthorization::load(
+            "deployment-1".to_owned(),
+            authorities,
+            credentials_path,
+            revocations_path,
+        )?;
         assert_eq!(reloaded.snapshot(), authorization.snapshot());
         fs::remove_dir_all(directory).ok();
         Ok(())

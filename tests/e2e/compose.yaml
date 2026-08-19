@@ -107,7 +107,6 @@ services:
       - "127.0.0.1:11083:10083"
     volumes:
       - ./generated/config:/config:ro
-      - ./generated/certs:/certs:ro
       - ./generated/travel:/travel
     networks: [flowsplice]
 

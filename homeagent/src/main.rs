@@ -26,9 +26,10 @@ use flowsplice_core::{
     authorization::{
         AuthorizationCache, SignedTravelCredential, TravelAuthorizationSnapshot,
         TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization, load_json,
-        store_json_atomic, unix_time_secs, validate_trusted_authorities,
+        store_json_atomic, unix_time_secs,
     },
     config::load_toml,
+    deployment::{DeploymentTrust, SignedDeploymentTrust},
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{ControlMessage, DataFrame, HomeCatalog, Role, Service, ServiceProtocol},
@@ -64,6 +65,9 @@ use zeroize::Zeroizing;
 
 mod tcp_flow;
 
+mod issuance_ledger;
+
+use issuance_ledger::{IssuanceLedger, IssuanceRecord, ledger_path};
 use tcp_flow::{IncomingCarrier, TcpFlowRegistry};
 
 #[derive(RustEmbed)]
@@ -97,7 +101,6 @@ struct Config {
     business_ca: PathBuf,
     #[serde(default)]
     server_spki_pins: Vec<String>,
-    travel_authorities: Vec<TrustedTravelAuthority>,
     travel_authorization_cache: PathBuf,
     issuer: IssuerConfig,
     services: Vec<Service>,
@@ -121,6 +124,8 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct IssuerConfig {
     listen: String,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
     management_ca_cert: PathBuf,
     management_ca_key: PathBuf,
     business_ca_cert: PathBuf,
@@ -142,7 +147,6 @@ struct IssuerConfig {
 #[serde(deny_unknown_fields)]
 struct SigningAuthorityConfig {
     id: String,
-    public_key: String,
     private_key: PathBuf,
 }
 
@@ -187,14 +191,22 @@ struct TlsMaterial {
 struct TravelAuthorizationState {
     tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
     cache: Mutex<AuthorizationCache>,
+    authorities: Arc<Vec<TrustedTravelAuthority>>,
+    deployment_id: Arc<String>,
 }
 
 impl TravelAuthorizationState {
-    fn new(cache: AuthorizationCache) -> Arc<Self> {
+    fn new(
+        cache: AuthorizationCache,
+        deployment_id: String,
+        authorities: Vec<TrustedTravelAuthority>,
+    ) -> Arc<Self> {
         let (tx, _) = watch::channel(None);
         Arc::new(Self {
             tx,
             cache: Mutex::new(cache),
+            authorities: Arc::new(authorities),
+            deployment_id: Arc::new(deployment_id),
         })
     }
 }
@@ -217,6 +229,7 @@ struct IssuerAppState {
     authorization: Arc<TravelAuthorizationState>,
     control_tx: mpsc::Sender<IssuerControlRequest>,
     key_operation: Arc<Mutex<()>>,
+    issuance_ledger: Arc<Mutex<IssuanceLedger>>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +246,7 @@ struct IssueRequest {
 struct IssueResponse {
     generation: u64,
     enrollment: TravelEnrollmentResponse,
+    reused: bool,
 }
 
 #[derive(Deserialize)]
@@ -296,8 +310,8 @@ async fn main() -> Result<()> {
     let config: Config = load_toml(&args.config)?;
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_trusted_authorities(&config.travel_authorities)?;
     validate_issuer_config(&config)?;
+    let (_, deployment_trust) = load_issuer_trust(&config)?;
     if !config.issuer.allow_unencrypted_test_keys
         && recover_private_key_password_rotation(&issuer_key_targets(&config))?
     {
@@ -328,7 +342,11 @@ async fn main() -> Result<()> {
     } else {
         AuthorizationCache::default()
     };
-    let authorization = TravelAuthorizationState::new(authorization_cache);
+    let authorization = TravelAuthorizationState::new(
+        authorization_cache,
+        deployment_trust.deployment_id,
+        deployment_trust.travel_authorities,
+    );
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let tcp_flows = TcpFlowRegistry::new(
         Arc::clone(&permits),
@@ -338,11 +356,13 @@ async fn main() -> Result<()> {
         config.max_unacked_bytes,
     );
     let (issuer_control_tx, issuer_control_rx) = mpsc::channel(32);
+    let issuance_ledger = IssuanceLedger::load(ledger_path(&config.issuer.management_ca_key)?)?;
     let issuer_state = IssuerAppState {
         config: Arc::clone(&config),
         authorization: Arc::clone(&authorization),
         control_tx: issuer_control_tx,
         key_operation: Arc::new(Mutex::new(())),
+        issuance_ledger: Arc::new(Mutex::new(issuance_ledger)),
     };
     let control = run_control_loop(
         Arc::clone(&config),
@@ -403,9 +423,22 @@ fn validate_issuer_config(config: &Config) -> Result<()> {
     if config.issuer.default_valid_days == 0 || config.issuer.default_valid_days > MAX_VALID_DAYS {
         bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
     }
-    validate_signing_authority(config, &config.issuer.home_authority, false)?;
+    let (_, trust) = load_issuer_trust(config)?;
+    if std::fs::read_to_string(&config.issuer.management_ca_cert)?
+        != trust.management_ca_certificate_pem
+        || std::fs::read_to_string(&config.issuer.business_ca_cert)?
+            != trust.business_ca_certificate_pem
+    {
+        bail!("Home issuer CA certificates do not match deployment trust");
+    }
+    validate_signing_authority(
+        config,
+        &trust.travel_authorities,
+        &config.issuer.home_authority,
+        false,
+    )?;
     if let Some(authority) = &config.issuer.global_authority {
-        validate_signing_authority(config, authority, true)?;
+        validate_signing_authority(config, &trust.travel_authorities, authority, true)?;
     }
     if config.issuer.allow_unencrypted_test_keys
         && std::env::var("FLOWSPLICE_ALLOW_UNENCRYPTED_TEST_KEYS").as_deref() != Ok("1")
@@ -415,13 +448,21 @@ fn validate_issuer_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn load_issuer_trust(config: &Config) -> Result<(String, DeploymentTrust)> {
+    let root_public_key = std::fs::read_to_string(&config.issuer.deployment_root_public_key)
+        .context("failed to read deployment root public key")?;
+    let signed: SignedDeploymentTrust = load_json(&config.issuer.deployment_trust)?;
+    let trust = signed.verify(root_public_key.trim(), unix_time_secs()?)?;
+    Ok((root_public_key.trim().to_owned(), trust))
+}
+
 fn validate_signing_authority(
     config: &Config,
+    authorities: &[TrustedTravelAuthority],
     signing: &SigningAuthorityConfig,
     global: bool,
 ) -> Result<()> {
-    let trusted = config
-        .travel_authorities
+    let trusted = authorities
         .iter()
         .find(|authority| authority.id() == signing.id)
         .ok_or_else(|| anyhow::anyhow!("issuer authority {} is not trusted", signing.id))?;
@@ -430,12 +471,7 @@ fn validate_signing_authority(
         (true, TrustedTravelAuthority::Global { .. })
             | (false, TrustedTravelAuthority::Home { .. })
     );
-    if !correct_kind
-        || trusted.home_id() != Some(config.id.as_str())
-        || !trusted
-            .public_key()
-            .eq_ignore_ascii_case(&signing.public_key)
-    {
+    if !correct_kind || trusted.home_id() != Some(config.id.as_str()) {
         bail!(
             "issuer authority {} does not match this Home's trusted authority",
             signing.id
@@ -845,7 +881,8 @@ async fn apply_authorization_snapshot(
     config: &Config,
     snapshot: TravelAuthorizationSnapshot,
 ) -> Result<u64> {
-    let authorization = VerifiedAuthorization::verify(&snapshot, &config.travel_authorities)?;
+    let authorization =
+        VerifiedAuthorization::verify(&snapshot, &state.authorities, &state.deployment_id)?;
     let mut cache = state.cache.lock().await;
     let proposed_cache = cache.accept(&authorization)?;
     if proposed_cache != *cache {
@@ -953,17 +990,20 @@ async fn api_issue(
 }
 
 async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Result<IssueResponse> {
-    let password = Zeroizing::new(request.password);
-    if password.is_empty() && !state.config.issuer.allow_unencrypted_test_keys {
-        bail!("private-key password must not be empty");
-    }
+    let IssueRequest {
+        request,
+        valid_days,
+        valid_minutes,
+        scope,
+        password,
+    } = request;
     let valid_for_secs = requested_validity_secs(
-        request.valid_days,
-        request.valid_minutes,
+        valid_days,
+        valid_minutes,
         state.config.issuer.default_valid_days,
     )?;
-    validate_requested_scope(&state.config, &request.scope)?;
-    let authority = match &request.scope {
+    validate_requested_scope(&state.config, &scope)?;
+    let authority = match &scope {
         TravelCredentialScope::Global => state
             .config
             .issuer
@@ -974,11 +1014,37 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
             &state.config.issuer.home_authority
         }
     };
+    let mut ledger = state.issuance_ledger.lock().await;
+    if let Some(record) = ledger.find(&request)? {
+        if !record.matches_intent(&authority.id, &scope, valid_for_secs) {
+            bail!(
+                "this enrollment request was already used for a different authorization; create a new enrollment request"
+            );
+        }
+        ensure_record_not_revoked(state, &record)?;
+        let generation = if let Some(generation) = record.published_generation() {
+            generation
+        } else {
+            let generation = publish_enrollment(state, record.enrollment()).await?;
+            ledger.mark_published(record.credential_id(), generation)?;
+            generation
+        };
+        return Ok(IssueResponse {
+            generation,
+            enrollment: record.enrollment().clone(),
+            reused: true,
+        });
+    }
+
+    let password = Zeroizing::new(password);
+    if password.is_empty() && !state.config.issuer.allow_unencrypted_test_keys {
+        bail!("private-key password must not be empty");
+    }
     let approval = prepare_enrollment_approval(
-        request.request,
+        request.clone(),
         valid_for_secs,
         authority.id.clone(),
-        request.scope,
+        scope.clone(),
         unix_time_secs()?,
     )?;
     let protected = |path| ProtectedKey {
@@ -986,18 +1052,52 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         password: Some(password.as_bytes()),
         allow_unencrypted: state.config.issuer.allow_unencrypted_test_keys,
     };
+    let deployment_root_public_key =
+        std::fs::read_to_string(&state.config.issuer.deployment_root_public_key)
+            .context("failed to read deployment root public key")?;
+    let deployment_trust: SignedDeploymentTrust = load_json(&state.config.issuer.deployment_trust)?;
     let material = IssuerMaterial {
+        deployment_trust: &deployment_trust,
+        deployment_root_public_key: deployment_root_public_key.trim(),
         management_ca_certificate: &state.config.issuer.management_ca_cert,
         management_ca_key: protected(&state.config.issuer.management_ca_key),
         business_ca_certificate: &state.config.issuer.business_ca_cert,
         business_ca_key: protected(&state.config.issuer.business_ca_key),
         travel_authority_key: protected(&authority.private_key),
-        expected_travel_authority_public_key: &authority.public_key,
     };
     let key_operation = state.key_operation.lock().await;
     recover_private_key_password_rotation(&issuer_key_targets(&state.config))?;
     let enrollment = issue_enrollment(approval, &material, unix_time_secs()?)?;
     drop(key_operation);
+    let record =
+        ledger.insert_pending(&request, &authority.id, &scope, valid_for_secs, enrollment)?;
+    let generation = publish_enrollment(state, record.enrollment()).await?;
+    ledger.mark_published(record.credential_id(), generation)?;
+    Ok(IssueResponse {
+        generation,
+        enrollment: record.enrollment().clone(),
+        reused: false,
+    })
+}
+
+fn ensure_record_not_revoked(state: &IssuerAppState, record: &IssuanceRecord) -> Result<()> {
+    let Some(authorization) = state.authorization.tx.borrow().clone() else {
+        return Ok(());
+    };
+    if authorization.credential(record.credential_id()).is_some()
+        && !authorization.is_active(record.credential_id(), unix_time_secs()?)
+    {
+        bail!(
+            "this enrollment intent was already issued, but its credential is no longer active; create a new enrollment request"
+        );
+    }
+    Ok(())
+}
+
+async fn publish_enrollment(
+    state: &IssuerAppState,
+    enrollment: &TravelEnrollmentResponse,
+) -> Result<u64> {
     let (response_tx, response_rx) = oneshot::channel();
     state
         .control_tx
@@ -1007,15 +1107,11 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         })
         .await
         .map_err(|_| anyhow::anyhow!("Home control connection is unavailable"))?;
-    let generation = timeout(Duration::from_secs(15), response_rx)
+    timeout(Duration::from_secs(15), response_rx)
         .await
         .context("Server did not confirm the signed credential")?
         .context("Home control connection closed before publication")?
-        .map_err(anyhow::Error::msg)?;
-    Ok(IssueResponse {
-        generation,
-        enrollment,
-    })
+        .map_err(anyhow::Error::msg)
 }
 
 async fn api_rotate_private_key_password(

@@ -15,6 +15,8 @@ COPY tools/precompress.mjs /src/tools/precompress.mjs
 RUN npm run build
 
 FROM rust:alpine AS build
+ARG FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY
+ENV FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY}
 RUN apk add --no-cache clang cmake make musl-dev perl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

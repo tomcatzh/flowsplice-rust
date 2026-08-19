@@ -11,9 +11,6 @@ msgstr "添加家庭端"
 msgid "Add Relay instance"
 msgstr "添加中继实例"
 
-msgid "Add Travel authority"
-msgstr "添加旅行端签发方"
-
 msgid "Add directory entry"
 msgstr "添加目录项"
 
@@ -25,15 +22,6 @@ msgstr "对外发布的数据地址"
 
 msgid "All enabled FlowSplice instances are valid."
 msgstr "所有已启用的 FlowSplice 实例配置均有效。"
-
-msgid "Authority ID"
-msgstr "签发方 ID"
-
-msgid "Authority type"
-msgstr "签发方类型"
-
-msgid "Authorization public key"
-msgstr "授权公钥"
 
 msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
 msgstr "请为局域网和 WAN IPv6 分别创建具名中继实例。每个实例都有独立的身份、监听地址、对外发布地址、日志和 procd 生命周期。"
@@ -59,26 +47,17 @@ msgstr "常规"
 msgid "Global settings"
 msgstr "全局设置"
 
-msgid "Global super-authority"
-msgstr "全局超级签发方"
-
 msgid "Handshake timeout"
 msgstr "握手超时"
 
 msgid "Handshake timeout (seconds)"
 msgstr "握手超时（秒）"
 
-msgid "Home"
-msgstr "家庭端"
-
 msgid "Home ID"
 msgstr "家庭端 ID"
 
 msgid "Home SPKI pins"
 msgstr "家庭端 SPKI 指纹"
-
-msgid "Home authorities may sign only their assigned Home. Global authorities are separate super-authorities and should exist only on a designated Home."
-msgstr "家庭端签发方只能签发分配给自己的家庭端权限。全局签发方是独立的超级权限，只应配置在指定的家庭端。"
 
 msgid "Home control listener"
 msgstr "家庭端控制监听地址"
@@ -137,17 +116,11 @@ msgstr "持久化旅行端撤销记录"
 msgid "Persistent revocation cache"
 msgstr "持久化撤销缓存"
 
-msgid "Publishing Home ID"
-msgstr "发布签发结果的家庭端 ID"
-
 msgid "RUNNING"
 msgstr "运行中"
 
 msgid "Relay ID"
 msgstr "中继 ID"
-
-msgid "Relay SPKI pins"
-msgstr "中继 SPKI 指纹"
 
 #, javascript-format
 msgid "Relay: %s"
@@ -198,9 +171,6 @@ msgstr "状态"
 msgid "Stop"
 msgstr "停止"
 
-msgid "TLS server name"
-msgstr "TLS 服务端名称"
-
 msgid "The file must be readable by the flowsplice service user."
 msgstr "flowsplice 服务用户必须能够读取此文件。"
 
@@ -213,9 +183,6 @@ msgstr "信任与身份"
 msgid "Trusted Home Agents"
 msgstr "受信任的家庭端"
 
-msgid "Trusted Travel authorities"
-msgstr "可信旅行端签发方"
-
 msgid "Use LAN addresses only; do not expose the Server control listener to WAN."
 msgstr "只能使用局域网地址；不要把服务端控制监听暴露到 WAN。"
 
@@ -224,3 +191,18 @@ msgstr "验证"
 
 msgid "armed"
 msgstr "已启用"
+
+msgid "Deployment root public key"
+msgstr "部署根公钥"
+
+msgid "Signed deployment trust"
+msgstr "已签名的部署信任清单"
+
+msgid "Server control signing key"
+msgstr "服务端控制签名私钥"
+
+msgid "The deployment root must certify its public key."
+msgstr "其公钥必须由部署根认证。"
+
+msgid "Signed control snapshot TTL (seconds)"
+msgstr "签名控制快照有效期（秒）"

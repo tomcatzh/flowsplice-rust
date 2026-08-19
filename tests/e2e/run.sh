@@ -10,8 +10,22 @@ export FLOWSPLICE_E2E_GID="$(id -g)"
 
 mkdir -p "${generated_dir}"
 
-docker build -f "${repo_root}/docker/e2e.Dockerfile" -t flowsplice-e2e:local "${repo_root}"
-"${repo_root}/tests/e2e/generate-certs.sh"
+if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
+  "${repo_root}/tests/e2e/generate-certs.sh" prepare
+else
+  find "${generated_dir}/state" -maxdepth 1 -type f ! -name relay-pins.json -delete
+  rm -f \
+    "${generated_dir}/offline/.flowsplice-issued-enrollments.json" \
+    "${generated_dir}/offline-home2/.flowsplice-issued-enrollments.json"
+  printf '{"credentials":[]}\n' >"${generated_dir}/authorization/credentials.json"
+fi
+deployment_root_public_key="$(tr -d '\r\n' <"${generated_dir}/certs/deployment-root.pub")"
+docker build \
+  --build-arg "FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${deployment_root_public_key}" \
+  -f "${repo_root}/docker/e2e.Dockerfile" \
+  -t flowsplice-e2e:local \
+  "${repo_root}"
+"${repo_root}/tests/e2e/generate-certs.sh" enroll-only
 
 teardown() {
   docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
@@ -22,7 +36,7 @@ finish() {
   set +e
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
   if (( status != 0 )); then
-    tail -n 300 "${log_file}" >&2
+    tail -n 120 "${log_file}" >&2
   fi
   teardown
   trap - EXIT
@@ -32,6 +46,12 @@ finish() {
 teardown
 trap finish EXIT
 docker compose -f "${compose_file}" up -d echo echo2 relay1 relay2 server homeagent homeagent2
+
+if docker compose -f "${compose_file}" exec -T homeagent \
+  test -e /issuer/deployment-root.key; then
+  echo 'deployment root private key was exposed to Home Agent' >&2
+  exit 1
+fi
 
 home_issuer_ready=0
 for _ in $(seq 1 60); do
@@ -63,18 +83,46 @@ python3 "${repo_root}/tests/e2e/home-issuer-client.py" issue \
   --scope global \
   --output "${generated_dir}/authorization/enrollment-response.json"
 
+python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
+  --input "${generated_dir}/authorization/enrollment-response.json" \
+  --output "${generated_dir}/authorization/tampered-enrollment-response.json" \
+  --mode root-signature
+python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
+  --input "${generated_dir}/authorization/enrollment-response.json" \
+  --output "${generated_dir}/authorization/spliced-certificate-response.json" \
+  --mode certificate
+python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
+  --input "${generated_dir}/authorization/enrollment-response.json" \
+  --output "${generated_dir}/authorization/spliced-request-response.json" \
+  --mode request
+for invalid_response in \
+  tampered-enrollment-response.json \
+  spliced-certificate-response.json \
+  spliced-request-response.json; do
+  if docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+    -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
+    -v "${generated_dir}/travel:/travel" \
+    -v "${generated_dir}/authorization:/authorization:ro" \
+    flowsplice-e2e:local \
+    /usr/local/bin/flowsplice-travelagent enroll-import \
+    --enrollment-dir /travel \
+    --response "/authorization/${invalid_response}" \
+    --test-password-file /travel/test-password.txt; then
+    echo "Travel accepted tampered Enrollment Response ${invalid_response}" >&2
+    exit 1
+  fi
+done
+
 docker run --rm \
   --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
   -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
   -v "${generated_dir}/travel:/travel" \
   -v "${generated_dir}/authorization:/authorization:ro" \
-  -v "${generated_dir}/certs:/certs:ro" \
   flowsplice-e2e:local \
   /usr/local/bin/flowsplice-travelagent enroll-import \
   --enrollment-dir /travel \
   --response /authorization/enrollment-response.json \
-  --management-ca /certs/management-ca.crt \
-  --business-ca /certs/business-ca.crt \
   --test-password-file /travel/test-password.txt
 
 docker compose -f "${compose_file}" up -d travelagent

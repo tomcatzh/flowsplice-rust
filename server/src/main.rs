@@ -2,28 +2,41 @@
 
 use std::{
     collections::HashMap,
+    fs,
     io::{self, IsTerminal},
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::{
+    rand::{SecureRandom, SystemRandom},
+    signature::{EcdsaKeyPair, KeyPair as _},
+};
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
-    authorization::{TravelAuthorizationSnapshot, TrustedTravelAuthority, unix_time_secs},
+    authorization::{TravelAuthorizationSnapshot, unix_time_secs},
     config::load_toml,
+    deployment::{
+        CONTROL_SNAPSHOT_OBJECT_TYPE, CONTROL_SNAPSHOT_VERSION, ControlSnapshotPayload,
+        DeploymentTrust, MAX_CONTROL_SNAPSHOT_TTL_SECS, SignedControlSnapshot,
+        SignedDeploymentTrust, control_signing_key_from_pkcs8,
+    },
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, HomeCatalog, RelayDirectory, RelayEndpoint, Role},
     route::{RouteSide, read_preface, verify_preface},
     tls::{
-        client_connector, peer_identity, require_peer, server_acceptor, server_name,
-        validate_spki_pins,
+        identity_client_connector, identity_server_name, peer_identity, require_peer,
+        server_acceptor, validate_spki_pins,
     },
 };
+use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use tokio::{
     io::copy_bidirectional,
@@ -55,14 +68,14 @@ struct Config {
     id: String,
     control_listen: String,
     data_listens: Vec<String>,
-    relays: Vec<RelayEndpoint>,
+    relays: Vec<ConfiguredRelay>,
     cert: PathBuf,
     key: PathBuf,
     management_ca: PathBuf,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
+    control_signing_key: PathBuf,
     homes: Vec<ConfiguredHome>,
-    #[serde(default)]
-    relay_spki_pins: Vec<String>,
-    travel_authorities: Vec<TrustedTravelAuthority>,
     travel_credentials: PathBuf,
     travel_revocations: PathBuf,
     #[serde(default = "default_handshake_timeout")]
@@ -71,6 +84,15 @@ struct Config {
     work_ttl_secs: u64,
     #[serde(default = "default_max_pending_work")]
     max_pending_work: usize,
+    #[serde(default = "default_control_snapshot_ttl")]
+    control_snapshot_ttl_secs: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredRelay {
+    id: String,
+    management_addr: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -93,7 +115,100 @@ const fn default_max_pending_work() -> usize {
     256
 }
 
+const fn default_control_snapshot_ttl() -> u64 {
+    120
+}
+
 const TRAVEL_SESSION_LEASE: Duration = Duration::from_secs(45);
+
+struct ControlSigner {
+    server_id: String,
+    signer_epoch: u64,
+    signed_trust: SignedDeploymentTrust,
+    trust: DeploymentTrust,
+    key: EcdsaKeyPair,
+    next_generation: AtomicU64,
+    ttl_secs: u64,
+}
+
+impl ControlSigner {
+    fn load(config: &Config) -> Result<Self> {
+        let root_public_key = fs::read_to_string(&config.deployment_root_public_key)
+            .context("failed to read deployment root public key")?;
+        let signed_trust: SignedDeploymentTrust =
+            flowsplice_core::authorization::load_json(&config.deployment_trust)?;
+        let now = unix_time_secs()?;
+        let trust = signed_trust.verify(root_public_key.trim(), now)?;
+        if fs::read_to_string(&config.management_ca)
+            .context("failed to read Server management CA")?
+            != trust.management_ca_certificate_pem
+        {
+            bail!("Server management CA does not match deployment trust");
+        }
+        let private_key = PrivateKeyDer::from_pem_file(&config.control_signing_key)
+            .context("failed to read Server control signing key")?;
+        let key = control_signing_key_from_pkcs8(private_key.secret_der())?;
+        let actual_public_key = hex::encode(key.public_key().as_ref());
+        let matching_keys = trust
+            .server_control_keys
+            .iter()
+            .filter(|candidate| {
+                candidate.server_id == config.id
+                    && candidate
+                        .public_key
+                        .eq_ignore_ascii_case(&actual_public_key)
+            })
+            .collect::<Vec<_>>();
+        let [matching_key] = matching_keys.as_slice() else {
+            bail!("Server control signing key must match exactly one deployment-trusted epoch");
+        };
+        let initial_generation = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock predates the Unix epoch")?
+                .as_nanos(),
+        )
+        .context("system clock is outside the control generation range")?;
+        Ok(Self {
+            server_id: config.id.clone(),
+            signer_epoch: matching_key.epoch,
+            signed_trust,
+            trust,
+            key,
+            next_generation: AtomicU64::new(initial_generation),
+            ttl_secs: config.control_snapshot_ttl_secs,
+        })
+    }
+
+    fn sign(
+        &self,
+        directory: RelayDirectory,
+        catalog: Catalog,
+        travel_id: &str,
+        travel_management_spki_sha256: &str,
+    ) -> Result<SignedControlSnapshot> {
+        let now = unix_time_secs()?;
+        SignedControlSnapshot::sign(
+            self.signed_trust.clone(),
+            &self.trust,
+            &ControlSnapshotPayload {
+                version: CONTROL_SNAPSHOT_VERSION,
+                object_type: CONTROL_SNAPSHOT_OBJECT_TYPE.to_owned(),
+                deployment_id: self.trust.deployment_id.clone(),
+                server_id: self.server_id.clone(),
+                signer_epoch: self.signer_epoch,
+                travel_id: travel_id.to_owned(),
+                travel_management_spki_sha256: travel_management_spki_sha256.to_owned(),
+                generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+                issued_at_unix_secs: now,
+                expires_at_unix_secs: now.saturating_add(self.ttl_secs),
+                relay_directory: directory,
+                catalog,
+            },
+            &self.key,
+        )
+    }
+}
 
 struct PendingWork {
     credential_id: Uuid,
@@ -206,6 +321,32 @@ struct TravelSessionRegistry {
     sessions: HashMap<String, TravelSession>,
 }
 
+#[derive(Default)]
+struct RelayDirectoryRegistry {
+    generation: u64,
+    endpoints: HashMap<String, RelayEndpoint>,
+}
+
+impl RelayDirectoryRegistry {
+    fn register(&mut self, endpoint: RelayEndpoint) -> RelayDirectory {
+        let changed = self.endpoints.get(&endpoint.id) != Some(&endpoint);
+        if changed {
+            self.endpoints.insert(endpoint.id.clone(), endpoint);
+            self.generation = self.generation.saturating_add(1);
+        }
+        self.directory()
+    }
+
+    fn directory(&self) -> RelayDirectory {
+        let mut relays = self.endpoints.values().cloned().collect::<Vec<_>>();
+        relays.sort_by(|left, right| left.id.cmp(&right.id));
+        RelayDirectory {
+            generation: self.generation,
+            relays,
+        }
+    }
+}
+
 impl TravelSessionRegistry {
     fn authorize(
         &mut self,
@@ -250,29 +391,53 @@ impl TravelSessionRegistry {
             !session.leases.is_empty()
         });
     }
+
+    fn release(&mut self, travel_id: &str, session_id: Uuid, lease_id: Uuid) -> bool {
+        let Some(active) = self.sessions.get_mut(travel_id) else {
+            return false;
+        };
+        if active.session_id != session_id || active.leases.remove(&lease_id).is_none() {
+            return false;
+        }
+        if active.leases.is_empty() {
+            self.sessions.remove(travel_id);
+        }
+        true
+    }
 }
 
 struct State {
     homes: Mutex<HomeRegistry>,
     relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
+    relay_directory: Mutex<RelayDirectoryRegistry>,
     travel_sessions: Mutex<TravelSessionRegistry>,
     pending: Mutex<HashMap<Uuid, PendingWork>>,
     authorization: RwLock<ServerAuthorization>,
     authorization_acks: Mutex<HashMap<String, u64>>,
     authorization_tx: watch::Sender<u64>,
+    control_signer: ControlSigner,
 }
 
 impl State {
-    fn new(authorization: ServerAuthorization) -> Self {
+    fn new(
+        authorization: ServerAuthorization,
+        relay_directory_generation: u64,
+        control_signer: ControlSigner,
+    ) -> Self {
         let (authorization_tx, _) = watch::channel(authorization.snapshot().generation);
         Self {
             homes: Mutex::new(HomeRegistry::default()),
             relay_txs: Mutex::new(HashMap::new()),
+            relay_directory: Mutex::new(RelayDirectoryRegistry {
+                generation: relay_directory_generation,
+                endpoints: HashMap::new(),
+            }),
             travel_sessions: Mutex::new(TravelSessionRegistry::default()),
             pending: Mutex::new(HashMap::new()),
             authorization: RwLock::new(authorization),
             authorization_acks: Mutex::new(HashMap::new()),
             authorization_tx,
+            control_signer,
         }
     }
 }
@@ -295,12 +460,25 @@ async fn main() -> Result<()> {
         info!(event = "config_validated", path = %args.config.display(), "server configuration is valid");
         return Ok(());
     }
+    let control_signer = ControlSigner::load(&config)?;
     let authorization = ServerAuthorization::load(
-        config.travel_authorities.clone(),
+        control_signer.trust.deployment_id.clone(),
+        control_signer.trust.travel_authorities.clone(),
         config.travel_credentials.clone(),
         config.travel_revocations.clone(),
     )?;
-    let state = Arc::new(State::new(authorization));
+    let relay_directory_generation = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock predates the Unix epoch")?
+            .as_nanos(),
+    )
+    .context("system clock is outside the Relay directory generation range")?;
+    let state = Arc::new(State::new(
+        authorization,
+        relay_directory_generation,
+        control_signer,
+    ));
 
     let control = run_home_listeners(config.clone(), Arc::clone(&state));
     let data = run_data_listeners(config.clone(), Arc::clone(&state));
@@ -316,10 +494,11 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     validate_listen(&config.control_listen, "control")?;
     validate_listens(&config.data_listens, "data")?;
-    validate_homes(&config.homes)?;
-    validate_spki_pins(&config.relay_spki_pins, "relay")?;
+    let control_signer = ControlSigner::load(config)?;
+    validate_homes(&config.homes, &control_signer.trust)?;
     ServerAuthorization::validate(
-        config.travel_authorities.clone(),
+        control_signer.trust.deployment_id,
+        control_signer.trust.travel_authorities,
         config.travel_credentials.clone(),
         config.travel_revocations.clone(),
     )?;
@@ -327,18 +506,17 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.handshake_timeout_secs == 0
         || config.work_ttl_secs == 0
         || config.max_pending_work == 0
+        || config.control_snapshot_ttl_secs == 0
+        || config.control_snapshot_ttl_secs > MAX_CONTROL_SNAPSHOT_TTL_SECS
     {
         bail!("server timeout and pending-work limits must be positive");
     }
     let _ = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
-    let _ = client_connector(&config.cert, &config.key, &config.management_ca)?;
-    for relay in &config.relays {
-        let _ = server_name(&relay.server_name)?;
-    }
+    let _ = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
     Ok(())
 }
 
-fn validate_homes(homes: &[ConfiguredHome]) -> Result<()> {
+fn validate_homes(homes: &[ConfiguredHome], trust: &DeploymentTrust) -> Result<()> {
     if homes.is_empty() {
         bail!("at least one Home Agent is required");
     }
@@ -348,6 +526,23 @@ fn validate_homes(homes: &[ConfiguredHome]) -> Result<()> {
             bail!("Home ids must be non-empty and unique");
         }
         validate_spki_pins(&home.spki_pins, &format!("Home {}", home.id))?;
+        let trusted = trust.home_endpoint(&home.id)?;
+        let configured = home
+            .spki_pins
+            .iter()
+            .map(|pin| pin.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let root_bound = trusted
+            .management_spki_pins
+            .iter()
+            .map(|pin| pin.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        if configured != root_bound {
+            bail!(
+                "Home {} management pins do not match deployment trust",
+                home.id
+            );
+        }
     }
     Ok(())
 }
@@ -378,18 +573,14 @@ fn validate_listen(address: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_relays(relays: &[RelayEndpoint]) -> Result<()> {
+fn validate_relays(relays: &[ConfiguredRelay]) -> Result<()> {
     if relays.is_empty() {
         bail!("at least one relay is required");
     }
     let mut ids = std::collections::HashSet::new();
     for relay in relays {
-        if relay.id.is_empty()
-            || relay.management_addr.is_empty()
-            || relay.server_name.is_empty()
-            || !ids.insert(&relay.id)
-        {
-            bail!("relay ids must be non-empty and unique, with non-empty addresses and names");
+        if relay.id.is_empty() || relay.management_addr.is_empty() || !ids.insert(&relay.id) {
+            bail!("relay ids must be non-empty and unique, with non-empty addresses");
         }
     }
     Ok(())
@@ -520,9 +711,7 @@ async fn handle_home(
         );
         let _ = previous.shutdown.send(true);
     }
-    if let Some(catalog) = catalog {
-        publish_catalog(&state, catalog).await;
-    }
+    let _ = catalog;
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             write_json(&mut writer, &message, CONTROL_FRAME_LIMIT).await?;
@@ -553,10 +742,7 @@ async fn handle_home(
                             if home.home_id != identity.id {
                                 bail!("catalog home id does not match the authenticated home");
                             }
-                            let catalog = state.homes.lock().await.update_catalog(home, session_id);
-                            if let Some(catalog) = catalog {
-                                publish_catalog(&state, catalog).await;
-                            }
+                            let _ = state.homes.lock().await.update_catalog(home, session_id);
                         }
                         ControlMessage::Heartbeat { nonce } => {
                             tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
@@ -680,29 +866,18 @@ async fn revoke_home_credential(
 }
 
 async fn clear_home_session(state: &Arc<State>, session_id: Uuid, home_id: &str) {
-    let catalog = state.homes.lock().await.remove(home_id, session_id);
-    if let Some(catalog) = catalog {
+    if state
+        .homes
+        .lock()
+        .await
+        .remove(home_id, session_id)
+        .is_some()
+    {
         state
             .authorization_acks
             .lock()
             .await
             .remove(&format!("home:{home_id}"));
-        publish_catalog(state, catalog).await;
-    }
-}
-
-async fn publish_catalog(state: &Arc<State>, catalog: Catalog) {
-    let relays = state.relay_txs.lock().await.clone();
-    for (relay_id, relay) in relays {
-        if relay
-            .send(ControlMessage::Catalog {
-                catalog: catalog.clone(),
-            })
-            .await
-            .is_err()
-        {
-            warn!(%relay_id, "failed to publish catalog to relay");
-        }
     }
 }
 
@@ -723,29 +898,28 @@ async fn run_relay_connectors(config: Config, state: Arc<State>) -> Result<()> {
 
 async fn run_relay_connector(
     config: Config,
-    relay: RelayEndpoint,
+    relay: ConfiguredRelay,
     state: Arc<State>,
 ) -> Result<()> {
-    let connector = client_connector(&config.cert, &config.key, &config.management_ca)?;
-    let dns_name = server_name(&relay.server_name)?;
+    let connector = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
     loop {
         let result = async {
             let socket = TcpStream::connect(&relay.management_addr).await?;
             socket.set_nodelay(true)?;
             let stream = timeout(
                 Duration::from_secs(config.handshake_timeout_secs),
-                connector.connect(dns_name.clone(), socket),
+                connector.connect(identity_server_name()?, socket),
             )
             .await
             .context("relay TLS handshake timed out")??;
             let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-            require_peer(
-                &identity,
-                Role::Relay,
-                Some(&relay.id),
-                &config.relay_spki_pins,
-            )?;
-            run_relay_session(stream, &config, &relay, &state).await
+            require_peer(&identity, Role::Relay, Some(&relay.id), &[])?;
+            let endpoint = RelayEndpoint {
+                id: relay.id.clone(),
+                management_addr: relay.management_addr.clone(),
+                management_spki_sha256: identity.spki_sha256,
+            };
+            run_relay_session(stream, &config, &relay, endpoint, &state).await
         }
         .await;
         if let Err(error) = result {
@@ -765,7 +939,8 @@ async fn run_relay_connector(
 async fn run_relay_session(
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     config: &Config,
-    relay: &RelayEndpoint,
+    relay: &ConfiguredRelay,
+    endpoint: RelayEndpoint,
     state: &Arc<State>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -821,22 +996,13 @@ async fn run_relay_session(
         })
         .await?;
     }
-    tx.send(ControlMessage::RelayDirectory {
-        directory: RelayDirectory {
-            generation: 1,
-            relays: config.relays.clone(),
-        },
-    })
-    .await?;
+    let directory = state.relay_directory.lock().await.register(endpoint);
     info!(
-        event = "relay_directory_published",
-        relay_id = %relay.id,
-        generation = 1,
-        relay_count = config.relays.len(),
-        "published relay directory to relay"
+        event = "relay_directory_updated",
+        generation = directory.generation,
+        relay_count = directory.relays.len(),
+        "updated authenticated Relay directory"
     );
-    let catalog = state.homes.lock().await.catalog();
-    tx.send(ControlMessage::Catalog { catalog }).await?;
     info!(relay_id = %relay.id, "relay control connected");
 
     let mut heartbeat = interval(Duration::from_secs(10));
@@ -867,10 +1033,13 @@ async fn run_relay_session(
                             None,
                         ).await;
                         match result {
-                            Ok(()) => {
+                            Ok(snapshot) => {
                                 write_json(
                                     &mut writer,
-                                    &ControlMessage::TravelSessionAccepted { request_id },
+                                    &ControlMessage::TravelSessionAccepted {
+                                        request_id,
+                                        snapshot,
+                                    },
                                     CONTROL_FRAME_LIMIT,
                                 )
                                 .await?;
@@ -890,6 +1059,26 @@ async fn run_relay_session(
                                 )
                                 .await?;
                             }
+                        }
+                    }
+                    ControlMessage::TravelSessionRelease {
+                        travel_id,
+                        travel_session_id,
+                        lease_id,
+                    } => {
+                        if state.travel_sessions.lock().await.release(
+                            &travel_id,
+                            travel_session_id,
+                            lease_id,
+                        ) {
+                            info!(
+                                event = "travel_session_released",
+                                relay_id = %relay.id,
+                                %travel_id,
+                                %travel_session_id,
+                                %lease_id,
+                                "released closed Travel login session"
+                            );
                         }
                     }
                     ControlMessage::RouteRequest {
@@ -1137,30 +1326,94 @@ async fn authorize_travel(
     travel_session_id: Uuid,
     lease_id: Option<Uuid>,
     home_id: Option<&str>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<SignedControlSnapshot, String> {
     let now = unix_time_secs().map_err(|error| error.to_string())?;
-    {
+    let (travel_management_spki_sha256, credentials) = {
         let authorization = state.authorization.read().await;
         let credential = authorization
             .verified()
             .credential(credential_id)
+            .cloned()
             .ok_or_else(|| "unknown Travel credential".to_owned())?;
         if credential.travel_id != travel_id {
             return Err("Travel credential identity does not match".to_owned());
         }
-        if !authorization.verified().is_active(credential_id, now) {
-            return Err("Travel credential is revoked, expired, or not yet valid".to_owned());
-        }
-        if home_id.is_some_and(|home_id| !credential.allows_home(home_id)) {
+        let credentials = authorization
+            .verified()
+            .credentials()
+            .filter(|candidate| {
+                candidate.travel_id == travel_id
+                    && candidate
+                        .management_spki_sha256
+                        .eq_ignore_ascii_case(&credential.management_spki_sha256)
+                    && authorization
+                        .verified()
+                        .is_active(candidate.credential_id, now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(home_id) = home_id
+            && !credentials
+                .iter()
+                .any(|candidate| candidate.allows_home(home_id))
+        {
             return Err("Travel credential is not authorized for the requested Home".to_owned());
         }
+        (credential.management_spki_sha256, credentials)
+    };
+    if !credentials.is_empty() {
+        state.travel_sessions.lock().await.authorize(
+            travel_id,
+            travel_session_id,
+            lease_id,
+            Instant::now(),
+        )?;
+    } else if home_id.is_some() {
+        return Err("Travel credential is revoked, expired, or not yet valid".to_owned());
     }
-    state.travel_sessions.lock().await.authorize(
-        travel_id,
-        travel_session_id,
-        lease_id,
-        Instant::now(),
-    )
+    let directory = state.relay_directory.lock().await.directory();
+    let catalog = state.homes.lock().await.catalog();
+    let catalog = catalog_for_credentials(&catalog, &credentials);
+    state
+        .control_signer
+        .sign(
+            directory,
+            catalog,
+            travel_id,
+            &travel_management_spki_sha256,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn catalog_for_credentials(
+    catalog: &Catalog,
+    credentials: &[flowsplice_core::authorization::TravelCredential],
+) -> Catalog {
+    let homes = catalog
+        .homes
+        .iter()
+        .filter_map(|home| {
+            let services = home
+                .services
+                .iter()
+                .filter(|service| {
+                    credentials.iter().any(|credential| {
+                        credential.allows_service(&home.home_id, &service.id, service.protocol)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!services.is_empty()).then(|| HomeCatalog {
+                home_id: home.home_id.clone(),
+                home_alias: home.home_alias.clone(),
+                services,
+            })
+        })
+        .collect();
+    Catalog {
+        generation: catalog.generation,
+        homes,
+    }
 }
 
 async fn record_authorization_ack(state: &Arc<State>, node: String, generation: u64) {
@@ -1228,13 +1481,16 @@ async fn wait_until_credential_inactive(state: &Arc<State>, credential_id: Uuid)
 mod tests {
     use std::time::{Duration, Instant};
 
-    use flowsplice_core::protocol::{HomeCatalog, Service, ServiceProtocol};
+    use flowsplice_core::{
+        deployment::{DeploymentTrust, HomeEndpointTrust},
+        protocol::{HomeCatalog, RelayEndpoint, Service, ServiceProtocol},
+    };
     use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
     use super::{
-        ConfiguredHome, HomeRegistry, HomeSession, TRAVEL_SESSION_LEASE, TravelSessionRegistry,
-        validate_homes, validate_listens,
+        ConfiguredHome, HomeRegistry, HomeSession, RelayDirectoryRegistry, TRAVEL_SESSION_LEASE,
+        TravelSessionRegistry, validate_homes, validate_listens,
     };
 
     fn home_session(session_id: Uuid) -> HomeSession {
@@ -1257,6 +1513,32 @@ mod tests {
                 protocol: ServiceProtocol::Tcp,
                 target: target.to_owned(),
             }],
+        }
+    }
+
+    fn deployment_trust() -> DeploymentTrust {
+        DeploymentTrust {
+            version: 1,
+            deployment_id: "deployment-1".to_owned(),
+            generation: 1,
+            not_before_unix_secs: 1,
+            not_after_unix_secs: u64::MAX,
+            management_ca_certificate_pem: String::new(),
+            business_ca_certificate_pem: String::new(),
+            server_control_keys: Vec::new(),
+            home_endpoints: vec![
+                HomeEndpointTrust {
+                    home_id: "home-1".to_owned(),
+                    management_spki_pins: vec!["11".repeat(32)],
+                    business_spki_pins: vec!["33".repeat(32)],
+                },
+                HomeEndpointTrust {
+                    home_id: "home-2".to_owned(),
+                    management_spki_pins: vec!["22".repeat(32)],
+                    business_spki_pins: vec!["44".repeat(32)],
+                },
+            ],
+            travel_authorities: Vec::new(),
         }
     }
 
@@ -1292,21 +1574,52 @@ mod tests {
                 spki_pins: vec!["22".repeat(32)],
             },
         ];
-        assert!(validate_homes(&homes).is_ok());
-        assert!(validate_homes(&[]).is_err());
+        let trust = deployment_trust();
+        assert!(validate_homes(&homes, &trust).is_ok());
+        assert!(validate_homes(&[], &trust).is_err());
         assert!(
-            validate_homes(&[
-                ConfiguredHome {
-                    id: "home-1".to_owned(),
-                    spki_pins: vec![pin.clone()],
-                },
-                ConfiguredHome {
-                    id: "home-1".to_owned(),
-                    spki_pins: vec![pin],
-                },
-            ])
+            validate_homes(
+                &[
+                    ConfiguredHome {
+                        id: "home-1".to_owned(),
+                        spki_pins: vec![pin.clone()],
+                    },
+                    ConfiguredHome {
+                        id: "home-1".to_owned(),
+                        spki_pins: vec![pin],
+                    },
+                ],
+                &trust
+            )
             .is_err()
         );
+    }
+
+    #[test]
+    fn relay_directory_uses_authenticated_spki_and_stable_generation() {
+        let mut registry = RelayDirectoryRegistry::default();
+        let relay_two = RelayEndpoint {
+            id: "relay-2".to_owned(),
+            management_addr: "192.0.2.2:8443".to_owned(),
+            management_spki_sha256: "22".repeat(32),
+        };
+        let first = registry.register(relay_two.clone());
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.relays, vec![relay_two.clone()]);
+
+        let unchanged = registry.register(relay_two);
+        assert_eq!(unchanged.generation, 1);
+
+        let relay_one = RelayEndpoint {
+            id: "relay-1".to_owned(),
+            management_addr: "192.0.2.1:8443".to_owned(),
+            management_spki_sha256: "11".repeat(32),
+        };
+        let complete = registry.register(relay_one);
+        assert_eq!(complete.generation, 2);
+        assert_eq!(complete.relays[0].id, "relay-1");
+        assert_eq!(complete.relays[1].id, "relay-2");
+        assert_eq!(complete.relays[1].management_spki_sha256, "22".repeat(32));
     }
 
     #[test]
@@ -1407,6 +1720,45 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn releasing_the_last_lease_allows_a_new_process_to_login_immediately() {
+        let now = Instant::now();
+        let old_session = Uuid::new_v4();
+        let old_lease = Uuid::new_v4();
+        let mut registry = TravelSessionRegistry::default();
+        assert!(
+            registry
+                .authorize("travel-1", old_session, Some(old_lease), now)
+                .is_ok()
+        );
+        assert!(registry.release("travel-1", old_session, old_lease));
+        assert!(
+            registry
+                .authorize("travel-1", Uuid::new_v4(), Some(Uuid::new_v4()), now,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_stale_or_wrong_release_cannot_end_the_active_session() {
+        let now = Instant::now();
+        let session = Uuid::new_v4();
+        let lease = Uuid::new_v4();
+        let mut registry = TravelSessionRegistry::default();
+        assert!(
+            registry
+                .authorize("travel-1", session, Some(lease), now)
+                .is_ok()
+        );
+
+        assert!(!registry.release("travel-1", Uuid::new_v4(), lease));
+        assert!(!registry.release("travel-1", session, Uuid::new_v4()));
+        let Some(active) = registry.sessions.get("travel-1") else {
+            panic!("stale release unexpectedly removed the active Travel session");
+        };
+        assert_eq!(active.session_id, session);
     }
 
     #[test]

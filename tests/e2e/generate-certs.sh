@@ -2,19 +2,38 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+mode="${1:-all}"
 cert_dir="${script_dir}/generated/certs"
 config_dir="${script_dir}/generated/config"
 authorization_dir="${script_dir}/generated/authorization"
 state_dir="${script_dir}/generated/state"
 offline_dir="${script_dir}/generated/offline"
 offline_home2_dir="${script_dir}/generated/offline-home2"
+root_dir="${script_dir}/generated/deployment-root-offline"
 travel_dir="${script_dir}/generated/travel"
+if [[ "${mode}" == "enroll-only" ]]; then
+  rm -rf "${travel_dir}"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
+    -v "${script_dir}/generated:/generated" \
+    flowsplice-e2e:local \
+    /usr/local/bin/flowsplice-travelagent enroll-init \
+    --travel-id travel-1 \
+    --enrollment-dir /generated/travel \
+    --test-password-file /generated/offline/test-password.txt
+  cp "${offline_dir}/test-password.txt" "${travel_dir}/test-password.txt"
+  cp "${travel_dir}/enrollment-request.json" "${authorization_dir}/enrollment-request.json"
+  chmod 600 "${travel_dir}/test-password.txt"
+  exit 0
+fi
 mkdir -p "${cert_dir}"
 mkdir -p "${config_dir}"
 mkdir -p "${authorization_dir}"
 mkdir -p "${state_dir}"
 mkdir -p "${offline_dir}"
 mkdir -p "${offline_home2_dir}"
+mkdir -p "${root_dir}"
 rm -rf "${travel_dir}"
 find "${cert_dir}" -maxdepth 1 -type f -delete
 find "${config_dir}" -maxdepth 1 -type f -delete
@@ -22,6 +41,7 @@ find "${authorization_dir}" -maxdepth 1 -type f -delete
 find "${state_dir}" -maxdepth 1 -type f -delete
 find "${offline_dir}" -maxdepth 1 -type f -delete
 find "${offline_home2_dir}" -maxdepth 1 -type f -delete
+find "${root_dir}" -maxdepth 1 -type f -delete
 password_file="${offline_dir}/test-password.txt"
 printf '%s\n' 'flowsplice-e2e-private-key-password' >"${password_file}"
 chmod 600 "${password_file}"
@@ -61,6 +81,13 @@ issue() {
     | grep -F "URI:flowsplice://identity/${role}/${id}" >/dev/null
 }
 
+spki_pin() {
+  openssl x509 -in "${cert_dir}/$1.crt" -pubkey -noout \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 \
+    | sed 's/^.*= //'
+}
+
 make_ca management-ca
 make_ca business-ca
 issue server server server-1 server.flowsplice serverAuth,clientAuth management-ca
@@ -70,6 +97,10 @@ issue home-management home home-1 home-management.flowsplice clientAuth manageme
 issue home-business home home-1 home-1.flowsplice serverAuth business-ca
 issue home2-management home home-2 home2-management.flowsplice clientAuth management-ca
 issue home2-business home home-2 home-2.flowsplice serverAuth business-ca
+home_management_pin="$(spki_pin home-management)"
+home_business_pin="$(spki_pin home-business)"
+home2_management_pin="$(spki_pin home2-management)"
+home2_business_pin="$(spki_pin home2-business)"
 for authority in home1-authority home2-authority global-authority; do
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
     -aes-256-cbc -pass "file:${password_file}" \
@@ -79,6 +110,27 @@ for authority in home1-authority home2-authority global-authority; do
     --password-file "${password_file}" \
     --output "${authorization_dir}/${authority}-public-key.txt"
 done
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -aes-256-cbc -pass "file:${password_file}" \
+  -out "${root_dir}/deployment-root.key" >/dev/null 2>&1
+python3 "${script_dir}/authority-public-key.py" \
+  --authority-key "${root_dir}/deployment-root.key" \
+  --password-file "${password_file}" \
+  --output "${cert_dir}/deployment-root.pub"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out "${authorization_dir}/server-control.key" >/dev/null 2>&1
+python3 "${script_dir}/authority-public-key.py" \
+  --authority-key "${authorization_dir}/server-control.key" \
+  --output "${authorization_dir}/server-control-public-key.txt"
+python3 "${script_dir}/generate-deployment-trust.py" \
+  --cert-dir "${cert_dir}" \
+  --authorization-dir "${authorization_dir}" \
+  --root-dir "${root_dir}" \
+  --password-file "${password_file}" \
+  --home1-management-pin "${home_management_pin}" \
+  --home1-business-pin "${home_business_pin}" \
+  --home2-management-pin "${home2_management_pin}" \
+  --home2-business-pin "${home2_business_pin}"
 
 # Each Home owns a separate writable issuer directory. Copy the shared CA keys
 # into Home 2's test-only directory so rotating one Home cannot mutate another
@@ -92,14 +144,8 @@ find "${cert_dir}" -maxdepth 1 \( -name '*.csr' -o -name '*.ext' -o -name '*.srl
 chmod 600 "${cert_dir}"/*.key
 chmod 600 "${offline_dir}"/*.key
 chmod 600 "${offline_home2_dir}"/*.key "${offline_home2_dir}/test-password.txt"
+chmod 600 "${root_dir}/deployment-root.key"
 chmod 644 "${cert_dir}"/*.crt
-
-spki_pin() {
-  openssl x509 -in "${cert_dir}/$1.crt" -pubkey -noout \
-    | openssl pkey -pubin -outform DER 2>/dev/null \
-    | openssl dgst -sha256 \
-    | sed 's/^.*= //'
-}
 
 server_pin="$(spki_pin server)"
 relay1_pin="$(spki_pin relay1)"
@@ -108,37 +154,18 @@ home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
 home2_management_pin="$(spki_pin home2-management)"
 home2_business_pin="$(spki_pin home2-business)"
-home1_authority_public_key="$(tr -d '\n' <"${authorization_dir}/home1-authority-public-key.txt")"
-home2_authority_public_key="$(tr -d '\n' <"${authorization_dir}/home2-authority-public-key.txt")"
-global_authority_public_key="$(tr -d '\n' <"${authorization_dir}/global-authority-public-key.txt")"
 printf '{"credentials":[]}\n' >"${authorization_dir}/credentials.json"
-
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
-  -v "${script_dir}/generated:/generated" \
-  flowsplice-e2e:local \
-  /usr/local/bin/flowsplice-travelagent enroll-init \
-  --travel-id travel-1 \
-  --output-dir /generated/travel \
-  --test-password-file /generated/offline/test-password.txt
-cp "${password_file}" "${travel_dir}/test-password.txt"
-cp "${travel_dir}/enrollment-request.json" "${authorization_dir}/enrollment-request.json"
-chmod 600 "${travel_dir}/test-password.txt"
+printf '{"relay-1":"%s","relay-2":"%s"}\n' \
+  "${relay1_pin}" "${relay2_pin}" >"${state_dir}/relay-pins.json"
 
 for template in "${script_dir}"/config/*.toml; do
   output="${config_dir}/$(basename -- "${template}")"
   sed \
     -e "s/__SERVER_PIN__/${server_pin}/g" \
-    -e "s/__RELAY1_PIN__/${relay1_pin}/g" \
-    -e "s/__RELAY2_PIN__/${relay2_pin}/g" \
     -e "s/__HOME_MANAGEMENT_PIN__/${home_management_pin}/g" \
     -e "s/__HOME_BUSINESS_PIN__/${home_business_pin}/g" \
     -e "s/__HOME2_MANAGEMENT_PIN__/${home2_management_pin}/g" \
     -e "s/__HOME2_BUSINESS_PIN__/${home2_business_pin}/g" \
-    -e "s/__HOME1_AUTHORITY_PUBLIC_KEY__/${home1_authority_public_key}/g" \
-    -e "s/__HOME2_AUTHORITY_PUBLIC_KEY__/${home2_authority_public_key}/g" \
-    -e "s/__GLOBAL_AUTHORITY_PUBLIC_KEY__/${global_authority_public_key}/g" \
     "${template}" >"${output}"
 done
 printf 'Generated E2E certificates in %s\n' "${cert_dir}"

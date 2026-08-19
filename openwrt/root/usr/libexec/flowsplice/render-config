@@ -60,16 +60,14 @@ require_option() {
 }
 
 write_relay_endpoint() {
-	local section="$1" enabled id management_addr server_name
+	local section="$1" enabled id management_addr
 	config_get_bool enabled "$section" enabled 1
 	[ "$enabled" -eq 1 ] || return 0
 	id="$(require_option "$section" id)"
 	management_addr="$(require_option "$section" management_addr)"
-	server_name="$(require_option "$section" server_name)"
 	printf '\n[[relays]]\n' >>"$RENDER_OUTPUT"
 	write_string id "$id" "$RENDER_OUTPUT"
 	write_string management_addr "$management_addr" "$RENDER_OUTPUT"
-	write_string server_name "$server_name" "$RENDER_OUTPUT"
 	RELAY_ENDPOINT_COUNT=$((RELAY_ENDPOINT_COUNT + 1))
 }
 
@@ -82,26 +80,10 @@ write_home() {
 	HOME_COUNT=$((HOME_COUNT + 1))
 }
 
-write_travel_authority() {
-	local section="$1" enabled kind id home_id public_key
-	config_get_bool enabled "$section" enabled 1
-	[ "$enabled" -eq 1 ] || return 0
-	kind="$(require_option "$section" kind)"
-	case "$kind" in home|global) ;; *) die "invalid Travel authority kind: $kind" ;; esac
-	id="$(require_option "$section" id)"
-	home_id="$(require_option "$section" home_id)"
-	public_key="$(require_option "$section" public_key)"
-	printf '\n[[travel_authorities]]\n' >>"$RENDER_OUTPUT"
-	write_string kind "$kind" "$RENDER_OUTPUT"
-	write_string id "$id" "$RENDER_OUTPUT"
-	write_string home_id "$home_id" "$RENDER_OUTPUT"
-	write_string public_key "$public_key" "$RENDER_OUTPUT"
-	TRAVEL_AUTHORITY_COUNT=$((TRAVEL_AUTHORITY_COUNT + 1))
-}
-
 render_server() {
 	local output="$1" tmp section=server
-	local id control_listen cert key management_ca credentials revocations handshake work_ttl max_pending
+	local id control_listen cert key management_ca deployment_root deployment_trust control_signing_key
+	local credentials revocations handshake work_ttl max_pending control_snapshot_ttl
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
@@ -110,27 +92,31 @@ render_server() {
 	cert="$(require_option "$section" cert)"
 	key="$(require_option "$section" key)"
 	management_ca="$(require_option "$section" management_ca)"
+	deployment_root="$(require_option "$section" deployment_root_public_key)"
+	deployment_trust="$(require_option "$section" deployment_trust)"
+	control_signing_key="$(require_option "$section" control_signing_key)"
 	credentials="$(require_option "$section" travel_credentials)"
 	revocations="$(require_option "$section" travel_revocations)"
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get work_ttl "$section" work_ttl_secs 15
 	config_get max_pending "$section" max_pending_work 256
+	config_get control_snapshot_ttl "$section" control_snapshot_ttl_secs 120
 	write_string id "$id" "$tmp"
 	write_string control_listen "$control_listen" "$tmp"
 	write_list "$section" data_listen data_listens "$tmp"
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
 	write_string management_ca "$management_ca" "$tmp"
-	write_list "$section" relay_spki_pin relay_spki_pins "$tmp"
+	write_string deployment_root_public_key "$deployment_root" "$tmp"
+	write_string deployment_trust "$deployment_trust" "$tmp"
+	write_string control_signing_key "$control_signing_key" "$tmp"
 	write_string travel_credentials "$credentials" "$tmp"
 	write_string travel_revocations "$revocations" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer work_ttl_secs "$work_ttl" "$tmp"
 	write_integer max_pending_work "$max_pending" "$tmp"
+	write_integer control_snapshot_ttl_secs "$control_snapshot_ttl" "$tmp"
 	RENDER_OUTPUT="$tmp"
-	TRAVEL_AUTHORITY_COUNT=0
-	config_foreach write_travel_authority travel_authority
-	[ "$TRAVEL_AUTHORITY_COUNT" -gt 0 ] || die 'at least one enabled Travel authority is required'
 	HOME_COUNT=0
 	config_foreach write_home home
 	[ "$HOME_COUNT" -gt 0 ] || die 'an enabled Server requires at least one home section'
@@ -144,7 +130,8 @@ render_server() {
 render_relay() {
 	local section="$1" output="$2" tmp
 	local id management_listen data_listen data_public_addr server_data_addr
-	local server_id cert key management_ca authorization_cache handshake route_ttl max_pending
+	local server_id cert key management_ca deployment_root deployment_trust
+	local authorization_cache handshake route_ttl max_pending
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
@@ -157,6 +144,8 @@ render_relay() {
 	cert="$(require_option "$section" cert)"
 	key="$(require_option "$section" key)"
 	management_ca="$(require_option "$section" management_ca)"
+	deployment_root="$(require_option "$section" deployment_root_public_key)"
+	deployment_trust="$(require_option "$section" deployment_trust)"
 	authorization_cache="$(require_option "$section" travel_authorization_cache)"
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get route_ttl "$section" route_ttl_secs 15
@@ -170,15 +159,13 @@ render_relay() {
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
 	write_string management_ca "$management_ca" "$tmp"
+	write_string deployment_root_public_key "$deployment_root" "$tmp"
+	write_string deployment_trust "$deployment_trust" "$tmp"
 	write_list "$section" server_spki_pin server_spki_pins "$tmp"
 	write_string travel_authorization_cache "$authorization_cache" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer route_ttl_secs "$route_ttl" "$tmp"
 	write_integer max_pending_routes "$max_pending" "$tmp"
-	RENDER_OUTPUT="$tmp"
-	TRAVEL_AUTHORITY_COUNT=0
-	config_foreach write_travel_authority travel_authority
-	[ "$TRAVEL_AUTHORITY_COUNT" -gt 0 ] || die 'at least one enabled Travel authority is required'
 	mv "$tmp" "$output"
 	trap - EXIT INT TERM
 }

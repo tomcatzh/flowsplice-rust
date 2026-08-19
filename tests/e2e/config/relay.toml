@@ -7,25 +7,9 @@ server_id = "server-1"
 cert = "/certs/relay1.crt"
 key = "/certs/relay1.key"
 management_ca = "/certs/management-ca.crt"
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
 server_spki_pins = ["__SERVER_PIN__"]
 travel_authorization_cache = "/state/relay1-authorization-cache.json"
 handshake_timeout_secs = 10
 route_ttl_secs = 15
-
-[[travel_authorities]]
-kind = "home"
-id = "home-1-authority"
-home_id = "home-1"
-public_key = "__HOME1_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "home"
-id = "home-2-authority"
-home_id = "home-2"
-public_key = "__HOME2_AUTHORITY_PUBLIC_KEY__"
-
-[[travel_authorities]]
-kind = "global"
-id = "operator-global-authority"
-home_id = "home-1"
-public_key = "__GLOBAL_AUTHORITY_PUBLIC_KEY__"

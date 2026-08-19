@@ -250,7 +250,10 @@ async fn perform_race(
     let mut candidate_ids = HashSet::new();
     let mut opens = JoinSet::new();
     let candidates = relay_candidates(state).await;
-    let relay_ids: Vec<_> = candidates.iter().map(|relay| relay.id.as_str()).collect();
+    let relay_ids: Vec<_> = candidates
+        .iter()
+        .map(super::RelayCandidate::label)
+        .collect();
     info!(
         event = "carrier_race_started",
         %flow_id,
@@ -263,9 +266,14 @@ async fn perform_race(
         "travel started carrier race"
     );
     for relay in candidates {
-        if old_relay_id.as_deref() == Some(relay.id.as_str()) {
+        if relay
+            .expected_id
+            .as_deref()
+            .is_some_and(|relay_id| old_relay_id.as_deref() == Some(relay_id))
+        {
             continue;
         }
+        let relay_label = relay.label().to_owned();
         let state = state.clone();
         let home_id = mapping.home_id.clone();
         let service_id = mapping.service_id.clone();
@@ -281,7 +289,7 @@ async fn perform_race(
                 &home_id,
             )
             .await;
-            (relay.id, result)
+            (relay_label, result)
         });
     }
     if let Some(carrier_id) = old_active {
@@ -313,7 +321,8 @@ async fn perform_race(
             opened = opens.join_next(), if !opens.is_empty() => {
                 if let Some(result) = opened {
                     match result? {
-                        (relay_id, Ok(carrier)) => {
+                        (_, Ok(carrier)) => {
+                            let relay_id = carrier.relay_id.clone();
                             if carrier.home_receive_offset > transfer.send_offset {
                                 bail!("Home acknowledged unsent Travel data");
                             }

@@ -20,20 +20,10 @@ carrier_timeout_secs = 30
 flow_detach_timeout_secs = 120
 max_unacked_bytes = 1048576
 
-[[travel_authorities]]
-kind = "home"
-id = "home-1-authority"
-home_id = "home-1"
-public_key = "replace-with-uncompressed-p256-public-key-hex"
-
-[[travel_authorities]]
-kind = "global"
-id = "operator-global-authority"
-home_id = "home-1"
-public_key = "replace-with-global-uncompressed-p256-public-key-hex"
-
 [issuer]
 listen = "127.0.0.1:9081"
+deployment_root_public_key = "/etc/flowsplice/issuer/deployment-root.pub"
+deployment_trust = "/etc/flowsplice/issuer/deployment-trust.json"
 management_ca_cert = "/etc/flowsplice/issuer/management-ca.crt"
 management_ca_key = "/etc/flowsplice/issuer/management-ca.key"
 business_ca_cert = "/etc/flowsplice/issuer/business-ca.crt"
@@ -42,12 +32,10 @@ default_valid_days = 365
 
 [issuer.home_authority]
 id = "home-1-authority"
-public_key = "replace-with-uncompressed-p256-public-key-hex"
 private_key = "/etc/flowsplice/issuer/home-authority.key"
 
 [issuer.global_authority]
 id = "operator-global-authority"
-public_key = "replace-with-global-uncompressed-p256-public-key-hex"
 private_key = "/etc/flowsplice/issuer/global-authority.key"
 
 [[services]]

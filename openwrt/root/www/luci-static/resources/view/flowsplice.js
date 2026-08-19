@@ -169,7 +169,9 @@ return view.extend({
 		addPathOption(s, 'trust', 'cert', _('Management certificate'));
 		addPathOption(s, 'trust', 'key', _('Management private key'), _('The file must be readable by the flowsplice service user.'));
 		addPathOption(s, 'trust', 'management_ca', _('Management CA'));
-		required(s.taboption('trust', form.DynamicList, 'relay_spki_pin', _('Relay SPKI pins')));
+		addPathOption(s, 'trust', 'deployment_root_public_key', _('Deployment root public key'));
+		addPathOption(s, 'trust', 'deployment_trust', _('Signed deployment trust'));
+		addPathOption(s, 'trust', 'control_signing_key', _('Server control signing key'), _('The deployment root must certify its public key.'));
 		addPathOption(s, 'trust', 'travel_credentials', _('Signed Travel credentials'));
 		addPathOption(s, 'trust', 'travel_revocations', _('Persistent Travel revocations'));
 		o = required(s.taboption('limits', form.Value, 'handshake_timeout_secs', _('Handshake timeout (seconds)')));
@@ -181,6 +183,9 @@ return view.extend({
 		o = required(s.taboption('limits', form.Value, 'max_pending_work', _('Maximum pending work')));
 		o.datatype = 'uinteger';
 		o.default = '256';
+		o = required(s.taboption('limits', form.Value, 'control_snapshot_ttl_secs', _('Signed control snapshot TTL (seconds)')));
+		o.datatype = 'uinteger';
+		o.default = '120';
 
 		s = m.section(form.GridSection, 'home', _('Trusted Home Agents'),
 			_('Add every Home Agent that may host a logical service. A Travel mapping selects one Home ID and one service; it never falls back to another Home.'));
@@ -189,22 +194,6 @@ return view.extend({
 		s.addbtntitle = _('Add Home Agent');
 		required(s.option(form.Value, 'id', _('Home ID')));
 		o = required(s.option(form.DynamicList, 'spki_pin', _('Home SPKI pins')));
-		o.modalonly = true;
-
-		s = m.section(form.GridSection, 'travel_authority', _('Trusted Travel authorities'),
-			_('Home authorities may sign only their assigned Home. Global authorities are separate super-authorities and should exist only on a designated Home.'));
-		s.addremove = true;
-		s.nodescriptions = true;
-		s.addbtntitle = _('Add Travel authority');
-		o = s.option(form.Flag, 'enabled', _('Enabled'));
-		o.default = o.enabled;
-		o.rmempty = false;
-		o = required(s.option(form.ListValue, 'kind', _('Authority type')));
-		o.value('home', _('Home'));
-		o.value('global', _('Global super-authority'));
-		required(s.option(form.Value, 'id', _('Authority ID')));
-		required(s.option(form.Value, 'home_id', _('Publishing Home ID')));
-		o = required(s.option(form.Value, 'public_key', _('Authorization public key')));
 		o.modalonly = true;
 
 		s = m.section(form.GridSection, 'relay', _('Local Relay instances'),
@@ -225,7 +214,7 @@ return view.extend({
 		o.modalonly = true;
 		o = required(s.option(form.Value, 'server_id', _('Server ID')));
 		o.modalonly = true;
-		[ [ 'cert', _('Management certificate') ], [ 'key', _('Management private key') ], [ 'management_ca', _('Management CA') ] ].forEach(function(item) {
+		[ [ 'cert', _('Management certificate') ], [ 'key', _('Management private key') ], [ 'management_ca', _('Management CA') ], [ 'deployment_root_public_key', _('Deployment root public key') ], [ 'deployment_trust', _('Signed deployment trust') ] ].forEach(function(item) {
 			var pathOption = required(s.option(form.Value, item[0], item[1]));
 			pathOption.modalonly = true;
 		});
@@ -252,7 +241,6 @@ return view.extend({
 		o.rmempty = false;
 		required(s.option(form.Value, 'id', _('Relay ID')));
 		required(s.option(form.Value, 'management_addr', _('Management address')));
-		required(s.option(form.Value, 'server_name', _('TLS server name')));
 
 		return m.render();
 	}

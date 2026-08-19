@@ -5,7 +5,6 @@ management_ca = "/etc/flowsplice/management-ca.crt"
 business_cert = "/etc/flowsplice/travel-business.crt"
 business_key = "/etc/flowsplice/travel-business.key"
 business_ca = "/etc/flowsplice/business-ca.crt"
-relay_spki_pins = ["replace-with-relay-spki-sha256-hex"]
 ui_listen = "127.0.0.1:9080"
 allow_remote_listen = false
 handshake_timeout_secs = 10
@@ -21,18 +20,14 @@ max_unacked_bytes = 1048576
 
 [[homes]]
 id = "home-1"
-server_name = "home-1.flowsplice"
 spki_pins = ["replace-with-home-spki-sha256-hex"]
 
 [[homes]]
 id = "home-2"
-server_name = "home-2.flowsplice"
 spki_pins = ["replace-with-second-home-spki-sha256-hex"]
 
 [[seed_relays]]
-id = "relay-1"
 management_addr = "relay-1.example.net:8443"
-server_name = "relay-1.example.net"
 
 [[mappings]]
 home_id = "home-1"

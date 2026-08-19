@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use flowsplice_core::{
     frame::{JsonFrameReader, write_json},
     protocol::{ControlMessage, Role, TravelConnectionPurpose},
-    tls::{client_connector_with_private_key, peer_identity, require_peer, server_name},
+    tls::{
+        identity_client_connector_with_private_key, identity_server_name, peer_identity,
+        require_peer,
+    },
 };
 use flowsplice_enrollment::key::load_private_key;
 use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpStream, time::timeout};
@@ -17,13 +20,12 @@ const CONTROL_FRAME_LIMIT: usize = 262_144;
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
-    if arguments.len() != 5 {
-        bail!("usage: flowsplice-travel-login-probe MODE RELAY_ADDR SERVER_NAME RELAY_ID");
+    if arguments.len() != 4 {
+        bail!("usage: flowsplice-travel-login-probe MODE RELAY_ADDR RELAY_ID");
     }
     let mode = &arguments[1];
     let relay_addr = &arguments[2];
-    let relay_server_name = &arguments[3];
-    let relay_id = &arguments[4];
+    let relay_id = &arguments[3];
     let password = fs::read_to_string("/travel/test-password.txt")
         .context("failed to read test-only Travel password")?;
     let key = load_private_key(
@@ -31,15 +33,13 @@ async fn main() -> Result<()> {
         Some(password.trim_end().as_bytes()),
         false,
     )?;
-    let connector = client_connector_with_private_key(
+    let connector = identity_client_connector_with_private_key(
         Path::new("/travel/travel-management.crt"),
         key,
         Path::new("/certs/management-ca.crt"),
     )?;
     let socket = TcpStream::connect(relay_addr).await?;
-    let mut stream = connector
-        .connect(server_name(relay_server_name)?, socket)
-        .await?;
+    let mut stream = connector.connect(identity_server_name()?, socket).await?;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
     require_peer(&identity, Role::Relay, Some(relay_id), &[])?;
     if mode == "slow-frame" {

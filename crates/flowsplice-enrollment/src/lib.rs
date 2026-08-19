@@ -10,11 +10,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use aws_lc_rs::digest;
+use aws_lc_rs::{
+    digest,
+    rand::{SecureRandom, SystemRandom},
+};
 use flowsplice_core::authorization::{
-    SignedTravelCredential, TravelCredential, TravelCredentialScope,
+    SignedTravelCredential, TRAVEL_CREDENTIAL_OBJECT_TYPE, TRAVEL_CREDENTIAL_VERSION,
+    TravelCredential, TravelCredentialScope, TrustedTravelAuthority,
 };
 use flowsplice_core::{
+    deployment::{DeploymentTrust, SignedDeploymentTrust},
     protocol::Role,
     tls::{peer_identity, require_peer},
 };
@@ -39,15 +44,19 @@ pub const MANAGEMENT_KEY_FILE: &str = "travel-management.key";
 pub const BUSINESS_KEY_FILE: &str = "travel-business.key";
 pub const MANAGEMENT_CERT_FILE: &str = "travel-management.crt";
 pub const BUSINESS_CERT_FILE: &str = "travel-business.crt";
+pub const MANAGEMENT_CA_FILE: &str = "management-ca.crt";
+pub const BUSINESS_CA_FILE: &str = "business-ca.crt";
 pub const REQUEST_FILE: &str = "enrollment-request.json";
 pub const STATE_FILE: &str = "enrollment-state.json";
 pub const RESPONSE_FILE: &str = "enrollment-response.json";
+pub const DEPLOYMENT_TRUST_FILE: &str = "deployment-trust.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TravelEnrollmentRequest {
     pub version: u32,
     pub request_id: Uuid,
+    pub nonce: String,
     pub travel_id: String,
     pub created_at_unix_secs: u64,
     pub management_csr_pem: String,
@@ -71,7 +80,7 @@ pub struct TravelEnrollmentApproval {
 pub struct TravelEnrollmentResponse {
     pub version: u32,
     pub approval: TravelEnrollmentApproval,
-    pub authority_public_key: String,
+    pub deployment_trust: SignedDeploymentTrust,
     pub management_certificate_pem: String,
     pub business_certificate_pem: String,
     pub signed_credential: SignedTravelCredential,
@@ -82,6 +91,7 @@ pub struct TravelEnrollmentResponse {
 pub struct EnrollmentState {
     pub version: u32,
     pub request_id: Uuid,
+    pub nonce: String,
     pub travel_id: String,
     pub management_spki_sha256: String,
     pub business_spki_sha256: String,
@@ -92,38 +102,51 @@ pub struct ParsedEnrollmentRequest {
     pub business: CertificateSigningRequestParams,
 }
 
+pub(crate) struct EnrollmentCredentialBindings<'a> {
+    pub signed_trust: &'a SignedDeploymentTrust,
+    pub trust: &'a DeploymentTrust,
+    pub authority: &'a TrustedTravelAuthority,
+    pub management_certificate_pem: &'a str,
+    pub business_certificate_pem: &'a str,
+}
+
 /// Creates an enrollment directory with two encrypted private keys and a public request.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid identity/authority data, an existing output path, or failed key
+/// Returns an error for invalid identity/authority data, an existing enrollment directory, or failed key
 /// generation and durable file creation.
 pub fn create_enrollment_request(
     travel_id: &str,
     password: &[u8],
-    output_dir: &Path,
+    enrollment_directory: &Path,
     now: u64,
 ) -> Result<TravelEnrollmentRequest> {
     validate_travel_id(travel_id)?;
-    if output_dir.exists() {
+    if enrollment_directory.exists() {
         bail!(
-            "enrollment output path already exists: {}",
-            output_dir.display()
+            "enrollment directory already exists: {}",
+            enrollment_directory.display()
         );
     }
-    fs::create_dir(output_dir).with_context(|| {
+    fs::create_dir(enrollment_directory).with_context(|| {
         format!(
             "failed to create enrollment directory {}",
-            output_dir.display()
+            enrollment_directory.display()
         )
     })?;
-    fs::set_permissions(output_dir, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(enrollment_directory, fs::Permissions::from_mode(0o700))?;
 
     let management = key::generate_encrypted_private_key(password)?;
     let business = key::generate_encrypted_private_key(password)?;
+    let mut nonce = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow!("failed to generate enrollment nonce"))?;
     let request = TravelEnrollmentRequest {
         version: ENROLLMENT_VERSION,
         request_id: Uuid::new_v4(),
+        nonce: hex::encode(nonce),
         travel_id: travel_id.to_owned(),
         created_at_unix_secs: now,
         management_csr_pem: create_csr(travel_id, &management.key_pair)?,
@@ -132,20 +155,21 @@ pub fn create_enrollment_request(
     let state = EnrollmentState {
         version: ENROLLMENT_VERSION,
         request_id: request.request_id,
+        nonce: request.nonce.clone(),
         travel_id: travel_id.to_owned(),
         management_spki_sha256: spki_pin(&management.key_pair),
         business_spki_sha256: spki_pin(&business.key_pair),
     };
     write_private_file(
-        &output_dir.join(MANAGEMENT_KEY_FILE),
+        &enrollment_directory.join(MANAGEMENT_KEY_FILE),
         management.encrypted_pem.as_bytes(),
     )?;
     write_private_file(
-        &output_dir.join(BUSINESS_KEY_FILE),
+        &enrollment_directory.join(BUSINESS_KEY_FILE),
         business.encrypted_pem.as_bytes(),
     )?;
-    write_json_private(&output_dir.join(REQUEST_FILE), &request)?;
-    write_json_private(&output_dir.join(STATE_FILE), &state)?;
+    write_json_private(&enrollment_directory.join(REQUEST_FILE), &request)?;
+    write_json_private(&enrollment_directory.join(STATE_FILE), &state)?;
     Ok(request)
 }
 
@@ -159,7 +183,8 @@ pub fn parse_enrollment_request(
     request: &TravelEnrollmentRequest,
     now: u64,
 ) -> Result<ParsedEnrollmentRequest> {
-    if request.version != ENROLLMENT_VERSION || request.request_id.is_nil() {
+    let nonce = hex::decode(&request.nonce).context("enrollment nonce must be hexadecimal")?;
+    if request.version != ENROLLMENT_VERSION || request.request_id.is_nil() || nonce.len() != 32 {
         bail!("unsupported or invalid enrollment request");
     }
     validate_travel_id(&request.travel_id)?;
@@ -226,8 +251,9 @@ pub fn prepare_enrollment_approval(
 /// public keys, or authorization signatures.
 pub fn validate_enrollment_response(
     response: &TravelEnrollmentResponse,
+    deployment_root_public_key: &str,
     now: u64,
-) -> Result<TravelCredential> {
+) -> Result<(TravelCredential, DeploymentTrust)> {
     if response.version != ENROLLMENT_VERSION
         || response.approval.version != ENROLLMENT_VERSION
         || response.approval.credential_id.is_nil()
@@ -242,17 +268,31 @@ pub fn validate_enrollment_response(
     if now >= response.approval.not_after_unix_secs {
         bail!("enrollment response is already expired");
     }
-    let expected = expected_credential(
-        &response.approval,
-        spki_pin(&parsed.management.public_key),
-        spki_pin(&parsed.business.public_key),
-    );
+    let trust = response
+        .deployment_trust
+        .verify(deployment_root_public_key, now)?;
+    if response.approval.not_before_unix_secs < trust.not_before_unix_secs
+        || response.approval.not_after_unix_secs > trust.not_after_unix_secs
+    {
+        bail!("enrollment validity is outside the deployment-trusted authority window");
+    }
     if response.signed_credential.authority_id != response.approval.authority_id {
         bail!("signed Travel credential has the wrong authority id");
     }
-    let actual = response
-        .signed_credential
-        .verify_public_key(&response.authority_public_key)?;
+    let authority = trust.travel_authority_by_id(&response.approval.authority_id)?;
+    let actual = response.signed_credential.verify(authority)?;
+    let expected = expected_credential(
+        &response.approval,
+        &EnrollmentCredentialBindings {
+            signed_trust: &response.deployment_trust,
+            trust: &trust,
+            authority,
+            management_certificate_pem: &response.management_certificate_pem,
+            business_certificate_pem: &response.business_certificate_pem,
+        },
+        spki_pin(&parsed.management.public_key),
+        spki_pin(&parsed.business.public_key),
+    )?;
     if actual != expected {
         bail!("signed Travel credential does not match the approved request");
     }
@@ -268,7 +308,7 @@ pub fn validate_enrollment_response(
         &expected.business_spki_sha256,
         "business",
     )?;
-    Ok(actual)
+    Ok((actual, trust))
 }
 
 /// Verifies and installs a response into the original enrollment directory.
@@ -283,8 +323,7 @@ pub fn validate_enrollment_response(
 pub fn install_enrollment_response(
     enrollment_directory: &Path,
     response: &TravelEnrollmentResponse,
-    management_ca: &Path,
-    business_ca: &Path,
+    deployment_root_public_key: &str,
     password: &[u8],
     now: u64,
 ) -> Result<TravelCredential> {
@@ -292,12 +331,14 @@ pub fn install_enrollment_response(
     let state: EnrollmentState = load_json(&enrollment_directory.join(STATE_FILE))?;
     if state.version != ENROLLMENT_VERSION
         || state.request_id != request.request_id
+        || state.nonce != request.nonce
         || state.travel_id != request.travel_id
         || response.approval.request != request
     {
         bail!("enrollment response does not match the local enrollment request");
     }
-    let credential = validate_enrollment_response(response, now)?;
+    let (credential, trust) =
+        validate_enrollment_response(response, deployment_root_public_key, now)?;
     let (management_key_path, business_key_path, management_cert_path, business_cert_path) =
         enrollment_paths(enrollment_directory);
     validate_local_key(
@@ -319,9 +360,31 @@ pub fn install_enrollment_response(
     }
     let management_certificate = certificate_from_pem(&response.management_certificate_pem)?;
     let business_certificate = certificate_from_pem(&response.business_certificate_pem)?;
-    verify_client_chain(&management_certificate, management_ca, now, "management")?;
-    verify_client_chain(&business_certificate, business_ca, now, "business")?;
+    verify_client_chain(
+        &management_certificate,
+        &trust.management_ca_certificate_pem,
+        now,
+        "management",
+    )?;
+    verify_client_chain(
+        &business_certificate,
+        &trust.business_ca_certificate_pem,
+        now,
+        "business",
+    )?;
 
+    write_or_verify(
+        &enrollment_directory.join(MANAGEMENT_CA_FILE),
+        trust.management_ca_certificate_pem.as_bytes(),
+    )?;
+    write_or_verify(
+        &enrollment_directory.join(BUSINESS_CA_FILE),
+        trust.business_ca_certificate_pem.as_bytes(),
+    )?;
+    write_or_verify(
+        &enrollment_directory.join(DEPLOYMENT_TRUST_FILE),
+        &serde_json::to_vec_pretty(&response.deployment_trust)?,
+    )?;
     write_or_verify(
         &management_cert_path,
         response.management_certificate_pem.as_bytes(),
@@ -435,19 +498,44 @@ fn validate_validity_interval(approval: &TravelEnrollmentApproval) -> Result<()>
 
 pub(crate) fn expected_credential(
     approval: &TravelEnrollmentApproval,
+    bindings: &EnrollmentCredentialBindings<'_>,
     management_spki_sha256: String,
     business_spki_sha256: String,
-) -> TravelCredential {
-    TravelCredential {
+) -> Result<TravelCredential> {
+    Ok(TravelCredential {
+        version: TRAVEL_CREDENTIAL_VERSION,
+        object_type: TRAVEL_CREDENTIAL_OBJECT_TYPE.to_owned(),
+        deployment_id: bindings.trust.deployment_id.clone(),
+        deployment_trust_sha256: bindings.signed_trust.payload_digest_sha256()?,
         credential_id: approval.credential_id,
         authority_id: approval.authority_id.clone(),
+        authority_epoch: bindings.authority.epoch(),
+        enrollment_request_id: approval.request.request_id,
+        enrollment_nonce: approval.request.nonce.clone(),
+        enrollment_request_sha256: sha256_json(&approval.request)?,
         travel_id: approval.request.travel_id.clone(),
         management_spki_sha256,
         business_spki_sha256,
+        management_ca_sha256: sha256_bytes(bindings.trust.management_ca_certificate_pem.as_bytes()),
+        business_ca_sha256: sha256_bytes(bindings.trust.business_ca_certificate_pem.as_bytes()),
+        management_certificate_sha256: certificate_sha256(bindings.management_certificate_pem)?,
+        business_certificate_sha256: certificate_sha256(bindings.business_certificate_pem)?,
         scope: approval.scope.clone(),
         not_before_unix_secs: approval.not_before_unix_secs,
         not_after_unix_secs: approval.not_after_unix_secs,
-    }
+    })
+}
+
+fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
+    Ok(sha256_bytes(&serde_json::to_vec(value)?))
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
+    hex::encode(digest::digest(&digest::SHA256, value).as_ref())
+}
+
+fn certificate_sha256(pem: &str) -> Result<String> {
+    Ok(sha256_bytes(certificate_from_pem(pem)?.as_ref()))
 }
 
 fn validate_travel_id(travel_id: &str) -> Result<()> {
@@ -514,14 +602,13 @@ fn certificate_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
 
 fn verify_client_chain(
     certificate: &CertificateDer<'_>,
-    ca_path: &Path,
+    ca_pem: &str,
     now: u64,
     label: &str,
 ) -> Result<()> {
-    let roots = CertificateDer::pem_file_iter(ca_path)
-        .with_context(|| format!("failed to open {label} CA {}", ca_path.display()))?
+    let roots = CertificateDer::pem_slice_iter(ca_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to parse {label} CA {}", ca_path.display()))?;
+        .with_context(|| format!("failed to parse embedded {label} CA"))?;
     let mut store = RootCertStore::empty();
     let root_count = roots.len();
     let (added, ignored) = store.add_parsable_certificates(roots);

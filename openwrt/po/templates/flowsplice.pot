@@ -10,9 +10,6 @@ msgstr ""
 msgid "Add Relay instance"
 msgstr ""
 
-msgid "Add Travel authority"
-msgstr ""
-
 msgid "Add directory entry"
 msgstr ""
 
@@ -23,15 +20,6 @@ msgid "Advertised data address"
 msgstr ""
 
 msgid "All enabled FlowSplice instances are valid."
-msgstr ""
-
-msgid "Authority ID"
-msgstr ""
-
-msgid "Authority type"
-msgstr ""
-
-msgid "Authorization public key"
 msgstr ""
 
 msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
@@ -58,25 +46,16 @@ msgstr ""
 msgid "Global settings"
 msgstr ""
 
-msgid "Global super-authority"
-msgstr ""
-
 msgid "Handshake timeout"
 msgstr ""
 
 msgid "Handshake timeout (seconds)"
 msgstr ""
 
-msgid "Home"
-msgstr ""
-
 msgid "Home ID"
 msgstr ""
 
 msgid "Home SPKI pins"
-msgstr ""
-
-msgid "Home authorities may sign only their assigned Home. Global authorities are separate super-authorities and should exist only on a designated Home."
 msgstr ""
 
 msgid "Home control listener"
@@ -136,16 +115,10 @@ msgstr ""
 msgid "Persistent revocation cache"
 msgstr ""
 
-msgid "Publishing Home ID"
-msgstr ""
-
 msgid "RUNNING"
 msgstr ""
 
 msgid "Relay ID"
-msgstr ""
-
-msgid "Relay SPKI pins"
 msgstr ""
 
 #, javascript-format
@@ -197,9 +170,6 @@ msgstr ""
 msgid "Stop"
 msgstr ""
 
-msgid "TLS server name"
-msgstr ""
-
 msgid "The file must be readable by the flowsplice service user."
 msgstr ""
 
@@ -212,9 +182,6 @@ msgstr ""
 msgid "Trusted Home Agents"
 msgstr ""
 
-msgid "Trusted Travel authorities"
-msgstr ""
-
 msgid "Use LAN addresses only; do not expose the Server control listener to WAN."
 msgstr ""
 
@@ -222,4 +189,19 @@ msgid "Validate"
 msgstr ""
 
 msgid "armed"
+msgstr ""
+
+msgid "Deployment root public key"
+msgstr ""
+
+msgid "Signed deployment trust"
+msgstr ""
+
+msgid "Server control signing key"
+msgstr ""
+
+msgid "The deployment root must certify its public key."
+msgstr ""
+
+msgid "Signed control snapshot TTL (seconds)"
 msgstr ""

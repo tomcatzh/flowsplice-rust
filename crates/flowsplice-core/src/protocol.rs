@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::authorization::{SignedTravelCredential, TravelAuthorizationSnapshot};
+use crate::deployment::SignedControlSnapshot;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,7 +64,7 @@ pub struct Catalog {
 pub struct RelayEndpoint {
     pub id: String,
     pub management_addr: String,
-    pub server_name: String,
+    pub management_spki_sha256: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,11 +100,8 @@ pub enum ControlMessage {
     HomeRegister {
         home: HomeCatalog,
     },
-    Catalog {
-        catalog: Catalog,
-    },
-    RelayDirectory {
-        directory: RelayDirectory,
+    ControlSnapshot {
+        snapshot: SignedControlSnapshot,
     },
     RouteRequest {
         request_id: Uuid,
@@ -127,6 +125,12 @@ pub enum ControlMessage {
     },
     TravelSessionAccepted {
         request_id: Uuid,
+        snapshot: SignedControlSnapshot,
+    },
+    TravelSessionRelease {
+        travel_id: String,
+        travel_session_id: Uuid,
+        lease_id: Uuid,
     },
     TravelSessionDenied {
         request_id: Uuid,
@@ -264,29 +268,32 @@ pub enum DataFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalog, ControlMessage, DataFrame, HomeCatalog, RelayDirectory, RelayEndpoint, Service,
-        ServiceProtocol, TravelConnectionPurpose,
+        Catalog, ControlMessage, DataFrame, HomeCatalog, Service, ServiceProtocol,
+        TravelConnectionPurpose,
     };
+    use crate::deployment::{SignedControlSnapshot, SignedDeploymentTrust};
     use uuid::Uuid;
 
     #[test]
-    fn relay_directory_round_trips() -> Result<(), serde_json::Error> {
-        let message = ControlMessage::RelayDirectory {
-            directory: RelayDirectory {
-                generation: 7,
-                relays: vec![RelayEndpoint {
-                    id: "relay-1".to_owned(),
-                    management_addr: "relay.example:8443".to_owned(),
-                    server_name: "relay.example".to_owned(),
-                }],
+    fn signed_control_snapshot_round_trips_without_reencoding_payloads()
+    -> Result<(), serde_json::Error> {
+        let message = ControlMessage::ControlSnapshot {
+            snapshot: SignedControlSnapshot {
+                trust: SignedDeploymentTrust {
+                    payload_hex: "0102".to_owned(),
+                    signature_hex: "0304".to_owned(),
+                },
+                payload_hex: "0506".to_owned(),
+                signature_hex: "0708".to_owned(),
             },
         };
         let encoded = serde_json::to_vec(&message)?;
         let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
         match decoded {
-            ControlMessage::RelayDirectory { directory } => {
-                assert_eq!(directory.generation, 7);
-                assert_eq!(directory.relays[0].id, "relay-1");
+            ControlMessage::ControlSnapshot { snapshot } => {
+                assert_eq!(snapshot.trust.payload_hex, "0102");
+                assert_eq!(snapshot.payload_hex, "0506");
+                assert_eq!(snapshot.signature_hex, "0708");
             }
             _ => panic!("wrong control message variant"),
         }
@@ -354,28 +361,23 @@ mod tests {
             protocol: ServiceProtocol::Tcp,
             target: target.to_owned(),
         };
-        let message = ControlMessage::Catalog {
-            catalog: Catalog {
-                generation: 9,
-                homes: vec![
-                    HomeCatalog {
-                        home_id: "home-1".to_owned(),
-                        home_alias: "Home One".to_owned(),
-                        services: vec![service("127.0.0.1:22")],
-                    },
-                    HomeCatalog {
-                        home_id: "home-2".to_owned(),
-                        home_alias: "Home Two".to_owned(),
-                        services: vec![service("127.0.0.1:22")],
-                    },
-                ],
-            },
+        let catalog = Catalog {
+            generation: 9,
+            homes: vec![
+                HomeCatalog {
+                    home_id: "home-1".to_owned(),
+                    home_alias: "Home One".to_owned(),
+                    services: vec![service("127.0.0.1:22")],
+                },
+                HomeCatalog {
+                    home_id: "home-2".to_owned(),
+                    home_alias: "Home Two".to_owned(),
+                    services: vec![service("127.0.0.1:22")],
+                },
+            ],
         };
-        let encoded = serde_json::to_vec(&message)?;
-        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
-        let ControlMessage::Catalog { catalog } = decoded else {
-            panic!("wrong control message variant");
-        };
+        let encoded = serde_json::to_vec(&catalog)?;
+        let catalog: Catalog = serde_json::from_slice(&encoded)?;
         assert_eq!(catalog.generation, 9);
         assert_eq!(catalog.homes.len(), 2);
         assert_eq!(catalog.homes[0].services[0].id, "ssh");

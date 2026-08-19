@@ -2,6 +2,7 @@
 
 pub mod authorization;
 pub mod config;
+pub mod deployment;
 pub mod frame;
 pub mod protocol;
 pub mod route;

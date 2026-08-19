@@ -5,15 +5,16 @@ use aws_lc_rs::{
     rand::SystemRandom,
     signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _},
 };
-use flowsplice_core::authorization::{SignedTravelCredential, validate_authority_public_key};
+use flowsplice_core::{authorization::SignedTravelCredential, deployment::SignedDeploymentTrust};
 use rcgen::{Issuer, KeyPair, PublicKeyData};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use crate::{
-    TravelEnrollmentApproval, TravelEnrollmentResponse, exact_leaf_params, expected_credential,
-    key, parse_enrollment_request, spki_pin, validate_approval,
+    EnrollmentCredentialBindings, TravelEnrollmentApproval, TravelEnrollmentResponse,
+    exact_leaf_params, expected_credential, key, parse_enrollment_request, spki_pin,
+    validate_approval,
 };
 
 pub struct ProtectedKey<'a> {
@@ -23,12 +24,13 @@ pub struct ProtectedKey<'a> {
 }
 
 pub struct IssuerMaterial<'a> {
+    pub deployment_trust: &'a SignedDeploymentTrust,
+    pub deployment_root_public_key: &'a str,
     pub management_ca_certificate: &'a Path,
     pub management_ca_key: ProtectedKey<'a>,
     pub business_ca_certificate: &'a Path,
     pub business_ca_key: ProtectedKey<'a>,
     pub travel_authority_key: ProtectedKey<'a>,
-    pub expected_travel_authority_public_key: &'a str,
 }
 
 /// Signs the two requested TLS identities and the exact Travel authorization credential.
@@ -46,7 +48,15 @@ pub fn issue_enrollment(
     now: u64,
 ) -> Result<TravelEnrollmentResponse> {
     validate_approval(&approval, now)?;
-    validate_authority_public_key(material.expected_travel_authority_public_key)?;
+    let trust = material
+        .deployment_trust
+        .verify(material.deployment_root_public_key, now)?;
+    if approval.not_before_unix_secs < trust.not_before_unix_secs
+        || approval.not_after_unix_secs > trust.not_after_unix_secs
+    {
+        bail!("enrollment validity is outside the deployment-trusted authority window");
+    }
+    let authority = trust.travel_authority_by_id(&approval.authority_id)?;
     let parsed = parse_enrollment_request(&approval.request, now)?;
 
     let management_issuer = load_ca_issuer(
@@ -59,6 +69,15 @@ pub fn issue_enrollment(
         &material.business_ca_key,
         "business",
     )?;
+    let management_ca_certificate_pem = fs::read_to_string(material.management_ca_certificate)
+        .context("failed to read management CA certificate for enrollment response")?;
+    let business_ca_certificate_pem = fs::read_to_string(material.business_ca_certificate)
+        .context("failed to read business CA certificate for enrollment response")?;
+    if management_ca_certificate_pem != trust.management_ca_certificate_pem
+        || business_ca_certificate_pem != trust.business_ca_certificate_pem
+    {
+        bail!("issuer CA certificates do not match deployment trust");
+    }
 
     let management_params = exact_leaf_params(
         &approval.request.travel_id,
@@ -77,11 +96,20 @@ pub fn issue_enrollment(
         .signed_by(&parsed.business.public_key, &business_issuer)
         .context("failed to sign Travel business certificate")?;
 
+    let management_certificate_pem = management_certificate.pem();
+    let business_certificate_pem = business_certificate.pem();
     let credential = expected_credential(
         &approval,
+        &EnrollmentCredentialBindings {
+            signed_trust: material.deployment_trust,
+            trust: &trust,
+            authority,
+            management_certificate_pem: &management_certificate_pem,
+            business_certificate_pem: &business_certificate_pem,
+        },
         spki_pin(&parsed.management.public_key),
         spki_pin(&parsed.business.public_key),
-    );
+    )?;
     let authority_private_key = Zeroizing::new(
         key::load_private_key(
             material.travel_authority_key.path,
@@ -96,7 +124,7 @@ pub fn issue_enrollment(
     )
     .map_err(|_| anyhow!("Travel authorization key is not a P-256 PKCS#8 private key"))?;
     let actual_public_key = hex::encode(authority_key.public_key().as_ref());
-    if !actual_public_key.eq_ignore_ascii_case(material.expected_travel_authority_public_key) {
+    if !actual_public_key.eq_ignore_ascii_case(authority.public_key()) {
         bail!("Travel authorization private key does not match the expected public key");
     }
     let payload = serde_json::to_vec(&credential)?;
@@ -112,9 +140,9 @@ pub fn issue_enrollment(
     Ok(TravelEnrollmentResponse {
         version: crate::ENROLLMENT_VERSION,
         approval,
-        authority_public_key: actual_public_key,
-        management_certificate_pem: management_certificate.pem(),
-        business_certificate_pem: business_certificate.pem(),
+        deployment_trust: material.deployment_trust.clone(),
+        management_certificate_pem,
+        business_certificate_pem,
         signed_credential,
     })
 }
@@ -165,10 +193,17 @@ mod tests {
     };
 
     use crate::{
-        BUSINESS_CERT_FILE, DEFAULT_VALID_DAYS, MANAGEMENT_CERT_FILE, create_enrollment_request,
-        install_enrollment_response, prepare_enrollment_approval, validate_enrollment_response,
+        BUSINESS_CA_FILE, BUSINESS_CERT_FILE, DEFAULT_VALID_DAYS, MANAGEMENT_CA_FILE,
+        MANAGEMENT_CERT_FILE, create_enrollment_request, install_enrollment_response,
+        prepare_enrollment_approval, validate_enrollment_response,
     };
-    use flowsplice_core::authorization::TravelCredentialScope;
+    use flowsplice_core::{
+        authorization::{TravelCredentialScope, TrustedTravelAuthority},
+        deployment::{
+            DEPLOYMENT_TRUST_VERSION, DeploymentTrust, HomeEndpointTrust, ServerControlKey,
+            SignedDeploymentTrust,
+        },
+    };
 
     struct TestCa {
         certificate: PathBuf,
@@ -196,7 +231,24 @@ mod tests {
         })
     }
 
+    fn assert_installed_ca_bundle(
+        enrollment_directory: &Path,
+        management_ca_pem: &str,
+        business_ca_pem: &str,
+    ) -> Result<()> {
+        assert_eq!(
+            fs::read_to_string(enrollment_directory.join(MANAGEMENT_CA_FILE))?,
+            management_ca_pem
+        );
+        assert_eq!(
+            fs::read_to_string(enrollment_directory.join(BUSINESS_CA_FILE))?,
+            business_ca_pem
+        );
+        Ok(())
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn issue_validate_and_install_are_bound_to_the_original_keys() -> Result<()> {
         flowsplice_core::init_crypto();
         let temporary = tempfile::tempdir()?;
@@ -209,8 +261,43 @@ mod tests {
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &authority.serialize_der())
                 .map_err(|_| anyhow!("failed to load authority fixture"))?;
         let authority_public_key = hex::encode(authority_key.public_key().as_ref());
+        let root_key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("failed to generate deployment root fixture"))?;
+        let server_key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("failed to generate Server control fixture"))?;
+        let root_public_key = hex::encode(root_key.public_key().as_ref());
         let enrollment_directory = temporary.path().join("travel");
         let now = 1_800_000_000;
+        let management_ca_pem = fs::read_to_string(&management_ca.certificate)?;
+        let business_ca_pem = fs::read_to_string(&business_ca.certificate)?;
+        let deployment_trust = SignedDeploymentTrust::sign(
+            &DeploymentTrust {
+                version: DEPLOYMENT_TRUST_VERSION,
+                deployment_id: "test-deployment".to_owned(),
+                generation: 1,
+                not_before_unix_secs: now - 300,
+                not_after_unix_secs: now + u64::from(DEFAULT_VALID_DAYS) * 24 * 60 * 60 + 600,
+                management_ca_certificate_pem: management_ca_pem.clone(),
+                business_ca_certificate_pem: business_ca_pem.clone(),
+                server_control_keys: vec![ServerControlKey {
+                    server_id: "server-1".to_owned(),
+                    epoch: 1,
+                    public_key: hex::encode(server_key.public_key().as_ref()),
+                }],
+                home_endpoints: vec![HomeEndpointTrust {
+                    home_id: "home-1".to_owned(),
+                    management_spki_pins: vec!["11".repeat(32)],
+                    business_spki_pins: vec!["22".repeat(32)],
+                }],
+                travel_authorities: vec![TrustedTravelAuthority::Home {
+                    id: "home-1-authority".to_owned(),
+                    epoch: 1,
+                    home_id: "home-1".to_owned(),
+                    public_key: authority_public_key,
+                }],
+            },
+            &root_key,
+        )?;
         let request = create_enrollment_request(
             "travel-test",
             b"correct horse battery staple",
@@ -227,6 +314,8 @@ mod tests {
             now + 1,
         )?;
         let material = IssuerMaterial {
+            deployment_trust: &deployment_trust,
+            deployment_root_public_key: &root_public_key,
             management_ca_certificate: &management_ca.certificate,
             management_ca_key: ProtectedKey {
                 path: &management_ca.key,
@@ -244,27 +333,25 @@ mod tests {
                 password: None,
                 allow_unencrypted: true,
             },
-            expected_travel_authority_public_key: &authority_public_key,
         };
         let response = issue_enrollment(approval, &material, now + 2)?;
-        let expected = validate_enrollment_response(&response, now + 2)?;
+        let (expected, _) = validate_enrollment_response(&response, &root_public_key, now + 2)?;
         let installed = install_enrollment_response(
             &enrollment_directory,
             &response,
-            &management_ca.certificate,
-            &business_ca.certificate,
+            &root_public_key,
             b"correct horse battery staple",
             now + 2,
         )?;
         assert_eq!(installed, expected);
+        assert_installed_ca_bundle(&enrollment_directory, &management_ca_pem, &business_ca_pem)?;
         assert!(enrollment_directory.join(MANAGEMENT_CERT_FILE).is_file());
         assert!(enrollment_directory.join(BUSINESS_CERT_FILE).is_file());
         assert_eq!(
             install_enrollment_response(
                 &enrollment_directory,
                 &response,
-                &management_ca.certificate,
-                &business_ca.certificate,
+                &root_public_key,
                 b"correct horse battery staple",
                 now + 2,
             )?,
@@ -274,19 +361,51 @@ mod tests {
             install_enrollment_response(
                 &enrollment_directory,
                 &response,
-                &management_ca.certificate,
-                &business_ca.certificate,
+                &root_public_key,
                 b"wrong password",
                 now + 2,
             )
             .is_err()
         );
+        let mut wrong_ca = response.clone();
+        wrong_ca
+            .deployment_trust
+            .payload_hex
+            .replace_range(0..2, "00");
+        assert!(
+            install_enrollment_response(
+                &enrollment_directory,
+                &wrong_ca,
+                &root_public_key,
+                b"correct horse battery staple",
+                now + 2,
+            )
+            .is_err()
+        );
+        let mut spliced_certificate = response.clone();
+        spliced_certificate.management_certificate_pem =
+            spliced_certificate.business_certificate_pem.clone();
+        assert!(
+            validate_enrollment_response(&spliced_certificate, &root_public_key, now + 2).is_err()
+        );
+        let mut spliced_request = response.clone();
+        let replacement = if spliced_request.approval.request.nonce.starts_with("00") {
+            "01"
+        } else {
+            "00"
+        };
+        spliced_request
+            .approval
+            .request
+            .nonce
+            .replace_range(0..2, replacement);
+        assert!(validate_enrollment_response(&spliced_request, &root_public_key, now + 2).is_err());
         let mut tampered = response;
         tampered
             .signed_credential
             .signature_hex
             .replace_range(0..2, "00");
-        assert!(validate_enrollment_response(&tampered, now + 2).is_err());
+        assert!(validate_enrollment_response(&tampered, &root_public_key, now + 2).is_err());
         Ok(())
     }
 

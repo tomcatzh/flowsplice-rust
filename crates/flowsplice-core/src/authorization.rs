@@ -15,6 +15,9 @@ use crate::{
     tls::{PeerIdentity, validate_spki_pin},
 };
 
+pub const TRAVEL_CREDENTIAL_VERSION: u32 = 1;
+pub const TRAVEL_CREDENTIAL_OBJECT_TYPE: &str = "flowsplice.travel_credential";
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TravelCredentialScope {
@@ -34,11 +37,13 @@ pub enum TravelCredentialScope {
 pub enum TrustedTravelAuthority {
     Global {
         id: String,
+        epoch: u64,
         home_id: String,
         public_key: String,
     },
     Home {
         id: String,
+        epoch: u64,
         home_id: String,
         public_key: String,
     },
@@ -47,11 +52,23 @@ pub enum TrustedTravelAuthority {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TravelCredential {
+    pub version: u32,
+    pub object_type: String,
+    pub deployment_id: String,
+    pub deployment_trust_sha256: String,
     pub credential_id: Uuid,
     pub authority_id: String,
+    pub authority_epoch: u64,
+    pub enrollment_request_id: Uuid,
+    pub enrollment_nonce: String,
+    pub enrollment_request_sha256: String,
     pub travel_id: String,
     pub management_spki_sha256: String,
     pub business_spki_sha256: String,
+    pub management_ca_sha256: String,
+    pub business_ca_sha256: String,
+    pub management_certificate_sha256: String,
+    pub business_certificate_sha256: String,
     pub scope: TravelCredentialScope,
     pub not_before_unix_secs: u64,
     pub not_after_unix_secs: u64,
@@ -104,7 +121,7 @@ pub struct VerifiedAuthorization {
 }
 
 impl SignedTravelCredential {
-    /// Verifies the detached signature against one configured authority.
+    /// Verifies the detached signature against one deployment-trusted authority.
     ///
     /// # Errors
     ///
@@ -117,6 +134,9 @@ impl SignedTravelCredential {
         if credential.authority_id != self.authority_id {
             bail!("signed Travel credential payload has a different authority id");
         }
+        if credential.authority_epoch != authority.epoch() {
+            bail!("signed Travel credential uses the wrong authority epoch");
+        }
         authority.validate_scope(&credential.scope)?;
         Ok(credential)
     }
@@ -124,7 +144,7 @@ impl SignedTravelCredential {
     /// Verifies the signature with an explicitly supplied P-256 public key.
     ///
     /// This is used by the enrolling Travel device to detect a corrupt response. Runtime access
-    /// decisions must instead use [`Self::verify`] with a configured trusted authority.
+    /// decisions must instead use [`Self::verify`] with a deployment-trusted authority.
     ///
     /// # Errors
     ///
@@ -161,6 +181,13 @@ impl TrustedTravelAuthority {
     }
 
     #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        match self {
+            Self::Global { epoch, .. } | Self::Home { epoch, .. } => *epoch,
+        }
+    }
+
+    #[must_use]
     pub fn home_id(&self) -> Option<&str> {
         match self {
             Self::Global { home_id, .. } | Self::Home { home_id, .. } => Some(home_id),
@@ -168,7 +195,7 @@ impl TrustedTravelAuthority {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.id().is_empty() {
+        if self.id().is_empty() || self.epoch() == 0 {
             bail!("Travel authority id must be non-empty");
         }
         if self.home_id().is_some_and(str::is_empty) {
@@ -194,7 +221,7 @@ impl TrustedTravelAuthority {
     }
 }
 
-/// Validates that configured Travel authorities are usable and uniquely named.
+/// Validates that deployment-trusted Travel authorities are usable and uniquely named.
 ///
 /// # Errors
 ///
@@ -233,13 +260,34 @@ fn decode_authority_public_key(authority_public_key_hex: &str) -> Result<Vec<u8>
 
 impl TravelCredential {
     fn validate(&self) -> Result<()> {
-        if self.credential_id.is_nil() || self.authority_id.is_empty() || self.travel_id.is_empty()
+        if self.version != TRAVEL_CREDENTIAL_VERSION
+            || self.object_type != TRAVEL_CREDENTIAL_OBJECT_TYPE
+            || self.deployment_id.is_empty()
+            || self.credential_id.is_nil()
+            || self.authority_id.is_empty()
+            || self.authority_epoch == 0
+            || self.enrollment_request_id.is_nil()
+            || self.travel_id.is_empty()
         {
             bail!("Travel credential id, authority id, and Travel id must be non-empty");
         }
         self.scope.validate()?;
         validate_spki_pin(&self.management_spki_sha256, "Travel management")?;
         validate_spki_pin(&self.business_spki_sha256, "Travel business")?;
+        for (digest, label) in [
+            (&self.deployment_trust_sha256, "deployment trust"),
+            (&self.enrollment_nonce, "enrollment nonce"),
+            (&self.enrollment_request_sha256, "enrollment request"),
+            (&self.management_ca_sha256, "management CA"),
+            (&self.business_ca_sha256, "business CA"),
+            (
+                &self.management_certificate_sha256,
+                "management certificate",
+            ),
+            (&self.business_certificate_sha256, "business certificate"),
+        ] {
+            validate_spki_pin(digest, label)?;
+        }
         if self.not_before_unix_secs >= self.not_after_unix_secs {
             bail!("Travel credential validity interval is empty");
         }
@@ -340,7 +388,11 @@ impl VerifiedAuthorization {
     pub fn verify(
         snapshot: &TravelAuthorizationSnapshot,
         authorities: &[TrustedTravelAuthority],
+        deployment_id: &str,
     ) -> Result<Self> {
+        if deployment_id.is_empty() {
+            bail!("Travel authorization deployment id must be non-empty");
+        }
         if snapshot.generation == 0 {
             bail!("Travel authorization generation must be positive");
         }
@@ -357,6 +409,9 @@ impl VerifiedAuthorization {
                 .get(signed.authority_id.as_str())
                 .ok_or_else(|| anyhow!("unknown Travel authority {}", signed.authority_id))?;
             let credential = signed.verify(authority)?;
+            if credential.deployment_id != deployment_id {
+                bail!("Travel credential belongs to a different deployment");
+            }
             let credential_id = credential.credential_id;
             if credentials
                 .insert(credential_id, credential.clone())
@@ -663,11 +718,23 @@ mod tests {
         let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
             .map_err(|_| anyhow!("failed to generate test key"))?;
         let credential = TravelCredential {
+            version: TRAVEL_CREDENTIAL_VERSION,
+            object_type: TRAVEL_CREDENTIAL_OBJECT_TYPE.to_owned(),
+            deployment_id: "deployment-1".to_owned(),
+            deployment_trust_sha256: "aa".repeat(32),
             credential_id: Uuid::new_v4(),
             authority_id: "home-1-authority".to_owned(),
+            authority_epoch: 1,
+            enrollment_request_id: Uuid::new_v4(),
+            enrollment_nonce: "aa".repeat(32),
+            enrollment_request_sha256: "bb".repeat(32),
             travel_id: "travel-1".to_owned(),
             management_spki_sha256: "11".repeat(32),
             business_spki_sha256: "22".repeat(32),
+            management_ca_sha256: "cc".repeat(32),
+            business_ca_sha256: "dd".repeat(32),
+            management_certificate_sha256: "ee".repeat(32),
+            business_certificate_sha256: "ff".repeat(32),
             scope: TravelCredentialScope::Home {
                 home_id: "home-1".to_owned(),
             },
@@ -678,6 +745,7 @@ mod tests {
         Ok((
             TrustedTravelAuthority::Home {
                 id: "home-1-authority".to_owned(),
+                epoch: 1,
                 home_id: "home-1".to_owned(),
                 public_key: hex::encode(key.public_key().as_ref()),
             },
@@ -694,10 +762,11 @@ mod tests {
             credentials: vec![signed],
             revocations: vec![],
         };
-        let authorization = VerifiedAuthorization::verify(&snapshot, &[authority])?;
+        let authorization = VerifiedAuthorization::verify(&snapshot, &[authority], "deployment-1")?;
         let management = PeerIdentity {
             role: Role::Travel,
             id: credential.travel_id.clone(),
+            certificate_sha256: credential.management_certificate_sha256.clone(),
             spki_sha256: credential.management_spki_sha256.clone(),
             not_before_unix_secs: 100,
             not_after_unix_secs: 200,
@@ -705,6 +774,7 @@ mod tests {
         let business = PeerIdentity {
             role: Role::Travel,
             id: credential.travel_id.clone(),
+            certificate_sha256: credential.business_certificate_sha256.clone(),
             spki_sha256: credential.business_spki_sha256.clone(),
             not_before_unix_secs: 100,
             not_after_unix_secs: 200,
@@ -723,6 +793,19 @@ mod tests {
         );
         assert!(authorization.authorize_management(&management, 99).is_err());
         assert!(authorization.authorize_business(&business, 200).is_err());
+
+        // A later credential for the same Travel keys may carry freshly issued leaf
+        // certificates. Runtime authorization therefore follows the signed Travel ID +
+        // SPKI, while the exact leaf hashes remain bound into each enrollment response
+        // to prevent response splicing during import.
+        let mut reissued_management_leaf = management.clone();
+        reissued_management_leaf.certificate_sha256 = "aa".repeat(32);
+        assert_eq!(
+            authorization
+                .authorize_management(&reissued_management_leaf, 150)?
+                .credential_id,
+            credential.credential_id
+        );
         Ok(())
     }
 
@@ -746,6 +829,7 @@ mod tests {
                     revocations: vec![wrong_revocation],
                 },
                 &[authority],
+                "deployment-1",
             )
             .is_err()
         );
@@ -762,6 +846,7 @@ mod tests {
                 }],
             },
             std::slice::from_ref(&authority),
+            "deployment-1",
         )?;
         let cache = AuthorizationCache::default().accept(&revoked)?;
         let rollback = VerifiedAuthorization::verify(
@@ -771,6 +856,7 @@ mod tests {
                 revocations: vec![],
             },
             &[authority],
+            "deployment-1",
         )?;
         assert!(cache.accept(&rollback).is_err());
         Ok(())

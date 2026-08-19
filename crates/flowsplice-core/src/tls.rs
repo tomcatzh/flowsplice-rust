@@ -2,8 +2,13 @@ use std::{io, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
-use rustls::{ClientConfig, RootCertStore, ServerConfig, server::WebPkiClientVerifier};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::WebPkiSupportedAlgorithms,
+    server::{ParsedCertificate, WebPkiClientVerifier},
+};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::{
     extensions::{GeneralName, ParsedExtension},
@@ -16,6 +21,7 @@ use crate::protocol::Role;
 pub struct PeerIdentity {
     pub role: Role,
     pub id: String,
+    pub certificate_sha256: String,
     pub spki_sha256: String,
     pub not_before_unix_secs: u64,
     pub not_after_unix_secs: u64,
@@ -60,6 +66,65 @@ fn load_roots(path: &Path) -> Result<RootCertStore> {
     Ok(roots)
 }
 
+#[derive(Debug)]
+struct CertificateChainVerifier {
+    roots: RootCertStore,
+    signature_algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for CertificateChainVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        let certificate = ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &certificate,
+            &self.roots,
+            intermediates,
+            now,
+            self.signature_algorithms.all,
+        )?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_algorithms.supported_schemes()
+    }
+}
+
 /// Builds a mutual-TLS server acceptor backed by rustls and AWS-LC.
 ///
 /// # Errors
@@ -100,6 +165,58 @@ pub fn client_connector_with_private_key(
         .with_client_auth_cert(load_certs(cert)?, key)
         .context("failed to build TLS client config")?;
     Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Builds an mTLS client connector that validates the certificate chain but leaves endpoint
+/// identity to `FlowSplice`'s URI role/id and SPKI checks after the handshake.
+///
+/// # Errors
+///
+/// Returns an error when certificate material is missing, malformed, or inconsistent.
+pub fn identity_client_connector_with_private_key(
+    cert: &Path,
+    key: PrivateKeyDer<'static>,
+    server_ca: &Path,
+) -> Result<TlsConnector> {
+    let roots = load_roots(server_ca)?;
+    let signature_algorithms =
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let verifier = CertificateChainVerifier {
+        roots,
+        signature_algorithms,
+    };
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_auth_cert(load_certs(cert)?, key)
+        .context("failed to build identity-verified TLS client config")?;
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Builds an mTLS client connector that validates the certificate chain while `FlowSplice` checks
+/// the peer's URI role/id and SPKI after the handshake.
+///
+/// # Errors
+///
+/// Returns an error when certificate material is missing, malformed, or inconsistent.
+pub fn identity_client_connector(
+    cert: &Path,
+    key: &Path,
+    server_ca: &Path,
+) -> Result<TlsConnector> {
+    identity_client_connector_with_private_key(cert, load_key(key)?, server_ca)
+}
+
+/// Returns the fixed SNI placeholder used by identity-verified connectors.
+///
+/// The connector deliberately does not use DNS names for identity; the application validates
+/// the certificate's `FlowSplice` URI identity and SPKI immediately after the handshake.
+///
+/// # Errors
+///
+/// Returns an error if the internal placeholder is not a valid TLS server name.
+pub fn identity_server_name() -> Result<ServerName<'static>> {
+    server_name("flowsplice.invalid")
 }
 
 /// Converts a configured DNS name into rustls' owned server-name type.
@@ -162,6 +279,7 @@ pub fn peer_identity(certs: Option<&[CertificateDer<'_>]>) -> Result<PeerIdentit
     Ok(PeerIdentity {
         role,
         id,
+        certificate_sha256: hex::encode(digest::digest(&digest::SHA256, leaf.as_ref()).as_ref()),
         spki_sha256: hex::encode(hash.as_ref()),
         not_before_unix_secs,
         not_after_unix_secs,
@@ -251,6 +369,7 @@ mod tests {
         let identity = PeerIdentity {
             role: Role::Home,
             id: "home-1".to_owned(),
+            certificate_sha256: "cd".repeat(32),
             spki_sha256: "ab".repeat(32),
             not_before_unix_secs: 1,
             not_after_unix_secs: u64::MAX,

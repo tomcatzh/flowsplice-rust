@@ -16,6 +16,8 @@ RUN npm run build
 
 FROM rust:alpine AS build
 ARG RUST_TARGET
+ARG FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY
+ENV FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY}
 RUN apk add --no-cache clang cmake make musl-dev perl file
 RUN rustup target add "${RUST_TARGET}"
 WORKDIR /src

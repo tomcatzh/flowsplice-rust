@@ -24,7 +24,7 @@ interface Credential {
   revoked: boolean;
   active: boolean;
 }
-interface IssueResult { generation: number; enrollment: unknown }
+interface IssueResult { generation: number; enrollment: unknown; reused: boolean }
 interface RotatePasswordResult { rotated_keys: number }
 
 const root = document.querySelector<HTMLElement>("#app");
@@ -95,6 +95,15 @@ function friendlyError(error: unknown): string {
   if (message.includes("failed to decrypt global authorization private key")) {
     return "当前密码无法解密全局授权签名私钥。";
   }
+  if (message.includes("credential is no longer active")) {
+    return "这份申请的相同授权已经失效或撤销，不能通过重复签发恢复。请在 Travel 上重新生成申请文件。";
+  }
+  if (message.includes("request id was reused with different request content")) {
+    return "申请编号与已记录内容冲突，请在 Travel 上重新生成申请文件。";
+  }
+  if (message.includes("already used for a different authorization")) {
+    return "这份 Travel 申请已经签发过其他授权范围或有效期。每份申请只能产生一张凭据，请在 Travel 上重新生成申请文件。";
+  }
   return message.replace(/^Error:\s*/, "");
 }
 
@@ -131,7 +140,9 @@ async function issue(): Promise<void> {
   download(result.enrollment, `flowsplice-${travelId}-response.json`);
   const passwordInput = document.querySelector<HTMLInputElement>("#password");
   if (passwordInput) passwordInput.value = "";
-  flash(`签发成功，授权已同步（第 ${result.generation} 代），签发结果已下载。`);
+  flash(result.reused
+    ? `此申请与授权此前已经签发，现已重新下载原结果；没有新增凭据（原结果同步于第 ${result.generation} 代）。`
+    : `签发成功，授权已同步（第 ${result.generation} 代），签发结果已下载。`);
   await renderCredentials();
 }
 
