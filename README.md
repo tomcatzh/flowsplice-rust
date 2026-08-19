@@ -49,6 +49,10 @@ FlowSplice assumes its source code, protocol, topology, and failure behavior are
 based on protected private keys, authenticated state, and fresh random secrets—not on hiding the
 design.
 
+For the complete rationale, primitive choices, key hierarchy, signed-object fields, verification
+order, persistent anti-rollback state, compromise boundaries, and implementation map, see
+[Cryptographic design and implementation](docs/cryptography.md).
+
 ### Three protection layers
 
 | Layer | Endpoints | Purpose |
