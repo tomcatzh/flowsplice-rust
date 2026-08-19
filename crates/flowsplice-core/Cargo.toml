@@ -11,6 +11,7 @@ aws-lc-rs.workspace = true
 hex.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

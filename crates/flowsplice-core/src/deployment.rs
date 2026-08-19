@@ -23,6 +23,12 @@ pub const CONTROL_SNAPSHOT_VERSION: u32 = 1;
 pub const CONTROL_SNAPSHOT_OBJECT_TYPE: &str = "flowsplice.control_snapshot";
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const MAX_CONTROL_SNAPSHOT_TTL_SECS: u64 = 300;
+const MAX_RELAY_ENDPOINTS: usize = 64;
+const MAX_CATALOG_HOMES: usize = 64;
+const MAX_SERVICES_PER_HOME: usize = 256;
+const MAX_ID_BYTES: usize = 128;
+const MAX_DISPLAY_OR_TARGET_BYTES: usize = 512;
+const MAX_CONTROL_SNAPSHOT_PAYLOAD_BYTES: usize = 400 * 1_024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +176,9 @@ impl SignedControlSnapshot {
             bail!("Server control private key is not certified by deployment trust");
         }
         let bytes = serde_json::to_vec(payload).context("failed to encode control snapshot")?;
+        if bytes.len() > MAX_CONTROL_SNAPSHOT_PAYLOAD_BYTES {
+            bail!("control snapshot payload exceeds the signed-frame budget");
+        }
         let signature = server_key
             .sign(&SystemRandom::new(), &bytes)
             .map_err(|_| anyhow!("failed to sign control snapshot"))?;
@@ -189,6 +198,9 @@ impl SignedControlSnapshot {
         let trust = self.trust.verify(root_public_key, now)?;
         let payload_bytes = hex::decode(&self.payload_hex)
             .context("control snapshot payload must be hexadecimal")?;
+        if payload_bytes.len() > MAX_CONTROL_SNAPSHOT_PAYLOAD_BYTES {
+            bail!("control snapshot payload exceeds the signed-frame budget");
+        }
         let payload: ControlSnapshotPayload = serde_json::from_slice(&payload_bytes)
             .context("control snapshot payload is invalid")?;
         payload.validate_at(now)?;
@@ -392,15 +404,25 @@ fn validate_single_certificate(pem: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_relay_directory(directory: &RelayDirectory) -> Result<()> {
-    if directory.generation == 0 || directory.relays.is_empty() {
+/// Validates the bounded Relay-directory shape accepted into signed control state.
+///
+/// # Errors
+///
+/// Returns an error for empty, duplicate, malformed, or excessive entries.
+pub fn validate_relay_directory(directory: &RelayDirectory) -> Result<()> {
+    if directory.generation == 0
+        || directory.relays.is_empty()
+        || directory.relays.len() > MAX_RELAY_ENDPOINTS
+    {
         bail!("signed Relay directory must be non-empty with a positive generation");
     }
     let mut ids = HashSet::new();
     let mut addresses = HashSet::new();
     for relay in &directory.relays {
         if relay.id.is_empty()
+            || relay.id.len() > MAX_ID_BYTES
             || relay.management_addr.is_empty()
+            || relay.management_addr.len() > MAX_DISPLAY_OR_TARGET_BYTES
             || !ids.insert(&relay.id)
             || !addresses.insert(&relay.management_addr)
         {
@@ -411,17 +433,34 @@ fn validate_relay_directory(directory: &RelayDirectory) -> Result<()> {
     Ok(())
 }
 
-fn validate_catalog(catalog: &Catalog) -> Result<()> {
+/// Validates the bounded Catalog shape accepted into signed control state.
+///
+/// # Errors
+///
+/// Returns an error for malformed, duplicate, or excessive entries.
+pub fn validate_catalog(catalog: &Catalog) -> Result<()> {
+    if catalog.homes.len() > MAX_CATALOG_HOMES {
+        bail!("signed Catalog contains too many Homes");
+    }
     let mut home_ids = HashSet::new();
     for home in &catalog.homes {
-        if home.home_id.is_empty() || !home_ids.insert(&home.home_id) {
+        if home.home_id.is_empty()
+            || home.home_id.len() > MAX_ID_BYTES
+            || home.home_alias.is_empty()
+            || home.home_alias.len() > MAX_DISPLAY_OR_TARGET_BYTES
+            || home.services.len() > MAX_SERVICES_PER_HOME
+            || !home_ids.insert(&home.home_id)
+        {
             bail!("signed Catalog contains empty or duplicate Home ids");
         }
         let mut services = HashSet::new();
         for service in &home.services {
             if service.id.is_empty()
+                || service.id.len() > MAX_ID_BYTES
                 || service.alias.is_empty()
+                || service.alias.len() > MAX_DISPLAY_OR_TARGET_BYTES
                 || service.target.is_empty()
+                || service.target.len() > MAX_DISPLAY_OR_TARGET_BYTES
                 || !services.insert((service.id.as_str(), service.protocol))
             {
                 bail!("signed Catalog contains an invalid or duplicate logical service");
@@ -447,6 +486,7 @@ pub fn control_signing_key_from_pkcs8(der: &[u8]) -> Result<EcdsaKeyPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{HomeCatalog, Service};
     use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
 
     fn keys() -> Result<(EcdsaKeyPair, EcdsaKeyPair, EcdsaKeyPair)> {
@@ -575,6 +615,58 @@ mod tests {
         let attacker_signed_trust = SignedDeploymentTrust::sign(&payload, &attacker)?;
         assert!(attacker_signed_trust.verify(&root_public, now + 1).is_err());
         assert!(signed.verify(&root_public, now + 120).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_control_snapshot_rejects_aggregate_catalog_over_frame_budget() -> Result<()> {
+        let now = 1_800_000_000;
+        let (root_public, server, trust) = fixture(now)?;
+        let verified_trust = trust.verify(&root_public, now)?;
+        let services = (0..MAX_SERVICES_PER_HOME)
+            .map(|index| Service {
+                id: format!("service-{index}"),
+                alias: "a".repeat(MAX_DISPLAY_OR_TARGET_BYTES),
+                protocol: ServiceProtocol::Tcp,
+                target: "t".repeat(MAX_DISPLAY_OR_TARGET_BYTES),
+            })
+            .collect::<Vec<_>>();
+        let payload = ControlSnapshotPayload {
+            version: CONTROL_SNAPSHOT_VERSION,
+            object_type: CONTROL_SNAPSHOT_OBJECT_TYPE.to_owned(),
+            deployment_id: "deployment-1".to_owned(),
+            server_id: "server-1".to_owned(),
+            signer_epoch: 1,
+            travel_id: "travel-1".to_owned(),
+            travel_management_spki_sha256: "33".repeat(32),
+            generation: 10,
+            issued_at_unix_secs: now,
+            expires_at_unix_secs: now + 120,
+            relay_directory: RelayDirectory {
+                generation: 1,
+                relays: vec![crate::protocol::RelayEndpoint {
+                    id: "relay-1".to_owned(),
+                    management_addr: "127.0.0.1:8443".to_owned(),
+                    management_spki_sha256: "11".repeat(32),
+                }],
+            },
+            catalog: Catalog {
+                generation: 1,
+                homes: vec![
+                    HomeCatalog {
+                        home_id: "home-1".to_owned(),
+                        home_alias: "Home One".to_owned(),
+                        services: services.clone(),
+                    },
+                    HomeCatalog {
+                        home_id: "home-2".to_owned(),
+                        home_alias: "Home Two".to_owned(),
+                        services,
+                    },
+                ],
+            },
+        };
+        assert!(SignedControlSnapshot::sign(trust, &verified_trust, &payload, &server).is_err());
         Ok(())
     }
 }

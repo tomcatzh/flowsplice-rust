@@ -4,6 +4,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Stateful bounded JSON frame reader that preserves partial input when a read future is cancelled.
 ///
 /// Tokio's `read_exact` is not cancellation safe. This reader deliberately advances its internal
@@ -115,6 +117,14 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    write_json_with_timeout(writer, value, limit, DEFAULT_WRITE_TIMEOUT).await
+}
+
+async fn write_json_inner<W, T>(writer: &mut W, value: &T, limit: usize) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let bytes = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if bytes.is_empty() || bytes.len() > limit {
@@ -131,6 +141,26 @@ where
     writer.write_u32(len).await?;
     writer.write_all(&bytes).await?;
     writer.flush().await
+}
+
+/// Writes one bounded JSON frame and fails when the complete write exceeds `deadline`.
+///
+/// # Errors
+///
+/// Returns `TimedOut` on deadline expiry or the underlying serialization/write error.
+pub async fn write_json_with_timeout<W, T>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+    deadline: Duration,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    timeout(deadline, write_json_inner(writer, value, limit))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "JSON frame write timed out"))?
 }
 
 #[cfg(test)]

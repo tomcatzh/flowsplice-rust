@@ -265,6 +265,11 @@ pub fn validate_enrollment_response(
         response.approval.request.created_at_unix_secs,
     )?;
     validate_validity_interval(&response.approval)?;
+    if now.saturating_add(flowsplice_core::deployment::MAX_CLOCK_SKEW_SECS)
+        < response.approval.not_before_unix_secs
+    {
+        bail!("enrollment response is not yet valid");
+    }
     if now >= response.approval.not_after_unix_secs {
         bail!("enrollment response is already expired");
     }
@@ -306,6 +311,18 @@ pub fn validate_enrollment_response(
         &response.business_certificate_pem,
         &expected,
         &expected.business_spki_sha256,
+        "business",
+    )?;
+    verify_client_chain(
+        &certificate_from_pem(&response.management_certificate_pem)?,
+        &trust.management_ca_certificate_pem,
+        now,
+        "management",
+    )?;
+    verify_client_chain(
+        &certificate_from_pem(&response.business_certificate_pem)?,
+        &trust.business_ca_certificate_pem,
+        now,
         "business",
     )?;
     Ok((actual, trust))
@@ -358,21 +375,6 @@ pub fn install_enrollment_response(
     {
         bail!("issued credential does not match the local private keys");
     }
-    let management_certificate = certificate_from_pem(&response.management_certificate_pem)?;
-    let business_certificate = certificate_from_pem(&response.business_certificate_pem)?;
-    verify_client_chain(
-        &management_certificate,
-        &trust.management_ca_certificate_pem,
-        now,
-        "management",
-    )?;
-    verify_client_chain(
-        &business_certificate,
-        &trust.business_ca_certificate_pem,
-        now,
-        "business",
-    )?;
-
     write_or_verify(
         &enrollment_directory.join(MANAGEMENT_CA_FILE),
         trust.management_ca_certificate_pem.as_bytes(),
@@ -597,7 +599,16 @@ fn validate_local_key(
 }
 
 fn certificate_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
-    CertificateDer::from_pem_slice(pem.as_bytes()).context("failed to parse PEM certificate")
+    let mut certificates = CertificateDer::pem_slice_iter(pem.as_bytes());
+    let certificate = certificates
+        .next()
+        .transpose()
+        .context("failed to parse PEM certificate")?
+        .ok_or_else(|| anyhow!("PEM contains no certificate"))?;
+    if certificates.next().is_some() {
+        bail!("PEM must contain exactly one certificate");
+    }
+    Ok(certificate)
 }
 
 fn verify_client_chain(

@@ -31,7 +31,7 @@ use serde::Deserialize;
 use tokio::io::copy_bidirectional;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     time::{interval, timeout},
 };
 use tokio_rustls::server::TlsStream;
@@ -70,6 +70,10 @@ struct Config {
     route_ttl_secs: u64,
     #[serde(default = "default_max_pending_routes")]
     max_pending_routes: usize,
+    #[serde(default = "default_max_management_connections")]
+    max_management_connections: usize,
+    #[serde(default = "default_max_data_connections")]
+    max_data_connections: usize,
 }
 
 const fn default_handshake_timeout() -> u64 {
@@ -82,6 +86,14 @@ const fn default_route_ttl() -> u64 {
 
 const fn default_max_pending_routes() -> usize {
     256
+}
+
+const fn default_max_management_connections() -> usize {
+    1_024
+}
+
+const fn default_max_data_connections() -> usize {
+    2_048
 }
 
 struct ServerGrant {
@@ -106,6 +118,7 @@ struct PendingRoute {
     route_secret: Vec<u8>,
     work_secret: Vec<u8>,
     expires: Instant,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct ServerSession {
@@ -123,6 +136,7 @@ struct State {
     authorization_cache: Mutex<AuthorizationCache>,
     travel_authorities: Arc<Vec<TrustedTravelAuthority>>,
     deployment_id: Arc<String>,
+    route_permits: Arc<Semaphore>,
 }
 
 impl State {
@@ -130,6 +144,7 @@ impl State {
         authorization_cache: AuthorizationCache,
         deployment_id: String,
         travel_authorities: Vec<TrustedTravelAuthority>,
+        max_pending_routes: usize,
     ) -> Self {
         let (authorization_tx, _) = watch::channel(None);
         Self {
@@ -141,6 +156,7 @@ impl State {
             authorization_cache: Mutex::new(authorization_cache),
             travel_authorities: Arc::new(travel_authorities),
             deployment_id: Arc::new(deployment_id),
+            route_permits: Arc::new(Semaphore::new(max_pending_routes)),
         }
     }
 }
@@ -172,13 +188,25 @@ async fn main() -> Result<()> {
         authorization_cache,
         deployment_trust.deployment_id,
         deployment_trust.travel_authorities,
+        config.max_pending_routes,
     ));
+    let trust_expiry = monitor_trust_expiry(deployment_trust.not_after_unix_secs);
     tokio::try_join!(
         run_management(config.clone(), Arc::clone(&state)),
         run_data(config, Arc::clone(&state)),
         cleanup_routes(state),
+        trust_expiry,
     )?;
     Ok(())
+}
+
+async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
+    loop {
+        if unix_time_secs()? >= not_after_unix_secs {
+            bail!("deployment trust expired; refusing to continue");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 fn validate_config(config: &Config) -> Result<DeploymentTrust> {
@@ -200,6 +228,8 @@ fn validate_config(config: &Config) -> Result<DeploymentTrust> {
     if config.handshake_timeout_secs == 0
         || config.route_ttl_secs == 0
         || config.max_pending_routes == 0
+        || config.max_management_connections == 0
+        || config.max_data_connections == 0
     {
         bail!("Relay timeout and pending-route limits must be positive");
     }
@@ -223,13 +253,19 @@ async fn run_management(config: Config, state: Arc<State>) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind management {}", config.management_listen))?;
     let acceptor = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let permits = Arc::new(Semaphore::new(config.max_management_connections));
     info!(address = %config.management_listen, "relay management listener ready");
     loop {
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("Relay management connection budget closed"))?;
         let (socket, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let config = config.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let stream = timeout(
                     Duration::from_secs(config.handshake_timeout_secs),
@@ -663,7 +699,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
-    if state.routes.lock().await.len() >= config.max_pending_routes {
+    let Ok(route_permit) = Arc::clone(&state.route_permits).try_acquire_owned() else {
         write_json(
             writer,
             &ControlMessage::RouteDenied {
@@ -674,7 +710,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         )
         .await?;
         return Ok(());
-    }
+    };
     match request_server_route(&request, state).await {
         Ok(grant) if grant.credential_id == request.credential && grant.home_id == request.home => {
             let route_id = Uuid::new_v4();
@@ -691,6 +727,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
                     route_secret: route_secret.clone(),
                     work_secret: grant.work_secret,
                     expires: Instant::now() + Duration::from_secs(config.route_ttl_secs),
+                    _permit: route_permit,
                 },
             );
             write_json(
@@ -773,11 +810,17 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind relay data {}", config.data_listen))?;
     info!(address = %config.data_listen, "relay data listener ready");
+    let permits = Arc::new(Semaphore::new(config.max_data_connections));
     loop {
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("Relay data connection budget closed"))?;
         let (mut travel, peer) = listener.accept().await?;
         let config = config.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let (preface, mac) = timeout(Duration::from_secs(10), read_preface(&mut travel))
                     .await
@@ -791,19 +834,30 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
                     .await
                     .remove(&preface.id)
                     .ok_or_else(|| anyhow!("unknown, expired, or already consumed route"))?;
+                if route.expires <= Instant::now() {
+                    bail!("route ticket expired");
+                }
                 let authorization_rx = state.authorization_tx.subscribe();
                 ensure_credential_active(&authorization_rx, route.credential_id)?;
                 if !verify_preface(preface, &mac, &route.route_secret) {
                     bail!("invalid route ticket MAC");
                 }
-                let mut server = TcpStream::connect(&config.server_data_addr).await?;
-                write_preface(
-                    &mut server,
-                    RouteSide::Relay,
-                    route.work_id,
-                    &route.work_secret,
+                let mut server = timeout(
+                    Duration::from_secs(config.handshake_timeout_secs),
+                    async {
+                        let mut server = TcpStream::connect(&config.server_data_addr).await?;
+                        write_preface(
+                            &mut server,
+                            RouteSide::Relay,
+                            route.work_id,
+                            &route.work_secret,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>(server)
+                    },
                 )
-                .await?;
+                .await
+                .context("Server data route setup timed out")??;
                 info!(route_id = %preface.id, work_id = %route.work_id, home_id = %route.home_id, "relay entered opaque forwarding");
                 tokio::select! {
                     result = zero_copy_or_portable(&mut travel, &mut server) => result?,

@@ -9,6 +9,20 @@ user_exists flowsplice || user_add flowsplice '' "$gid" FlowSplice /var/run/flow
 mkdir -p /etc/flowsplice/state
 chown flowsplice:flowsplice /etc/flowsplice/state
 chmod 700 /etc/flowsplice/state
+if [ ! -e /etc/flowsplice/state/server-authorization.json ]; then
+	printf '%s\n' '{"version":1,"snapshot":{"generation":1,"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
+		>/etc/flowsplice/state/server-authorization.json
+fi
+if [ ! -e /etc/flowsplice/state/server-control-generation.json ]; then
+	printf '%s\n' '{"next_generation":1}' \
+		>/etc/flowsplice/state/server-control-generation.json
+fi
+chown flowsplice:flowsplice \
+	/etc/flowsplice/state/server-authorization.json \
+	/etc/flowsplice/state/server-control-generation.json
+chmod 600 \
+	/etc/flowsplice/state/server-authorization.json \
+	/etc/flowsplice/state/server-control-generation.json
 /etc/init.d/flowsplice enable
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 rm -rf /tmp/luci-modulecache

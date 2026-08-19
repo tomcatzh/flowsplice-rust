@@ -106,7 +106,10 @@ msgstr ""
 msgid "Pending work TTL (seconds)"
 msgstr ""
 
-msgid "Persistent Travel revocations"
+msgid "Travel authorization state"
+msgstr ""
+
+msgid "Control generation state"
 msgstr ""
 
 msgid "Persistent revocation cache"
@@ -155,7 +158,13 @@ msgstr ""
 msgid "Service action failed"
 msgstr ""
 
-msgid "Signed Travel credentials"
+msgid "Maximum control connections"
+msgstr ""
+
+msgid "Maximum data connections"
+msgstr ""
+
+msgid "Maximum management connections"
 msgstr ""
 
 msgid "Start"

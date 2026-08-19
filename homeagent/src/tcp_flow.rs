@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    time::{Instant, interval, sleep_until},
+    time::{Instant, interval, sleep_until, timeout},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -34,11 +34,14 @@ struct FlowHandle {
     service_id: String,
     tx: mpsc::Sender<IncomingCarrier>,
     shutdown: watch::Sender<bool>,
+    carrier_slots: Arc<Semaphore>,
 }
 
 pub struct IncomingCarrier {
     pub carrier_id: Uuid,
     pub stream: TlsStream<TcpStream>,
+    pub global_permit: Option<OwnedSemaphorePermit>,
+    pub flow_permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct TcpFlowRegistry {
@@ -48,6 +51,8 @@ pub struct TcpFlowRegistry {
     carrier_timeout: Duration,
     detach_timeout: Duration,
     max_unacked_bytes: usize,
+    carrier_permits: Arc<Semaphore>,
+    max_carriers_per_flow: usize,
 }
 
 impl TcpFlowRegistry {
@@ -57,6 +62,8 @@ impl TcpFlowRegistry {
         carrier_timeout: Duration,
         detach_timeout: Duration,
         max_unacked_bytes: usize,
+        max_active_carriers: usize,
+        max_carriers_per_flow: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             flows: Mutex::new(HashMap::new()),
@@ -65,6 +72,8 @@ impl TcpFlowRegistry {
             carrier_timeout,
             detach_timeout,
             max_unacked_bytes,
+            carrier_permits: Arc::new(Semaphore::new(max_active_carriers)),
+            max_carriers_per_flow,
         })
     }
 
@@ -74,7 +83,7 @@ impl TcpFlowRegistry {
         travel_id: String,
         flow_id: Uuid,
         service: Service,
-        carrier: IncomingCarrier,
+        mut carrier: IncomingCarrier,
         not_after_unix_secs: u64,
     ) -> Result<()> {
         let key = FlowKey {
@@ -82,13 +91,13 @@ impl TcpFlowRegistry {
             travel_id,
             flow_id,
         };
-        let tx = {
+        let (tx, carrier_slots) = {
             let mut flows = self.flows.lock().await;
             if let Some(existing) = flows.get(&key) {
                 if existing.service_id != service.id {
                     bail!("flow attempted to change services");
                 }
-                existing.tx.clone()
+                (existing.tx.clone(), Arc::clone(&existing.carrier_slots))
             } else {
                 let permit = Arc::clone(&self.permits)
                     .try_acquire_owned()
@@ -96,6 +105,7 @@ impl TcpFlowRegistry {
                 let (tx, rx) = mpsc::channel(16);
                 let (shutdown, shutdown_rx) = watch::channel(false);
                 let instance_id = Uuid::new_v4();
+                let carrier_slots = Arc::new(Semaphore::new(self.max_carriers_per_flow));
                 flows.insert(
                     key.clone(),
                     FlowHandle {
@@ -103,6 +113,7 @@ impl TcpFlowRegistry {
                         service_id: service.id.clone(),
                         tx: tx.clone(),
                         shutdown,
+                        carrier_slots: Arc::clone(&carrier_slots),
                     },
                 );
                 let registry = Arc::clone(self);
@@ -123,9 +134,19 @@ impl TcpFlowRegistry {
                     }
                     registry.remove(&key, instance_id).await;
                 });
-                tx
+                (tx, carrier_slots)
             }
         };
+        carrier.global_permit = Some(
+            Arc::clone(&self.carrier_permits)
+                .try_acquire_owned()
+                .map_err(|_| anyhow!("home active-Carrier limit reached"))?,
+        );
+        carrier.flow_permit = Some(
+            carrier_slots
+                .try_acquire_owned()
+                .map_err(|_| anyhow!("home per-flow Carrier limit reached"))?,
+        );
         tx.send(carrier)
             .await
             .map_err(|_| anyhow!("home flow closed while attaching carrier"))
@@ -152,18 +173,35 @@ impl TcpFlowRegistry {
     }
 }
 
-#[derive(Clone)]
 struct Segment {
     offset: u64,
     bytes: Vec<u8>,
+    _credit: OwnedSemaphorePermit,
 }
 
 enum FlowEvent {
-    CarrierFrame { carrier_id: Uuid, frame: DataFrame },
-    CarrierClosed { carrier_id: Uuid, reason: String },
-    TargetData(Vec<u8>),
+    CarrierFrame {
+        carrier_id: Uuid,
+        frame: DataFrame,
+    },
+    CarrierClosed {
+        carrier_id: Uuid,
+        reason: String,
+    },
+    TargetData {
+        bytes: Vec<u8>,
+        credit: OwnedSemaphorePermit,
+    },
     TargetEof,
     TargetError(String),
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -177,14 +215,19 @@ async fn run_flow(
     not_after_unix_secs: u64,
     _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
-    let target = TcpStream::connect(&service.target)
-        .await
-        .with_context(|| format!("failed to connect service {}", service.id))?;
+    let target = timeout(
+        registry.carrier_timeout,
+        TcpStream::connect(&service.target),
+    )
+    .await
+    .context("target TCP connection timed out")?
+    .with_context(|| format!("failed to connect service {}", service.id))?;
     target.set_nodelay(true)?;
     let (mut target_reader, mut target_writer) = target.into_split();
-    let (event_tx, mut events) = mpsc::channel::<FlowEvent>(256);
+    let (event_tx, mut events) = mpsc::channel::<FlowEvent>(32);
+    let send_credit = Arc::new(Semaphore::new(registry.max_unacked_bytes));
     let target_events = event_tx.clone();
-    tokio::spawn(async move {
+    let target_reader_task = tokio::spawn(async move {
         let mut buffer = vec![0_u8; MAX_DATA_PAYLOAD];
         loop {
             match target_reader.read(&mut buffer).await {
@@ -193,8 +236,23 @@ async fn run_flow(
                     return;
                 }
                 Ok(count) => {
+                    let Ok(count_u32) = u32::try_from(count) else {
+                        let _ = target_events
+                            .send(FlowEvent::TargetError(
+                                "target read size overflow".to_owned(),
+                            ))
+                            .await;
+                        return;
+                    };
+                    let Ok(credit) = Arc::clone(&send_credit).acquire_many_owned(count_u32).await
+                    else {
+                        return;
+                    };
                     if target_events
-                        .send(FlowEvent::TargetData(buffer[..count].to_vec()))
+                        .send(FlowEvent::TargetData {
+                            bytes: buffer[..count].to_vec(),
+                            credit,
+                        })
                         .await
                         .is_err()
                     {
@@ -210,6 +268,7 @@ async fn run_flow(
             }
         }
     });
+    let _target_reader_task = AbortOnDrop(target_reader_task);
 
     let mut carriers: HashMap<Uuid, mpsc::Sender<DataFrame>> = HashMap::new();
     let mut active_carrier = None;
@@ -327,7 +386,12 @@ async fn run_flow(
                             {
                                 let end = offset.saturating_add(bytes.len() as u64);
                                 if offset == receive_offset && active_carrier == Some(carrier_id) {
-                                    target_writer.write_all(&bytes).await?;
+                                    timeout(
+                                        registry.carrier_timeout,
+                                        target_writer.write_all(&bytes),
+                                    )
+                                    .await
+                                    .context("target TCP write timed out")??;
                                     receive_offset = end;
                                     debug!(event = "tcp_data_accepted", travel_id = %key.travel_id, flow_id = %key.flow_id, %carrier_id, offset, next_offset = receive_offset, bytes = bytes.len(), "accepted Travel-to-Home TCP data");
                                     send_to(
@@ -376,7 +440,9 @@ async fn run_flow(
                                 if flow_id == key.flow_id && final_offset == receive_offset =>
                             {
                                 if !travel_eof {
-                                    target_writer.shutdown().await?;
+                                    timeout(registry.carrier_timeout, target_writer.shutdown())
+                                        .await
+                                        .context("target TCP shutdown timed out")??;
                                     travel_eof = true;
                                 }
                                 send_to(
@@ -417,11 +483,15 @@ async fn run_flow(
                             debug!(event = "carrier_closed_inactive", travel_id = %key.travel_id, flow_id = %key.flow_id, %carrier_id, %reason, "inactive home carrier closed");
                         }
                     }
-                    FlowEvent::TargetData(bytes) => {
+                    FlowEvent::TargetData { bytes, credit } => {
                         if unacked_bytes.saturating_add(bytes.len()) > registry.max_unacked_bytes {
                             bail!("home unacknowledged-data limit reached");
                         }
-                        let segment = Segment { offset: send_offset, bytes };
+                        let segment = Segment {
+                            offset: send_offset,
+                            bytes,
+                            _credit: credit,
+                        };
                         send_offset = send_offset.saturating_add(segment.bytes.len() as u64);
                         unacked_bytes += segment.bytes.len();
                         debug!(event = "tcp_data_buffered", travel_id = %key.travel_id, flow_id = %key.flow_id, offset = segment.offset, bytes = segment.bytes.len(), unacked_bytes, "buffered Home-to-Travel TCP data");
@@ -477,8 +547,14 @@ fn spawn_carrier(
     timeout_period: Duration,
 ) {
     tokio::spawn(async move {
-        let carrier_id = carrier.carrier_id;
-        let (reader, mut writer) = tokio::io::split(carrier.stream);
+        let IncomingCarrier {
+            carrier_id,
+            stream,
+            global_permit,
+            flow_permit,
+        } = carrier;
+        let _carrier_permits = (global_permit, flow_permit);
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = JsonFrameReader::new(reader, DATA_FRAME_LIMIT);
         let mut heartbeat = interval(heartbeat_period);
         let mut nonce = 0_u64;

@@ -103,7 +103,7 @@ resolved versions are:
 | Digests and SPKI pins | SHA-256, encoded as 64 lowercase hexadecimal characters |
 | Route/work admission | HMAC-SHA256 with independent 32-byte random keys |
 | Enrollment and authority keys | P-256 keys encoded as PKCS#8 |
-| Password-protected private keys | Encrypted PKCS#8 using PBES2, scrypt `log2(N)=15, r=8, p=1`, and AES-256-CBC |
+| Password-protected private keys | Encrypted PKCS#8 using PBES2, scrypt `log2(N)=17, r=8, p=1`, and AES-256-CBC |
 | Randomness | AWS-LC `SystemRandom` for protocol secrets/nonces/signatures; operating-system `OsRng` for encrypted-PKCS#8 salt and IV generation |
 | Certificate construction/parsing | `rcgen` 0.14.9, `rustls-pki-types`, and `x509-parser` 0.18.1 |
 | Secret cleanup | `zeroize`/`Zeroizing` for passwords and selected private-key buffers |
@@ -421,18 +421,23 @@ irreversible; replacement requires a fresh enrollment request, keys, certificate
 ## Private-key encryption and password rotation
 
 Deployment-root, issuer CA/authority, and Travel private keys use encrypted PKCS#8 PEM. The current
-`pkcs8` crate profile derives a 256-bit encryption key with scrypt parameters `N=32768`, `r=8`, and
+`pkcs8` crate profile derives a 256-bit encryption key with scrypt parameters `N=131072`, `r=8`, and
 `p=1`, using a fresh random 16-byte salt, then encrypts with AES-256-CBC and a fresh random 16-byte IV.
 FlowSplice's interactive root/Travel creation and password-rotation paths require at least 12
 characters. The decoder can load externally provisioned material with any correct nonempty password,
 so 12 characters is an operator-workflow floor, not an on-disk format property or a claim of
 sufficient entropy.
 
-Passwords are read through hidden terminal input or submitted for one UI/API operation. The default
-and recommended UI listeners are loopback-only; password rotation is disabled unless the relevant UI
-listener is loopback. Passwords are not stored in macOS Keychain, configuration, the issuer ledger,
+Passwords are read through hidden terminal input or submitted for one UI/API operation. Production
+UI listeners require an explicit `127.0.0.1` address; there is no remote-listen configuration gate.
+Passwords are not stored in macOS Keychain, configuration, the issuer ledger,
 or the rotation journal. Backend password strings and selected decoded private-key buffers use
 `Zeroizing`.
+
+Runtime private-key files are opened with no-follow semantics and checked on the opened descriptor:
+they must be regular files owned by the effective service user, have no group/other permission bits,
+and be no larger than 1 MiB. This prevents symlink substitution, FIFO blocking, and silently using a
+key exposed through broad file permissions.
 
 Password rotation does not rotate a public key. It:
 
@@ -463,8 +468,9 @@ authenticated encryption. A future format change may choose an authenticated pri
 | State | Persistence and rule |
 | --- | --- |
 | Travel deployment/control state | Atomic JSON beside enrollment material; binds deployment/trust digest, signer epoch, highest generation, same-generation hash, and cached signed snapshot |
-| Relay/Home authorization cache | Atomic JSON; rejects lower authorization generations and loss of any observed revocation |
-| Server credentials/revocations | Separate durable JSON stores; credentials are add-only and revocations are irreversible |
+| Relay/Home authorization cache | Atomic JSON; rejects lower authorization generations, same-generation content changes, and loss of any observed revocation |
+| Server authorization state | One atomic JSON object containing generation, add-only credentials, irreversible revocations, and permanently spent enrollment-request hashes |
+| Server control generation | Atomic JSON high-water mark reserved before each signed snapshot; gaps are allowed but reuse after restart is not |
 | Home issuance ledger | Mode-`0600` atomic file; makes enrollment requests permanently single-use and retry-idempotent |
 | Password rotation journal | Mode-`0600`, password-free, hash-bound recovery record removed after all replacements complete |
 | Pending route/work secrets | Memory only, single-use, bounded, and short-lived; lost on process restart |
@@ -476,9 +482,9 @@ a replicated consensus log and do not defend against an attacker who can arbitra
 host's files.
 
 Travel durably prevents deployment-trust rollback. Server, Relay, and Home verify their configured
-root-signed trust at startup, but do not currently maintain an independent durable high-water record
-for deployment-trust generations. Protecting or deliberately replacing their trust files remains an
-operator responsibility.
+root-signed trust at startup and stop once it expires; they do not currently maintain an independent
+durable high-water record for deployment-trust generations. Protecting or deliberately replacing
+their trust files remains an operator responsibility.
 
 ## Compromise boundaries
 

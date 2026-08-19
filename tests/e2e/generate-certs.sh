@@ -150,7 +150,10 @@ chmod 644 "${cert_dir}"/*.crt
 server_pin="$(spki_pin server)"
 relay1_pin="$(spki_pin relay1)"
 relay2_pin="$(spki_pin relay2)"
-printf '{"credentials":[]}\n' >"${authorization_dir}/credentials.json"
+printf '%s\n' \
+  '{"version":1,"snapshot":{"generation":1,"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
+  >"${state_dir}/server-authorization.json"
+printf '{"next_generation":1}\n' >"${state_dir}/server-control-generation.json"
 printf '{"relay-1":"%s","relay-2":"%s"}\n' \
   "${relay1_pin}" "${relay2_pin}" >"${state_dir}/relay-pins.json"
 

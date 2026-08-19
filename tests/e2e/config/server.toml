@@ -7,11 +7,13 @@ management_ca = "/certs/management-ca.crt"
 deployment_root_public_key = "/certs/deployment-root.pub"
 deployment_trust = "/certs/deployment-trust.json"
 control_signing_key = "/authorization/server-control.key"
-travel_credentials = "/authorization/credentials.json"
-travel_revocations = "/state/server-revocations.json"
+travel_authorization_state = "/state/server-authorization.json"
+control_generation_state = "/state/server-control-generation.json"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 control_snapshot_ttl_secs = 120
+max_control_connections = 64
+max_data_connections = 128
 
 [[homes]]
 id = "home-1"

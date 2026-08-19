@@ -28,7 +28,7 @@ Travel access is distributed as authority-signed, scoped credentials. Issuance a
 
 Server signs each Travel-visible Relay-directory and filtered-Catalog snapshot as one short-lived payload. Relay only transports that signature, so a compromised Relay cannot rewrite directory endpoints or Catalog metadata. Seed Relays therefore remain discovery addresses rather than trust anchors.
 
-The Server keeps an add-only authorization set and revocation log, and each Relay keeps a persistent anti-rollback cache below `/etc/flowsplice/state`, allowing Home-published issuance or revocation to take effect without restarting any process. Validate before starting:
+The Server keeps one atomic authorization state containing the generation, add-only credentials, irreversible revocations, and spent enrollment-request hashes, plus a separate durable control-snapshot generation high-water mark. Each Relay keeps a persistent anti-rollback cache below `/etc/flowsplice/state`, allowing Home-published issuance or revocation to take effect without restarting any process. The package initializes the two empty Server state files only when absent and never overwrites them on upgrade. Validate before starting:
 
 ```sh
 /etc/init.d/flowsplice validate

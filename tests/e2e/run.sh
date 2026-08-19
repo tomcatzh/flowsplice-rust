@@ -17,7 +17,11 @@ else
   rm -f \
     "${generated_dir}/offline/.flowsplice-issued-enrollments.json" \
     "${generated_dir}/offline-home2/.flowsplice-issued-enrollments.json"
-  printf '{"credentials":[]}\n' >"${generated_dir}/authorization/credentials.json"
+  printf '%s\n' \
+    '{"version":1,"snapshot":{"generation":1,"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
+    >"${generated_dir}/state/server-authorization.json"
+  printf '{"next_generation":1}\n' \
+    >"${generated_dir}/state/server-control-generation.json"
 fi
 deployment_root_public_key="$(tr -d '\r\n' <"${generated_dir}/certs/deployment-root.pub")"
 docker build \

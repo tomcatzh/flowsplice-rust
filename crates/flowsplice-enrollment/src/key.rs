@@ -1,8 +1,8 @@
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -92,8 +92,7 @@ pub fn generate_encrypted_private_key(password: &[u8]) -> Result<GeneratedPrivat
 ///
 /// Returns an error when the key file cannot be read.
 pub fn is_encrypted_private_key(path: &Path) -> Result<bool> {
-    let data =
-        fs::read(path).with_context(|| format!("failed to read private key {}", path.display()))?;
+    let data = read_private_key_file(path)?;
     Ok(data
         .windows(b"-----BEGIN ENCRYPTED PRIVATE KEY-----".len())
         .any(|window| window == b"-----BEGIN ENCRYPTED PRIVATE KEY-----"))
@@ -110,12 +109,15 @@ pub fn load_private_key(
     password: Option<&[u8]>,
     allow_unencrypted: bool,
 ) -> Result<PrivateKeyDer<'static>> {
-    if is_encrypted_private_key(path)? {
+    let data = read_private_key_file(path)?;
+    if data
+        .windows(b"-----BEGIN ENCRYPTED PRIVATE KEY-----".len())
+        .any(|window| window == b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    {
         let password =
             password.ok_or_else(|| anyhow!("encrypted private key requires a password"))?;
-        let pem = fs::read_to_string(path)
-            .with_context(|| format!("failed to read private key {}", path.display()))?;
-        let (label, document) = SecretDocument::from_pem(&pem)
+        let pem = std::str::from_utf8(&data).context("private key PEM is not UTF-8")?;
+        let (label, document) = SecretDocument::from_pem(pem)
             .context("failed to parse encrypted PKCS#8 private key")?;
         if label != ENCRYPTED_KEY_LABEL {
             bail!("encrypted private key has an unexpected PEM label");
@@ -131,8 +133,45 @@ pub fn load_private_key(
     if !allow_unencrypted {
         bail!("unencrypted private keys are forbidden");
     }
-    PrivateKeyDer::from_pem_file(path)
+    PrivateKeyDer::from_pem_slice(&data)
         .with_context(|| format!("failed to parse private key {}", path.display()))
+}
+
+fn read_private_key_file(path: &Path) -> Result<Vec<u8>> {
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("failed to open private key {}", path.display()))?;
+    let mut file = fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect private key {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("private key {} must be a regular file", path.display());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "private key {} must not be accessible by group or other users",
+            path.display()
+        );
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        bail!(
+            "private key {} must be owned by the current user",
+            path.display()
+        );
+    }
+    if metadata.len() > 1024 * 1024 {
+        bail!("private key {} exceeds 1 MiB", path.display());
+    }
+    let capacity =
+        usize::try_from(metadata.len()).context("private-key size does not fit usize")?;
+    let mut data = Vec::with_capacity(capacity);
+    file.read_to_end(&mut data)
+        .with_context(|| format!("failed to read private key {}", path.display()))?;
+    Ok(data)
 }
 
 /// Re-encrypts a set of PKCS#8 private keys with one new password.
@@ -480,11 +519,15 @@ fn remove_staged_files(staged: &[StagedRotation]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::fs::PermissionsExt};
+    use std::{
+        io::Write,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
 
     fn create_encrypted_key(path: &Path, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let generated = generate_encrypted_private_key(password)?;
         fs::write(path, generated.encrypted_pem.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(Zeroizing::new(generated.key_pair.serialize_der()))
     }
 
@@ -495,10 +538,26 @@ mod tests {
         let path = directory.path().join("travel.key");
         let mut file = fs::File::create(&path)?;
         file.write_all(generated.encrypted_pem.as_bytes())?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         assert!(is_encrypted_private_key(&path)?);
         assert!(load_private_key(&path, None, false).is_err());
         assert!(load_private_key(&path, Some(b"wrong"), false).is_err());
         assert!(load_private_key(&path, Some(b"correct horse battery staple"), false).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn private_key_loader_rejects_wide_permissions_and_symlinks() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("travel.key");
+        create_encrypted_key(&path, b"correct horse battery staple")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        assert!(load_private_key(&path, Some(b"correct horse battery staple"), false).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let link = directory.path().join("travel-link.key");
+        symlink(&path, &link)?;
+        assert!(load_private_key(&link, Some(b"correct horse battery staple"), false).is_err());
         Ok(())
     }
 

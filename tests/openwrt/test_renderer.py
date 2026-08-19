@@ -27,12 +27,14 @@ config_get() {
 		server.deployment_root_public_key) resolved='/etc/flowsplice/deployment-root.pub' ;;
 		server.deployment_trust) resolved='/etc/flowsplice/deployment-trust.json' ;;
 		server.control_signing_key) resolved='/etc/flowsplice/server-control.key' ;;
-		server.travel_credentials) resolved='/etc/flowsplice/credentials.json' ;;
-		server.travel_revocations) resolved='/etc/flowsplice/revocations.json' ;;
+		server.travel_authorization_state) resolved='/etc/flowsplice/server-authorization.json' ;;
+		server.control_generation_state) resolved='/etc/flowsplice/server-control-generation.json' ;;
 		server.handshake_timeout_secs) resolved='10' ;;
 		server.work_ttl_secs) resolved='15' ;;
 		server.max_pending_work) resolved='256' ;;
 		server.control_snapshot_ttl_secs) resolved='120' ;;
+		server.max_control_connections) resolved='256' ;;
+		server.max_data_connections) resolved='1024' ;;
 		home_1.id) resolved='home-1' ;;
 		home_2.id) resolved='home-2' ;;
 		relay_1.id) resolved='relay-1' ;;

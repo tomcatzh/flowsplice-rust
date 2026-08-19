@@ -6,7 +6,6 @@ business_cert = "/etc/flowsplice/travel-business.crt"
 business_key = "/etc/flowsplice/travel-business.key"
 business_ca = "/etc/flowsplice/business-ca.crt"
 ui_listen = "127.0.0.1:9080"
-allow_remote_listen = false
 handshake_timeout_secs = 10
 udp_idle_secs = 60
 max_active_flows = 128
@@ -17,6 +16,8 @@ carrier_recovery_timeout_secs = 90
 carrier_reevaluate_secs = 60
 max_carrier_reevaluate_secs = 900
 max_unacked_bytes = 1048576
+max_active_carriers = 512
+max_carriers_per_flow = 16
 
 [[homes]]
 id = "home-1"

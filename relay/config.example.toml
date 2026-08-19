@@ -14,3 +14,5 @@ travel_authorization_cache = "/var/lib/flowsplice/relay-authorization-cache.json
 handshake_timeout_secs = 10
 route_ttl_secs = 15
 max_pending_routes = 256
+max_management_connections = 1024
+max_data_connections = 2048

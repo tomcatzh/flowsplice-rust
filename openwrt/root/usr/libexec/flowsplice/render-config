@@ -82,7 +82,8 @@ write_home() {
 render_server() {
 	local output="$1" tmp section=server
 	local id control_listen cert key management_ca deployment_root deployment_trust control_signing_key
-	local credentials revocations handshake work_ttl max_pending control_snapshot_ttl
+	local authorization_state generation_state handshake work_ttl max_pending control_snapshot_ttl
+	local max_control_connections max_data_connections
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
@@ -94,12 +95,14 @@ render_server() {
 	deployment_root="$(require_option "$section" deployment_root_public_key)"
 	deployment_trust="$(require_option "$section" deployment_trust)"
 	control_signing_key="$(require_option "$section" control_signing_key)"
-	credentials="$(require_option "$section" travel_credentials)"
-	revocations="$(require_option "$section" travel_revocations)"
+	authorization_state="$(require_option "$section" travel_authorization_state)"
+	generation_state="$(require_option "$section" control_generation_state)"
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get work_ttl "$section" work_ttl_secs 15
 	config_get max_pending "$section" max_pending_work 256
 	config_get control_snapshot_ttl "$section" control_snapshot_ttl_secs 120
+	config_get max_control_connections "$section" max_control_connections 256
+	config_get max_data_connections "$section" max_data_connections 1024
 	write_string id "$id" "$tmp"
 	write_string control_listen "$control_listen" "$tmp"
 	write_list "$section" data_listen data_listens "$tmp"
@@ -109,12 +112,14 @@ render_server() {
 	write_string deployment_root_public_key "$deployment_root" "$tmp"
 	write_string deployment_trust "$deployment_trust" "$tmp"
 	write_string control_signing_key "$control_signing_key" "$tmp"
-	write_string travel_credentials "$credentials" "$tmp"
-	write_string travel_revocations "$revocations" "$tmp"
+	write_string travel_authorization_state "$authorization_state" "$tmp"
+	write_string control_generation_state "$generation_state" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer work_ttl_secs "$work_ttl" "$tmp"
 	write_integer max_pending_work "$max_pending" "$tmp"
 	write_integer control_snapshot_ttl_secs "$control_snapshot_ttl" "$tmp"
+	write_integer max_control_connections "$max_control_connections" "$tmp"
+	write_integer max_data_connections "$max_data_connections" "$tmp"
 	RENDER_OUTPUT="$tmp"
 	HOME_COUNT=0
 	config_foreach write_home home
@@ -130,7 +135,7 @@ render_relay() {
 	local section="$1" output="$2" tmp
 	local id management_listen data_listen data_public_addr server_data_addr
 	local server_id cert key management_ca deployment_root deployment_trust
-	local authorization_cache handshake route_ttl max_pending
+	local authorization_cache handshake route_ttl max_pending max_management_connections max_data_connections
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
@@ -149,6 +154,8 @@ render_relay() {
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get route_ttl "$section" route_ttl_secs 15
 	config_get max_pending "$section" max_pending_routes 256
+	config_get max_management_connections "$section" max_management_connections 1024
+	config_get max_data_connections "$section" max_data_connections 2048
 	write_string id "$id" "$tmp"
 	write_string management_listen "$management_listen" "$tmp"
 	write_string data_listen "$data_listen" "$tmp"
@@ -165,6 +172,8 @@ render_relay() {
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer route_ttl_secs "$route_ttl" "$tmp"
 	write_integer max_pending_routes "$max_pending" "$tmp"
+	write_integer max_management_connections "$max_management_connections" "$tmp"
+	write_integer max_data_connections "$max_data_connections" "$tmp"
 	mv "$tmp" "$output"
 	trap - EXIT INT TERM
 }

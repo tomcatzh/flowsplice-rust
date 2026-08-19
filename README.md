@@ -33,7 +33,7 @@ not interchangeable failover replicas.
 | --- | --- |
 | `flowsplice-server` | Aggregates Home catalogs, signs Travel-visible control state, coordinates opaque work sockets, and distributes Travel authorization state. |
 | `flowsplice-relay` | Provides public management/data ingress and opaque forwarding; Linux builds use `splice(2)` for paired data sockets. |
-| `flowsplice-homeagent` | Publishes services, terminates business TLS, connects authorized Flows to local targets, and hosts the local issuer/revocation UI. |
+| `flowsplice-homeagent` | Publishes services, terminates business TLS, connects authorized Flows to local targets, and optionally hosts the local issuer/revocation UI. |
 | `flowsplice-travelagent` | Creates local mappings, verifies signed discovery state, races Relays, and originates end-to-end business TLS. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
 | `flowsplice-core` | Implements shared framing, authorization, deployment trust, TLS identity, and route admission. |
@@ -99,8 +99,9 @@ validity, enrollment request/nonce, CA and leaf-certificate hashes, and deployme
 enrollment request can create only one credential. An identical retry returns the original response;
 changing scope or validity is rejected, and revocation or expiry never makes the request reusable.
 
-Revocation originates from the Home that owns the signing authority. Server persists and broadcasts
-a monotonic authorization generation; Relay and Home durably reject rollback. Issuance and
+Revocation originates from the Home that owns the signing authority. Server atomically persists the
+credential set, revocations, permanently spent enrollment-request fingerprints, and monotonic
+authorization generation; Relay and Home durably reject rollback and same-generation conflicts. Issuance and
 revocation take effect without restarting Server, Relay, or Home.
 
 Server accepts only the first live process-session UUID for a stable Travel identity. A later process
@@ -247,7 +248,7 @@ protocol = "tcp"
 bind = "127.0.0.1:10022"
 ```
 
-The complete example contains timeout, Carrier reevaluation, resource, and remote-listen controls.
+The complete example contains timeout, Carrier reevaluation, and resource controls.
 Home SPKIs and the full Relay directory are authenticated state, not operator-entered configuration.
 One reachable Seed address is sufficient; multiple addresses are optional bootstrap redundancy.
 
@@ -257,9 +258,8 @@ Start Travel and enter its private-key password:
 flowsplice-travelagent --config ./travelagent.toml
 ```
 
-Keep mappings on loopback unless remote exposure is deliberate and protected separately. A remotely
-bound Travel UI requires `allow_remote_listen = true` and a bearer token of at least 32 characters,
-but the built-in UI is HTTP; use an external secure tunnel or TLS reverse proxy on untrusted networks.
+Mappings and the Travel UI must bind an explicit `127.0.0.1` address. To use them from another
+machine, keep FlowSplice loopback-only and provide a separately authenticated local tunnel.
 
 ### 5. Test, rotate, and revoke
 
@@ -295,6 +295,10 @@ Production operators must provision the signed deployment trust, both CA roots, 
 identities, Server control key, Home authority material, renewal procedure, and the explicit Server
 pins used by Home and Relay. Home endpoint SPKIs and Travel authorities live only in the signed
 deployment trust; Relay discovery state is signed and learned at runtime.
+
+Only Homes that issue or revoke Travel credentials need an `[issuer]` section and CA/authority
+private keys. A secondary Home can omit the section entirely while still publishing services and
+accepting credentials whose scope covers it.
 
 The offline deployment-root utility supports encrypted root creation and trust signing:
 

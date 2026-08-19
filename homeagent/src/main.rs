@@ -10,11 +10,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use aws_lc_rs::constant_time::verify_slices_are_equal;
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -99,10 +98,13 @@ struct Config {
     business_cert: PathBuf,
     business_key: PathBuf,
     business_ca: PathBuf,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
     #[serde(default)]
     server_spki_pins: Vec<String>,
     travel_authorization_cache: PathBuf,
-    issuer: IssuerConfig,
+    #[serde(default)]
+    issuer: Option<IssuerConfig>,
     services: Vec<Service>,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
@@ -110,6 +112,10 @@ struct Config {
     udp_idle_secs: u64,
     #[serde(default = "default_max_active_flows")]
     max_active_flows: usize,
+    #[serde(default = "default_max_active_carriers")]
+    max_active_carriers: usize,
+    #[serde(default = "default_max_carriers_per_flow")]
+    max_carriers_per_flow: usize,
     #[serde(default = "default_carrier_heartbeat")]
     carrier_heartbeat_secs: u64,
     #[serde(default = "default_carrier_timeout")]
@@ -124,21 +130,19 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct IssuerConfig {
     listen: String,
-    deployment_root_public_key: PathBuf,
-    deployment_trust: PathBuf,
-    management_ca_cert: PathBuf,
     management_ca_key: PathBuf,
-    business_ca_cert: PathBuf,
     business_ca_key: PathBuf,
     home_authority: SigningAuthorityConfig,
     #[serde(default)]
     global_authority: Option<SigningAuthorityConfig>,
     #[serde(default = "default_travel_valid_days")]
     default_valid_days: u32,
+    #[cfg(feature = "e2e-remote-ui")]
     #[serde(default)]
-    allow_remote_listen: bool,
+    test_allow_remote_listen: bool,
+    #[cfg(feature = "e2e-remote-ui")]
     #[serde(default)]
-    admin_token: Option<String>,
+    test_admin_token: Option<String>,
     #[serde(default)]
     allow_unencrypted_test_keys: bool,
 }
@@ -164,6 +168,14 @@ const fn default_udp_idle() -> u64 {
 
 const fn default_max_active_flows() -> usize {
     128
+}
+
+const fn default_max_active_carriers() -> usize {
+    512
+}
+
+const fn default_max_carriers_per_flow() -> usize {
+    16
 }
 
 const fn default_carrier_heartbeat() -> u64 {
@@ -226,9 +238,11 @@ enum IssuerControlRequest {
 #[derive(Clone)]
 struct IssuerAppState {
     config: Arc<Config>,
+    issuer: Arc<IssuerConfig>,
     authorization: Arc<TravelAuthorizationState>,
     control_tx: mpsc::Sender<IssuerControlRequest>,
     key_operation: Arc<Mutex<()>>,
+    sensitive_operation: Arc<Semaphore>,
     issuance_ledger: Arc<Mutex<IssuanceLedger>>,
 }
 
@@ -310,17 +324,24 @@ async fn main() -> Result<()> {
     let config: Config = load_toml(&args.config)?;
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
-    validate_issuer_config(&config)?;
-    let (_, deployment_trust) = load_issuer_trust(&config)?;
-    if !config.issuer.allow_unencrypted_test_keys
-        && recover_private_key_password_rotation(&issuer_key_targets(&config))?
-    {
-        info!("completed interrupted Home issuer private-key password rotation");
+    let (_, deployment_trust) = load_home_trust(&config)?;
+    if let Some(issuer) = &config.issuer {
+        validate_issuer_config(&config, issuer)?;
+        if !issuer.allow_unencrypted_test_keys
+            && recover_private_key_password_rotation(&issuer_key_targets(issuer))?
+        {
+            info!("completed interrupted Home issuer private-key password rotation");
+        }
     }
     if config.carrier_heartbeat_secs == 0
         || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
         || config.flow_detach_timeout_secs <= config.carrier_timeout_secs
         || config.max_unacked_bytes < MAX_DATA_PAYLOAD
+        || config.max_unacked_bytes > u32::MAX as usize
+        || config.max_active_flows == 0
+        || config.max_active_carriers == 0
+        || config.max_carriers_per_flow == 0
+        || config.max_carriers_per_flow > config.max_active_carriers
     {
         bail!("carrier/flow timeout or unacknowledged-data limits are invalid");
     }
@@ -354,15 +375,26 @@ async fn main() -> Result<()> {
         Duration::from_secs(config.carrier_timeout_secs),
         Duration::from_secs(config.flow_detach_timeout_secs),
         config.max_unacked_bytes,
+        config.max_active_carriers,
+        config.max_carriers_per_flow,
     );
-    let (issuer_control_tx, issuer_control_rx) = mpsc::channel(32);
-    let issuance_ledger = IssuanceLedger::load(ledger_path(&config.issuer.management_ca_key)?)?;
-    let issuer_state = IssuerAppState {
-        config: Arc::clone(&config),
-        authorization: Arc::clone(&authorization),
-        control_tx: issuer_control_tx,
-        key_operation: Arc::new(Mutex::new(())),
-        issuance_ledger: Arc::new(Mutex::new(issuance_ledger)),
+    let (issuer_state, issuer_control_rx) = if let Some(issuer) = &config.issuer {
+        let (issuer_control_tx, issuer_control_rx) = mpsc::channel(32);
+        let issuance_ledger = IssuanceLedger::load(ledger_path(&issuer.management_ca_key)?)?;
+        (
+            Some(IssuerAppState {
+                config: Arc::clone(&config),
+                issuer: Arc::new(issuer.clone()),
+                authorization: Arc::clone(&authorization),
+                control_tx: issuer_control_tx,
+                key_operation: Arc::new(Mutex::new(())),
+                sensitive_operation: Arc::new(Semaphore::new(1)),
+                issuance_ledger: Arc::new(Mutex::new(issuance_ledger)),
+            }),
+            Some(issuer_control_rx),
+        )
+    } else {
+        (None, None)
     };
     let control = run_control_loop(
         Arc::clone(&config),
@@ -372,9 +404,23 @@ async fn main() -> Result<()> {
         Arc::clone(&authorization),
         issuer_control_rx,
     );
-    let issuer = run_issuer_ui(issuer_state);
-    tokio::try_join!(control, issuer)?;
+    let trust_expiry = monitor_trust_expiry(deployment_trust.not_after_unix_secs);
+    if let Some(issuer_state) = issuer_state {
+        let issuer = run_issuer_ui(issuer_state);
+        tokio::try_join!(control, issuer, trust_expiry)?;
+    } else {
+        tokio::try_join!(control, trust_expiry)?;
+    }
     Ok(())
+}
+
+async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
+    loop {
+        if unix_time_secs()? >= not_after_unix_secs {
+            bail!("deployment trust expired; refusing to continue");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 async fn run_control_loop(
@@ -383,7 +429,7 @@ async fn run_control_loop(
     tls: Arc<TlsMaterial>,
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
-    mut issuer_control_rx: mpsc::Receiver<IssuerControlRequest>,
+    mut issuer_control_rx: Option<mpsc::Receiver<IssuerControlRequest>>,
 ) -> Result<()> {
     loop {
         if let Err(error) = run_control(
@@ -402,45 +448,35 @@ async fn run_control_loop(
     }
 }
 
-fn validate_issuer_config(config: &Config) -> Result<()> {
-    let listen = config
-        .issuer
+fn validate_issuer_config(config: &Config, issuer: &IssuerConfig) -> Result<()> {
+    let listen = issuer
         .listen
         .parse::<SocketAddr>()
         .context("invalid Home issuer listen address")?;
-    if !listen.ip().is_loopback() && !config.issuer.allow_remote_listen {
-        bail!("Home issuer listen must be loopback unless allow_remote_listen is true");
-    }
-    if !listen.ip().is_loopback()
-        && config
-            .issuer
-            .admin_token
-            .as_deref()
-            .is_none_or(|token| token.len() < 32)
+    if listen != SocketAddr::from(([127, 0, 0, 1], listen.port()))
+        && !test_remote_issuer_enabled(issuer)
     {
-        bail!("remote Home issuer UI requires an administrator token of at least 32 bytes");
+        bail!("Home issuer UI must listen directly on 127.0.0.1");
     }
-    if config.issuer.default_valid_days == 0 || config.issuer.default_valid_days > MAX_VALID_DAYS {
+    if issuer.default_valid_days == 0 || issuer.default_valid_days > MAX_VALID_DAYS {
         bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
     }
-    let (_, trust) = load_issuer_trust(config)?;
-    if std::fs::read_to_string(&config.issuer.management_ca_cert)?
-        != trust.management_ca_certificate_pem
-        || std::fs::read_to_string(&config.issuer.business_ca_cert)?
-            != trust.business_ca_certificate_pem
+    let (_, trust) = load_home_trust(config)?;
+    if std::fs::read_to_string(&config.management_ca)? != trust.management_ca_certificate_pem
+        || std::fs::read_to_string(&config.business_ca)? != trust.business_ca_certificate_pem
     {
         bail!("Home issuer CA certificates do not match deployment trust");
     }
     validate_signing_authority(
         config,
         &trust.travel_authorities,
-        &config.issuer.home_authority,
+        &issuer.home_authority,
         false,
     )?;
-    if let Some(authority) = &config.issuer.global_authority {
+    if let Some(authority) = &issuer.global_authority {
         validate_signing_authority(config, &trust.travel_authorities, authority, true)?;
     }
-    if config.issuer.allow_unencrypted_test_keys
+    if issuer.allow_unencrypted_test_keys
         && std::env::var("FLOWSPLICE_ALLOW_UNENCRYPTED_TEST_KEYS").as_deref() != Ok("1")
     {
         bail!("unencrypted issuer keys are disabled outside the explicit test environment");
@@ -448,10 +484,24 @@ fn validate_issuer_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn load_issuer_trust(config: &Config) -> Result<(String, DeploymentTrust)> {
-    let root_public_key = std::fs::read_to_string(&config.issuer.deployment_root_public_key)
+#[cfg(feature = "e2e-remote-ui")]
+fn test_remote_issuer_enabled(issuer: &IssuerConfig) -> bool {
+    issuer.test_allow_remote_listen
+        && issuer
+            .test_admin_token
+            .as_deref()
+            .is_some_and(|token| token.len() >= 32)
+}
+
+#[cfg(not(feature = "e2e-remote-ui"))]
+const fn test_remote_issuer_enabled(_issuer: &IssuerConfig) -> bool {
+    false
+}
+
+fn load_home_trust(config: &Config) -> Result<(String, DeploymentTrust)> {
+    let root_public_key = std::fs::read_to_string(&config.deployment_root_public_key)
         .context("failed to read deployment root public key")?;
-    let signed: SignedDeploymentTrust = load_json(&config.issuer.deployment_trust)?;
+    let signed: SignedDeploymentTrust = load_json(&config.deployment_trust)?;
     let trust = signed.verify(root_public_key.trim(), unix_time_secs()?)?;
     Ok((root_public_key.trim().to_owned(), trust))
 }
@@ -480,22 +530,22 @@ fn validate_signing_authority(
     Ok(())
 }
 
-fn issuer_key_targets(config: &Config) -> Vec<PrivateKeyRotationTarget<'_>> {
+fn issuer_key_targets(issuer: &IssuerConfig) -> Vec<PrivateKeyRotationTarget<'_>> {
     let mut targets = vec![
         PrivateKeyRotationTarget {
             label: "management CA",
-            path: &config.issuer.management_ca_key,
+            path: &issuer.management_ca_key,
         },
         PrivateKeyRotationTarget {
             label: "business CA",
-            path: &config.issuer.business_ca_key,
+            path: &issuer.business_ca_key,
         },
         PrivateKeyRotationTarget {
             label: "Home authorization",
-            path: &config.issuer.home_authority.private_key,
+            path: &issuer.home_authority.private_key,
         },
     ];
-    if let Some(authority) = &config.issuer.global_authority {
+    if let Some(authority) = &issuer.global_authority {
         targets.push(PrivateKeyRotationTarget {
             label: "global authorization",
             path: &authority.private_key,
@@ -526,7 +576,7 @@ async fn run_control(
     tls: Arc<TlsMaterial>,
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
-    issuer_control_rx: &mut mpsc::Receiver<IssuerControlRequest>,
+    issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
 ) -> Result<()> {
     let socket = TcpStream::connect(&config.server_control_addr).await?;
     let stream = timeout(
@@ -563,7 +613,7 @@ async fn run_control_session(
     tls: Arc<TlsMaterial>,
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
-    issuer_control_rx: &mut mpsc::Receiver<IssuerControlRequest>,
+    issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -620,7 +670,7 @@ async fn run_control_session(
         HashMap::<Uuid, oneshot::Sender<std::result::Result<u64, String>>>::new();
     loop {
         tokio::select! {
-            command = issuer_control_rx.recv() => {
+            command = receive_issuer_command(issuer_control_rx) => {
                 let Some(command) = command else { bail!("Home issuer control channel closed"); };
                 let request_id = Uuid::new_v4();
                 let (message, response) = match command {
@@ -696,6 +746,15 @@ async fn run_control_session(
     }
 }
 
+async fn receive_issuer_command(
+    receiver: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
+) -> Option<IssuerControlRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_work(
     config: Arc<Config>,
@@ -707,8 +766,13 @@ async fn run_work(
     work_id: Uuid,
     work_secret: Vec<u8>,
 ) -> Result<()> {
-    let mut socket = TcpStream::connect(&config.server_data_addr).await?;
-    write_preface(&mut socket, RouteSide::Home, work_id, &work_secret).await?;
+    let socket = timeout(Duration::from_secs(config.handshake_timeout_secs), async {
+        let mut socket = TcpStream::connect(&config.server_data_addr).await?;
+        write_preface(&mut socket, RouteSide::Home, work_id, &work_secret).await?;
+        Ok::<_, anyhow::Error>(socket)
+    })
+    .await
+    .context("Server data work setup timed out")??;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         tls.business_acceptor.accept(socket),
@@ -754,7 +818,12 @@ async fn run_work(
                     identity.id,
                     flow_id,
                     service,
-                    IncomingCarrier { carrier_id, stream },
+                    IncomingCarrier {
+                        carrier_id,
+                        stream,
+                        global_permit: None,
+                        flow_permit: None,
+                    },
                     not_after_unix_secs,
                 )
                 .await
@@ -920,8 +989,8 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
         .fallback(serve_spa)
         .with_state(state.clone())
         .layer(from_fn_with_state(state.clone(), authorize_issuer_ui));
-    let listener = tokio::net::TcpListener::bind(&state.config.issuer.listen).await?;
-    info!(address = %state.config.issuer.listen, "Home Travel issuer UI ready");
+    let listener = tokio::net::TcpListener::bind(&state.issuer.listen).await?;
+    info!(address = %state.issuer.listen, "Home Travel issuer UI ready");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -930,9 +999,9 @@ async fn api_issuer_status(State(state): State<IssuerAppState>) -> Json<IssuerSt
     Json(IssuerStatus {
         home_id: state.config.id.clone(),
         home_alias: state.config.alias.clone(),
-        default_valid_days: state.config.issuer.default_valid_days,
-        global_authority_available: state.config.issuer.global_authority.is_some(),
-        private_key_password_rotation_available: issuer_password_rotation_is_local(&state.config),
+        default_valid_days: state.issuer.default_valid_days,
+        global_authority_available: state.issuer.global_authority.is_some(),
+        private_key_password_rotation_available: issuer_password_rotation_is_local(&state.issuer),
         services: state.config.services.clone(),
     })
 }
@@ -942,9 +1011,8 @@ async fn api_issued_credentials(
 ) -> Json<Vec<IssuedCredentialStatus>> {
     let now = unix_time_secs().unwrap_or_default();
     let authority_ids = [
-        Some(state.config.issuer.home_authority.id.as_str()),
+        Some(state.issuer.home_authority.id.as_str()),
         state
-            .config
             .issuer
             .global_authority
             .as_ref()
@@ -997,21 +1065,17 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         scope,
         password,
     } = request;
-    let valid_for_secs = requested_validity_secs(
-        valid_days,
-        valid_minutes,
-        state.config.issuer.default_valid_days,
-    )?;
-    validate_requested_scope(&state.config, &scope)?;
+    let valid_for_secs =
+        requested_validity_secs(valid_days, valid_minutes, state.issuer.default_valid_days)?;
+    validate_requested_scope(&state.config, &state.issuer, &scope)?;
     let authority = match &scope {
         TravelCredentialScope::Global => state
-            .config
             .issuer
             .global_authority
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("global super authorization is not configured"))?,
         TravelCredentialScope::Home { .. } | TravelCredentialScope::Service { .. } => {
-            &state.config.issuer.home_authority
+            &state.issuer.home_authority
         }
     };
     let mut ledger = state.issuance_ledger.lock().await;
@@ -1036,8 +1100,11 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         });
     }
 
+    let _sensitive_permit = Arc::clone(&state.sensitive_operation)
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("another sensitive issuer operation is already running"))?;
     let password = Zeroizing::new(password);
-    if password.is_empty() && !state.config.issuer.allow_unencrypted_test_keys {
+    if password.is_empty() && !state.issuer.allow_unencrypted_test_keys {
         bail!("private-key password must not be empty");
     }
     let approval = prepare_enrollment_approval(
@@ -1050,23 +1117,23 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
     let protected = |path| ProtectedKey {
         path,
         password: Some(password.as_bytes()),
-        allow_unencrypted: state.config.issuer.allow_unencrypted_test_keys,
+        allow_unencrypted: state.issuer.allow_unencrypted_test_keys,
     };
     let deployment_root_public_key =
-        std::fs::read_to_string(&state.config.issuer.deployment_root_public_key)
+        std::fs::read_to_string(&state.config.deployment_root_public_key)
             .context("failed to read deployment root public key")?;
-    let deployment_trust: SignedDeploymentTrust = load_json(&state.config.issuer.deployment_trust)?;
+    let deployment_trust: SignedDeploymentTrust = load_json(&state.config.deployment_trust)?;
     let material = IssuerMaterial {
         deployment_trust: &deployment_trust,
         deployment_root_public_key: deployment_root_public_key.trim(),
-        management_ca_certificate: &state.config.issuer.management_ca_cert,
-        management_ca_key: protected(&state.config.issuer.management_ca_key),
-        business_ca_certificate: &state.config.issuer.business_ca_cert,
-        business_ca_key: protected(&state.config.issuer.business_ca_key),
+        management_ca_certificate: &state.config.management_ca,
+        management_ca_key: protected(&state.issuer.management_ca_key),
+        business_ca_certificate: &state.config.business_ca,
+        business_ca_key: protected(&state.issuer.business_ca_key),
         travel_authority_key: protected(&authority.private_key),
     };
     let key_operation = state.key_operation.lock().await;
-    recover_private_key_password_rotation(&issuer_key_targets(&state.config))?;
+    recover_private_key_password_rotation(&issuer_key_targets(&state.issuer))?;
     let enrollment = issue_enrollment(approval, &material, unix_time_secs()?)?;
     drop(key_operation);
     let record =
@@ -1128,12 +1195,15 @@ async fn rotate_issuer_private_key_password(
     state: &IssuerAppState,
     request: RotatePrivateKeyPasswordRequest,
 ) -> Result<RotatePrivateKeyPasswordResponse> {
-    if !issuer_password_rotation_is_local(&state.config) {
+    if !issuer_password_rotation_is_local(&state.issuer) {
         bail!("Home private-key password rotation is available only on a loopback issuer UI");
     }
-    if state.config.issuer.allow_unencrypted_test_keys {
+    if state.issuer.allow_unencrypted_test_keys {
         bail!("password rotation is unavailable for unencrypted test issuer keys");
     }
+    let _sensitive_permit = Arc::clone(&state.sensitive_operation)
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("another sensitive issuer operation is already running"))?;
     let current_password = Zeroizing::new(request.current_password);
     let new_password = Zeroizing::new(request.new_password);
     if new_password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
@@ -1141,12 +1211,12 @@ async fn rotate_issuer_private_key_password(
             "new private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
         );
     }
-    let rotated_keys = issuer_key_targets(&state.config).len();
-    let config = Arc::clone(&state.config);
+    let rotated_keys = issuer_key_targets(&state.issuer).len();
+    let issuer = Arc::clone(&state.issuer);
     let key_operation = state.key_operation.lock().await;
     tokio::task::spawn_blocking(move || {
         rotate_private_key_passwords(
-            &issuer_key_targets(&config),
+            &issuer_key_targets(&issuer),
             current_password.as_str(),
             new_password.as_str(),
         )
@@ -1158,14 +1228,12 @@ async fn rotate_issuer_private_key_password(
     Ok(RotatePrivateKeyPasswordResponse { rotated_keys })
 }
 
-fn issuer_password_rotation_is_local(config: &Config) -> bool {
-    config
-        .issuer
+fn issuer_password_rotation_is_local(issuer: &IssuerConfig) -> bool {
+    issuer
         .listen
         .parse::<SocketAddr>()
         .is_ok_and(|address| address.ip().is_loopback())
-        || std::env::var("FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY").as_deref()
-            == Ok("1")
+        || test_remote_issuer_enabled(issuer)
 }
 
 fn requested_validity_secs(
@@ -1192,10 +1260,14 @@ fn requested_validity_secs(
     Ok(u64::from(days) * 24 * 60 * 60)
 }
 
-fn validate_requested_scope(config: &Config, scope: &TravelCredentialScope) -> Result<()> {
+fn validate_requested_scope(
+    config: &Config,
+    issuer: &IssuerConfig,
+    scope: &TravelCredentialScope,
+) -> Result<()> {
     match scope {
         TravelCredentialScope::Global => {
-            if config.issuer.global_authority.is_none() {
+            if issuer.global_authority.is_none() {
                 bail!("global super authorization is not configured");
             }
         }
@@ -1267,44 +1339,71 @@ async fn authorize_issuer_ui(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_loopback = state
-        .config
-        .issuer
-        .listen
-        .parse::<SocketAddr>()
-        .is_ok_and(|address| address.ip().is_loopback());
-    if is_loopback {
+    if local_ui_request_allowed(&request, &state.issuer.listen) {
         return next.run(request).await;
     }
-    let expected = state
-        .config
-        .issuer
-        .admin_token
-        .as_deref()
-        .unwrap_or_default();
-    let authorized = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| {
-            verify_slices_are_equal(token.as_bytes(), expected.as_bytes()).is_ok()
-        });
-    if authorized {
-        next.run(request).await
-    } else {
-        let mut response = StatusCode::UNAUTHORIZED.into_response();
-        response.headers_mut().insert(
-            axum::http::header::WWW_AUTHENTICATE,
-            axum::http::HeaderValue::from_static("Bearer"),
-        );
-        response
+    #[cfg(feature = "e2e-remote-ui")]
+    if test_remote_issuer_enabled(&state.issuer) {
+        use aws_lc_rs::constant_time::verify_slices_are_equal;
+        let expected = state.issuer.test_admin_token.as_deref().unwrap_or_default();
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| {
+                verify_slices_are_equal(token.as_bytes(), expected.as_bytes()).is_ok()
+            });
+        if authorized {
+            return next.run(request).await;
+        }
     }
+    StatusCode::FORBIDDEN.into_response()
+}
+
+fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
+    let Ok(address) = listen.parse::<SocketAddr>() else {
+        return false;
+    };
+    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
+        return false;
+    }
+    let authority = address.to_string();
+    if request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        != Some(authority.as_str())
+    {
+        return false;
+    }
+    if let Some(site) = request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        && !matches!(site, "same-origin" | "none")
+    {
+        return false;
+    }
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        let expected = format!("http://{authority}");
+        if request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            != Some(expected.as_str())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
-    use super::requested_validity_secs;
+    use axum::{body::Body, extract::Request, http::Method};
+
+    use super::{Config, local_ui_request_allowed, requested_validity_secs};
     use anyhow::Result;
 
     #[test]
@@ -1316,6 +1415,68 @@ mod tests {
         assert_eq!(requested_validity_secs(None, Some(30), 365)?, 30 * 60);
         assert!(requested_validity_secs(Some(1), Some(30), 365).is_err());
         assert!(requested_validity_secs(None, Some(0), 365).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn issuer_ui_requires_exact_loopback_host_and_origin() -> Result<()> {
+        let get = Request::builder()
+            .uri("http://127.0.0.1:9081/")
+            .header("host", "127.0.0.1:9081")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&get, "127.0.0.1:9081"));
+
+        let bad_host = Request::builder()
+            .uri("http://attacker.invalid/")
+            .header("host", "attacker.invalid")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&bad_host, "127.0.0.1:9081"));
+
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("http://127.0.0.1:9081/api/issue")
+            .header("host", "127.0.0.1:9081")
+            .header("origin", "http://127.0.0.1:9081")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&post, "127.0.0.1:9081"));
+
+        let missing_origin = Request::builder()
+            .method(Method::POST)
+            .uri("http://127.0.0.1:9081/api/issue")
+            .header("host", "127.0.0.1:9081")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&missing_origin, "127.0.0.1:9081"));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_home_configuration_does_not_require_an_issuer() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+id = "home-2"
+alias = "Secondary Home"
+server_control_addr = "127.0.0.1:7443"
+server_data_addr = "127.0.0.1:7444"
+server_name = "server.invalid"
+server_id = "server-1"
+management_cert = "home.crt"
+management_key = "home.key"
+management_ca = "management-ca.crt"
+business_cert = "home-business.crt"
+business_key = "home-business.key"
+business_ca = "business-ca.crt"
+deployment_root_public_key = "deployment-root.pub"
+deployment_trust = "deployment-trust.json"
+travel_authorization_cache = "authorization-cache.json"
+
+[[services]]
+id = "ssh"
+alias = "SSH"
+protocol = "tcp"
+target = "127.0.0.1:22"
+"#,
+        )?;
+        assert!(config.issuer.is_none());
         Ok(())
     }
 }

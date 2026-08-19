@@ -10,6 +10,8 @@ management_ca = "/etc/flowsplice/management-ca.crt"
 business_cert = "/etc/flowsplice/home-business.crt"
 business_key = "/etc/flowsplice/home-business.key"
 business_ca = "/etc/flowsplice/business-ca.crt"
+deployment_root_public_key = "/etc/flowsplice/deployment-root.pub"
+deployment_trust = "/etc/flowsplice/deployment-trust.json"
 server_spki_pins = ["replace-with-server-spki-sha256-hex"]
 travel_authorization_cache = "/var/lib/flowsplice/home-authorization-cache.json"
 handshake_timeout_secs = 10
@@ -19,14 +21,13 @@ carrier_heartbeat_secs = 5
 carrier_timeout_secs = 30
 flow_detach_timeout_secs = 120
 max_unacked_bytes = 1048576
+max_active_carriers = 512
+max_carriers_per_flow = 16
 
+# Omit this entire section on a secondary Home that must not issue Travel credentials.
 [issuer]
 listen = "127.0.0.1:9081"
-deployment_root_public_key = "/etc/flowsplice/issuer/deployment-root.pub"
-deployment_trust = "/etc/flowsplice/issuer/deployment-trust.json"
-management_ca_cert = "/etc/flowsplice/issuer/management-ca.crt"
 management_ca_key = "/etc/flowsplice/issuer/management-ca.key"
-business_ca_cert = "/etc/flowsplice/issuer/business-ca.crt"
 business_ca_key = "/etc/flowsplice/issuer/business-ca.key"
 default_valid_days = 365
 

@@ -1,4 +1,10 @@
-use std::{io, path::Path, sync::Arc};
+use std::{
+    fs,
+    io::{self, Read},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
@@ -48,9 +54,61 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path)
+/// Loads one private key through the no-follow, owner/mode-checked file path.
+///
+/// # Errors
+///
+/// Returns an error when the file boundary or PEM key is invalid.
+pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let bytes = read_private_key_file(path)?;
+    PrivateKeyDer::from_pem_slice(&bytes)
         .with_context(|| format!("failed to parse private key {}", path.display()))
+}
+
+/// Rejects symlinks, non-regular files, and group/world-readable private keys.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot safely be used as a private-key file.
+pub fn validate_private_key_path(path: &Path) -> Result<()> {
+    read_private_key_file(path).map(|_| ())
+}
+
+fn read_private_key_file(path: &Path) -> Result<Vec<u8>> {
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("failed to open private key {}", path.display()))?;
+    let mut file = fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect private key {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("private key {} must be a regular file", path.display());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "private key {} must not be accessible by group or other users",
+            path.display()
+        );
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        bail!(
+            "private key {} must be owned by the current user",
+            path.display()
+        );
+    }
+    if metadata.len() > 1024 * 1024 {
+        bail!("private key {} exceeds 1 MiB", path.display());
+    }
+    let capacity =
+        usize::try_from(metadata.len()).context("private-key size does not fit usize")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read private key {}", path.display()))?;
+    Ok(bytes)
 }
 
 fn load_roots(path: &Path) -> Result<RootCertStore> {
@@ -136,7 +194,7 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
         .context("failed to build client certificate verifier")?;
     let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(verifier)
-        .with_single_cert(load_certs(cert)?, load_key(key)?)
+        .with_single_cert(load_certs(cert)?, load_private_key(key)?)
         .context("failed to build TLS server config")?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
@@ -147,7 +205,7 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
 ///
 /// Returns an error when certificate material is missing, malformed, or inconsistent.
 pub fn client_connector(cert: &Path, key: &Path, server_ca: &Path) -> Result<TlsConnector> {
-    client_connector_with_private_key(cert, load_key(key)?, server_ca)
+    client_connector_with_private_key(cert, load_private_key(key)?, server_ca)
 }
 
 /// Builds a mutual-TLS client connector from an already decrypted private key.
@@ -204,7 +262,7 @@ pub fn identity_client_connector(
     key: &Path,
     server_ca: &Path,
 ) -> Result<TlsConnector> {
-    identity_client_connector_with_private_key(cert, load_key(key)?, server_ca)
+    identity_client_connector_with_private_key(cert, load_private_key(key)?, server_ca)
 }
 
 /// Returns the fixed SNI placeholder used by identity-verified connectors.

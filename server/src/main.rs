@@ -5,11 +5,8 @@ use std::{
     fs,
     io::{self, IsTerminal},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,28 +17,27 @@ use aws_lc_rs::{
 use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
-    authorization::{TravelAuthorizationSnapshot, unix_time_secs},
+    authorization::{TravelAuthorizationSnapshot, load_json, store_json_atomic, unix_time_secs},
     config::load_toml,
     deployment::{
         CONTROL_SNAPSHOT_OBJECT_TYPE, CONTROL_SNAPSHOT_VERSION, ControlSnapshotPayload,
         DeploymentTrust, MAX_CONTROL_SNAPSHOT_TTL_SECS, SignedControlSnapshot,
-        SignedDeploymentTrust, control_signing_key_from_pkcs8,
+        SignedDeploymentTrust, control_signing_key_from_pkcs8, validate_catalog,
     },
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{Catalog, ControlMessage, HomeCatalog, RelayDirectory, RelayEndpoint, Role},
     route::{RouteSide, read_preface, verify_preface},
     tls::{
-        identity_client_connector, identity_server_name, peer_identity, require_peer,
-        server_acceptor,
+        identity_client_connector, identity_server_name, load_private_key, peer_identity,
+        require_peer, server_acceptor,
     },
 };
-use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, mpsc, watch},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{interval, sleep, timeout},
 };
@@ -76,14 +72,18 @@ struct Config {
     deployment_trust: PathBuf,
     control_signing_key: PathBuf,
     homes: Vec<ConfiguredHome>,
-    travel_credentials: PathBuf,
-    travel_revocations: PathBuf,
+    travel_authorization_state: PathBuf,
+    control_generation_state: PathBuf,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
     #[serde(default = "default_work_ttl")]
     work_ttl_secs: u64,
     #[serde(default = "default_max_pending_work")]
     max_pending_work: usize,
+    #[serde(default = "default_max_control_connections")]
+    max_control_connections: usize,
+    #[serde(default = "default_max_data_connections")]
+    max_data_connections: usize,
     #[serde(default = "default_control_snapshot_ttl")]
     control_snapshot_ttl_secs: u64,
 }
@@ -113,6 +113,14 @@ const fn default_max_pending_work() -> usize {
     256
 }
 
+const fn default_max_control_connections() -> usize {
+    256
+}
+
+const fn default_max_data_connections() -> usize {
+    1_024
+}
+
 const fn default_control_snapshot_ttl() -> u64 {
     120
 }
@@ -123,10 +131,18 @@ struct ControlSigner {
     server_id: String,
     signer_epoch: u64,
     signed_trust: SignedDeploymentTrust,
+    root_public_key: String,
     trust: DeploymentTrust,
     key: EcdsaKeyPair,
-    next_generation: AtomicU64,
+    next_generation: StdMutex<u64>,
+    generation_path: PathBuf,
     ttl_secs: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControlGenerationState {
+    next_generation: u64,
 }
 
 impl ControlSigner {
@@ -143,7 +159,7 @@ impl ControlSigner {
         {
             bail!("Server management CA does not match deployment trust");
         }
-        let private_key = PrivateKeyDer::from_pem_file(&config.control_signing_key)
+        let private_key = load_private_key(&config.control_signing_key)
             .context("failed to read Server control signing key")?;
         let key = control_signing_key_from_pkcs8(private_key.secret_der())?;
         let actual_public_key = hex::encode(key.public_key().as_ref());
@@ -160,20 +176,20 @@ impl ControlSigner {
         let [matching_key] = matching_keys.as_slice() else {
             bail!("Server control signing key must match exactly one deployment-trusted epoch");
         };
-        let initial_generation = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock predates the Unix epoch")?
-                .as_nanos(),
-        )
-        .context("system clock is outside the control generation range")?;
+        let generation: ControlGenerationState = load_json(&config.control_generation_state)
+            .context("failed to load persistent Server control generation")?;
+        if generation.next_generation == 0 {
+            bail!("Server control generation must be positive");
+        }
         Ok(Self {
             server_id: config.id.clone(),
             signer_epoch: matching_key.epoch,
             signed_trust,
+            root_public_key: root_public_key.trim().to_owned(),
             trust,
             key,
-            next_generation: AtomicU64::new(initial_generation),
+            next_generation: StdMutex::new(generation.next_generation),
+            generation_path: config.control_generation_state.clone(),
             ttl_secs: config.control_snapshot_ttl_secs,
         })
     }
@@ -186,6 +202,28 @@ impl ControlSigner {
         travel_management_spki_sha256: &str,
     ) -> Result<SignedControlSnapshot> {
         let now = unix_time_secs()?;
+        let current_trust = self.signed_trust.verify(&self.root_public_key, now)?;
+        if current_trust != self.trust {
+            bail!("Server deployment trust changed unexpectedly in memory");
+        }
+        let generation = {
+            let mut next = self
+                .next_generation
+                .lock()
+                .map_err(|_| anyhow!("Server control generation lock is poisoned"))?;
+            let generation = *next;
+            let following = generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Server control generation exhausted"))?;
+            store_json_atomic(
+                &self.generation_path,
+                &ControlGenerationState {
+                    next_generation: following,
+                },
+            )?;
+            *next = following;
+            generation
+        };
         SignedControlSnapshot::sign(
             self.signed_trust.clone(),
             &self.trust,
@@ -197,7 +235,7 @@ impl ControlSigner {
                 signer_epoch: self.signer_epoch,
                 travel_id: travel_id.to_owned(),
                 travel_management_spki_sha256: travel_management_spki_sha256.to_owned(),
-                generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+                generation,
                 issued_at_unix_secs: now,
                 expires_at_unix_secs: now.saturating_add(self.ttl_secs),
                 relay_directory: directory,
@@ -213,8 +251,13 @@ struct PendingWork {
     home_id: String,
     secret: Vec<u8>,
     expires: Instant,
-    home: Option<TcpStream>,
-    relay: Option<TcpStream>,
+    home: Option<BudgetedSocket>,
+    relay: Option<BudgetedSocket>,
+}
+
+struct BudgetedSocket {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct RouteRequestContext {
@@ -462,16 +505,9 @@ async fn main() -> Result<()> {
     let authorization = ServerAuthorization::load(
         control_signer.trust.deployment_id.clone(),
         control_signer.trust.travel_authorities.clone(),
-        config.travel_credentials.clone(),
-        config.travel_revocations.clone(),
+        config.travel_authorization_state.clone(),
     )?;
-    let relay_directory_generation = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock predates the Unix epoch")?
-            .as_nanos(),
-    )
-    .context("system clock is outside the Relay directory generation range")?;
+    let relay_directory_generation = 1;
     let state = Arc::new(State::new(
         authorization,
         relay_directory_generation,
@@ -482,8 +518,18 @@ async fn main() -> Result<()> {
     let data = run_data_listeners(config.clone(), Arc::clone(&state));
     let relay = run_relay_connectors(config.clone(), Arc::clone(&state));
     let cleanup = cleanup_pending(Arc::clone(&state));
-    tokio::try_join!(control, data, relay, cleanup)?;
+    let trust_expiry = monitor_trust_expiry(state.control_signer.trust.not_after_unix_secs);
+    tokio::try_join!(control, data, relay, cleanup, trust_expiry)?;
     Ok(())
+}
+
+async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
+    loop {
+        if unix_time_secs()? >= not_after_unix_secs {
+            bail!("deployment trust expired; refusing to continue");
+        }
+        sleep(Duration::from_secs(30)).await;
+    }
 }
 
 fn validate_config(config: &Config) -> Result<()> {
@@ -497,13 +543,14 @@ fn validate_config(config: &Config) -> Result<()> {
     ServerAuthorization::validate(
         control_signer.trust.deployment_id,
         control_signer.trust.travel_authorities,
-        config.travel_credentials.clone(),
-        config.travel_revocations.clone(),
+        config.travel_authorization_state.clone(),
     )?;
     validate_relays(&config.relays)?;
     if config.handshake_timeout_secs == 0
         || config.work_ttl_secs == 0
         || config.max_pending_work == 0
+        || config.max_control_connections == 0
+        || config.max_data_connections < 2
         || config.control_snapshot_ttl_secs == 0
         || config.control_snapshot_ttl_secs > MAX_CONTROL_SNAPSHOT_TTL_SECS
     {
@@ -580,7 +627,8 @@ async fn run_home_listeners(config: Config, state: Arc<State>) -> Result<()> {
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind home control {address}"))?;
-    run_home_accept_loop(listener, address, acceptor, config, state).await
+    let permits = Arc::new(Semaphore::new(config.max_control_connections));
+    run_home_accept_loop(listener, address, acceptor, config, state, permits).await
 }
 
 async fn run_home_accept_loop(
@@ -589,15 +637,21 @@ async fn run_home_accept_loop(
     acceptor: tokio_rustls::TlsAcceptor,
     config: Config,
     state: Arc<State>,
+    permits: Arc<Semaphore>,
 ) -> Result<()> {
     info!(%address, "home control listener ready");
     loop {
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("home control connection budget closed"))?;
         let (socket, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let state = Arc::clone(&state);
         let config = config.clone();
         let timeout_duration = Duration::from_secs(config.handshake_timeout_secs);
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let stream = timeout(timeout_duration, acceptor.accept(socket))
                     .await
@@ -661,6 +715,10 @@ async fn handle_home(
     if home.home_id != identity.id {
         bail!("catalog home id does not match the authenticated home");
     }
+    validate_catalog(&Catalog {
+        generation: 1,
+        homes: vec![home.clone()],
+    })?;
     let snapshot = state.authorization.read().await.snapshot();
     write_json(
         &mut writer,
@@ -732,6 +790,10 @@ async fn handle_home(
                             if home.home_id != identity.id {
                                 bail!("catalog home id does not match the authenticated home");
                             }
+                            validate_catalog(&Catalog {
+                                generation: 1,
+                                homes: vec![home.clone()],
+                            })?;
                             let _ = state.homes.lock().await.update_catalog(home, session_id);
                         }
                         ControlMessage::Heartbeat { nonce } => {
@@ -1215,9 +1277,11 @@ async fn run_data_listeners(config: Config, state: Arc<State>) -> Result<()> {
         listeners.push((address.clone(), listener));
     }
     let mut tasks = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(config.max_data_connections));
     for (address, listener) in listeners {
         let state = Arc::clone(&state);
-        tasks.spawn(async move { run_data_accept_loop(listener, address, state).await });
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move { run_data_accept_loop(listener, address, state, permits).await });
     }
     while let Some(result) = tasks.join_next().await {
         result??;
@@ -1229,14 +1293,26 @@ async fn run_data_accept_loop(
     listener: TcpListener,
     address: String,
     state: Arc<State>,
+    permits: Arc<Semaphore>,
 ) -> Result<()> {
     info!(%address, "data pairing listener ready");
     loop {
-        let (mut socket, peer) = listener.accept().await?;
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("data connection budget closed"))?;
+        let (socket, peer) = listener.accept().await?;
+        let mut socket = BudgetedSocket {
+            stream: socket,
+            _permit: permit,
+        };
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let result = async {
-                let (preface, mac) = timeout(Duration::from_secs(10), read_preface(&mut socket))
+                let (preface, mac) = timeout(
+                    Duration::from_secs(10),
+                    read_preface(&mut socket.stream),
+                )
                     .await
                     .context("route preface timed out")??;
                 let pair = {
@@ -1275,7 +1351,7 @@ async fn run_data_accept_loop(
                 if let Some((credential_id, home_id, mut home, mut relay)) = pair {
                     info!(work_id = %preface.id, %credential_id, %home_id, "paired opaque server work sockets");
                     tokio::select! {
-                        result = copy_bidirectional(&mut home, &mut relay) => {
+                        result = copy_bidirectional(&mut home.stream, &mut relay.stream) => {
                             let _ = result?;
                         }
                         () = wait_until_credential_inactive(&state, credential_id) => {
@@ -1422,15 +1498,27 @@ async fn broadcast_authorization(state: &Arc<State>, snapshot: TravelAuthorizati
         snapshot: snapshot.clone(),
     };
     let relays = state.relay_txs.lock().await.clone();
+    let mut publishes = JoinSet::new();
     for (relay_id, relay) in relays {
-        if relay.send(message.clone()).await.is_err() {
-            warn!(%relay_id, "failed to publish Travel authorization state to Relay");
-        }
+        let message = message.clone();
+        publishes.spawn(async move {
+            let sent = timeout(Duration::from_secs(5), relay.send(message)).await;
+            (format!("Relay {relay_id}"), sent)
+        });
     }
     let homes = state.homes.lock().await.senders();
     for (home_id, home) in homes {
-        if home.send(message.clone()).await.is_err() {
-            warn!(%home_id, "failed to publish Travel authorization state to Home");
+        let message = message.clone();
+        publishes.spawn(async move {
+            let sent = timeout(Duration::from_secs(5), home.send(message)).await;
+            (format!("Home {home_id}"), sent)
+        });
+    }
+    while let Some(result) = publishes.join_next().await {
+        match result {
+            Ok((_node, Ok(Ok(())))) => {}
+            Ok((node, _)) => warn!(%node, "failed to publish Travel authorization state"),
+            Err(error) => warn!(%error, "authorization publication task failed"),
         }
     }
     info!(

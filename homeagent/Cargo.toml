@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+e2e-remote-ui = []
+
 [dependencies]
 anyhow.workspace = true
 aws-lc-rs.workspace = true
@@ -29,3 +32,4 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"
+toml.workspace = true

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,19 +16,19 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
-    time::{Instant, interval, sleep, sleep_until},
+    time::{Instant, interval, sleep, sleep_until, timeout},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{AppState, BusinessCarrier, Mapping, open_business_on, relay_candidates};
 
-#[derive(Clone)]
 struct Segment {
     offset: u64,
     bytes: Vec<u8>,
+    _credit: OwnedSemaphorePermit,
 }
 
 struct CarrierHandle {
@@ -37,11 +38,28 @@ struct CarrierHandle {
 }
 
 enum FlowEvent {
-    LocalData(Vec<u8>),
+    LocalData {
+        bytes: Vec<u8>,
+        credit: OwnedSemaphorePermit,
+    },
     LocalEof,
     LocalError(String),
-    CarrierFrame { carrier_id: Uuid, frame: DataFrame },
-    CarrierClosed { carrier_id: Uuid, reason: String },
+    CarrierFrame {
+        carrier_id: Uuid,
+        frame: DataFrame,
+    },
+    CarrierClosed {
+        carrier_id: Uuid,
+        reason: String,
+    },
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct TransferState {
@@ -56,6 +74,7 @@ struct TransferState {
     local_eof: bool,
     local_fin_acked: bool,
     remote_eof: bool,
+    io_timeout: Duration,
 }
 
 pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<()> {
@@ -84,8 +103,13 @@ async fn run_inner(
 ) -> Result<()> {
     local.set_nodelay(true)?;
     let (local_reader, local_writer) = local.into_split();
-    let (events_tx, mut events) = mpsc::channel(512);
-    spawn_local_reader(local_reader, events_tx.clone());
+    let (events_tx, mut events) = mpsc::channel(32);
+    let send_credit = Arc::new(Semaphore::new(state.config.max_unacked_bytes));
+    let _local_reader = AbortOnDrop(spawn_local_reader(
+        local_reader,
+        events_tx.clone(),
+        send_credit,
+    ));
 
     let mut transfer = TransferState {
         flow_id,
@@ -99,6 +123,7 @@ async fn run_inner(
         local_eof: false,
         local_fin_acked: false,
         remote_eof: false,
+        io_timeout: Duration::from_secs(state.config.carrier_timeout_secs),
     };
     let mut carriers = HashMap::<Uuid, CarrierHandle>::new();
     let mut active = None;
@@ -265,7 +290,11 @@ async fn perform_race(
         had_active_carrier = old_active.is_some(),
         "travel started carrier race"
     );
-    for relay in candidates {
+    let available_slots = state
+        .config
+        .max_carriers_per_flow
+        .saturating_sub(usize::from(old_active.is_some()));
+    for relay in candidates.into_iter().take(available_slots) {
         if relay
             .expected_id
             .as_deref()
@@ -275,6 +304,10 @@ async fn perform_race(
         }
         let relay_label = relay.label().to_owned();
         let state = state.clone();
+        let Ok(carrier_permit) = Arc::clone(&state.carrier_permits).try_acquire_owned() else {
+            warn!(%flow_id, "travel active-Carrier limit reached during race");
+            break;
+        };
         let home_id = mapping.home_id.clone();
         let service_id = mapping.service_id.clone();
         opens.spawn(async move {
@@ -289,7 +322,7 @@ async fn perform_race(
                 &home_id,
             )
             .await;
-            (relay_label, result)
+            (relay_label, carrier_permit, result)
         });
     }
     if let Some(carrier_id) = old_active {
@@ -321,7 +354,7 @@ async fn perform_race(
             opened = opens.join_next(), if !opens.is_empty() => {
                 if let Some(result) = opened {
                     match result? {
-                        (_, Ok(carrier)) => {
+                        (_, carrier_permit, Ok(carrier)) => {
                             let relay_id = carrier.relay_id.clone();
                             if carrier.home_receive_offset > transfer.send_offset {
                                 bail!("Home acknowledged unsent Travel data");
@@ -350,6 +383,7 @@ async fn perform_race(
                                 events_tx.clone(),
                                 Duration::from_secs(state.config.carrier_heartbeat_secs),
                                 Duration::from_secs(state.config.carrier_timeout_secs),
+                                carrier_permit,
                             );
                             carriers.insert(carrier_id, handle);
                             candidate_ids.insert(carrier_id);
@@ -364,7 +398,7 @@ async fn perform_race(
                             )
                             .await;
                         }
-                        (relay_id, Err(error)) => {
+                        (relay_id, _carrier_permit, Err(error)) => {
                             warn!(%flow_id, %relay_id, %error, "carrier race attempt failed");
                         }
                     }
@@ -466,13 +500,14 @@ async fn handle_event(
     ignored_race: Option<Uuid>,
 ) -> Result<bool> {
     match event {
-        FlowEvent::LocalData(bytes) => {
+        FlowEvent::LocalData { bytes, credit } => {
             if transfer.unacked_bytes.saturating_add(bytes.len()) > transfer.max_unacked_bytes {
                 bail!("travel unacknowledged-data limit reached");
             }
             let segment = Segment {
                 offset: transfer.send_offset,
                 bytes,
+                _credit: credit,
             };
             transfer.send_offset = transfer
                 .send_offset
@@ -547,7 +582,9 @@ async fn handle_event(
             } if flow_id == transfer.flow_id && bytes.len() <= MAX_DATA_PAYLOAD => {
                 let end = offset.saturating_add(bytes.len() as u64);
                 if offset == transfer.receive_offset {
-                    transfer.local_writer.write_all(&bytes).await?;
+                    timeout(transfer.io_timeout, transfer.local_writer.write_all(&bytes))
+                        .await
+                        .map_err(|_| anyhow!("local TCP write timed out"))??;
                     transfer.receive_offset = end;
                     debug!(event = "tcp_data_accepted", flow_id = %transfer.flow_id, %carrier_id, offset, next_offset = transfer.receive_offset, bytes = bytes.len(), "accepted Home-to-Travel TCP data");
                     send_to(
@@ -601,7 +638,9 @@ async fn handle_event(
                 final_offset,
             } if flow_id == transfer.flow_id && final_offset == transfer.receive_offset => {
                 if !transfer.remote_eof {
-                    transfer.local_writer.shutdown().await?;
+                    timeout(transfer.io_timeout, transfer.local_writer.shutdown())
+                        .await
+                        .map_err(|_| anyhow!("local TCP shutdown timed out"))??;
                     transfer.remote_eof = true;
                 }
                 send_to(
@@ -633,7 +672,11 @@ async fn handle_event(
     Ok(false)
 }
 
-fn spawn_local_reader(mut reader: OwnedReadHalf, events: mpsc::Sender<FlowEvent>) {
+fn spawn_local_reader(
+    mut reader: OwnedReadHalf,
+    events: mpsc::Sender<FlowEvent>,
+    send_credit: Arc<Semaphore>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = vec![0_u8; MAX_DATA_PAYLOAD];
         loop {
@@ -643,8 +686,21 @@ fn spawn_local_reader(mut reader: OwnedReadHalf, events: mpsc::Sender<FlowEvent>
                     return;
                 }
                 Ok(count) => {
+                    let Ok(count_u32) = u32::try_from(count) else {
+                        let _ = events
+                            .send(FlowEvent::LocalError("local read size overflow".to_owned()))
+                            .await;
+                        return;
+                    };
+                    let Ok(credit) = Arc::clone(&send_credit).acquire_many_owned(count_u32).await
+                    else {
+                        return;
+                    };
                     if events
-                        .send(FlowEvent::LocalData(buffer[..count].to_vec()))
+                        .send(FlowEvent::LocalData {
+                            bytes: buffer[..count].to_vec(),
+                            credit,
+                        })
                         .await
                         .is_err()
                     {
@@ -657,7 +713,7 @@ fn spawn_local_reader(mut reader: OwnedReadHalf, events: mpsc::Sender<FlowEvent>
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_carrier(
@@ -666,6 +722,7 @@ fn spawn_carrier(
     events: mpsc::Sender<FlowEvent>,
     heartbeat_period: Duration,
     timeout_period: Duration,
+    carrier_permit: OwnedSemaphorePermit,
 ) -> CarrierHandle {
     let BusinessCarrier {
         carrier_id,
@@ -678,6 +735,7 @@ fn spawn_carrier(
     let (tx, mut outgoing) = mpsc::channel(128);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
+        let _carrier_permit = carrier_permit;
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = JsonFrameReader::new(reader, DATA_FRAME_LIMIT);
         let mut heartbeat = interval(heartbeat_period);

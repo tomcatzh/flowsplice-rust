@@ -10,6 +10,8 @@ management_ca = "/certs/management-ca.crt"
 business_cert = "/certs/home-business.crt"
 business_key = "/certs/home-business.key"
 business_ca = "/certs/business-ca.crt"
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
 server_spki_pins = ["__SERVER_PIN__"]
 travel_authorization_cache = "/state/home-authorization-cache.json"
 handshake_timeout_secs = 10
@@ -21,15 +23,11 @@ max_unacked_bytes = 1048576
 
 [issuer]
 listen = "0.0.0.0:9081"
-deployment_root_public_key = "/certs/deployment-root.pub"
-deployment_trust = "/certs/deployment-trust.json"
-management_ca_cert = "/certs/management-ca.crt"
 management_ca_key = "/issuer/management-ca.key"
-business_ca_cert = "/certs/business-ca.crt"
 business_ca_key = "/issuer/business-ca.key"
 default_valid_days = 365
-allow_remote_listen = true
-admin_token = "flowsplice-e2e-home-issuer-administrator-token"
+test_allow_remote_listen = true
+test_admin_token = "flowsplice-e2e-home-issuer-administrator-token"
 
 [issuer.home_authority]
 id = "home-1-authority"

@@ -185,7 +185,7 @@ fn first_certificate(path: &Path, label: &str) -> Result<CertificateDer<'static>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyUsagePurpose,
@@ -225,6 +225,7 @@ mod tests {
         let key_path = directory.join(format!("{name}-ca.key"));
         fs::write(&certificate_path, certificate.pem())?;
         fs::write(&key_path, key_pair.serialize_pem())?;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
         Ok(TestCa {
             certificate: certificate_path,
             key: key_path,
@@ -257,6 +258,7 @@ mod tests {
         let authority = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let authority_key_path = temporary.path().join("authority.key");
         fs::write(&authority_key_path, authority.serialize_pem())?;
+        fs::set_permissions(&authority_key_path, fs::Permissions::from_mode(0o600))?;
         let authority_key =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &authority.serialize_der())
                 .map_err(|_| anyhow!("failed to load authority fixture"))?;
@@ -388,6 +390,16 @@ mod tests {
         assert!(
             validate_enrollment_response(&spliced_certificate, &root_public_key, now + 2).is_err()
         );
+        let mut appended_certificate = response.clone();
+        appended_certificate
+            .management_certificate_pem
+            .push_str(&appended_certificate.business_certificate_pem);
+        assert!(
+            validate_enrollment_response(&appended_certificate, &root_public_key, now + 2).is_err()
+        );
+        let mut future = response.clone();
+        future.approval.not_before_unix_secs = now + 10_000;
+        assert!(validate_enrollment_response(&future, &root_public_key, now + 2).is_err());
         let mut spliced_request = response.clone();
         let replacement = if spliced_request.approval.request.nonce.starts_with("00") {
             "01"
@@ -417,6 +429,7 @@ mod tests {
         let encrypted = key::generate_encrypted_private_key(b"correct issuer password")?;
         let encrypted_path = temporary.path().join("encrypted-management-ca.key");
         fs::write(&encrypted_path, encrypted.encrypted_pem.as_bytes())?;
+        fs::set_permissions(&encrypted_path, fs::Permissions::from_mode(0o600))?;
         let protected = ProtectedKey {
             path: &encrypted_path,
             password: Some(b"wrong issuer password"),

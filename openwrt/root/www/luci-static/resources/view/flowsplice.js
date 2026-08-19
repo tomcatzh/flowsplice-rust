@@ -172,8 +172,8 @@ return view.extend({
 		addPathOption(s, 'trust', 'deployment_root_public_key', _('Deployment root public key'));
 		addPathOption(s, 'trust', 'deployment_trust', _('Signed deployment trust'));
 		addPathOption(s, 'trust', 'control_signing_key', _('Server control signing key'), _('The deployment root must certify its public key.'));
-		addPathOption(s, 'trust', 'travel_credentials', _('Signed Travel credentials'));
-		addPathOption(s, 'trust', 'travel_revocations', _('Persistent Travel revocations'));
+		addPathOption(s, 'trust', 'travel_authorization_state', _('Travel authorization state'));
+		addPathOption(s, 'trust', 'control_generation_state', _('Control generation state'));
 		o = required(s.taboption('limits', form.Value, 'handshake_timeout_secs', _('Handshake timeout (seconds)')));
 		o.datatype = 'uinteger';
 		o.default = '10';
@@ -186,6 +186,12 @@ return view.extend({
 		o = required(s.taboption('limits', form.Value, 'control_snapshot_ttl_secs', _('Signed control snapshot TTL (seconds)')));
 		o.datatype = 'uinteger';
 		o.default = '120';
+		o = required(s.taboption('limits', form.Value, 'max_control_connections', _('Maximum control connections')));
+		o.datatype = 'uinteger';
+		o.default = '256';
+		o = required(s.taboption('limits', form.Value, 'max_data_connections', _('Maximum data connections')));
+		o.datatype = 'uinteger';
+		o.default = '1024';
 
 		s = m.section(form.GridSection, 'home', _('Trusted Home Agents'),
 			_('Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home.'));
@@ -222,7 +228,7 @@ return view.extend({
 		});
 		o = required(s.option(form.Value, 'travel_authorization_cache', _('Persistent revocation cache')));
 		o.modalonly = true;
-		[ [ 'handshake_timeout_secs', _('Handshake timeout'), '10' ], [ 'route_ttl_secs', _('Route TTL'), '15' ], [ 'max_pending_routes', _('Maximum pending routes'), '256' ] ].forEach(function(item) {
+		[ [ 'handshake_timeout_secs', _('Handshake timeout'), '10' ], [ 'route_ttl_secs', _('Route TTL'), '15' ], [ 'max_pending_routes', _('Maximum pending routes'), '256' ], [ 'max_management_connections', _('Maximum management connections'), '1024' ], [ 'max_data_connections', _('Maximum data connections'), '2048' ] ].forEach(function(item) {
 			var limitOption = required(s.option(form.Value, item[0], item[1]));
 			limitOption.datatype = 'uinteger';
 			limitOption.default = item[2];

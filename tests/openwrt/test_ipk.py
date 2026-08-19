@@ -94,11 +94,11 @@ class IpkBuilderTest(unittest.TestCase):
                 self.assertEqual(data.getmember("./etc/config/flowsplice").mode, 0o644)
                 packaged_config = open_member(data, "./etc/config/flowsplice").decode()
                 self.assertIn(
-                    "option travel_credentials '/etc/flowsplice/state/travel-credentials.json'",
+                    "option travel_authorization_state '/etc/flowsplice/state/server-authorization.json'",
                     packaged_config,
                 )
                 self.assertNotIn(
-                    "option travel_credentials '/etc/flowsplice/travel-credentials.json'",
+                    "option travel_authorization_state '/etc/flowsplice/travel-credentials.json'",
                     packaged_config,
                 )
                 self.assertNotIn("option admin_socket", packaged_config)

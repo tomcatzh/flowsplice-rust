@@ -107,8 +107,11 @@ msgstr ""
 msgid "Pending work TTL (seconds)"
 msgstr "待处理任务有效期（秒）"
 
-msgid "Persistent Travel revocations"
-msgstr "持久化旅行端撤销记录"
+msgid "Travel authorization state"
+msgstr "旅行端授权状态"
+
+msgid "Control generation state"
+msgstr "控制快照代次状态"
 
 msgid "Persistent revocation cache"
 msgstr "持久化撤销缓存"
@@ -156,8 +159,14 @@ msgstr "服务端数据地址"
 msgid "Service action failed"
 msgstr "服务操作失败"
 
-msgid "Signed Travel credentials"
-msgstr "已签名的旅行端凭据"
+msgid "Maximum control connections"
+msgstr "最大控制连接数"
+
+msgid "Maximum data connections"
+msgstr "最大数据连接数"
+
+msgid "Maximum management connections"
+msgstr "最大管理连接数"
 
 msgid "Start"
 msgstr "启动"

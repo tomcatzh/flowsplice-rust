@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
+use aws_lc_rs::{
+    digest,
+    signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -108,12 +111,14 @@ pub struct TravelAuthorizationSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationCache {
     pub generation: u64,
+    pub snapshot_sha256: String,
     pub revoked_credentials: HashSet<Uuid>,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerifiedAuthorization {
     generation: u64,
+    snapshot_sha256: String,
     credentials: HashMap<Uuid, TravelCredential>,
     management_index: HashMap<(String, String), Vec<Uuid>>,
     business_index: HashMap<(String, String), Vec<Uuid>>,
@@ -438,6 +443,12 @@ impl VerifiedAuthorization {
         }
         let mut revoked_credentials = HashSet::new();
         for revocation in &snapshot.revocations {
+            if revocation.revoked_at_unix_secs == 0
+                || revocation.reason.is_empty()
+                || revocation.reason.len() > 256
+            {
+                bail!("Travel revocation has an invalid time or reason");
+            }
             if !credentials.contains_key(&revocation.credential_id) {
                 bail!(
                     "revocation references unknown Travel credential {}",
@@ -451,8 +462,11 @@ impl VerifiedAuthorization {
                 );
             }
         }
+        let snapshot_bytes = serde_json::to_vec(snapshot)
+            .context("failed to encode Travel authorization snapshot")?;
         Ok(Self {
             generation: snapshot.generation,
+            snapshot_sha256: hex::encode(digest::digest(&digest::SHA256, &snapshot_bytes).as_ref()),
             credentials,
             management_index,
             business_index,
@@ -463,6 +477,11 @@ impl VerifiedAuthorization {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[must_use]
+    pub fn snapshot_sha256(&self) -> &str {
+        &self.snapshot_sha256
     }
 
     #[must_use]
@@ -613,6 +632,12 @@ impl AuthorizationCache {
         if authorization.generation() < self.generation {
             bail!("Travel authorization generation rollback detected");
         }
+        if self.generation != 0
+            && authorization.generation() == self.generation
+            && authorization.snapshot_sha256() != self.snapshot_sha256
+        {
+            bail!("Travel authorization content changed without a generation increase");
+        }
         if !self
             .revoked_credentials
             .is_subset(authorization.revoked_credentials())
@@ -621,6 +646,7 @@ impl AuthorizationCache {
         }
         Ok(Self {
             generation: authorization.generation(),
+            snapshot_sha256: authorization.snapshot_sha256().to_owned(),
             revoked_credentials: authorization.revoked_credentials().clone(),
         })
     }
@@ -859,6 +885,21 @@ mod tests {
             "deployment-1",
         )?;
         assert!(cache.accept(&rollback).is_err());
+        let (same_authority, credential, valid) = fixture()?;
+        let same_generation_different_content = VerifiedAuthorization::verify(
+            &TravelAuthorizationSnapshot {
+                generation: 3,
+                credentials: vec![valid],
+                revocations: vec![TravelRevocation {
+                    credential_id: credential.credential_id,
+                    revoked_at_unix_secs: 151,
+                    reason: "different signed state".to_owned(),
+                }],
+            },
+            std::slice::from_ref(&same_authority),
+            "deployment-1",
+        )?;
+        assert!(cache.accept(&same_generation_different_content).is_err());
         Ok(())
     }
 }

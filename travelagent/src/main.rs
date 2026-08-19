@@ -11,11 +11,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use aws_lc_rs::constant_time::verify_slices_are_equal;
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -121,10 +120,12 @@ struct Config {
     business_key: PathBuf,
     business_ca: PathBuf,
     ui_listen: String,
+    #[cfg(feature = "e2e-remote-ui")]
     #[serde(default)]
-    allow_remote_listen: bool,
+    test_allow_remote_listen: bool,
+    #[cfg(feature = "e2e-remote-ui")]
     #[serde(default)]
-    admin_token: Option<String>,
+    test_admin_token: Option<String>,
     mappings: Vec<Mapping>,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
@@ -132,6 +133,10 @@ struct Config {
     udp_idle_secs: u64,
     #[serde(default = "default_max_active_flows")]
     max_active_flows: usize,
+    #[serde(default = "default_max_active_carriers")]
+    max_active_carriers: usize,
+    #[serde(default = "default_max_carriers_per_flow")]
+    max_carriers_per_flow: usize,
     #[serde(default = "default_carrier_heartbeat")]
     carrier_heartbeat_secs: u64,
     #[serde(default = "default_carrier_timeout")]
@@ -191,6 +196,14 @@ const fn default_udp_idle() -> u64 {
 
 const fn default_max_active_flows() -> usize {
     128
+}
+
+const fn default_max_active_carriers() -> usize {
+    512
+}
+
+const fn default_max_carriers_per_flow() -> usize {
+    16
 }
 
 const fn default_carrier_heartbeat() -> u64 {
@@ -319,8 +332,10 @@ struct AppState {
     started: Instant,
     active_flows: Arc<std::sync::atomic::AtomicUsize>,
     permits: Arc<Semaphore>,
+    carrier_permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
     key_operation: Arc<Mutex<()>>,
+    sensitive_operation: Arc<Semaphore>,
     deployment_root_public_key: Arc<String>,
     deployment_trust: Arc<RwLock<DeploymentTrust>>,
     management_spki_sha256: Arc<String>,
@@ -417,6 +432,7 @@ async fn main() -> Result<()> {
         )?,
     });
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
+    let carrier_permits = Arc::new(Semaphore::new(config.max_active_carriers));
     let state = AppState {
         config: Arc::new(config),
         session_id: Uuid::new_v4(),
@@ -438,8 +454,10 @@ async fn main() -> Result<()> {
         started: Instant::now(),
         active_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         permits,
+        carrier_permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
         key_operation: Arc::new(Mutex::new(())),
+        sensitive_operation: Arc::new(Semaphore::new(1)),
         deployment_root_public_key: Arc::new(deployment_root_public_key),
         deployment_trust: Arc::new(RwLock::new(deployment_trust)),
         management_spki_sha256: Arc::new(management_identity.spki_sha256),
@@ -450,6 +468,7 @@ async fn main() -> Result<()> {
     let mut tasks = JoinSet::new();
     tasks.spawn(run_catalog_subscription(state.clone()));
     tasks.spawn(run_ui(state.clone()));
+    tasks.spawn(monitor_trust_expiry(state.clone()));
     for mapping in state.config.mappings.clone() {
         let state = state.clone();
         match mapping.protocol {
@@ -461,6 +480,15 @@ async fn main() -> Result<()> {
         result??;
     }
     Ok(())
+}
+
+async fn monitor_trust_expiry(state: AppState) -> Result<()> {
+    loop {
+        if unix_time_secs()? >= state.deployment_trust.read().await.not_after_unix_secs {
+            bail!("deployment trust expired; refusing to continue");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 fn run_command(command: Command) -> Result<()> {
@@ -755,20 +783,19 @@ fn validate_config(config: &Config) -> Result<()> {
         || config.carrier_reevaluate_secs == 0
         || config.max_carrier_reevaluate_secs < config.carrier_reevaluate_secs
         || config.max_unacked_bytes < MAX_DATA_PAYLOAD
+        || config.max_unacked_bytes > u32::MAX as usize
+        || config.max_active_flows == 0
+        || config.max_active_carriers == 0
+        || config.max_carriers_per_flow == 0
+        || config.max_carriers_per_flow > config.max_active_carriers
     {
         bail!("carrier timeout, reevaluation, or unacknowledged-data limits are invalid");
     }
     let ui_addr: SocketAddr = config.ui_listen.parse().context("invalid ui_listen")?;
-    if !config.allow_remote_listen && !ui_addr.ip().is_loopback() {
-        bail!("ui_listen must be loopback unless allow_remote_listen is true");
-    }
-    if !ui_addr.ip().is_loopback()
-        && config
-            .admin_token
-            .as_deref()
-            .is_none_or(|token| token.len() < 32)
+    if ui_addr != SocketAddr::from(([127, 0, 0, 1], ui_addr.port()))
+        && !test_remote_ui_enabled(config)
     {
-        bail!("a non-loopback UI requires admin_token with at least 32 characters");
+        bail!("Travel UI must listen directly on 127.0.0.1");
     }
     let mut services = HashSet::new();
     let mut binds = HashSet::new();
@@ -777,8 +804,8 @@ fn validate_config(config: &Config) -> Result<()> {
             bail!("every mapping must name a configured Home and a non-empty service");
         }
         let bind: SocketAddr = mapping.bind.parse().context("invalid mapping bind")?;
-        if !config.allow_remote_listen && !bind.ip().is_loopback() {
-            bail!("mapping binds must be loopback unless allow_remote_listen is true");
+        if bind.ip() != std::net::Ipv4Addr::LOCALHOST && !test_remote_ui_enabled(config) {
+            bail!("Travel mapping listeners must bind directly to 127.0.0.1");
         }
         if !services.insert((&mapping.home_id, &mapping.service_id, mapping.protocol)) {
             bail!("mapping Home/service/protocol tuples must be unique");
@@ -788,6 +815,20 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "e2e-remote-ui")]
+fn test_remote_ui_enabled(config: &Config) -> bool {
+    config.test_allow_remote_listen
+        && config
+            .test_admin_token
+            .as_deref()
+            .is_some_and(|token| token.len() >= 32)
+}
+
+#[cfg(not(feature = "e2e-remote-ui"))]
+const fn test_remote_ui_enabled(_config: &Config) -> bool {
+    false
 }
 
 fn configured_home_ids(homes: &[ConfiguredHome]) -> Result<HashSet<&str>> {
@@ -1029,13 +1070,17 @@ async fn open_business_on(
     .await
     .context("relay data connection timed out")??;
     socket.set_nodelay(true)?;
-    write_preface(
-        &mut socket,
-        RouteSide::Travel,
-        grant.route_id,
-        &grant.route_secret,
+    timeout(
+        Duration::from_secs(config.handshake_timeout_secs),
+        write_preface(
+            &mut socket,
+            RouteSide::Travel,
+            grant.route_id,
+            &grant.route_secret,
+        ),
     )
-    .await?;
+    .await
+    .context("relay data preface timed out")??;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         state
@@ -1429,6 +1474,9 @@ async fn rotate_travel_private_key_password(
     {
         bail!("password rotation is unavailable for unencrypted test Travel keys");
     }
+    let _sensitive_permit = Arc::clone(&state.sensitive_operation)
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("another sensitive Travel operation is already running"))?;
     let current_password = Zeroizing::new(request.current_password);
     let new_password = Zeroizing::new(request.new_password);
     if new_password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
@@ -1456,9 +1504,8 @@ fn travel_password_rotation_is_local(config: &Config) -> bool {
     config
         .ui_listen
         .parse::<SocketAddr>()
-        .is_ok_and(|address| address.ip().is_loopback())
-        || std::env::var("FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY").as_deref()
-            == Ok("1")
+        .is_ok_and(|address| address.ip() == std::net::Ipv4Addr::LOCALHOST)
+        || test_remote_ui_enabled(config)
 }
 
 fn api_error(error: impl Into<anyhow::Error>) -> (StatusCode, Json<ApiError>) {
@@ -1476,33 +1523,64 @@ async fn serve_spa(request: Request) -> Response {
 }
 
 async fn authorize_ui(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let is_loopback = state
-        .config
-        .ui_listen
-        .parse::<SocketAddr>()
-        .is_ok_and(|address| address.ip().is_loopback());
-    if is_loopback {
+    if local_ui_request_allowed(&request, &state.config.ui_listen) {
         return next.run(request).await;
     }
-    let expected = state.config.admin_token.as_deref().unwrap_or_default();
-    let authorized = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| {
-            verify_slices_are_equal(token.as_bytes(), expected.as_bytes()).is_ok()
-        });
-    if authorized {
-        next.run(request).await
-    } else {
-        let mut response = StatusCode::UNAUTHORIZED.into_response();
-        response.headers_mut().insert(
-            axum::http::header::WWW_AUTHENTICATE,
-            axum::http::HeaderValue::from_static("Bearer"),
-        );
-        response
+    #[cfg(feature = "e2e-remote-ui")]
+    if test_remote_ui_enabled(&state.config) {
+        use aws_lc_rs::constant_time::verify_slices_are_equal;
+        let expected = state.config.test_admin_token.as_deref().unwrap_or_default();
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| {
+                verify_slices_are_equal(token.as_bytes(), expected.as_bytes()).is_ok()
+            });
+        if authorized {
+            return next.run(request).await;
+        }
     }
+    StatusCode::FORBIDDEN.into_response()
+}
+
+fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
+    let Ok(address) = listen.parse::<SocketAddr>() else {
+        return false;
+    };
+    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
+        return false;
+    }
+    let authority = address.to_string();
+    if request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        != Some(authority.as_str())
+    {
+        return false;
+    }
+    if let Some(site) = request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        && !matches!(site, "same-origin" | "none")
+    {
+        return false;
+    }
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        let expected = format!("http://{authority}");
+        if request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            != Some(expected.as_str())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 struct FlowGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -1524,6 +1602,7 @@ impl Drop for FlowGuard {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::Body, extract::Request, http::Method};
     use flowsplice_core::{
         authorization::TrustedTravelAuthority,
         deployment::{
@@ -1534,9 +1613,41 @@ mod tests {
 
     use super::{
         ConfiguredHome, ControlTrustState, configured_home_ids, configured_homes_are_trusted,
-        require_authenticated_relay_in_snapshot, require_control_snapshot_subject,
-        trusted_home_business_pins,
+        local_ui_request_allowed, require_authenticated_relay_in_snapshot,
+        require_control_snapshot_subject, trusted_home_business_pins,
     };
+
+    #[test]
+    fn travel_ui_requires_exact_loopback_host_and_origin() -> anyhow::Result<()> {
+        let get = Request::builder()
+            .uri("http://127.0.0.1:9080/")
+            .header("host", "127.0.0.1:9080")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&get, "127.0.0.1:9080"));
+
+        let bad_site = Request::builder()
+            .uri("http://127.0.0.1:9080/")
+            .header("host", "127.0.0.1:9080")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&bad_site, "127.0.0.1:9080"));
+
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("http://127.0.0.1:9080/api/keys/password")
+            .header("host", "127.0.0.1:9080")
+            .header("origin", "http://127.0.0.1:9080")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&post, "127.0.0.1:9080"));
+
+        let missing_origin = Request::builder()
+            .method(Method::POST)
+            .uri("http://127.0.0.1:9080/api/keys/password")
+            .header("host", "127.0.0.1:9080")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&missing_origin, "127.0.0.1:9080"));
+        Ok(())
+    }
 
     fn verified(trust_generation: u64, generation: u64, digest: &str) -> VerifiedControlSnapshot {
         VerifiedControlSnapshot {

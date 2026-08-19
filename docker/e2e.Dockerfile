@@ -30,6 +30,7 @@ COPY tests/fixtures/echo/ tests/fixtures/echo/
 COPY --from=travel-web /src/travelagent/web/dist/ travelagent/web/dist/
 COPY --from=home-web /src/homeagent/web/dist/ homeagent/web/dist/
 RUN cargo build --release \
+    --features flowsplice-homeagent/e2e-remote-ui,flowsplice-travelagent/e2e-remote-ui \
     -p flowsplice-server \
     -p flowsplice-relay \
     -p flowsplice-homeagent \

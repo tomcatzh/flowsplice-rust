@@ -7,12 +7,14 @@ management_ca = "/etc/flowsplice/management-ca.crt"
 deployment_root_public_key = "/etc/flowsplice/deployment-root.pub"
 deployment_trust = "/etc/flowsplice/deployment-trust.json"
 control_signing_key = "/etc/flowsplice/server-control.key"
-travel_credentials = "/etc/flowsplice/travel-credentials.json"
-travel_revocations = "/var/lib/flowsplice/travel-revocations.json"
+travel_authorization_state = "/var/lib/flowsplice/server-authorization.json"
+control_generation_state = "/var/lib/flowsplice/server-control-generation.json"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 max_pending_work = 256
 control_snapshot_ttl_secs = 120
+max_control_connections = 256
+max_data_connections = 1024
 
 [[homes]]
 id = "home-1"
