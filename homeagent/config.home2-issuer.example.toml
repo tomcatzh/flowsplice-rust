@@ -1,0 +1,44 @@
+id = "home-2"
+alias = "Second Home Issuer"
+server_control_addr = "REPLACE_SERVER_HOST:7443"
+server_name = "REPLACE_SERVER_TLS_NAME"
+server_id = "server-1"
+management_cert = "__HOME2_ROOT__/cert/home2-management.crt"
+management_key = "__HOME2_ROOT__/cert/home2-management.key"
+management_ca = "__HOME2_ROOT__/cert/management-ca.crt"
+business_cert = "__HOME2_ROOT__/cert/home2-business.crt"
+business_key = "__HOME2_ROOT__/cert/home2-business.key"
+business_ca = "__HOME2_ROOT__/cert/business-ca.crt"
+deployment_root_public_key = "__HOME2_ROOT__/cert/deployment-root.pub"
+deployment_trust = "__HOME2_ROOT__/cert/deployment-trust.json"
+server_spki_pins = ["REPLACE_WITH_SERVER_SPKI_SHA256_HEX"]
+travel_authorization_cache = "__HOME2_ROOT__/state/authorization-cache.json"
+state_store = "__HOME2_ROOT__/state/home2-state.redb"
+ui_listen = "127.0.0.1:9082"
+handshake_timeout_secs = 10
+udp_idle_secs = 60
+max_active_flows = 128
+carrier_heartbeat_secs = 5
+carrier_timeout_secs = 30
+flow_detach_timeout_secs = 120
+max_unacked_bytes = 1048576
+max_active_carriers = 512
+max_carriers_per_flow = 16
+
+# This profile requires an explicit production CA-custody decision. It deliberately
+# has no global authority: Home 2 may approve only its own Home or one of its services.
+[issuer]
+management_ca_key = "__HOME2_ROOT__/issuer/management-ca.key"
+business_ca_key = "__HOME2_ROOT__/issuer/business-ca.key"
+default_valid_days = 365
+
+[issuer.home_authority]
+id = "home-2-authority"
+private_key = "__HOME2_ROOT__/issuer/home2-authority.key"
+
+# Repeat this block for every business published by Home 2.
+[[services]]
+id = "foobar"
+alias = "Home 2 Foobar"
+protocol = "tcp"
+target = "127.0.0.1:10090"

@@ -222,6 +222,10 @@ before using any Relay for business.
 For a detailed Chinese walkthrough, including recovery and replacement enrollment, see
 [Travel Quick Start (简体中文)](docs/QUICK_START.zh-CN.md).
 
+For a separate macOS arm64 Home 2, including serving-only and explicitly authorized issuer profiles,
+control-plane prerequisites, installation, launchd, and acceptance checks, see
+[Second Home macOS Quick Start (简体中文)](docs/HOME2_QUICK_START.zh-CN.md).
+
 ### Test, rotate, replace, and revoke
 
 For a Foobar mapping on `127.0.0.1:10080`:
@@ -320,6 +324,12 @@ The script uses the lockfile and produces:
 - `dist/linux-amd64/` — static PIE, musl;
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
+
+`make home2-macos-package` builds and verifies the dedicated
+`dist/macos-arm64/flowsplice-home2-0.2.0-macos-arm64.tar.gz` bundle. It contains the same HomeAgent
+binary used by every Home plus separate serving-only and issuer configuration templates, a launchd
+template, the Chinese Quick Start, and internal SHA-256 checksums. It contains no certificate,
+private key, password, production address, or Server SPKI.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc
