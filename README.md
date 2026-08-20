@@ -181,7 +181,7 @@ flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel \
-  --tcp ssh=127.0.0.1:10022
+  --tcp foobar=127.0.0.1:10080
 ```
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
@@ -189,12 +189,12 @@ two encrypted private keys locally, contacts the embedded bootstrap Relays using
 CA, and prints a short Home verification code. The command remains running while it retries and
 waits for attended Home approval.
 
-On the Home machine, open the issuer page at its loopback `ui_listen` address (normally
-`http://127.0.0.1:9081`). If the Home is remote, reach that loopback page through an authenticated
-administrative tunnel; never publish the issuer HTTP listener on the WAN. Open the pending Travel
-request, compare the verification code with Travel, choose the narrowest scope and validity, click
-approve, and enter the Home issuer password. This password is used only on Home and is never sent to
-Travel, Relay, or Server.
+Leave `enroll-remote` running on the Travel machine. On the separate machine that runs Home, open the
+issuer page locally at its loopback `ui_listen` address (normally `http://127.0.0.1:9081`). Open the
+pending Travel request, compare the verification code, choose the narrowest scope and validity,
+click approve, and enter the Home issuer password. No SSH tunnel or remote Home-page access is part
+of this workflow. The request and response continue through Relay and Server control connections;
+the password is used only on Home and is never sent to Travel, Relay, or Server.
 
 After approval, the waiting Travel verifies and installs the returned trust, dual certificates, and
 credential, then atomically creates:

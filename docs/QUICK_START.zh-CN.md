@@ -15,7 +15,7 @@ codesign --verify --strict --verbose=2 ./flowsplice-travelagent
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
 
-选择一个全新的 Travel ID 和一个空安装目录。下面把 Home 的 `ssh` 业务映射到本机 `127.0.0.1:10022`：
+选择一个全新的 Travel ID 和一个空安装目录。下面把 Home 的 `foobar` 业务映射到 Travel 本机 `127.0.0.1:10080`：
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -23,7 +23,7 @@ mkdir -m 700 ./my-travel
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel \
-  --tcp ssh=127.0.0.1:10022
+  --tcp foobar=127.0.0.1:10080
 ```
 
 命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
@@ -38,19 +38,17 @@ mkdir -m 700 ./my-travel
 
 ## 在 Home 本地批准
 
-Home 签发页面默认是：
+保持 Travel 机器上的 `enroll-remote` 命令运行。它会停在等待状态，并继续通过 Relay 轮询签发结果。
+
+走到 Home 所在的另一台机器，在那台 Home 机器的浏览器中打开本地签发页面：
 
 ```text
 http://127.0.0.1:9081
 ```
 
-这个 HTTP 页面必须保持 loopback-only。若 Home 在远端，通过你已有的安全管理通道把远端 loopback 转到本机，例如：
+这个 HTTP 页面保持 loopback-only，只在 Home 机器本地操作。Travel 与 Home 可以位于不同网络；无需远程打开 Home 页面，无需 SSH 隧道，也无需人工传递 enrollment 文件。
 
-```bash
-ssh -L 9081:127.0.0.1:9081 <user>@<home-host>.zxf.io
-```
-
-然后在本机浏览器打开 `http://127.0.0.1:9081`：
+在 Home 页面中：
 
 1. 打开收到的远程 Travel 请求；
 2. 对比页面与 Travel 终端显示的 verification code；
@@ -64,7 +62,7 @@ Home 签发密码只在 Home 本机解锁签发密钥，不会发送给 Server�
 
 ## 自动安装结果
 
-Home 批准后，等待中的 `enroll-remote` 会验证部署信任、请求/响应绑定、双证书链、Travel 身份、两把公钥、授权范围和有效期，然后创建：
+Home 批准后，签发结果通过 `Home -> Server -> Relay -> Travel` 返回。等待中的 `enroll-remote` 会自动解除等待，验证部署信任、请求/响应绑定、双证书链、Travel 身份、两把公钥、授权范围和有效期，然后创建：
 
 ```text
 my-travel/
@@ -92,7 +90,7 @@ my-travel/
 
 输入刚才设置的 Travel 私钥密码。随后：
 
-- `127.0.0.1:10022` 是上例的本地业务入口；
+- `127.0.0.1:10080` 是上例的本地业务入口；
 - `http://127.0.0.1:9080` 是 Travel 本地页面；
 - 页面可查看当前业务、Relay、五分钟统计和日/周/月/年报表；
 - 启动后 Travel 会向 Home 确认新凭据已经真正启用，双方随后清理 enrollment 生命周期记录。
@@ -116,9 +114,9 @@ id = "home-1"
 
 [[mappings]]
 home_id = "home-1"
-service_id = "ssh"
+service_id = "foobar"
 protocol = "tcp"
-bind = "127.0.0.1:10022"
+bind = "127.0.0.1:10080"
 ```
 
 ## 换发和撤销
