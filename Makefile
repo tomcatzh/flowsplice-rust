@@ -29,5 +29,5 @@ openwrt-ipk:
 		--server dist/linux-arm64/flowsplice-server \
 		--relay dist/linux-arm64/flowsplice-relay \
 		--architecture aarch64_generic \
-		--version 0.1.0 \
+		--version 0.1.1 \
 		--output-dir dist/openwrt

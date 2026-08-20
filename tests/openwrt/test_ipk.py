@@ -46,7 +46,7 @@ class IpkBuilderTest(unittest.TestCase):
                         "--architecture",
                         "aarch64_generic",
                         "--version",
-                        "0.1.0",
+                        "0.1.1",
                         "--output-dir",
                         str(output),
                         "--source-date-epoch",
