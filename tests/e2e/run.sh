@@ -113,7 +113,6 @@ docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
   --travel-id first-remote-e2e \
   --home-id home-1 \
   --install-dir /first-travel \
-  --tcp tcp-echo=0.0.0.0:10080 \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-first-remote-administrator-token \
   --test-password-file /first-travel/test-password.txt \
@@ -172,6 +171,13 @@ if grep -Fq 'flowsplice-e2e-private-key-password' \
   echo 'generated Travel config contains a private-key password' >&2
   exit 1
 fi
+if grep -Eq '^(mappings =|\[\[mappings\]\])' \
+  "${generated_dir}/first-travel/travelagent.toml"; then
+  echo 'first remote enrollment generated an unsolicited business mapping' >&2
+  exit 1
+fi
+printf '\n[[mappings]]\nhome_id = "home-1"\nservice_id = "tcp-echo"\nprotocol = "tcp"\nbind = "0.0.0.0:10080"\n' \
+  >>"${generated_dir}/first-travel/travelagent.toml"
 bootstrap_credential_id="$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["enrollment"]["approval"]["credential_id"])' \
   "${generated_dir}/first-travel/approval.json")"

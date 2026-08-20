@@ -180,8 +180,7 @@ mkdir -m 700 ./my-travel
 flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
-  --install-dir ./my-travel \
-  --tcp foobar=127.0.0.1:10080
+  --install-dir ./my-travel
 ```
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
@@ -212,12 +211,13 @@ generated TOML contains paths and public Relay addresses but no private-key pass
 flowsplice-travelagent --config ./my-travel/travelagent.toml
 ```
 
-Enter the same Travel password. The generated mapping and UI bind loopback addresses. The generated
-TOML is already complete; edit it only to add another Home or mapping, change local loopback ports,
-or tune limits. Do not add Home SPKIs or a full Relay authorization list. TOML Relay entries are
-bootstrap addresses only. Travel durably remembers every Relay learned from a verified signed
-directory, but after restart it still requires a fresh signed directory before using any Relay for
-business.
+Enter the same Travel password. Enrollment does not require a business mapping. The generated TOML
+already contains the identity, trust, Home, Relay bootstrap, local UI, and state paths; add
+`[[mappings]]` afterward for the businesses this Travel should expose, or edit it to add another
+Home, change local loopback ports, or tune limits. Do not add Home SPKIs or a full Relay authorization
+list. TOML Relay entries are bootstrap addresses only. Travel durably remembers every Relay learned
+from a verified signed directory, but after restart it still requires a fresh signed directory
+before using any Relay for business.
 
 For a detailed Chinese walkthrough, including recovery and replacement enrollment, see
 [Travel Quick Start (简体中文)](docs/QUICK_START.zh-CN.md).

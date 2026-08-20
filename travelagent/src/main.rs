@@ -133,10 +133,6 @@ struct EnrollRemoteArgs {
     install_dir: PathBuf,
     #[arg(long = "bootstrap-relay")]
     bootstrap_relays: Vec<String>,
-    #[arg(long = "tcp")]
-    tcp_mappings: Vec<String>,
-    #[arg(long = "udp")]
-    udp_mappings: Vec<String>,
     #[arg(long, default_value = "127.0.0.1:9080")]
     ui_listen: String,
     #[arg(long, default_value_t = 900)]
@@ -172,6 +168,7 @@ struct Config {
     #[cfg(feature = "e2e-remote-ui")]
     #[serde(default)]
     test_admin_token: Option<String>,
+    #[serde(default)]
     mappings: Vec<Mapping>,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
@@ -274,6 +271,7 @@ struct InstalledTravelConfig {
     test_admin_token: Option<String>,
     homes: Vec<InstalledHome>,
     seed_relays: Vec<SeedRelayOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     mappings: Vec<Mapping>,
 }
 
@@ -952,7 +950,6 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
     seed_relays.sort();
     seed_relays.dedup();
 
-    let mappings = build_installed_mappings(&args.home_id, &args.tcp_mappings, &args.udp_mappings)?;
     let state_store_path = install_root.join("state/travel-state.redb");
     let generated = InstalledTravelConfig {
         id: args.travel_id.clone(),
@@ -976,7 +973,7 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             .into_iter()
             .map(|management_addr| SeedRelayOutput { management_addr })
             .collect(),
-        mappings,
+        mappings: Vec::new(),
     };
     let encoded = toml::to_string_pretty(&generated).context("failed to encode Travel config")?;
     let mut config_file = fs::OpenOptions::new()
@@ -1095,29 +1092,6 @@ async fn poll_bootstrap_relay(
                 .map(|response| (response, seed_relays))
         })
         .transpose()
-}
-
-fn build_installed_mappings(home_id: &str, tcp: &[String], udp: &[String]) -> Result<Vec<Mapping>> {
-    let mut mappings = Vec::new();
-    for (protocol, values) in [(ServiceProtocol::Tcp, tcp), (ServiceProtocol::Udp, udp)] {
-        for value in values {
-            let (service_id, bind) = value
-                .split_once('=')
-                .ok_or_else(|| anyhow!("mapping must use service_id=bind_address: {value}"))?;
-            if service_id.is_empty() {
-                bail!("mapping service id must not be empty");
-            }
-            bind.parse::<SocketAddr>()
-                .with_context(|| format!("invalid mapping bind address {bind}"))?;
-            mappings.push(Mapping {
-                home_id: home_id.to_owned(),
-                service_id: service_id.to_owned(),
-                protocol,
-                bind: bind.to_owned(),
-            });
-        }
-    }
-    Ok(mappings)
 }
 
 fn enrollment_sibling(certificate: &Path, file_name: &str) -> PathBuf {

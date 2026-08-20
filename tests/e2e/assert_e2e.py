@@ -1693,6 +1693,7 @@ checks = [
     "remote-enrollment-restart-activation",
     "remote-enrollment-installed-acknowledgement",
     "remote-enrollment-new-identity-restores-business",
+    "remote-enrollment-generates-no-business-mapping",
     "home-two-remote-enrollment-isolation",
     "home-two-remote-enrollment-password-gate",
     "home-two-remote-enrollment-install-acknowledgement",

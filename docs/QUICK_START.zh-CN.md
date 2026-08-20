@@ -15,15 +15,14 @@ codesign --verify --strict --verbose=2 ./flowsplice-travelagent
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
 
-选择一个全新的 Travel ID 和一个空安装目录。下面把 Home 的 `foobar` 业务映射到 Travel 本机 `127.0.0.1:10080`：
+选择一个全新的 Travel ID 和一个空安装目录。首次注册只需要 Travel ID、要申请的 Home ID 和安装目录：
 
 ```bash
 mkdir -m 700 ./my-travel
 ./flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
-  --install-dir ./my-travel \
-  --tcp foobar=127.0.0.1:10080
+  --install-dir ./my-travel
 ```
 
 命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
@@ -90,14 +89,15 @@ my-travel/
 
 输入刚才设置的 Travel 私钥密码。随后：
 
-- `127.0.0.1:10080` 是上例的本地业务入口；
 - `http://127.0.0.1:9080` 是 Travel 本地页面；
 - 页面可查看当前业务、Relay、五分钟统计和日/周/月/年报表；
 - 启动后 Travel 会向 Home 确认新凭据已经真正启用，双方随后清理 enrollment 生命周期记录。
 
 ## TOML 什么时候需要修改
 
-第一次远程注册已经生成完整 TOML。通常只修改以下内容：
+第一次远程注册已经生成身份、信任、Home、Relay bootstrap 和本地状态所需的完整 TOML。首次注册不要求业务映射；获得凭据后，再按实际需要增加 `[[mappings]]`。
+
+通常只修改以下内容：
 
 - 增加 `[[homes]]`；
 - 增加或调整 `[[mappings]]` 的 `home_id`、`service_id`、`protocol` 和本地 `bind`；
@@ -106,7 +106,7 @@ my-travel/
 
 不要把 Home SPKI、完整 Relay 授权名单或密码手工写进 TOML。`[[seed_relays]]` 只是首次取得签名目录的联系地址。Travel 会把历史上从有效签名目录中验证过的 Relay 长期保存在 `travel-state.redb`，以后重启时把它们也当成 bootstrap 候选；旧记录永远不能代替新的 Server 签名目录授权。
 
-一个映射示例：
+例如，注册完成后再增加一个 Foobar TCP 映射：
 
 ```toml
 [[homes]]
