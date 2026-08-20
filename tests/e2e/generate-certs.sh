@@ -11,6 +11,7 @@ offline_dir="${script_dir}/generated/offline"
 offline_home2_dir="${script_dir}/generated/offline-home2"
 root_dir="${script_dir}/generated/deployment-root-offline"
 travel_dir="${script_dir}/generated/travel"
+first_travel_dir="${script_dir}/generated/first-travel"
 if [[ "${mode}" == "enroll-only" ]]; then
   rm -rf "${travel_dir}"
   docker run --rm \
@@ -35,6 +36,7 @@ mkdir -p "${offline_dir}"
 mkdir -p "${offline_home2_dir}"
 mkdir -p "${root_dir}"
 rm -rf "${travel_dir}"
+rm -rf "${first_travel_dir}"
 find "${cert_dir}" -maxdepth 1 -type f -delete
 find "${config_dir}" -maxdepth 1 -type f -delete
 find "${authorization_dir}" -maxdepth 1 -type f -delete

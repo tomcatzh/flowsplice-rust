@@ -9,19 +9,65 @@ h2 { font-size: 1.45rem; letter-spacing: -.03em; }
 .eyebrow { color: #76d6b8; font-size: .7rem; font-weight: 800; letter-spacing: .16em; margin-bottom: 9px; }
 .subtitle { color: #869b94; margin-top: 14px; }
 .local { color: #8aa098; border: 1px solid #25463d; border-radius: 999px; padding: 8px 12px; font-size: .78rem; }
+.page-tabs { display: inline-flex; gap: 4px; margin-top: 24px; padding: 4px; border: 1px solid #25463d; border-radius: 10px; background: #091713; }
+.page-tab { min-width: 88px; padding: 8px 15px; color: #879b94; background: transparent; }
+.page-tab.active { color: #07110e; background: #70d8b6; }
 .notice { min-height: 42px; margin: 22px 0 6px; padding: 11px 14px; border-radius: 9px; color: transparent; }
 .notice.success { color: #b9f1df; background: #123b30; border: 1px solid #296c58; }
 .notice.error { color: #ffc8c2; background: #3e1d1a; border: 1px solid #7e3731; }
 .panel { margin-top: 18px; border: 1px solid #193a31; border-radius: 14px; background: rgba(10, 25, 21, .94); overflow: hidden; }
 .panel-title { padding: 21px 24px; border-bottom: 1px solid #193a31; }
 .panel-title > span { color: #7d918a; font-size: .78rem; }
+.panel-title select { width: auto; min-width: 116px; min-height: 34px; padding: 6px 28px 6px 10px; font-size: .78rem; }
+.issue-summary { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 21px 24px; cursor: pointer; list-style: none; transition: background-color .16s ease; }
+.issue-summary::-webkit-details-marker { display: none; }
+.issue-summary::marker { content: ""; }
+.issue-summary:hover { background: rgba(28, 65, 54, .28); }
+.issue-summary:focus-visible { outline: 2px solid #70d8b6; outline-offset: -3px; }
+.issue-summary-copy { display: grid; }
+.issue-summary-copy .eyebrow { display: block; }
+.issue-summary-title { font-size: 1.45rem; font-weight: 700; letter-spacing: -.03em; }
+.issue-summary-action { display: inline-flex; align-items: center; gap: 10px; color: #8aa098; font-size: .78rem; }
+.issue-summary-open { display: none; }
+.issue-summary-chevron { width: 9px; height: 9px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg) translateY(-2px); transition: transform .16s ease; }
+.issue-panel[open] .issue-summary { border-bottom: 1px solid #193a31; }
+.issue-panel[open] .issue-summary-closed { display: none; }
+.issue-panel[open] .issue-summary-open { display: inline; }
+.issue-panel[open] .issue-summary-chevron { transform: rotate(225deg) translate(-2px, -2px); }
 .scope-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 22px 24px 8px; }
 .scope { position: relative; display: grid; gap: 7px; min-height: 112px; padding: 17px; border: 1px solid #25463d; border-radius: 11px; cursor: pointer; }
 .scope:has(input:checked) { border-color: #63d0ac; background: #102d25; box-shadow: inset 0 0 0 1px #63d0ac; }
 .scope.super { border-color: #5b4a2c; }
 .scope.super:has(input:checked) { border-color: #e0aa4e; background: #2d2514; box-shadow: inset 0 0 0 1px #e0aa4e; }
-.scope input { position: absolute; top: 14px; right: 14px; accent-color: #62d5af; }
-.scope strong { font-size: 1rem; }
+.scope input[type="radio"] {
+  appearance: none;
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #6f817a;
+  border-radius: 50%;
+  background: #0a1714;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.scope input[type="radio"]::after {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #62d5af;
+  content: "";
+  transform: scale(0);
+  transition: transform .12s ease;
+}
+.scope input[type="radio"]:checked::after { transform: scale(1); }
+.scope input[type="radio"]:focus-visible { outline: 2px solid #9af0d4; outline-offset: 3px; }
+.scope strong { padding-right: 28px; font-size: 1rem; }
 .scope small, label small { color: #799087; line-height: 1.45; }
 .form-grid { display: grid; grid-template-columns: 1.4fr 1.2fr .65fr 1.2fr; gap: 16px; padding: 18px 24px 24px; }
 label { display: grid; gap: 8px; color: #acbdb7; font-size: .8rem; }
@@ -35,6 +81,7 @@ button { border: 0; border-radius: 8px; padding: 10px 16px; color: #07110e; back
 button:disabled { opacity: .55; cursor: wait; }
 button.secondary { color: #b7c8c2; background: transparent; border: 1px solid #315249; }
 button.danger { color: #ffb3ac; background: transparent; border: 1px solid #713832; padding: 7px 11px; }
+button.danger-solid { color: #fff1ef; background: #a44238; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; text-align: left; }
 th, td { padding: 15px 24px; border-bottom: 1px solid #142f28; }
@@ -45,12 +92,27 @@ td small { display: block; color: #637a72; margin-top: 4px; font-family: "SFMono
 .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #6c7975; }
 .state.active::before { background: #57d7ad; box-shadow: 0 0 10px #57d7ad; }
 .empty { color: #71867f; text-align: center; padding: 38px; }
+.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 22px 24px 8px; }
+.stat-card { display: grid; gap: 8px; min-height: 112px; padding: 17px; border: 1px solid #25463d; border-radius: 11px; background: #0a1714; }
+.stat-card span { color: #7d918a; font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; }
+.stat-card strong { color: #dff8ef; font-size: 1.45rem; letter-spacing: -.03em; }
+.stat-card small { color: #6f857d; font-size: .72rem; line-height: 1.4; }
+.subheading { padding: 20px 24px 4px; color: #9eb2aa; font-size: .8rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.stats-note { padding: 15px 24px 20px; color: #657c74; font-size: .75rem; line-height: 1.5; }
+.stats-controls { display: flex; align-items: flex-end; gap: 10px; }
+.stats-controls label { min-width: 116px; }
 .maintenance-copy { display: grid; gap: 7px; padding: 18px 24px 22px; color: #82978f; font-size: .8rem; line-height: 1.5; }
 dialog { width: min(520px, calc(100% - 28px)); padding: 0; color: #edf3f1; background: #0a1915; border: 1px solid #315249; border-radius: 15px; box-shadow: 0 28px 90px rgba(0, 0, 0, .58); }
+dialog.wide-dialog { width: min(760px, calc(100% - 28px)); }
 dialog::backdrop { background: rgba(2, 9, 7, .78); backdrop-filter: blur(4px); }
-#password-form { display: grid; gap: 16px; padding: 25px; }
+#password-form, #approval-form, #revoke-form { display: grid; gap: 16px; padding: 25px; }
+.dialog-scope-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.dialog-scope-grid .scope { min-height: 104px; padding: 15px; }
+.dialog-form-grid { display: grid; grid-template-columns: 1.5fr .65fr; gap: 12px; }
 .dialog-title { display: grid; gap: 7px; margin-bottom: 2px; }
 .dialog-title p:last-child { color: #7f958d; font-size: .79rem; line-height: 1.5; }
+.dialog-title code { color: #c8fff0; font-size: .95rem; letter-spacing: .08em; }
+.hidden { display: none !important; }
 .dialog-notice { min-height: 0; color: #ffc8c2; font-size: .8rem; line-height: 1.45; }
 .dialog-notice:not(:empty) { padding: 10px 12px; background: #3e1d1a; border: 1px solid #7e3731; border-radius: 8px; }
 .saved-confirmation { display: flex; grid-template-columns: none; align-items: center; gap: 9px; color: #9fb1ab; }
@@ -59,5 +121,5 @@ dialog::backdrop { background: rgba(2, 9, 7, .78); backdrop-filter: blur(4px); }
 footer { color: #5d746c; font-size: .75rem; margin: 17px 2px; }
 .loading, .fatal { margin-top: 28vh; }
 .fatal p { color: #8da099; margin-top: 16px; }
-@media (max-width: 880px) { .scope-grid, .form-grid { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 620px) { main { width: calc(100% - 24px); padding-top: 28px; } header { align-items: flex-start; } .scope-grid, .form-grid { grid-template-columns: 1fr; } .actions { align-items: stretch; flex-direction: column; } th, td { padding: 13px 15px; } }
+@media (max-width: 880px) { .scope-grid, .form-grid, .stats-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 620px) { main { width: calc(100% - 24px); padding-top: 28px; } header { align-items: flex-start; } .panel-title { align-items: flex-start; flex-direction: column; } .scope-grid, .form-grid, .stats-grid, .dialog-scope-grid, .dialog-form-grid { grid-template-columns: 1fr; } .actions { align-items: stretch; flex-direction: column; } th, td { padding: 13px 15px; } }

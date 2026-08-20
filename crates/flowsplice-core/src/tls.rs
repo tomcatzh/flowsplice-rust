@@ -29,6 +29,7 @@ pub struct PeerIdentity {
     pub id: String,
     pub certificate_sha256: String,
     pub spki_sha256: String,
+    pub signing_public_key: Vec<u8>,
     pub not_before_unix_secs: u64,
     pub not_after_unix_secs: u64,
 }
@@ -113,15 +114,29 @@ fn read_private_key_file(path: &Path) -> Result<Vec<u8>> {
 
 fn load_roots(path: &Path) -> Result<RootCertStore> {
     let certs = load_certs(path)?;
+    roots_from_certificates(certs, &format!("CA file {}", path.display()))
+}
+
+fn roots_from_certificates(
+    certs: Vec<CertificateDer<'static>>,
+    label: &str,
+) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let (added, ignored) = roots.add_parsable_certificates(certs);
     if added == 0 || ignored != 0 {
-        bail!(
-            "CA file {} added {added} certificates and ignored {ignored}",
-            path.display()
-        );
+        bail!("{label} added {added} certificates and ignored {ignored}");
     }
     Ok(roots)
+}
+
+fn roots_from_pem(pem: &str, label: &str) -> Result<RootCertStore> {
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse {label}"))?;
+    if certs.is_empty() {
+        bail!("{label} contains no certificates");
+    }
+    roots_from_certificates(certs, label)
 }
 
 #[derive(Debug)]
@@ -199,6 +214,29 @@ pub fn server_acceptor(cert: &Path, key: &Path, client_ca: &Path) -> Result<TlsA
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Builds a TLS 1.3 server acceptor that verifies presented client certificates but also permits
+/// an anonymous peer. Callers must restrict anonymous peers to a narrowly scoped bootstrap
+/// protocol and reject every authenticated control/data message without an application identity.
+///
+/// # Errors
+///
+/// Returns an error when certificate material is missing, malformed, or inconsistent.
+pub fn optional_client_server_acceptor(
+    cert: &Path,
+    key: &Path,
+    client_ca: &Path,
+) -> Result<TlsAcceptor> {
+    let verifier = WebPkiClientVerifier::builder(Arc::new(load_roots(client_ca)?))
+        .allow_unauthenticated()
+        .build()
+        .context("failed to build optional client certificate verifier")?;
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(load_certs(cert)?, load_private_key(key)?)
+        .context("failed to build optional-client TLS server config")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Builds a mutual-TLS client connector backed by rustls and AWS-LC.
 ///
 /// # Errors
@@ -248,6 +286,31 @@ pub fn identity_client_connector_with_private_key(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(load_certs(cert)?, key)
         .context("failed to build identity-verified TLS client config")?;
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Builds a TLS 1.3 server-authenticated connector from an in-memory public CA certificate.
+///
+/// This connector deliberately sends no client certificate. It is intended only for first-device
+/// enrollment transport, before a Travel identity exists. The application must still validate the
+/// Relay URI role and must cryptographically validate every enrollment response against the
+/// embedded deployment root.
+///
+/// # Errors
+///
+/// Returns an error when the CA certificate is malformed.
+pub fn identity_server_auth_connector_from_ca_pem(ca_pem: &str) -> Result<TlsConnector> {
+    let roots = roots_from_pem(ca_pem, "embedded management CA")?;
+    let signature_algorithms =
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let verifier = CertificateChainVerifier {
+        roots,
+        signature_algorithms,
+    };
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
@@ -329,6 +392,7 @@ pub fn peer_identity(certs: Option<&[CertificateDer<'_>]>) -> Result<PeerIdentit
     let (role, id) =
         identity.ok_or_else(|| anyhow!("peer certificate has no FlowSplice URI SAN"))?;
     let spki = cert.public_key().raw;
+    let signing_public_key = cert.public_key().subject_public_key.data.to_vec();
     let hash = digest::digest(&digest::SHA256, spki);
     let not_before_unix_secs = u64::try_from(cert.validity().not_before.timestamp())
         .context("peer certificate not-before predates the Unix epoch")?;
@@ -339,9 +403,24 @@ pub fn peer_identity(certs: Option<&[CertificateDer<'_>]>) -> Result<PeerIdentit
         id,
         certificate_sha256: hex::encode(digest::digest(&digest::SHA256, leaf.as_ref()).as_ref()),
         spki_sha256: hex::encode(hash.as_ref()),
+        signing_public_key,
         not_before_unix_secs,
         not_after_unix_secs,
     })
+}
+
+/// Extracts a `FlowSplice` identity and signing key from one PEM leaf certificate.
+///
+/// This parses identity material only. Callers must separately bind the exact certificate digest
+/// to an authenticated TLS peer or a deployment-authorized credential.
+///
+/// # Errors
+///
+/// Returns an error when the PEM does not contain one valid `FlowSplice` leaf certificate.
+pub fn identity_from_certificate_pem(pem: &str) -> Result<PeerIdentity> {
+    let certificate = CertificateDer::from_pem_slice(pem.as_bytes())
+        .context("failed to parse statistics signing certificate")?;
+    peer_identity(Some(std::slice::from_ref(&certificate)))
 }
 
 /// Applies the application identity, role, and optional SPKI allowlist checks.
@@ -429,6 +508,7 @@ mod tests {
             id: "home-1".to_owned(),
             certificate_sha256: "cd".repeat(32),
             spki_sha256: "ab".repeat(32),
+            signing_public_key: Vec::new(),
             not_before_unix_secs: 1,
             not_after_unix_secs: u64::MAX,
         };

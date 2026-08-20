@@ -1,8 +1,24 @@
+use aws_lc_rs::digest;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::authorization::{SignedTravelCredential, TravelAuthorizationSnapshot};
 use crate::deployment::SignedControlSnapshot;
+use crate::statistics::SignedStatisticsReport;
+
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+
+/// Returns the short human comparison code for one first-enrollment request and its private
+/// retrieval token. This code is not an authentication secret; it lets the Home operator confirm
+/// that the locally visible request is the one displayed by the new Travel.
+#[must_use]
+pub fn bootstrap_verification_code(request_json: &[u8], retrieval_token: &[u8]) -> String {
+    let mut material = Vec::with_capacity(request_json.len().saturating_add(retrieval_token.len()));
+    material.extend_from_slice(request_json);
+    material.extend_from_slice(retrieval_token);
+    let encoded = hex::encode_upper(digest::digest(&digest::SHA256, &material).as_ref());
+    format!("{}-{}-{}", &encoded[0..4], &encoded[4..8], &encoded[8..12])
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +80,7 @@ pub struct Catalog {
 pub struct RelayEndpoint {
     pub id: String,
     pub management_addr: String,
+    pub data_public_addr: String,
     pub management_spki_sha256: String,
 }
 
@@ -77,10 +94,12 @@ pub struct RelayDirectory {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
     Hello {
+        protocol_version: u32,
         role: Role,
         id: String,
     },
     TravelHello {
+        protocol_version: u32,
         id: String,
         session_id: Uuid,
         purpose: TravelConnectionPurpose,
@@ -136,12 +155,17 @@ pub enum ControlMessage {
         request_id: Uuid,
         reason: String,
     },
-    ServerRouteGrant {
+    ServerRelayGrant {
         request_id: Uuid,
         work_id: Uuid,
         work_secret: Vec<u8>,
         credential_id: Uuid,
         home_id: String,
+        expires_at_unix_secs: u64,
+    },
+    RelayWorkReady {
+        request_id: Uuid,
+        work_id: Uuid,
     },
     RouteGrant {
         request_id: Uuid,
@@ -153,10 +177,13 @@ pub enum ControlMessage {
         request_id: Uuid,
         reason: String,
     },
-    OpenWork {
+    OpenRelayWork {
         work_id: Uuid,
         work_secret: Vec<u8>,
         credential_id: Uuid,
+        relay_id: String,
+        relay_data_addr: String,
+        expires_at_unix_secs: u64,
     },
     TravelAuthorizationSnapshot {
         snapshot: TravelAuthorizationSnapshot,
@@ -183,6 +210,62 @@ pub enum ControlMessage {
         request_id: Uuid,
         accepted: bool,
         generation: u64,
+        error: Option<String>,
+    },
+    StatisticsReport {
+        report: SignedStatisticsReport,
+    },
+    StatisticsReportAck {
+        digest_sha256: String,
+        accepted: bool,
+        error: Option<String>,
+    },
+    TravelEnrollmentSubmit {
+        request_id: Uuid,
+        travel_id: String,
+        travel_session_id: Uuid,
+        home_id: String,
+        request_json: Vec<u8>,
+    },
+    RemoteEnrollmentSubmit {
+        request_id: Uuid,
+        travel_id: String,
+        travel_session_id: Uuid,
+        credential_id: Uuid,
+        home_id: String,
+        request_json: Vec<u8>,
+    },
+    RemoteEnrollmentResult {
+        request_id: Uuid,
+        accepted: bool,
+        response_json: Option<Vec<u8>>,
+        error: Option<String>,
+    },
+    BootstrapEnrollmentSubmit {
+        protocol_version: u32,
+        request_id: Uuid,
+        travel_id: String,
+        home_id: String,
+        retrieval_token: Vec<u8>,
+        request_json: Vec<u8>,
+    },
+    BootstrapEnrollmentResult {
+        request_id: Uuid,
+        accepted: bool,
+        response_json: Option<Vec<u8>>,
+        seed_relays: Vec<String>,
+        error: Option<String>,
+    },
+    RemoteEnrollmentInstalled {
+        request_id: Uuid,
+        travel_id: String,
+        travel_session_id: Uuid,
+        credential_id: Uuid,
+        home_id: String,
+    },
+    RemoteEnrollmentInstalledAck {
+        request_id: Uuid,
+        accepted: bool,
         error: Option<String>,
     },
     Error {
@@ -268,8 +351,8 @@ pub enum DataFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalog, ControlMessage, DataFrame, HomeCatalog, Service, ServiceProtocol,
-        TravelConnectionPurpose,
+        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DataFrame, HomeCatalog, Service,
+        ServiceProtocol, TravelConnectionPurpose,
     };
     use crate::deployment::{SignedControlSnapshot, SignedDeploymentTrust};
     use uuid::Uuid;
@@ -331,6 +414,7 @@ mod tests {
     fn travel_hello_carries_process_session_and_purpose() -> Result<(), serde_json::Error> {
         let session_id = Uuid::new_v4();
         let message = ControlMessage::TravelHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: "travel-1".to_owned(),
             session_id,
             purpose: TravelConnectionPurpose::Catalog,
@@ -339,10 +423,12 @@ mod tests {
         let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
         match decoded {
             ControlMessage::TravelHello {
+                protocol_version,
                 id,
                 session_id: decoded_session,
                 purpose,
             } => {
+                assert_eq!(protocol_version, CONTROL_PROTOCOL_VERSION);
                 assert_eq!(id, "travel-1");
                 assert_eq!(decoded_session, session_id);
                 assert_eq!(purpose, TravelConnectionPurpose::Catalog);

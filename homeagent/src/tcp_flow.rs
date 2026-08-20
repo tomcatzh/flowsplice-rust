@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -11,6 +11,7 @@ use flowsplice_core::{
     frame::{JsonFrameReader, write_json},
     protocol::{DataFrame, Service},
 };
+use flowsplice_storage::LocalStatistics;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -39,6 +40,7 @@ struct FlowHandle {
 
 pub struct IncomingCarrier {
     pub carrier_id: Uuid,
+    pub relay_id: String,
     pub stream: TlsStream<TcpStream>,
     pub global_permit: Option<OwnedSemaphorePermit>,
     pub flow_permit: Option<OwnedSemaphorePermit>,
@@ -53,9 +55,11 @@ pub struct TcpFlowRegistry {
     max_unacked_bytes: usize,
     carrier_permits: Arc<Semaphore>,
     max_carriers_per_flow: usize,
+    statistics: Arc<LocalStatistics>,
 }
 
 impl TcpFlowRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         permits: Arc<Semaphore>,
         heartbeat: Duration,
@@ -64,6 +68,7 @@ impl TcpFlowRegistry {
         max_unacked_bytes: usize,
         max_active_carriers: usize,
         max_carriers_per_flow: usize,
+        statistics: Arc<LocalStatistics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             flows: Mutex::new(HashMap::new()),
@@ -74,7 +79,13 @@ impl TcpFlowRegistry {
             max_unacked_bytes,
             carrier_permits: Arc::new(Semaphore::new(max_active_carriers)),
             max_carriers_per_flow,
+            statistics,
         })
+    }
+
+    #[must_use]
+    pub fn statistics(&self) -> Arc<LocalStatistics> {
+        Arc::clone(&self.statistics)
     }
 
     pub async fn attach(
@@ -118,7 +129,9 @@ impl TcpFlowRegistry {
                 );
                 let registry = Arc::clone(self);
                 tokio::spawn(async move {
-                    if let Err(error) = run_flow(
+                    let outcome_key = key.clone();
+                    let outcome_service = service.clone();
+                    let result = run_flow(
                         Arc::clone(&registry),
                         key.clone(),
                         instance_id,
@@ -128,9 +141,31 @@ impl TcpFlowRegistry {
                         not_after_unix_secs,
                         permit,
                     )
-                    .await
-                    {
+                    .await;
+                    if let Err(error) = &result {
+                        let family = if error.to_string().contains("target") {
+                            "target_failure"
+                        } else {
+                            "home_flow_failed"
+                        };
+                        record_home_tcp_metric(
+                            &registry,
+                            &outcome_key,
+                            &outcome_service,
+                            None,
+                            family,
+                            1,
+                        );
                         warn!(travel_id = %key.travel_id, flow_id = %key.flow_id, %error, "home TCP flow ended");
+                    } else {
+                        record_home_tcp_metric(
+                            &registry,
+                            &outcome_key,
+                            &outcome_service,
+                            None,
+                            "home_flow_completed",
+                            1,
+                        );
                     }
                     registry.remove(&key, instance_id).await;
                 });
@@ -215,6 +250,7 @@ async fn run_flow(
     not_after_unix_secs: u64,
     _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
+    let target_started = Instant::now();
     let target = timeout(
         registry.carrier_timeout,
         TcpStream::connect(&service.target),
@@ -222,6 +258,17 @@ async fn run_flow(
     .await
     .context("target TCP connection timed out")?
     .with_context(|| format!("failed to connect service {}", service.id))?;
+    let target_latency_ms = u64::try_from(target_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record_home_tcp_metric_sample(
+        &registry,
+        &key,
+        &service,
+        None,
+        "target_connection_latency_ms",
+        target_latency_ms,
+        Some(target_latency_ms),
+    );
+    record_home_tcp_metric(&registry, &key, &service, None, "home_flow_accepted", 1);
     target.set_nodelay(true)?;
     let (mut target_reader, mut target_writer) = target.into_split();
     let (event_tx, mut events) = mpsc::channel::<FlowEvent>(32);
@@ -271,6 +318,7 @@ async fn run_flow(
     let _target_reader_task = AbortOnDrop(target_reader_task);
 
     let mut carriers: HashMap<Uuid, mpsc::Sender<DataFrame>> = HashMap::new();
+    let mut carrier_relays = HashMap::<Uuid, String>::new();
     let mut active_carrier = None;
     let mut receive_offset = 0_u64;
     let mut send_offset = 0_u64;
@@ -296,6 +344,7 @@ async fn run_flow(
                 if carriers.contains_key(&carrier.carrier_id) {
                     continue;
                 }
+                carrier_relays.insert(carrier.carrier_id, carrier.relay_id.clone());
                 write_json(
                     &mut carrier.stream,
                     &DataFrame::OpenOk {
@@ -393,6 +442,14 @@ async fn run_flow(
                                     .await
                                     .context("target TCP write timed out")??;
                                     receive_offset = end;
+                                    record_home_tcp_metric(
+                                        &registry,
+                                        &key,
+                                        &service,
+                                        carrier_relays.get(&carrier_id).map(String::as_str),
+                                        "delivered_upload_bytes",
+                                        bytes.len() as u64,
+                                    );
                                     debug!(event = "tcp_data_accepted", travel_id = %key.travel_id, flow_id = %key.flow_id, %carrier_id, offset, next_offset = receive_offset, bytes = bytes.len(), "accepted Travel-to-Home TCP data");
                                     send_to(
                                         &carriers,
@@ -475,6 +532,7 @@ async fn run_flow(
                     }
                     FlowEvent::CarrierClosed { carrier_id, reason } => {
                         carriers.remove(&carrier_id);
+                        carrier_relays.remove(&carrier_id);
                         if active_carrier == Some(carrier_id) {
                             active_carrier = None;
                             detached_deadline = Some(Instant::now() + registry.detach_timeout);
@@ -492,6 +550,14 @@ async fn run_flow(
                             bytes,
                             _credit: credit,
                         };
+                        record_home_tcp_metric(
+                            &registry,
+                            &key,
+                            &service,
+                            active_carrier.and_then(|carrier_id| carrier_relays.get(&carrier_id).map(String::as_str)),
+                            "home_flow_download_observed_bytes",
+                            segment.bytes.len() as u64,
+                        );
                         send_offset = send_offset.saturating_add(segment.bytes.len() as u64);
                         unacked_bytes += segment.bytes.len();
                         debug!(event = "tcp_data_buffered", travel_id = %key.travel_id, flow_id = %key.flow_id, offset = segment.offset, bytes = segment.bytes.len(), unacked_bytes, "buffered Home-to-Travel TCP data");
@@ -538,6 +604,40 @@ async fn run_flow(
     }
 }
 
+fn record_home_tcp_metric(
+    registry: &TcpFlowRegistry,
+    key: &FlowKey,
+    service: &Service,
+    relay_id: Option<&str>,
+    family: &str,
+    value: u64,
+) {
+    record_home_tcp_metric_sample(registry, key, service, relay_id, family, value, None);
+}
+
+fn record_home_tcp_metric_sample(
+    registry: &TcpFlowRegistry,
+    key: &FlowKey,
+    service: &Service,
+    relay_id: Option<&str>,
+    family: &str,
+    value: u64,
+    histogram_sample: Option<u64>,
+) {
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert("travel_id".to_owned(), key.travel_id.clone());
+    dimensions.insert("service_id".to_owned(), service.id.clone());
+    dimensions.insert("protocol".to_owned(), "tcp".to_owned());
+    if let Some(relay_id) = relay_id {
+        dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
+    }
+    if let Ok(now) = unix_time_secs() {
+        registry
+            .statistics
+            .record(now, family, dimensions, value, histogram_sample);
+    }
+}
+
 fn spawn_carrier(
     flow_id: Uuid,
     carrier: IncomingCarrier,
@@ -552,6 +652,7 @@ fn spawn_carrier(
             stream,
             global_permit,
             flow_permit,
+            ..
         } = carrier;
         let _carrier_permits = (global_permit, flow_permit);
         let (reader, mut writer) = tokio::io::split(stream);

@@ -16,6 +16,8 @@ clap.workspace = true
 embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }
 flowsplice-core.workspace = true
 flowsplice-enrollment.workspace = true
+flowsplice-storage.workspace = true
+hex.workspace = true
 rpassword.workspace = true
 rust-embed = { version = "8.7", features = ["debug-embed", "deterministic-timestamps"] }
 rustls-pki-types.workspace = true
@@ -25,8 +27,12 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

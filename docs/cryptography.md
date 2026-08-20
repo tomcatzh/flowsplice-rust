@@ -25,14 +25,16 @@ material. Private keys, passwords, bearer tokens, and short-lived route/work sec
 
 ### One bootstrap trust point, not a pile of manual pins
 
-A personal Travel binary contains one deployment-root public key. That public key verifies a signed
+A personal Travel binary contains one deployment-root public key, the public Management CA
+certificate needed to authenticate a first-enrollment Relay, and bootstrap Relay addresses. The
+root public key verifies a signed
 deployment-trust document, which in turn binds the management and business CAs, Server control keys,
 Home endpoint keys, and scoped Travel authorities. Relay identities and Home SPKIs are learned from
 authenticated state instead of being copied into each Travel configuration.
 
-The configured Seed Relay is therefore transport, not authority. Reaching a Seed cannot change what
-Travel trusts. This keeps the operator workflow to one Seed address and one enrollment response
-without making first contact trust-on-first-use.
+The configured or embedded Seed Relay is therefore transport, not authority. Reaching a Seed cannot
+change what Travel trusts. The embedded Management CA prevents first contact from becoming
+trust-on-first-use; the deployment root remains the authority for the returned complete trust state.
 
 ### Separate keys and channels for separate powers
 
@@ -70,24 +72,27 @@ operation and simultaneously promise that an offline client has the latest revoc
 
 ### Cryptography protects integrity and confidentiality, not availability
 
-Relay and Server can always delay, drop, reorder, replay, or corrupt opaque bytes. A compromised
-Server control key can sign an incomplete or split view. TLS and signatures make unauthorized changes
-detectable; they cannot compel a component to answer or prove to one isolated client that no other
-client received a different signed view.
+Relay can always delay, drop, reorder, replay, or corrupt opaque business bytes. Server can deny or
+misdirect new route setup but is not on the established business path. A compromised Server control
+key can sign an incomplete or split view. TLS and signatures make unauthorized changes detectable;
+they cannot compel a component to answer or prove to one isolated client that no other client
+received a different signed view.
 
 ## Protection layers
 
 | Layer | Endpoints | Construction | Security purpose |
 | --- | --- | --- | --- |
 | Management TLS | Home→Server, Server→Relay, Travel→Relay | Mutual TLS 1.3 under the management CA, followed by application role/ID/SPKI/grant checks | Authenticates control peers and protects catalogs, heartbeats, authorization state, and route/work-secret delivery |
-| Route admission | Travel→Relay and Relay/Home→Server data sockets | HMAC-SHA256 over a fixed preface with an independent random 32-byte secret | Proves that a socket owns one allocated route or work item before it is paired |
-| Business TLS | Travel↔Home through Relay and Server | End-to-end mutual TLS 1.3 under the business CA, followed by Home/Travel SPKI and grant checks | Protects the selected service ID, logical Flow frames, acknowledgements, and business plaintext |
+| Route admission | Travel→Relay and Home→Relay data sockets | HMAC-SHA256 over a fixed preface with an independent random 32-byte secret | Proves that a socket owns one allocated route or work item before Relay pairs it |
+| Business TLS | Travel↔Home through one Relay | End-to-end mutual TLS 1.3 under the business CA, followed by Home/Travel SPKI and grant checks | Protects the selected service ID, logical Flow frames, acknowledgements, and business plaintext |
 | Signed deployment state | Offline root→all components | ECDSA P-256/SHA-256 over exact serialized deployment-trust bytes | Binds every lower-level trust domain to one deployment root |
 | Signed authorization | Home authority→Server/Relay/Home | ECDSA P-256/SHA-256 over an exact Travel credential | Grants the bound Travel keys one explicit Global, Home, or Service scope |
 | Signed discovery state | Server→Travel | ECDSA P-256/SHA-256 over an atomic Relay-directory and filtered-Catalog snapshot | Prevents a Seed or Relay from forging discovery or Catalog contents |
+| Signed statistics | Travel/Relay/Home→Server | ECDSA P-256/SHA-256 over exact five-minute summaries, bound to the reporter's management certificate and live role/session | Authenticates node-observed business aggregates for idempotent global collection |
 
-The outer management and route layers do not replace the inner business TLS. Relay and Server forward
-the business TLS stream but do not possess the Travel or Home business private keys.
+The outer management and route layers do not replace the inner business TLS. Relay forwards the
+business TLS stream but does not possess the Travel or Home business private keys. Server forwards
+only control messages and signed summaries.
 
 ## Concrete primitives and libraries
 
@@ -137,9 +142,8 @@ DER `SubjectPublicKeyInfo` and are always exactly 32 SHA-256 bytes.
 | Travel management key | Travel device, password-encrypted | Management leaf certificate and signed credential SPKI | Authenticates Travel control connections; never uploaded during enrollment |
 | Travel business key | Travel device, password-encrypted | Business leaf certificate and signed credential SPKI | Terminates end-to-end business TLS; never uploaded during enrollment |
 | Route secret | Relay memory, delivered to one Travel over management TLS | Never persisted or published | Single-use admission to one Relay route; default lifetime 15 seconds |
-| Work secret | Server memory, delivered to one Relay and one Home over management TLS | Never persisted or published | Single-use pairing of Relay and Home data sockets; default lifetime 15 seconds |
+| Work secret | Created by Server, delivered to one Relay and one Home over management TLS, then held pending by Relay | Never persisted or published | Single-use pairing of Home and Travel data sockets at that Relay; default lifetime 15 seconds |
 | Travel process-session UUID | Travel memory | Presented only after Travel mTLS authentication | Supplementary 45-second first-live-session capability; not a replacement for credential revocation |
-| UI bearer token | Operator configuration | No public binding | Protects deliberately remote UI/API listeners; compared in constant time and does not decrypt signing keys |
 
 The deployment-root public key is not a credential. Stealing a Travel binary or copying that public
 key provides verification capability only.
@@ -214,9 +218,10 @@ trusted channel carrying the replacement root.
 
 ### Request creation
 
-`enroll-init` creates a new mode-`0700` directory and refuses to reuse an existing directory. It
-generates distinct P-256 management and business keys and writes both as mode-`0600`
-password-encrypted PKCS#8 files. It also generates:
+The normal `enroll-remote` bootstrap and the manual-recovery `enroll-init` path both create a new
+mode-`0700` directory and refuse conflicting reuse. They generate distinct P-256 management and
+business keys and write both as mode-`0600`
+password-encrypted PKCS#8 files. They also generate:
 
 - a random request UUID;
 - an independent 32-byte enrollment nonce;
@@ -229,6 +234,14 @@ future are rejected.
 
 Only `enrollment-request.json` is public input to an issuer. The encrypted keys and
 `enrollment-state.json` stay on the Travel device.
+
+For first remote enrollment, Travel additionally creates a random 32-byte retrieval token and keeps
+it in a mode-`0600` resumable bootstrap record. The token and exact request derive the short code
+shown independently by Travel and Home. The anonymous TLS client is restricted to bootstrap submit
+and poll messages, the request remains subject to CSR proof-of-possession and freshness checks, and
+Home still performs local attended password-gated signing. A bearer of the retrieval token may read
+the public enrollment response, but cannot derive either Travel private key or sign another
+credential. The token record is removed after verified installation.
 
 ### Home-side issuance
 
@@ -305,7 +318,7 @@ Travel-specific `ControlSnapshotPayload` containing:
 - exact Travel ID and management SPKI;
 - monotonic generation;
 - issue and expiry times;
-- the complete Relay directory, including each Relay ID, address, and authenticated management SPKI;
+- the complete Relay directory, including each Relay ID, management address, public data address, and authenticated management SPKI;
 - the aggregate Catalog filtered by all active grants for that Travel identity.
 
 Server signs the exact payload bytes with its root-certified P-256 control key. The snapshot also
@@ -329,11 +342,15 @@ Before applying a snapshot, Travel verifies:
 7. the connected Relay's URI ID and SPKI against an entry in the signed directory;
 8. durable trust/signer epoch and generation rules.
 
-Travel atomically persists `deployment_id`, trust generation/digest, signer epoch, highest snapshot
-generation, that generation's unique content hash, and the complete signed snapshot. A lower trust
-generation, lower signer epoch, or lower snapshot generation is rejected. The same generation with
-different bytes is a hard failure. Cached state is reused only while its signatures and expiry remain
-valid; expiry never fails open.
+Travel commits `deployment_id`, trust generation/digest, signer epoch, highest snapshot generation,
+that generation's unique content hash, and the complete signed snapshot to redb with immediate
+durability. A lower trust generation, lower signer epoch, or lower snapshot generation is rejected.
+The same generation with different bytes is a hard failure. Cached state is reused only while its
+signatures and expiry remain valid; expiry never fails open. Independently, Travel retains every Relay
+from a verified directory as a historical startup candidate. That history can help reconnect after a
+restart but cannot authorize business use: a fresh signed snapshot must authorize the Relay first. A
+legacy `control-trust-state.json` is verified, committed to redb, read back and digest-checked, then
+deleted.
 
 There is currently no `previous_state_hash` chain and no transparency log, witness, gossip, or quorum.
 A certified Server control key can sign different same-generation or different-generation views for
@@ -351,19 +368,19 @@ route secret and sends it to Travel over management TLS.
 The joining data socket writes this fixed authenticated preface:
 
 ```text
-magic "FSLCRTE1" (8 bytes)
-side                 (1 byte: Travel, Relay, or Home)
+magic "FSLCRTE2" (8 bytes)
+side                 (1 byte: Travel or Home)
 route/work UUID     (16 bytes)
 HMAC-SHA256         (32 bytes over the preceding 25 bytes)
 ```
 
-The receiver checks the fixed length, magic, side, UUID, expected side, and HMAC. Relay removes the
-named pending route on the first connection attempt and then verifies its authorization and MAC,
-making the route single-attempt as well as single-use. Server accepts at most one authenticated Home
-socket and one authenticated Relay socket for a work ID and removes the entry when the pair is
-complete. Secrets must be exactly 32 bytes. Pending entries expire after a short configured lifetime
-and are process-local. An attacker who can learn a live route ID and reach Relay may consume that
-pending route with an invalid attempt, causing denial of service but not successful admission.
+Relay checks the fixed length, magic, side, UUID, expected side, and HMAC. It consumes the named
+Travel-route or Home-work half on the first connection attempt, making each half single-attempt as
+well as single-use, and pairs a socket only after both halves authenticate. Server has no data socket
+or pending data listener. Secrets must be exactly 32 bytes. Relay's pending entries expire after a
+short configured lifetime and are process-local. An attacker who can learn a live route/work ID and
+reach Relay may consume that pending half with an invalid attempt, causing denial of service but not
+successful admission.
 
 This HMAC authenticates socket admission only. It does not encrypt the data socket, authenticate the
 business endpoint, or protect bytes after the preface. Those properties come from the inner
@@ -371,8 +388,8 @@ Travel↔Home business TLS.
 
 ## End-to-end business TLS and authorization
 
-After Relay and Server pair the opaque sockets, Travel and Home complete a mutual TLS 1.3 handshake
-through them. Rustls may resume an earlier in-process TLS session, but FlowSplice still obtains the
+After Relay pairs the opaque Travel and Home sockets, Travel and Home complete a mutual TLS 1.3
+handshake through that Relay. Rustls may resume an earlier in-process TLS session, but FlowSplice still obtains the
 authenticated peer identity and applies the current SPKI/grant checks. Travel requires the
 certificate to contain the selected Home ID and a business SPKI present in root-signed deployment
 trust. Home resolves the Travel certificate's ID and business SPKI through the current
@@ -467,7 +484,11 @@ authenticated encryption. A future format change may choose an authenticated pri
 
 | State | Persistence and rule |
 | --- | --- |
-| Travel deployment/control state | Atomic JSON beside enrollment material; binds deployment/trust digest, signer epoch, highest generation, same-generation hash, and cached signed snapshot |
+| Travel deployment/control state | redb with immediate durability; binds deployment/trust digest, signer epoch, highest generation, same-generation hash, and cached signed snapshot; verified legacy JSON migrates once |
+| Travel Relay history | redb; retains every Relay from a verified directory as a startup candidate, never as permanent authorization |
+| Local business statistics | Travel/Relay/Home redb stores five-minute buckets and a durable signed-report outbox; only locally observed business metrics are recorded |
+| Server collected statistics | redb; verifies certificate/role/session-bound signatures and idempotently deduplicates node summaries by revision/digest |
+| Remote enrollment | A temporary Travel bootstrap record makes first enrollment resumable; after installation, Travel redb outbox and Home redb inbox preserve request/response/install-ack lifecycle across reconnect and restart |
 | Relay/Home authorization cache | Atomic JSON; rejects lower authorization generations, same-generation content changes, and loss of any observed revocation |
 | Server authorization state | One atomic JSON object containing generation, add-only credentials, irreversible revocations, and permanently spent enrollment-request hashes |
 | Server control generation | Atomic JSON high-water mark reserved before each signed snapshot; gaps are allowed but reuse after restart is not |
@@ -476,9 +497,10 @@ authenticated encryption. A future format change may choose an authenticated pri
 | Pending route/work secrets | Memory only, single-use, bounded, and short-lived; lost on process restart |
 | Travel session lease | Server memory only; 45-second crash/network-partition fallback |
 
-`store_json_atomic` writes a new file, fsyncs it, renames it over the target, then fsyncs the parent
-directory. These stores provide crash-safe high-water behavior on the local filesystem; they are not
-a replicated consensus log and do not defend against an attacker who can arbitrarily rewrite that
+redb commits use immediate durability for security-sensitive state and durable outboxes. The
+remaining JSON stores use `store_json_atomic`, which writes a new file, fsyncs it, renames it over the
+target, then fsyncs the parent directory. These stores provide crash-safe local behavior; they are
+not a replicated consensus log and do not defend against an attacker who can arbitrarily rewrite that
 host's files.
 
 Travel durably prevents deployment-trust rollback. Server, Relay, and Home verify their configured
@@ -496,7 +518,7 @@ their trust files remains an operator responsibility.
 | Management CA key | Can issue management certificates; later role/ID/SPKI/grant checks still apply, but relationships without a separately pinned peer key can be impersonated |
 | Business CA key | Can issue business certificates; root-bound Home SPKIs and signed Travel grants still constrain endpoint acceptance |
 | Server control key | Can forge, omit, or equivocate Relay/Catalog views and control path availability; cannot impersonate a root-bound Home business key |
-| Pinned Server runtime | Can observe/control routing metadata, drop opaque business streams, distribute revocations, and deny service; cannot decrypt business TLS without an endpoint key |
+| Pinned Server runtime | Can observe/control routing metadata, misdirect or deny new routes, distribute revocations, and alter collected statistics; it is not on an established business stream and cannot decrypt business TLS without an endpoint key |
 | Relay | Can observe metadata and delay/drop/corrupt opaque traffic; cannot forge signed control state or decrypt business TLS |
 | Home host | Exposes that Home's services and plaintext plus every issuer key actually stored there; a designated global issuer has correspondingly global authorization power |
 | Travel host | Exposes that device's local plaintext, private keys while usable, mappings, and every scope granted to it |
@@ -519,9 +541,8 @@ Travel build, and reissuance under the replacement deployment.
   root custody are not implemented.
 - Non-Travel runtime TLS keys and the Server control key are not automatically encrypted or backed by
   an HSM. Their filesystem and host protection are deployment responsibilities.
-- The built-in Home and Travel UIs use HTTP. A deliberately remote listener requires an administrator
-  bearer token, but the operator must still provide a trusted tunnel or TLS reverse proxy to protect
-  passwords and tokens on an untrusted network.
+- The built-in Home, Travel, Relay, and Server UIs use HTTP and require exact loopback listeners.
+  Remote administration requires a separately authenticated and encrypted tunnel.
 - Password-protected private keys are not locked with `mlock`, and the implementation cannot promise
   that every compiler/library/OS copy of sensitive memory is erased.
 - Route/work secrets are currently protocol `Vec<u8>` values that may be cloned and are not
@@ -544,13 +565,15 @@ Travel build, and reissuance under the replacement deployment.
 | HMAC route/work preface | [`crates/flowsplice-core/src/route.rs`](../crates/flowsplice-core/src/route.rs) |
 | Deployment trust and Server control snapshots | [`crates/flowsplice-core/src/deployment.rs`](../crates/flowsplice-core/src/deployment.rs) |
 | Scoped Travel credentials, revocations, authorization cache | [`crates/flowsplice-core/src/authorization.rs`](../crates/flowsplice-core/src/authorization.rs) |
+| Five-minute statistics payloads and signatures | [`crates/flowsplice-core/src/statistics.rs`](../crates/flowsplice-core/src/statistics.rs) |
+| redb state, statistics buckets/outboxes, history, and deduplication | [`crates/flowsplice-storage/src/lib.rs`](../crates/flowsplice-storage/src/lib.rs) |
 | Enrollment request/import and certificate validation | [`crates/flowsplice-enrollment/src/lib.rs`](../crates/flowsplice-enrollment/src/lib.rs) |
 | Private-key encryption and transactional password rotation | [`crates/flowsplice-enrollment/src/key.rs`](../crates/flowsplice-enrollment/src/key.rs) |
 | Home certificate/credential issuance | [`crates/flowsplice-enrollment/src/issuer.rs`](../crates/flowsplice-enrollment/src/issuer.rs) |
 | Offline root utility | [`crates/flowsplice-enrollment/src/bin/flowsplice-trust.rs`](../crates/flowsplice-enrollment/src/bin/flowsplice-trust.rs) |
 | Server credential/revocation store | [`server/src/authorization.rs`](../server/src/authorization.rs) |
 | Home single-use issuance ledger | [`homeagent/src/issuance_ledger.rs`](../homeagent/src/issuance_ledger.rs) |
-| Travel durable control high-water state | [`travelagent/src/main.rs`](../travelagent/src/main.rs) |
+| Travel durable control state and authenticated remote enrollment | [`travelagent/src/main.rs`](../travelagent/src/main.rs) |
 | End-to-end regressions | [`tests/e2e/run.sh`](../tests/e2e/run.sh) and [`tests/e2e/assert_e2e.py`](../tests/e2e/assert_e2e.py) |
 
 ## Verification coverage
@@ -562,17 +585,23 @@ enforcement, authorization rollback, and interrupted password-rotation recovery.
 The Docker E2E suite additionally exercises:
 
 - TLS 1.3 acceptance and TLS 1.2 rejection;
-- encrypted local Travel enrollment and one-file response import;
+- credential-less first remote Travel enrollment, authenticated remote replacement enrollment,
+  verification-code comparison, Home password approval, Travel password installation, explicit
+  install acknowledgement, and restart activation;
 - tampered trust and cross-request/cross-certificate response-splicing rejection;
 - independent enrollment nonce binding and single-use/idempotent issuance;
 - Global, Home, and Service scopes across two Homes;
 - discovery of two Relay SPKIs from one Seed;
-- durable Travel control high-water state across restart;
+- durable Travel control high-water state, one-time legacy JSON migration, and historical Relay
+  candidates across restart without stale authorization;
 - Home-originated live revocation, cross-Home revocation rejection, and rollback-resistant Relay/Home
   caches;
 - rejection of revoked Travel certificates at both Relays;
 - Home and Travel password rotation, wrong-password rejection, and recovery across restart;
-- same-logical-TCP-flow Carrier handover after killing the winning Relay.
+- same-logical-TCP-flow Carrier handover after killing the winning Relay;
+- established-flow continuity while Server is stopped and the absence of any Server business listener;
+- five-minute node statistics, signed upload, Server certificate binding and idempotent deduplication,
+  role-owned metric rejection, and rolling day/week/month/year report windows.
 
 Passing these tests demonstrates the encoded invariants for the exercised cases. It is not a
 cryptographic proof or substitute for independent review.
@@ -591,3 +620,4 @@ cryptographic proof or substitute for independent review.
 - [`rustls` 0.23.43 documentation](https://docs.rs/rustls/0.23.43/rustls/)
 - [`aws-lc-rs` 1.18.0 documentation](https://docs.rs/aws-lc-rs/1.18.0/aws_lc_rs/)
 - [`pkcs8` 0.10.2 documentation](https://docs.rs/pkcs8/0.10.2/pkcs8/)
+- [`redb` 4.2.0 documentation](https://docs.rs/redb/4.2.0/redb/)

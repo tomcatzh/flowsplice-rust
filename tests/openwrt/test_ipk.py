@@ -92,6 +92,19 @@ class IpkBuilderTest(unittest.TestCase):
                 self.assertIn("./usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo", names)
                 self.assertEqual(data.getmember("./etc/init.d/flowsplice").mode, 0o755)
                 self.assertEqual(data.getmember("./etc/config/flowsplice").mode, 0o644)
+                init_script = open_member(data, "./etc/init.d/flowsplice").decode()
+                self.assertIn(
+                    'start-stop-daemon -S -x "$binary" -p "$pid_file" -m -c flowsplice:flowsplice',
+                    init_script,
+                )
+                self.assertIn(
+                    'validate_as_flowsplice "$SERVER_BIN" "$server_config"',
+                    init_script,
+                )
+                self.assertIn(
+                    'validate_as_flowsplice "$RELAY_BIN" "$config_file"',
+                    init_script,
+                )
                 packaged_config = open_member(data, "./etc/config/flowsplice").decode()
                 self.assertIn(
                     "option travel_authorization_state '/etc/flowsplice/state/server-authorization.json'",

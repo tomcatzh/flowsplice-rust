@@ -5,6 +5,8 @@ management_ca = "/travel/management-ca.crt"
 business_cert = "/travel/travel-business.crt"
 business_key = "/travel/travel-business.key"
 business_ca = "/travel/business-ca.crt"
+state_store = "/state/travel-state.redb"
+enrollment_work_dir = "/state/travel-enrollment"
 ui_listen = "0.0.0.0:9080"
 test_allow_remote_listen = true
 test_admin_token = "flowsplice-e2e-administrator-token"
@@ -51,3 +53,15 @@ home_id = "home-2"
 service_id = "home-1-only"
 protocol = "tcp"
 bind = "0.0.0.0:10083"
+
+[[mappings]]
+home_id = "home-1"
+service_id = "target-failure"
+protocol = "tcp"
+bind = "0.0.0.0:10084"
+
+[[mappings]]
+home_id = "home-2"
+service_id = "target-failure"
+protocol = "tcp"
+bind = "0.0.0.0:10085"

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use flowsplice_core::{
     DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    authorization::unix_time_secs,
     frame::{JsonFrameReader, write_json},
     protocol::{DataFrame, ServiceProtocol},
 };
@@ -87,11 +88,40 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
         "travel TCP flow started"
     );
     let result = run_inner(&state, &mapping, local, flow_id).await;
-    state.flow_relays.lock().await.remove(&flow_id);
-    if result.is_ok() {
+    let relay_id = state.flow_relays.lock().await.remove(&flow_id);
+    if let Ok((upload_bytes, download_bytes)) = result.as_ref() {
+        record_flow_metric(
+            &state,
+            &mapping,
+            relay_id.as_deref(),
+            "travel_flow_upload_observed_bytes",
+            *upload_bytes,
+        );
+        record_flow_metric(
+            &state,
+            &mapping,
+            relay_id.as_deref(),
+            "delivered_download_bytes",
+            *download_bytes,
+        );
+        record_flow_metric(
+            &state,
+            &mapping,
+            relay_id.as_deref(),
+            "travel_flow_completed",
+            1,
+        );
         info!(event = "tcp_flow_finished", %flow_id, "travel TCP flow finished");
+    } else {
+        record_flow_metric(
+            &state,
+            &mapping,
+            relay_id.as_deref(),
+            "travel_flow_failed",
+            1,
+        );
     }
-    result
+    result.map(|_| ())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -100,7 +130,7 @@ async fn run_inner(
     mapping: &Mapping,
     local: TcpStream,
     flow_id: Uuid,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     local.set_nodelay(true)?;
     let (local_reader, local_writer) = local.into_split();
     let (events_tx, mut events) = mpsc::channel(32);
@@ -138,7 +168,7 @@ async fn run_inner(
             && transfer.local_fin_acked
             && transfer.unacked.is_empty()
         {
-            return Ok(());
+            return Ok((transfer.send_offset, transfer.receive_offset));
         }
 
         if active.is_none() || Instant::now() >= next_reevaluation {
@@ -254,6 +284,43 @@ async fn run_inner(
     }
 }
 
+fn record_flow_metric(
+    state: &AppState,
+    mapping: &Mapping,
+    relay_id: Option<&str>,
+    family: &str,
+    value: u64,
+) {
+    record_flow_metric_sample(state, mapping, relay_id, family, value, None, None);
+}
+
+fn record_flow_metric_sample(
+    state: &AppState,
+    mapping: &Mapping,
+    relay_id: Option<&str>,
+    family: &str,
+    value: u64,
+    result: Option<&str>,
+    histogram_sample: Option<u64>,
+) {
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
+    dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
+    dimensions.insert("protocol".to_owned(), "tcp".to_owned());
+    dimensions.insert("mapping".to_owned(), mapping.bind.clone());
+    if let Some(relay_id) = relay_id {
+        dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
+    }
+    if let Some(result) = result {
+        dimensions.insert("result".to_owned(), result.to_owned());
+    }
+    if let Ok(now) = unix_time_secs() {
+        state
+            .statistics
+            .record(now, family, dimensions, value, histogram_sample);
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn perform_race(
     state: &AppState,
@@ -266,6 +333,7 @@ async fn perform_race(
     transfer: &mut TransferState,
 ) -> Result<Option<Uuid>> {
     let race_id = Uuid::new_v4();
+    let race_started = Instant::now();
     let race_deadline =
         Instant::now() + Duration::from_secs(state.config.carrier_race_timeout_secs);
     let old_active = *active;
@@ -312,6 +380,7 @@ async fn perform_race(
         let service_id = mapping.service_id.clone();
         opens.spawn(async move {
             let carrier_id = Uuid::new_v4();
+            let attempt_started = Instant::now();
             let result = open_business_on(
                 &state,
                 &relay,
@@ -322,7 +391,12 @@ async fn perform_race(
                 &home_id,
             )
             .await;
-            (relay_label, carrier_permit, result)
+            (
+                relay_label,
+                carrier_permit,
+                result,
+                attempt_started.elapsed(),
+            )
         });
     }
     if let Some(carrier_id) = old_active {
@@ -354,8 +428,28 @@ async fn perform_race(
             opened = opens.join_next(), if !opens.is_empty() => {
                 if let Some(result) = opened {
                     match result? {
-                        (_, carrier_permit, Ok(carrier)) => {
+                        (relay_label, carrier_permit, Ok(carrier), elapsed) => {
                             let relay_id = carrier.relay_id.clone();
+                            let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                            record_flow_metric_sample(
+                                state,
+                                mapping,
+                                Some(&relay_id),
+                                "carrier_attempt",
+                                1,
+                                Some("accepted"),
+                                None,
+                            );
+                            record_flow_metric_sample(
+                                state,
+                                mapping,
+                                Some(&relay_id),
+                                "carrier_setup_latency_ms",
+                                latency_ms,
+                                Some("accepted"),
+                                Some(latency_ms),
+                            );
+                            debug!(%flow_id, %relay_label, %latency_ms, "carrier candidate setup measured");
                             if carrier.home_receive_offset > transfer.send_offset {
                                 bail!("Home acknowledged unsent Travel data");
                             }
@@ -398,7 +492,26 @@ async fn perform_race(
                             )
                             .await;
                         }
-                        (relay_id, _carrier_permit, Err(error)) => {
+                        (relay_id, _carrier_permit, Err(error), elapsed) => {
+                            let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                            record_flow_metric_sample(
+                                state,
+                                mapping,
+                                Some(&relay_id),
+                                "carrier_attempt",
+                                1,
+                                Some("failed"),
+                                None,
+                            );
+                            record_flow_metric_sample(
+                                state,
+                                mapping,
+                                Some(&relay_id),
+                                "carrier_setup_latency_ms",
+                                latency_ms,
+                                Some("failed"),
+                                Some(latency_ms),
+                            );
                             warn!(%flow_id, %relay_id, %error, "carrier race attempt failed");
                         }
                     }
@@ -467,10 +580,52 @@ async fn perform_race(
         for loser in losers {
             close_carrier(carriers, loser);
         }
+        let winner_relay_id = carriers
+            .get(&winner)
+            .map(|carrier| carrier.relay_id.as_str());
+        record_flow_metric_sample(
+            state,
+            mapping,
+            winner_relay_id,
+            "carrier_winner",
+            1,
+            None,
+            None,
+        );
+        if old_active.is_some() && old_active != Some(winner) {
+            record_flow_metric_sample(
+                state,
+                mapping,
+                winner_relay_id,
+                "carrier_handover",
+                1,
+                None,
+                None,
+            );
+        }
+        let race_latency_ms = u64::try_from(race_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        record_flow_metric_sample(
+            state,
+            mapping,
+            winner_relay_id,
+            "carrier_race_latency_ms",
+            race_latency_ms,
+            Some("winner"),
+            Some(race_latency_ms),
+        );
         *active = Some(winner);
         retransmit(transfer, carriers, winner).await;
         Ok(Some(winner))
     } else {
+        record_flow_metric_sample(
+            state,
+            mapping,
+            old_relay_id.as_deref(),
+            "carrier_race_failed",
+            1,
+            Some("no_winner"),
+            None,
+        );
         warn!(
             event = "carrier_race_timed_out",
             %flow_id,

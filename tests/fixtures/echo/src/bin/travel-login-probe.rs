@@ -5,7 +5,7 @@ use std::{env, fs, path::Path, time::Duration};
 use anyhow::{Context, Result, bail};
 use flowsplice_core::{
     frame::{JsonFrameReader, write_json},
-    protocol::{ControlMessage, Role, TravelConnectionPurpose},
+    protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, Role, TravelConnectionPurpose},
     tls::{
         identity_client_connector_with_private_key, identity_server_name, peer_identity,
         require_peer,
@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
     write_json(
         &mut stream,
         &ControlMessage::TravelHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: "travel-1".to_owned(),
             session_id: Uuid::new_v4(),
             purpose: TravelConnectionPurpose::Catalog,

@@ -29,9 +29,6 @@ msgstr "请为局域网和 WAN IPv6 分别创建具名中继实例。每个实�
 msgid "Data listen"
 msgstr "数据监听地址"
 
-msgid "Data listeners"
-msgstr "数据监听地址"
-
 msgid "Enabled"
 msgstr "启用"
 
@@ -95,9 +92,6 @@ msgstr "最大待处理路由数"
 msgid "Maximum pending work"
 msgstr "最大待处理任务数"
 
-msgid "May contain explicit LAN IPv4 and WAN IPv6 socket addresses."
-msgstr "可以同时填写明确的局域网 IPv4 和 WAN IPv6 套接字地址。"
-
 msgid "No instances configured."
 msgstr "尚未配置实例。"
 
@@ -153,9 +147,6 @@ msgstr "服务端中继目录"
 msgid "Server SPKI pins"
 msgstr "服务端 SPKI 指纹"
 
-msgid "Server data address"
-msgstr "服务端数据地址"
-
 msgid "Service action failed"
 msgstr "服务操作失败"
 
@@ -167,6 +158,15 @@ msgstr "最大数据连接数"
 
 msgid "Maximum management connections"
 msgstr "最大管理连接数"
+
+msgid "Local redb state"
+msgstr "本地 redb 状态库"
+
+msgid "Statistics UI listen"
+msgstr "统计页面监听地址"
+
+msgid "Keep this listener on loopback or another trusted management address."
+msgstr "请只在回环地址或其他可信管理地址上监听。"
 
 msgid "Start"
 msgstr "启动"

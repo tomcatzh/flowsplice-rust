@@ -90,6 +90,45 @@ def travel_request(method: str, path: str, body=None, expect_ok=True):
     return decoded
 
 
+def container_json_request(service: str, port: int, path: str):
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            service,
+            "wget",
+            "-qO-",
+            f"http://127.0.0.1:{port}{path}",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return json.loads(result.stdout)
+
+
+def container_page(service: str, port: int) -> bytes:
+    return subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            service,
+            "wget",
+            "-qO-",
+            f"http://127.0.0.1:{port}/",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
 def wait_ready() -> dict:
     deadline = time.monotonic() + 90
     last_error = None
@@ -112,9 +151,9 @@ def wait_ready() -> dict:
                     and homes["home-1"]["home_alias"] == "E2E Home"
                     and homes["home-2"]["home_alias"] == "E2E Home Two"
                     and {service["id"] for service in homes["home-1"]["services"]}
-                    == {"tcp-echo", "udp-echo", "home-1-only"}
+                    == {"tcp-echo", "udp-echo", "home-1-only", "target-failure"}
                     and {service["id"] for service in homes["home-2"]["services"]}
-                    == {"tcp-echo"}
+                    == {"tcp-echo", "target-failure"}
                     and directory["generation"] >= 1
                     and {
                         relay["id"]: relay["management_spki_sha256"]
@@ -130,16 +169,16 @@ def wait_ready() -> dict:
 
 
 def read_control_high_water() -> dict:
-    path = Path(__file__).resolve().parent / "generated/travel/control-trust-state.json"
-    state = json.loads(path.read_text())
-    assert state["object_type"] == "flowsplice.travel_control_high_water", state
-    assert state["deployment_id"] == "flowsplice-e2e", state
-    assert state["trust_generation"] >= 1, state
-    assert len(state["trust_digest_sha256"]) == 64, state
-    assert state["signer_epoch"] >= 1, state
-    assert state["snapshot_generation"] >= 1, state
-    assert len(state["snapshot_digest_sha256"]) == 64, state
-    assert state["cached_snapshot"], state
+    generated = Path(__file__).resolve().parent / "generated"
+    state_store = generated / "state/travel-state.redb"
+    legacy_state = generated / "travel/control-trust-state.json"
+    assert state_store.is_file() and state_store.stat().st_size > 0, state_store
+    assert not legacy_state.exists(), "legacy control-trust-state.json was not migrated"
+    status, _, body = http_get("/api/status", {"Accept": "application/json"})
+    assert status == 200, (status, body)
+    state = json.loads(body)
+    assert state["catalog_generation"] >= 1, state
+    assert state["relay_directory_generation"] >= 1, state
     return state
 
 
@@ -221,15 +260,30 @@ def check_multi_home_business_routing() -> None:
     expect_mapping_unavailable_without_cross_home_fallback(11083)
 
 
+def check_target_failures_are_home_isolated() -> None:
+    expect_mapping_unavailable_without_cross_home_fallback(11084)
+    expect_mapping_unavailable_without_cross_home_fallback(11085)
+
+
 def check_home_lifecycle_is_isolated() -> None:
-    subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "homeagent2"],
-        check=True,
-    )
-    wait_catalog_homes({"home-1"})
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+    with (
+        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+    ):
         home_one.settimeout(15)
-        exchange_line(home_one, b"home-one-survives-home-two-offline")
+        home_two.settimeout(15)
+        home_one_connection = exchange_line(home_one, b"before-home-two-offline")
+        exchange_line(home_two, b"before-home-two-offline", b"home-2")
+        subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "homeagent2"],
+            check=True,
+        )
+        wait_catalog_homes({"home-1"})
+        assert (
+            exchange_line(home_one, b"home-one-survives-home-two-offline")
+            == home_one_connection
+        )
+        wait_local_flow_closed(home_two)
     expect_mapping_unavailable_without_cross_home_fallback(11082)
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "homeagent2"],
@@ -239,6 +293,170 @@ def check_home_lifecycle_is_isolated() -> None:
     with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-returned", b"home-2")
+
+
+def check_serving_only_home2_profile() -> None:
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "homeagent2"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "homeagent2serving",
+        ],
+        check=True,
+    )
+    wait_catalog_homes({"home-1", "home-2"})
+    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+        home_two.settimeout(15)
+        exchange_line(home_two, b"home-two-serving-only", b"home-2")
+    time.sleep(7)
+    statistics = container_json_request(
+        "homeagent2serving", 9081, "/api/statistics?period=day"
+    )
+    assert statistics["period"] == "day", statistics
+    assert statistics["points"], statistics
+    page = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "homeagent2serving",
+            "wget",
+            "-qO-",
+            "http://127.0.0.1:9081/",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    assert b"serving-only" in page
+    issue = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "homeagent2serving",
+            "wget",
+            "-qO-",
+            "http://127.0.0.1:9081/api/issue",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert issue.returncode != 0, issue.stdout
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "stop",
+            "homeagent2serving",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "homeagent2"],
+        check=True,
+    )
+    wait_catalog_homes({"home-1", "home-2"})
+
+
+def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
+    statistics = travel_request("GET", "/api/statistics?period=day")
+    learned = {row["relay_id"]: row for row in statistics["relay_discovery"]}
+    assert learned["relay-1"]["configured_seed"] is True, learned
+    assert learned["relay-2"]["configured_seed"] is False, learned
+    assert learned["relay-2"]["learned"] is True, learned
+    relay2_success_before = learned["relay-2"]["last_success_unix_secs"]
+
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "stop",
+            "travelagent",
+            "relay1",
+        ],
+        check=True,
+    )
+    # The signed snapshot has a 15-second lifetime. Waiting beyond it proves that
+    # restart reachability comes from redb Relay history, not the cached snapshot.
+    time.sleep(18)
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            "travelagent",
+        ],
+        check=True,
+    )
+    relay1_container = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "ps",
+            "-aq",
+            "relay1",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert relay1_container
+    relay1_running = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", relay1_container],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert relay1_running == "false", relay1_running
+    wait_ready()
+    refreshed = travel_request("GET", "/api/statistics?period=day")
+    refreshed_relays = {
+        row["relay_id"]: row for row in refreshed["relay_discovery"]
+    }
+    relay2_success_after = refreshed_relays["relay-2"]["last_success_unix_secs"]
+    assert relay2_success_after is not None
+    assert relay2_success_before is None or relay2_success_after > relay2_success_before
+    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
+        stream.settimeout(15)
+        exchange_line(stream, b"fresh-directory-via-learned-relay")
+
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "relay1",
+        ],
+        check=True,
+    )
+    wait_ready()
 
 
 def wait_active_relay(excluded: str | None = None) -> str:
@@ -253,13 +471,20 @@ def wait_active_relay(excluded: str | None = None) -> str:
     raise AssertionError(f"Travel did not select a replacement Relay; excluded={excluded}")
 
 
-def check_tcp_relay_failover() -> tuple[str, str]:
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
+def check_tcp_relay_failover(
+    port: int = 11080, expected_home: bytes | None = None
+) -> tuple[str, str]:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
         stream.settimeout(30)
-        connection_id = exchange_line(stream, b"before-relay-failure")
+        connection_id = exchange_line(
+            stream, b"before-relay-failure", expected_home
+        )
         active = wait_active_relay()
         time.sleep(3)
-        assert exchange_line(stream, b"after-stable-reevaluation") == connection_id
+        assert (
+            exchange_line(stream, b"after-stable-reevaluation", expected_home)
+            == connection_id
+        )
         assert wait_active_relay() == active
         service = {"relay-1": "relay1", "relay-2": "relay2"}[active]
         subprocess.run(
@@ -268,7 +493,11 @@ def check_tcp_relay_failover() -> tuple[str, str]:
         )
 
         for sequence in range(32):
-            observed = exchange_line(stream, f"after-relay-failure-{sequence:04d}".encode())
+            observed = exchange_line(
+                stream,
+                f"after-relay-failure-{sequence:04d}".encode(),
+                expected_home,
+            )
             assert observed == connection_id, (observed, connection_id)
 
         replacement = wait_active_relay(excluded=active)
@@ -303,6 +532,11 @@ def check_embedded_spa() -> None:
     assert travel_asset_body
     if asset.endswith(".js"):
         assert b"Travel private-key password" in travel_asset_body
+        assert b"Business statistics" in travel_asset_body
+        assert b"Configured and learned Relays" in travel_asset_body
+        assert b'data-page="overview"' in travel_asset_body
+        assert b'data-page="statistics"' in travel_asset_body
+        assert b"Statistics are read only after this page is opened" in travel_asset_body
     assert br_body
     assert identity_headers.get("cache-control")
 
@@ -334,6 +568,40 @@ def check_embedded_spa() -> None:
         assert "旅行端凭据签发".encode() in issuer_javascript
         assert "更改 Home 签发密码".encode() in issuer_javascript
         assert "此前已经签发".encode() in issuer_javascript
+        assert "业务统计".encode() in issuer_javascript
+        assert "交付流量与 Relay 路径".encode() in issuer_javascript
+        assert b'<details class="panel issue-panel">' in issuer_javascript
+        assert "手动签发".encode() in issuer_javascript
+        assert "批准使用下方".encode() not in issuer_javascript
+        assert "批准并远程返回".encode() in issuer_javascript
+        assert "必须用签发密码确认".encode() in issuer_javascript
+        assert b'class="stats-grid"' in issuer_javascript
+        assert b'class="stat-card"' in issuer_javascript
+        assert b'class="stats-note"' in issuer_javascript
+        assert b'class="statistics-cards"' not in issuer_javascript
+        assert b'data-page="overview"' in issuer_javascript
+        assert b'data-page="statistics"' in issuer_javascript
+        assert "统计数据只在打开本页".encode() in issuer_javascript
+        assert b"window.prompt" not in issuer_javascript
+
+    issuer_assets = {
+        asset.decode()
+        for asset in re.findall(
+            rb'(?:src|href)="(/assets/[^"]+\.(?:js|css))"', issuer_body
+        )
+    }
+    issuer_css = next(asset for asset in issuer_assets if asset.endswith(".css"))
+    issuer_css_status, issuer_css_headers, issuer_css_body = issuer_get(
+        issuer_css, {"Accept-Encoding": "gzip"}
+    )
+    assert issuer_css_status == 200
+    assert issuer_css_headers.get("content-encoding") == "gzip"
+    issuer_stylesheet = gzip.decompress(issuer_css_body)
+    assert b".scope input[type=radio]" in issuer_stylesheet
+    assert b"width:18px" in issuer_stylesheet
+    assert b"height:18px" in issuer_stylesheet
+    assert b"min-height:18px" in issuer_stylesheet
+    assert b"padding:0" in issuer_stylesheet
 
     issuer_api_status, _, _ = issuer_get(
         "/api/not-a-route", {"Accept": "text/html"}
@@ -402,12 +670,34 @@ def issue_scope(
 
 
 def revoke_from_home(port: int, credential_id: str, expect_ok=True) -> dict:
+    generated = Path(__file__).resolve().parent / "generated"
+    issuer_directory = "offline-home2" if port == 29081 else "offline"
     return issuer_request(
         port,
         "POST",
         "/api/revoke",
-        {"credential_id": credential_id, "reason": "E2E revocation"},
+        {
+            "credential_id": credential_id,
+            "reason": "E2E revocation",
+            "password": (generated / issuer_directory / "test-password.txt")
+            .read_text()
+            .strip(),
+        },
         expect_ok=expect_ok,
+    )
+
+
+def revoke_with_wrong_password(port: int, credential_id: str) -> dict:
+    return issuer_request(
+        port,
+        "POST",
+        "/api/revoke",
+        {
+            "credential_id": credential_id,
+            "reason": "must not be accepted",
+            "password": "wrong-flowsplice-e2e-revocation-password",
+        },
+        expect_ok=False,
     )
 
 
@@ -595,11 +885,462 @@ def check_private_key_password_rotation(
     )
     ready = wait_ready()
     after_restart = read_control_high_water()
-    assert after_restart["trust_generation"] >= before_restart["trust_generation"]
-    assert after_restart["signer_epoch"] >= before_restart["signer_epoch"]
-    if after_restart["signer_epoch"] == before_restart["signer_epoch"]:
-        assert after_restart["snapshot_generation"] >= before_restart["snapshot_generation"]
+    assert after_restart["catalog_generation"] >= before_restart["catalog_generation"]
+    assert (
+        after_restart["relay_directory_generation"]
+        >= before_restart["relay_directory_generation"]
+    )
     return ready
+
+
+def wait_remote_enrollment_status(request_id: str, field: str, expected=True) -> dict:
+    deadline = time.monotonic() + 90
+    last = None
+    while time.monotonic() < deadline:
+        records = travel_request("GET", "/api/enrollment")
+        last = next(
+            (record for record in records if record["request_id"] == request_id), None
+        )
+        if last is not None and last[field] == expected:
+            return last
+        time.sleep(1)
+    raise AssertionError(
+        f"remote enrollment {request_id} did not reach {field}={expected}: {last}"
+    )
+
+
+def prepare_remote_enrollment() -> tuple[str, str]:
+    generated = Path(__file__).resolve().parent / "generated"
+    password = (generated / "travel/test-password.txt").read_text().strip()
+    created = travel_request(
+        "POST", "/api/enrollment", {"home_id": "home-1", "password": password}
+    )
+    request_id = created["request_id"]
+
+    deadline = time.monotonic() + 90
+    pending = None
+    while time.monotonic() < deadline:
+        records = issuer_request(19081, "GET", "/api/enrollment/pending")
+        pending = next(
+            (record for record in records if record["request_id"] == request_id), None
+        )
+        if pending is not None:
+            break
+        time.sleep(1)
+    assert pending is not None and pending["approved"] is False, pending
+
+    issuer_request(
+        19081,
+        "POST",
+        "/api/enrollment/approve",
+        {
+            "request_id": request_id,
+            "valid_days": 365,
+            "scope": {"kind": "global"},
+            "password": "wrong-flowsplice-e2e-enrollment-password",
+        },
+        expect_ok=False,
+    )
+    pending_after_wrong_password = next(
+        record
+        for record in issuer_request(19081, "GET", "/api/enrollment/pending")
+        if record["request_id"] == request_id
+    )
+    assert pending_after_wrong_password["approved"] is False
+
+    approved = issuer_request(
+        19081,
+        "POST",
+        "/api/enrollment/approve",
+        {
+            "request_id": request_id,
+            "valid_days": 365,
+            "scope": {"kind": "global"},
+            "password": (generated / "offline/test-password.txt").read_text().strip(),
+        },
+    )
+    assert approved["enrollment"]["approval"]["request"]["request_id"] == request_id
+    wait_remote_enrollment_status(request_id, "response_received")
+    return request_id, password
+
+
+def activate_remote_enrollment(request_id: str, password: str) -> tuple[dict, str]:
+    travel_request(
+        "POST",
+        "/api/enrollment/install",
+        {"request_id": request_id, "password": "wrong-install-password"},
+        expect_ok=False,
+    )
+    before = wait_remote_enrollment_status(request_id, "response_received")
+    assert before["restart_required"] is False, before
+    installed = travel_request(
+        "POST",
+        "/api/enrollment/install",
+        {"request_id": request_id, "password": password},
+    )
+    assert installed["restart_required"] is True, installed
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "travelagent"],
+        check=True,
+    )
+    ready = wait_ready()
+    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
+        stream.settimeout(15)
+        exchange_line(stream, b"remote-enrollment-identity-active")
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        travel_pending = travel_request("GET", "/api/enrollment")
+        home_pending = issuer_request(19081, "GET", "/api/enrollment/pending")
+        if (
+            all(record["request_id"] != request_id for record in travel_pending)
+            and all(record["request_id"] != request_id for record in home_pending)
+        ):
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("installed remote enrollment was not acknowledged and retired")
+    return ready, installed["credential_id"]
+
+
+def check_home2_remote_enrollment(password: str) -> str:
+    generated = Path(__file__).resolve().parent / "generated"
+    created = travel_request(
+        "POST", "/api/enrollment", {"home_id": "home-2", "password": password}
+    )
+    request_id = created["request_id"]
+    deadline = time.monotonic() + 90
+    pending = None
+    while time.monotonic() < deadline:
+        home_one_records = issuer_request(19081, "GET", "/api/enrollment/pending")
+        home_two_records = issuer_request(29081, "GET", "/api/enrollment/pending")
+        assert all(record["request_id"] != request_id for record in home_one_records)
+        pending = next(
+            (record for record in home_two_records if record["request_id"] == request_id),
+            None,
+        )
+        if pending is not None:
+            break
+        time.sleep(1)
+    assert pending is not None and pending["home_id"] == "home-2", pending
+    issuer_request(
+        19081,
+        "POST",
+        "/api/enrollment/approve",
+        {
+            "request_id": request_id,
+            "valid_days": 365,
+            "scope": {"kind": "home", "home_id": "home-2"},
+            "password": (generated / "offline/test-password.txt").read_text().strip(),
+        },
+        expect_ok=False,
+    )
+    issuer_request(
+        29081,
+        "POST",
+        "/api/enrollment/approve",
+        {
+            "request_id": request_id,
+            "valid_days": 365,
+            "scope": {"kind": "home", "home_id": "home-2"},
+            "password": "wrong-home-two-enrollment-password",
+        },
+        expect_ok=False,
+    )
+    approved = issuer_request(
+        29081,
+        "POST",
+        "/api/enrollment/approve",
+        {
+            "request_id": request_id,
+            "valid_days": 365,
+            "scope": {"kind": "home", "home_id": "home-2"},
+            "password": (generated / "offline-home2/test-password.txt")
+            .read_text()
+            .strip(),
+        },
+    )
+    credential_id = approved["enrollment"]["approval"]["credential_id"]
+    wait_remote_enrollment_status(request_id, "response_received")
+    travel_request(
+        "POST",
+        "/api/enrollment/install",
+        {"request_id": request_id, "password": password},
+    )
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "travelagent"],
+        check=True,
+    )
+    wait_scoped_catalog({"home-2": {"tcp-echo", "target-failure"}})
+    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+        home_two.settimeout(15)
+        exchange_line(home_two, b"remote-home-two-scope", b"home-2")
+    expect_mapping_unavailable_without_cross_home_fallback(11080)
+
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if (
+            all(
+                record["request_id"] != request_id
+                for record in travel_request("GET", "/api/enrollment")
+            )
+            and all(
+                record["request_id"] != request_id
+                for record in issuer_request(29081, "GET", "/api/enrollment/pending")
+            )
+        ):
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("Home-2 remote enrollment was not acknowledged and retired")
+
+    revoke_with_wrong_password(29081, credential_id)
+    active = next(
+        credential
+        for credential in issued_credentials(29081)
+        if credential["credential_id"] == credential_id
+    )
+    assert active["active"] and not active["revoked"], active
+    revoke_from_home(29081, credential_id)
+    wait_scoped_catalog({})
+    return credential_id
+
+
+def check_server_failure_does_not_break_established_data_flow() -> None:
+    server_config = (
+        Path(__file__).resolve().parent / "generated/config/server.toml"
+    ).read_text()
+    assert "data_listen" not in server_config
+    listener_probe = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "server",
+            "sh",
+            "-c",
+            "nc -z -w 1 127.0.0.1 7444",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert listener_probe.returncode != 0, listener_probe.stdout
+    with (
+        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+    ):
+        home_one.settimeout(20)
+        home_two.settimeout(20)
+        home_one_connection = exchange_line(home_one, b"before-server-stop")
+        home_two_connection = exchange_line(
+            home_two, b"before-server-stop", b"home-2"
+        )
+        subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "server"],
+            check=True,
+        )
+        assert (
+            exchange_line(home_one, b"server-stopped-direct-flow")
+            == home_one_connection
+        )
+        assert (
+            exchange_line(home_two, b"server-stopped-direct-flow", b"home-2")
+            == home_two_connection
+        )
+        subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "server"],
+            check=True,
+        )
+        wait_ready()
+        assert (
+            exchange_line(home_one, b"server-returned-same-flow")
+            == home_one_connection
+        )
+        assert (
+            exchange_line(home_two, b"server-returned-same-flow", b"home-2")
+            == home_two_connection
+        )
+    deadline = time.monotonic() + 45
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 11080), timeout=3) as fresh:
+                fresh.settimeout(6)
+                exchange_line(fresh, b"new-route-after-server-recovery")
+                return
+        except (AssertionError, ConnectionError, OSError, socket.timeout) as error:
+            last_error = error
+            time.sleep(1)
+    raise AssertionError(f"new route did not recover after Server restart: {last_error}")
+
+
+def check_statistics_pipeline() -> None:
+    deadline = time.monotonic() + 45
+    last = None
+    while time.monotonic() < deadline:
+        travel = travel_request("GET", "/api/statistics?period=day")
+        home = issuer_request(19081, "GET", "/api/statistics?period=week")
+        relay_one = container_json_request(
+            "relay1", 9084, "/api/statistics?period=month"
+        )
+        relay_two = container_json_request(
+            "relay2", 9084, "/api/statistics?period=year"
+        )
+        server = container_json_request(
+            "server", 9083, "/api/statistics?period=day"
+        )
+        last = (travel, home, relay_one, relay_two, server)
+        roles = {
+            report["payload"]["reporter_role"].lower()
+            for report in server["reports"]
+        }
+        if (
+            travel["points"]
+            and home["points"]
+            and (relay_one["points"] or relay_two["points"])
+            and {"travel", "home", "relay"}.issubset(roles)
+        ):
+            assert travel["period"] == "day"
+            assert home["period"] == "week"
+            assert relay_one["period"] == "month"
+            assert relay_two["period"] == "year"
+            assert travel["overview"] and travel["breakdowns"]
+            assert home["overview"] and home["breakdowns"]
+            assert server["overview"] and server["breakdowns"] and server["nodes"]
+            assert all(
+                not report["payload"]["metric_family"].startswith("server_")
+                and "control" not in report["payload"]["metric_family"]
+                for report in server["reports"]
+            )
+            for report in server["reports"]:
+                role = report["payload"]["reporter_role"].lower()
+                family = report["payload"]["metric_family"]
+                if role == "travel":
+                    assert family.startswith(("delivered_download", "carrier_", "travel_flow_"))
+                elif role == "home":
+                    assert family.startswith(("delivered_upload", "home_flow_", "target_", "issuer_"))
+                elif role == "relay":
+                    assert family.startswith(("relay_transport_", "relay_route_"))
+                else:
+                    raise AssertionError((role, family))
+            raw_sums = {}
+            for report in server["reports"]:
+                role = report["payload"]["reporter_role"].lower()
+                family = report["payload"]["metric_family"]
+                authoritative = (
+                    (role == "travel" and family.startswith(("delivered_download", "carrier_")))
+                    or (
+                        role == "home"
+                        and family.startswith(
+                            (
+                                "delivered_upload",
+                                "home_flow_accepted",
+                                "home_flow_completed",
+                                "home_flow_failed",
+                                "target_",
+                                "issuer_",
+                            )
+                        )
+                    )
+                    or (role == "relay" and family.startswith("relay_"))
+                )
+                if not authoritative:
+                    continue
+                raw_sums[family] = raw_sums.get(family, 0) + report["payload"]["value"]["sum"]
+            assert {row["metric_family"]: row["sum"] for row in server["overview"]} == raw_sums
+            target_failure_reporters = {
+                report["payload"]["reporter_id"]
+                for report in server["reports"]
+                if report["payload"]["reporter_role"].lower() == "home"
+                and report["payload"]["metric_family"] == "target_failure"
+            }
+            assert {"home-1", "home-2"}.issubset(target_failure_reporters)
+            for service, port, title in (
+                ("relay1", 9084, b"Relay statistics"),
+                ("server", 9083, b"Global statistics"),
+            ):
+                page = container_page(service, port)
+                assert title in page
+                assert b"Report window" in page
+                assert b"Five-minute series" in page
+                assert b'id="statistics-page" class="view" hidden' in page
+                assert b"activate('overview')" in page
+                assert b"render();setInterval(render,30000)" not in page
+                assert b"<pre>" not in page
+            return
+        time.sleep(1)
+    raise AssertionError(f"statistics reports did not converge: {last}")
+
+
+def home_delivered_upload_sum(port: int) -> int:
+    statistics = issuer_request(port, "GET", "/api/statistics?period=day")
+    return sum(
+        point["value"]["sum"]
+        for point in statistics["points"]
+        if point["identity"]["metric_family"] == "delivered_upload_bytes"
+        and point["identity"]["dimensions"].get("service_id") == "tcp-echo"
+    )
+
+
+def check_home_statistics_write_failures_are_isolated() -> None:
+    for service, issuer_port, business_port, expected_home in (
+        ("homeagent", 19081, 11080, None),
+        ("homeagent2", 29081, 11082, b"home-2"),
+    ):
+        before = home_delivered_upload_sum(issuer_port)
+        armed = issuer_request(
+            issuer_port,
+            "POST",
+            "/api/test/statistics-flush-failures",
+            {"failures": 1},
+        )
+        assert armed["remaining"] == 1, armed
+        payload = f"{service}-statistics-write-failure".encode()
+        with socket.create_connection(("127.0.0.1", business_port), timeout=5) as stream:
+            stream.settimeout(15)
+            exchange_line(stream, payload, expected_home)
+
+        deadline = time.monotonic() + 20
+        remaining = None
+        while time.monotonic() < deadline:
+            remaining = issuer_request(
+                issuer_port, "GET", "/api/test/statistics-flush-failures"
+            )["remaining"]
+            if remaining == 0:
+                break
+            time.sleep(0.25)
+        assert remaining == 0, (service, remaining)
+
+        # Business remains available while the node is recovering its best-effort statistics
+        # write path. The next successful flush must include the delta restored after failure.
+        with socket.create_connection(("127.0.0.1", business_port), timeout=5) as stream:
+            stream.settimeout(15)
+            exchange_line(stream, b"business-survives-statistics-write-failure", expected_home)
+        deadline = time.monotonic() + 20
+        after = before
+        while time.monotonic() < deadline:
+            after = home_delivered_upload_sum(issuer_port)
+            if after >= before + len(payload):
+                break
+            time.sleep(0.5)
+        assert after >= before + len(payload), (service, before, after)
+
+        logs = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "logs",
+                "--no-color",
+                service,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        assert b"injected statistics redb write failure" in logs, service
 
 
 def assert_revoked_management_certificate_rejected(relay: str) -> None:
@@ -654,15 +1395,18 @@ def wait_scoped_catalog(expected: dict[str, set[str]]) -> None:
     deadline = time.monotonic() + 35
     last = None
     while time.monotonic() < deadline:
-        status, _, body = http_get("/api/catalog", {"Accept": "application/json"})
-        if status == 200:
-            catalog = json.loads(body)
-            last = {
-                home["home_id"]: {service["id"] for service in home["services"]}
-                for home in catalog["homes"]
-            }
-            if last == expected:
-                return
+        try:
+            status, _, body = http_get("/api/catalog", {"Accept": "application/json"})
+            if status == 200:
+                catalog = json.loads(body)
+                last = {
+                    home["home_id"]: {service["id"] for service in home["services"]}
+                    for home in catalog["homes"]
+                }
+                if last == expected:
+                    return
+        except (ConnectionError, OSError) as error:
+            last = error
         time.sleep(0.25)
     raise AssertionError(f"scoped catalog did not converge: {last}")
 
@@ -706,6 +1450,20 @@ def check_scoped_authorization_and_home_revocation(
             29081, {"kind": "home", "home_id": "home-2"}
         )
         revoke_from_home(29081, global_credential_id, expect_ok=False)
+        wrong_password = revoke_with_wrong_password(19081, global_credential_id)
+        assert wrong_password["error"], wrong_password
+        still_active = next(
+            credential
+            for credential in issued_credentials(19081)
+            if credential["credential_id"] == global_credential_id
+        )
+        assert still_active["active"] and not still_active["revoked"], still_active
+        exchange_line(home_one, b"wrong-revoke-password-kept-home-one-open")
+        exchange_line(
+            home_two,
+            b"wrong-revoke-password-kept-home-two-open",
+            b"home-2",
+        )
         revoke_from_home(19081, global_credential_id)
         wait_local_flow_closed(home_one)
         wait_local_flow_closed(home_two)
@@ -728,7 +1486,7 @@ def check_scoped_authorization_and_home_revocation(
     assert "no longer active" in revoked_retry["error"], revoked_retry
 
     wait_scoped_catalog(
-        {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo"}}
+        {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo", "target-failure"}}
     )
     with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
         home_one.settimeout(15)
@@ -749,7 +1507,7 @@ def check_scoped_authorization_and_home_revocation(
     revoke_from_home(29081, home_one_credential, expect_ok=False)
     revoke_from_home(19081, home_one_credential)
     revoke_from_home(19081, home_one_credential)
-    wait_scoped_catalog({"home-2": {"tcp-echo"}})
+    wait_scoped_catalog({"home-2": {"tcp-echo", "target-failure"}})
     expect_mapping_unavailable_without_cross_home_fallback(11080)
 
     revoke_from_home(29081, home_two_credential)
@@ -806,28 +1564,89 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
     )
 
 
+def checkpoint(name: str) -> None:
+    print(json.dumps({"checkpoint": name}), flush=True)
+
+
+checkpoint("initial-ready")
 state = wait_ready()
+checkpoint("expired-snapshot-learned-relay")
+check_expired_snapshot_bootstraps_through_learned_relay()
+checkpoint("home-issued-enrollment")
 credential_id = check_home_issued_enrollment()
+checkpoint("duplicate-enrollment-idempotency")
 issuance_generation = check_duplicate_enrollment_issue_is_idempotent(credential_id)
+checkpoint("private-key-password-rotation")
 state = check_private_key_password_rotation(credential_id, issuance_generation)
+checkpoint("prepare-remote-enrollment")
+remote_request_id, remote_identity_password = prepare_remote_enrollment()
+checkpoint("udp")
 check_udp()
+checkpoint("multi-home-business-routing")
 check_multi_home_business_routing()
+checkpoint("per-home-target-failures")
+check_target_failures_are_home_isolated()
+checkpoint("home-lifecycle-isolation")
 check_home_lifecycle_is_isolated()
+checkpoint("serving-only-home2")
+check_serving_only_home2_profile()
+checkpoint("server-outage-established-flow")
+check_server_failure_does_not_break_established_data_flow()
+checkpoint("embedded-spa")
 check_embedded_spa()
+checkpoint("duplicate-travel-login")
 check_duplicate_travel_login_is_rejected()
+checkpoint("tls-policy-and-slow-loris")
 check_tls_policy_and_slow_loris_deadline()
+checkpoint("statistics-pipeline")
+check_statistics_pipeline()
+checkpoint("home-statistics-write-failure-isolation")
+check_home_statistics_write_failures_are_isolated()
+checkpoint("home1-tcp-relay-failover")
 failed_relay, replacement_relay = check_tcp_relay_failover()
-check_scoped_authorization_and_home_revocation(failed_relay, credential_id)
+subprocess.run(
+    [
+        "docker",
+        "compose",
+        "-f",
+        str(COMPOSE_FILE),
+        "up",
+        "-d",
+        {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay],
+    ],
+    check=True,
+)
+wait_ready()
+checkpoint("home2-tcp-relay-failover")
+home2_failed_relay, _ = check_tcp_relay_failover(11082, b"home-2")
+checkpoint("scoped-authorization-and-revocation")
+check_scoped_authorization_and_home_revocation(home2_failed_relay, credential_id)
+checkpoint("activate-remote-enrollment")
+state, remote_credential_id = activate_remote_enrollment(
+    remote_request_id, remote_identity_password
+)
+assert remote_credential_id != credential_id
+checkpoint("home2-remote-enrollment")
+home2_remote_credential_id = check_home2_remote_enrollment(remote_identity_password)
+assert home2_remote_credential_id not in {credential_id, remote_credential_id}
 checks = [
     "server-downlinked-two-relay-spki-directory",
     "two-home-catalog",
     "same-service-id-isolated-by-home",
     "logical-business-selects-exact-home",
     "wrong-home-service-fails-without-fallback",
+    "target-failure-isolated-per-home",
     "one-home-offline-does-not-affect-other-home",
     "home-catalog-removal-and-return",
+    "home-two-serving-only-profile",
+    "home-two-serving-only-has-no-issuer-routes-or-keys",
+    "home-two-state-persists-across-issuer-to-serving-only-restart",
     "same-tcp-flow-relay-failover",
+    "home-two-same-tcp-flow-relay-failover",
     "same-home-target-connection",
+    "server-failure-does-not-break-established-direct-flow",
+    "server-failure-preserves-both-home-flows",
+    "server-has-no-business-data-listener",
     "udp",
     "embedded-spa",
     "tls13-only",
@@ -848,6 +1667,8 @@ checks = [
     "password-rotation-survives-restart",
     "deployment-root-private-key-not-mounted-in-home",
     "durable-control-high-water-survives-restart",
+    "expired-snapshot-bootstrap-through-learned-relay",
+    "fresh-directory-required-before-learned-relay-business",
     "default-one-year-validity",
     "global-super-authorization",
     "home-scoped-authorization",
@@ -861,6 +1682,21 @@ checks = [
     "revocation-without-process-restart",
     "home-revocation-idempotent",
     "restarted-relay-retains-revocation",
+    "five-minute-local-statistics",
+    "signed-statistics-upload",
+    "server-statistics-idempotent-collection",
+    "day-week-month-year-statistics-queries",
+    "statistics-write-failure-isolated-per-home",
+    "remote-enrollment-outbox-to-home-inbox",
+    "remote-enrollment-wrong-approval-password-rejected",
+    "remote-enrollment-wrong-install-password-rejected",
+    "remote-enrollment-restart-activation",
+    "remote-enrollment-installed-acknowledgement",
+    "remote-enrollment-new-identity-restores-business",
+    "home-two-remote-enrollment-isolation",
+    "home-two-remote-enrollment-password-gate",
+    "home-two-remote-enrollment-install-acknowledgement",
+    "home-two-password-gated-revocation",
 ]
 print(
     json.dumps(
@@ -869,6 +1705,9 @@ print(
             "travel": state["travel_id"],
             "failed_relay": failed_relay,
             "replacement_relay": replacement_relay,
+            "home2_failed_relay": home2_failed_relay,
+            "remote_credential_id": remote_credential_id,
+            "home2_remote_credential_id": home2_remote_credential_id,
             "checks": checks,
         }
     )

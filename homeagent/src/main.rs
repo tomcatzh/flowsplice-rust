@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, IsTerminal},
     net::SocketAddr,
     path::PathBuf,
@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use aws_lc_rs::{digest, signature::EcdsaKeyPair};
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -31,11 +32,15 @@ use flowsplice_core::{
     deployment::{DeploymentTrust, SignedDeploymentTrust},
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{ControlMessage, DataFrame, HomeCatalog, Role, Service, ServiceProtocol},
+    protocol::{
+        CONTROL_PROTOCOL_VERSION, ControlMessage, DataFrame, HomeCatalog, Role, Service,
+        ServiceProtocol, bootstrap_verification_code,
+    },
     route::{RouteSide, write_preface},
+    statistics::{statistics_dashboard_html, statistics_signing_key},
     tls::{
-        client_connector, peer_identity, require_peer, server_acceptor, server_name,
-        validate_spki_pins,
+        client_connector, load_private_key as load_management_private_key, peer_identity,
+        require_peer, server_acceptor, server_name, validate_spki_pins,
     },
 };
 use flowsplice_enrollment::{
@@ -43,9 +48,14 @@ use flowsplice_enrollment::{
     issuer::{IssuerMaterial, ProtectedKey, issue_enrollment},
     key::{
         MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget,
-        recover_private_key_password_rotation, rotate_private_key_passwords,
+        load_private_key as load_issuer_private_key, recover_private_key_password_rotation,
+        rotate_private_key_passwords,
     },
-    prepare_enrollment_approval,
+    parse_enrollment_request, prepare_enrollment_approval,
+};
+use flowsplice_storage::{
+    LocalStatistics, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
+    summarize_metric_points,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -85,11 +95,11 @@ struct Args {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     id: String,
     alias: String,
     server_control_addr: String,
-    server_data_addr: String,
     server_name: String,
     server_id: String,
     management_cert: PathBuf,
@@ -103,6 +113,8 @@ struct Config {
     #[serde(default)]
     server_spki_pins: Vec<String>,
     travel_authorization_cache: PathBuf,
+    state_store: PathBuf,
+    ui_listen: String,
     #[serde(default)]
     issuer: Option<IssuerConfig>,
     services: Vec<Service>,
@@ -129,7 +141,6 @@ struct Config {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssuerConfig {
-    listen: String,
     management_ca_key: PathBuf,
     business_ca_key: PathBuf,
     home_authority: SigningAuthorityConfig,
@@ -244,6 +255,17 @@ struct IssuerAppState {
     key_operation: Arc<Mutex<()>>,
     sensitive_operation: Arc<Semaphore>,
     issuance_ledger: Arc<Mutex<IssuanceLedger>>,
+    statistics: HomeStatistics,
+}
+
+#[derive(Clone)]
+struct HomeStatistics {
+    store: Arc<StateStore>,
+    local: Arc<LocalStatistics>,
+    signer: Arc<EcdsaKeyPair>,
+    certificate_pem: Arc<String>,
+    deployment_id: Arc<String>,
+    reporter_id: Arc<String>,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +290,41 @@ struct IssueResponse {
 struct RevokeRequest {
     credential_id: Uuid,
     reason: String,
+    password: String,
+}
+
+const REMOTE_ENROLLMENT_VERSION: u32 = 1;
+const MAX_REMOTE_ENROLLMENT_INBOX_RECORDS: usize = 1024;
+const REMOTE_ENROLLMENT_PENDING_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+const REMOTE_ENROLLMENT_INSTALLED_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteEnrollmentInboxRecord {
+    version: u32,
+    travel_id: String,
+    home_id: String,
+    received_at_unix_secs: u64,
+    request: TravelEnrollmentRequest,
+    response: Option<TravelEnrollmentResponse>,
+    #[serde(default)]
+    bootstrap_token_sha256: Option<String>,
+    #[serde(default)]
+    verification_code: Option<String>,
+    #[serde(default)]
+    installed_credential_id: Option<Uuid>,
+    #[serde(default)]
+    installed_at_unix_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveRemoteEnrollmentRequest {
+    request_id: Uuid,
+    valid_days: Option<u32>,
+    valid_minutes: Option<u32>,
+    scope: TravelCredentialScope,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -310,6 +367,7 @@ struct ApiError {
 
 type ApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     init_crypto();
@@ -322,6 +380,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let config: Config = load_toml(&args.config)?;
+    validate_home_ui_config(&config)?;
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
     let (_, deployment_trust) = load_home_trust(&config)?;
@@ -345,6 +404,20 @@ async fn main() -> Result<()> {
     {
         bail!("carrier/flow timeout or unacknowledged-data limits are invalid");
     }
+    let state_store = Arc::new(StateStore::open(&config.state_store)?);
+    let statistics = HomeStatistics {
+        store: Arc::clone(&state_store),
+        local: Arc::new(LocalStatistics::new(state_store.as_ref().clone())),
+        signer: Arc::new(statistics_signing_key(&load_management_private_key(
+            &config.management_key,
+        )?)?),
+        certificate_pem: Arc::new(
+            std::fs::read_to_string(&config.management_cert)
+                .context("failed to read Home statistics signing certificate")?,
+        ),
+        deployment_id: Arc::new(deployment_trust.deployment_id.clone()),
+        reporter_id: Arc::new(config.id.clone()),
+    };
     let tls = Arc::new(TlsMaterial {
         management_connector: client_connector(
             &config.management_cert,
@@ -377,6 +450,7 @@ async fn main() -> Result<()> {
         config.max_unacked_bytes,
         config.max_active_carriers,
         config.max_carriers_per_flow,
+        Arc::clone(&statistics.local),
     );
     let (issuer_state, issuer_control_rx) = if let Some(issuer) = &config.issuer {
         let (issuer_control_tx, issuer_control_rx) = mpsc::channel(32);
@@ -390,6 +464,7 @@ async fn main() -> Result<()> {
                 key_operation: Arc::new(Mutex::new(())),
                 sensitive_operation: Arc::new(Semaphore::new(1)),
                 issuance_ledger: Arc::new(Mutex::new(issuance_ledger)),
+                statistics: statistics.clone(),
             }),
             Some(issuer_control_rx),
         )
@@ -403,13 +478,17 @@ async fn main() -> Result<()> {
         Arc::clone(&tcp_flows),
         Arc::clone(&authorization),
         issuer_control_rx,
+        statistics.clone(),
     );
     let trust_expiry = monitor_trust_expiry(deployment_trust.not_after_unix_secs);
     if let Some(issuer_state) = issuer_state {
-        let issuer = run_issuer_ui(issuer_state);
-        tokio::try_join!(control, issuer, trust_expiry)?;
+        tokio::try_join!(control, run_issuer_ui(issuer_state), trust_expiry)?;
     } else {
-        tokio::try_join!(control, trust_expiry)?;
+        tokio::try_join!(
+            control,
+            run_statistics_only_ui(Arc::clone(&config), statistics),
+            trust_expiry
+        )?;
     }
     Ok(())
 }
@@ -430,6 +509,7 @@ async fn run_control_loop(
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
     mut issuer_control_rx: Option<mpsc::Receiver<IssuerControlRequest>>,
+    statistics: HomeStatistics,
 ) -> Result<()> {
     loop {
         if let Err(error) = run_control(
@@ -439,6 +519,7 @@ async fn run_control_loop(
             Arc::clone(&tcp_flows),
             Arc::clone(&authorization),
             &mut issuer_control_rx,
+            statistics.clone(),
         )
         .await
         {
@@ -449,10 +530,10 @@ async fn run_control_loop(
 }
 
 fn validate_issuer_config(config: &Config, issuer: &IssuerConfig) -> Result<()> {
-    let listen = issuer
-        .listen
+    let listen = config
+        .ui_listen
         .parse::<SocketAddr>()
-        .context("invalid Home issuer listen address")?;
+        .context("invalid Home UI listen address")?;
     if listen != SocketAddr::from(([127, 0, 0, 1], listen.port()))
         && !test_remote_issuer_enabled(issuer)
     {
@@ -480,6 +561,25 @@ fn validate_issuer_config(config: &Config, issuer: &IssuerConfig) -> Result<()> 
         && std::env::var("FLOWSPLICE_ALLOW_UNENCRYPTED_TEST_KEYS").as_deref() != Ok("1")
     {
         bail!("unencrypted issuer keys are disabled outside the explicit test environment");
+    }
+    Ok(())
+}
+
+fn validate_home_ui_config(config: &Config) -> Result<()> {
+    if config.state_store.as_os_str().is_empty() {
+        bail!("state_store must be non-empty");
+    }
+    let listen = config
+        .ui_listen
+        .parse::<SocketAddr>()
+        .context("invalid Home UI listen address")?;
+    if !listen.ip().is_loopback()
+        && !config
+            .issuer
+            .as_ref()
+            .is_some_and(test_remote_issuer_enabled)
+    {
+        bail!("Home UI must listen directly on a loopback address");
     }
     Ok(())
 }
@@ -577,6 +677,7 @@ async fn run_control(
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
     issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
+    statistics: HomeStatistics,
 ) -> Result<()> {
     let socket = TcpStream::connect(&config.server_control_addr).await?;
     let stream = timeout(
@@ -601,11 +702,13 @@ async fn run_control(
         tcp_flows,
         authorization,
         issuer_control_rx,
+        statistics,
     )
     .await
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_control_session(
     stream: ClientTlsStream<TcpStream>,
     config: Arc<Config>,
@@ -614,12 +717,14 @@ async fn run_control_session(
     tcp_flows: Arc<TcpFlowRegistry>,
     authorization: Arc<TravelAuthorizationState>,
     issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
+    statistics: HomeStatistics,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     write_json(
         &mut writer,
         &ControlMessage::Hello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
             role: Role::Home,
             id: config.id.clone(),
         },
@@ -630,7 +735,13 @@ async fn run_control_session(
         .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Server && id == config.server_id => {}
+        ControlMessage::Hello {
+            protocol_version,
+            role,
+            id,
+        } if protocol_version == CONTROL_PROTOCOL_VERSION
+            && role == Role::Server
+            && id == config.server_id => {}
         _ => bail!("server sent an invalid HELLO"),
     }
     write_json(
@@ -664,6 +775,9 @@ async fn run_control_session(
     info!(server = %config.server_control_addr, "home agent registered");
 
     let mut heartbeat = interval(Duration::from_secs(10));
+    let mut statistics_tick = interval(Duration::from_secs(5));
+    let mut report_keys = HashMap::<String, Vec<u8>>::new();
+    let mut last_enrollment_prune = Instant::now();
     let mut nonce = 0_u64;
     let mut last_received = Instant::now();
     let mut pending_issuer =
@@ -704,7 +818,14 @@ async fn run_control_session(
                         )
                         .await?;
                     }
-                    ControlMessage::OpenWork { work_id, work_secret, credential_id } => {
+                    ControlMessage::OpenRelayWork {
+                        work_id,
+                        work_secret,
+                        credential_id,
+                        relay_id,
+                        relay_data_addr,
+                        expires_at_unix_secs,
+                    } => {
                         ensure_credential_active(&authorization.tx.subscribe(), credential_id)?;
                         let config = Arc::clone(&config);
                         let tls = Arc::clone(&tls);
@@ -712,10 +833,120 @@ async fn run_control_session(
                         let tcp_flows = Arc::clone(&tcp_flows);
                         let authorization_rx = authorization.tx.subscribe();
                         tokio::spawn(async move {
-                            if let Err(error) = run_work(config, tls, permits, tcp_flows, authorization_rx, credential_id, work_id, work_secret).await {
-                                warn!(%work_id, %error, "home work failed");
+                            if let Err(error) = run_work(config, tls, permits, tcp_flows, authorization_rx, credential_id, work_id, work_secret, relay_id.clone(), relay_data_addr, expires_at_unix_secs).await {
+                                warn!(%work_id, %relay_id, %error, "home direct Relay work failed");
                             }
                         });
+                    }
+                    ControlMessage::RemoteEnrollmentSubmit {
+                        request_id,
+                        travel_id,
+                        home_id,
+                        request_json,
+                        ..
+                    } => {
+                        let result = persist_remote_enrollment_request(
+                            &statistics,
+                            &config,
+                            request_id,
+                            travel_id,
+                            home_id,
+                            request_json,
+                            None,
+                        )
+                        .await;
+                        let (accepted, response_json, error) = match result {
+                            Ok(response) => (
+                                true,
+                                response
+                                    .map(|response| serde_json::to_vec(&response))
+                                    .transpose()?,
+                                None,
+                            ),
+                            Err(error) => (false, None, Some(error.to_string())),
+                        };
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::RemoteEnrollmentResult {
+                                request_id,
+                                accepted,
+                                response_json,
+                                error,
+                            },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::BootstrapEnrollmentSubmit {
+                        protocol_version,
+                        request_id,
+                        travel_id,
+                        home_id,
+                        retrieval_token,
+                        request_json,
+                    } => {
+                        let result = if protocol_version == CONTROL_PROTOCOL_VERSION {
+                            persist_remote_enrollment_request(
+                                &statistics,
+                                &config,
+                                request_id,
+                                travel_id,
+                                home_id,
+                                request_json,
+                                Some(retrieval_token),
+                            )
+                            .await
+                        } else {
+                            Err(anyhow::anyhow!("unsupported bootstrap protocol version"))
+                        };
+                        let (accepted, response_json, error) = match result {
+                            Ok(response) => (
+                                true,
+                                response
+                                    .map(|response| serde_json::to_vec(&response))
+                                    .transpose()?,
+                                None,
+                            ),
+                            Err(error) => (false, None, Some(error.to_string())),
+                        };
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::RemoteEnrollmentResult {
+                                request_id,
+                                accepted,
+                                response_json,
+                                error,
+                            },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::RemoteEnrollmentInstalled {
+                        request_id,
+                        travel_id,
+                        credential_id,
+                        home_id,
+                        ..
+                    } => {
+                        let result = acknowledge_remote_enrollment_installed(
+                            &statistics,
+                            &config,
+                            request_id,
+                            &travel_id,
+                            credential_id,
+                            &home_id,
+                        )
+                        .await;
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::RemoteEnrollmentInstalledAck {
+                                request_id,
+                                accepted: result.is_ok(),
+                                error: result.err().map(|error| error.to_string()),
+                            },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
                     }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -732,6 +963,19 @@ async fn run_control_session(
                             let _ = response.send(result);
                         }
                     }
+                    ControlMessage::StatisticsReportAck { digest_sha256, accepted, error } => {
+                        if accepted {
+                            if let Some(key) = report_keys.remove(&digest_sha256) {
+                                let local = Arc::clone(&statistics.local);
+                                let digest = digest_sha256.clone();
+                                tokio::task::spawn_blocking(move || local.acknowledge_report(&key, &digest))
+                                    .await
+                                    .context("Home statistics acknowledgement task failed")??;
+                            }
+                        } else {
+                            warn!(?error, %digest_sha256, "Server rejected Home statistics report");
+                        }
+                    }
                     _ => bail!("unexpected message from server"),
                 }
             }
@@ -742,8 +986,238 @@ async fn run_control_session(
                 nonce = nonce.wrapping_add(1);
                 write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
             }
+            _ = statistics_tick.tick() => {
+                flush_and_send_home_statistics(&statistics, &mut writer, &mut report_keys).await?;
+                if last_enrollment_prune.elapsed() >= Duration::from_secs(60) {
+                    prune_remote_enrollment_inbox(&statistics).await?;
+                    last_enrollment_prune = Instant::now();
+                }
+            }
         }
     }
+}
+
+async fn persist_remote_enrollment_request(
+    statistics: &HomeStatistics,
+    config: &Config,
+    request_id: Uuid,
+    travel_id: String,
+    home_id: String,
+    request_json: Vec<u8>,
+    bootstrap_token: Option<Vec<u8>>,
+) -> Result<Option<TravelEnrollmentResponse>> {
+    if request_id.is_nil() || request_json.is_empty() || request_json.len() > 512 * 1024 {
+        bail!("remote enrollment request is missing or oversized");
+    }
+    if home_id != config.id {
+        bail!("remote enrollment request targets a different Home");
+    }
+    let request: TravelEnrollmentRequest =
+        serde_json::from_slice(&request_json).context("remote enrollment request is invalid")?;
+    if request.request_id != request_id || request.travel_id != travel_id {
+        bail!("remote enrollment request does not match authenticated transport identity");
+    }
+    if bootstrap_token
+        .as_ref()
+        .is_some_and(|token| token.len() != 32)
+    {
+        bail!("first enrollment retrieval token has an invalid length");
+    }
+    parse_enrollment_request(&request, unix_time_secs()?)?;
+    let bootstrap_token_sha256 = bootstrap_token
+        .as_ref()
+        .map(|token| hex::encode(digest::digest(&digest::SHA256, token).as_ref()));
+    let verification_code = bootstrap_token
+        .as_ref()
+        .map(|token| bootstrap_verification_code(&request_json, token));
+    let store = Arc::clone(&statistics.store);
+    tokio::task::spawn_blocking(move || {
+        let now = unix_time_secs()?;
+        prune_remote_enrollment_inbox_store(&store, now)?;
+        let key = request_id.as_bytes();
+        if let Some(existing) =
+            store.get_json::<RemoteEnrollmentInboxRecord>(Table::EnrollmentInbox, key)?
+        {
+            if existing.version != REMOTE_ENROLLMENT_VERSION
+                || existing.travel_id != travel_id
+                || existing.home_id != home_id
+                || existing.request != request
+                || existing.bootstrap_token_sha256 != bootstrap_token_sha256
+            {
+                bail!("conflicting reuse of remote enrollment request id");
+            }
+            return Ok(existing.response);
+        }
+        if !remote_enrollment_capacity_available(
+            store.scan_prefix(Table::EnrollmentInbox, b"")?.len(),
+            MAX_REMOTE_ENROLLMENT_INBOX_RECORDS,
+        ) {
+            bail!(
+                "remote enrollment inbox capacity of {MAX_REMOTE_ENROLLMENT_INBOX_RECORDS} is exhausted"
+            );
+        }
+        let record = RemoteEnrollmentInboxRecord {
+            version: REMOTE_ENROLLMENT_VERSION,
+            travel_id,
+            home_id,
+            received_at_unix_secs: now,
+            request,
+            response: None,
+            bootstrap_token_sha256,
+            verification_code,
+            installed_credential_id: None,
+            installed_at_unix_secs: None,
+        };
+        store.apply_immediate(WriteBatch::new().put_json(
+            Table::EnrollmentInbox,
+            request_id.as_bytes().to_vec(),
+            &record,
+        )?)?;
+        Ok(None)
+    })
+    .await
+    .context("Home enrollment inbox task failed")?
+}
+
+async fn acknowledge_remote_enrollment_installed(
+    statistics: &HomeStatistics,
+    config: &Config,
+    request_id: Uuid,
+    travel_id: &str,
+    credential_id: Uuid,
+    home_id: &str,
+) -> Result<()> {
+    if home_id != config.id {
+        bail!("remote enrollment acknowledgement targets a different Home");
+    }
+    let store = Arc::clone(&statistics.store);
+    let travel_id = travel_id.to_owned();
+    let home_id = home_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut record = store
+            .get_json::<RemoteEnrollmentInboxRecord>(Table::EnrollmentInbox, request_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("unknown remote enrollment request"))?;
+        if record.travel_id != travel_id || record.home_id != home_id {
+            bail!("remote enrollment acknowledgement identity does not match the inbox");
+        }
+        if let Some(installed) = record.installed_credential_id {
+            if installed != credential_id {
+                bail!("conflicting installed credential acknowledgement");
+            }
+            return Ok(());
+        }
+        let response = record
+            .response
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("remote enrollment has no approved response"))?;
+        if response.approval.request.request_id != request_id
+            || response.approval.request.travel_id != travel_id
+            || response.approval.credential_id != credential_id
+        {
+            bail!("installed credential does not match the approved enrollment response");
+        }
+        record.response = None;
+        record.verification_code = None;
+        record.installed_credential_id = Some(credential_id);
+        record.installed_at_unix_secs = Some(unix_time_secs()?);
+        store.apply_immediate(WriteBatch::new().put_json(
+            Table::EnrollmentInbox,
+            request_id.as_bytes().to_vec(),
+            &record,
+        )?)
+    })
+    .await
+    .context("Home enrollment acknowledgement task failed")?
+}
+
+async fn prune_remote_enrollment_inbox(statistics: &HomeStatistics) -> Result<()> {
+    let store = Arc::clone(&statistics.store);
+    tokio::task::spawn_blocking(move || {
+        let now = unix_time_secs()?;
+        prune_remote_enrollment_inbox_store(&store, now)
+    })
+    .await
+    .context("Home enrollment inbox retention task failed")?
+}
+
+fn prune_remote_enrollment_inbox_store(store: &StateStore, now: u64) -> Result<()> {
+    let mut batch = WriteBatch::new();
+    for (key, value) in store.scan_prefix(Table::EnrollmentInbox, b"")? {
+        let Ok(record) = serde_json::from_slice::<RemoteEnrollmentInboxRecord>(&value) else {
+            continue;
+        };
+        let expired = remote_enrollment_inbox_expired(
+            record.received_at_unix_secs,
+            record.installed_at_unix_secs,
+            now,
+        );
+        if expired {
+            batch = batch.delete(Table::EnrollmentInbox, key);
+        }
+    }
+    if batch.is_empty() {
+        Ok(())
+    } else {
+        store.apply_immediate(batch)
+    }
+}
+
+fn remote_enrollment_inbox_expired(
+    received_at_unix_secs: u64,
+    installed_at_unix_secs: Option<u64>,
+    now: u64,
+) -> bool {
+    installed_at_unix_secs.map_or_else(
+        || now.saturating_sub(received_at_unix_secs) >= REMOTE_ENROLLMENT_PENDING_RETENTION_SECS,
+        |installed_at| {
+            now.saturating_sub(installed_at) >= REMOTE_ENROLLMENT_INSTALLED_RETENTION_SECS
+        },
+    )
+}
+
+fn remote_enrollment_capacity_available(current: usize, maximum: usize) -> bool {
+    current < maximum
+}
+
+async fn flush_and_send_home_statistics<W: tokio::io::AsyncWrite + Unpin>(
+    statistics: &HomeStatistics,
+    writer: &mut W,
+    report_keys: &mut HashMap<String, Vec<u8>>,
+) -> Result<()> {
+    let local = Arc::clone(&statistics.local);
+    let deployment_id = Arc::clone(&statistics.deployment_id);
+    let reporter_id = Arc::clone(&statistics.reporter_id);
+    let certificate_pem = Arc::clone(&statistics.certificate_pem);
+    let signer = Arc::clone(&statistics.signer);
+    let flush_result = tokio::task::spawn_blocking(move || {
+        local.flush_and_stage(
+            &deployment_id,
+            Role::Home,
+            &reporter_id,
+            &certificate_pem,
+            &signer,
+        )
+    })
+    .await
+    .context("Home statistics flush task failed")?;
+    if let Err(error) = flush_result {
+        warn!(%error, "Home statistics write failed; business processing remains active and pending deltas were retained");
+    }
+    let local = Arc::clone(&statistics.local);
+    let reports = tokio::task::spawn_blocking(move || local.pending_reports(16))
+        .await
+        .context("Home statistics outbox task failed")??;
+    for (key, report) in reports {
+        let digest = report.digest_sha256()?;
+        report_keys.insert(digest, key);
+        write_json(
+            writer,
+            &ControlMessage::StatisticsReport { report },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn receive_issuer_command(
@@ -765,14 +1239,20 @@ async fn run_work(
     expected_credential_id: Uuid,
     work_id: Uuid,
     work_secret: Vec<u8>,
+    relay_id: String,
+    relay_data_addr: String,
+    expires_at_unix_secs: u64,
 ) -> Result<()> {
+    if unix_time_secs()? >= expires_at_unix_secs {
+        bail!("direct Relay work expired before Home connection");
+    }
     let socket = timeout(Duration::from_secs(config.handshake_timeout_secs), async {
-        let mut socket = TcpStream::connect(&config.server_data_addr).await?;
+        let mut socket = TcpStream::connect(&relay_data_addr).await?;
         write_preface(&mut socket, RouteSide::Home, work_id, &work_secret).await?;
         Ok::<_, anyhow::Error>(socket)
     })
     .await
-    .context("Server data work setup timed out")??;
+    .with_context(|| format!("Relay {relay_id} direct work setup timed out"))??;
     let mut stream = timeout(
         Duration::from_secs(config.handshake_timeout_secs),
         tls.business_acceptor.accept(socket),
@@ -820,6 +1300,7 @@ async fn run_work(
                     service,
                     IncomingCarrier {
                         carrier_id,
+                        relay_id,
                         stream,
                         global_permit: None,
                         flow_permit: None,
@@ -841,6 +1322,9 @@ async fn run_work(
                 authorization_rx,
                 credential_id,
                 not_after_unix_secs,
+                tcp_flows.statistics(),
+                identity.id,
+                relay_id,
             )
             .await
         }
@@ -857,9 +1341,31 @@ async fn serve_udp(
     mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
     credential_id: Uuid,
     not_after_unix_secs: u64,
+    statistics: Arc<LocalStatistics>,
+    travel_id: String,
+    relay_id: String,
 ) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let target_started = Instant::now();
     socket.connect(&service.target).await?;
+    let target_latency_ms = u64::try_from(target_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record_home_udp_metric_sample(
+        &statistics,
+        &travel_id,
+        service,
+        &relay_id,
+        "target_connection_latency_ms",
+        target_latency_ms,
+        Some(target_latency_ms),
+    );
+    record_home_udp_metric(
+        &statistics,
+        &travel_id,
+        service,
+        &relay_id,
+        "home_flow_accepted",
+        1,
+    );
     let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
     let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
     write_json(
@@ -880,6 +1386,7 @@ async fn serve_udp(
         tokio::select! {
             response = timeout(Duration::from_secs(idle_secs), socket.recv(&mut buffer)) => {
                 let count = response.context("UDP association idle timeout")??;
+                record_home_udp_metric(&statistics, &travel_id, service, &relay_id, "home_flow_download_observed_datagram_bytes", count as u64);
                 write_json(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: buffer[..count].to_vec() }, DATA_FRAME_LIMIT).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
@@ -888,6 +1395,7 @@ async fn serve_udp(
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
                             socket.send(&bytes).await?;
+                            record_home_udp_metric(&statistics, &travel_id, service, &relay_id, "delivered_upload_datagram_bytes", bytes.len() as u64);
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
@@ -903,6 +1411,38 @@ async fn serve_udp(
                 bail!("Travel credential expired");
             }
         }
+    }
+}
+
+fn record_home_udp_metric(
+    statistics: &LocalStatistics,
+    travel_id: &str,
+    service: &Service,
+    relay_id: &str,
+    family: &str,
+    value: u64,
+) {
+    record_home_udp_metric_sample(
+        statistics, travel_id, service, relay_id, family, value, None,
+    );
+}
+
+fn record_home_udp_metric_sample(
+    statistics: &LocalStatistics,
+    travel_id: &str,
+    service: &Service,
+    relay_id: &str,
+    family: &str,
+    value: u64,
+    histogram_sample: Option<u64>,
+) {
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert("travel_id".to_owned(), travel_id.to_owned());
+    dimensions.insert("service_id".to_owned(), service.id.clone());
+    dimensions.insert("protocol".to_owned(), "udp".to_owned());
+    dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
+    if let Ok(now) = unix_time_secs() {
+        statistics.record(now, family, dimensions, value, histogram_sample);
     }
 }
 
@@ -977,6 +1517,9 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
     let api = Router::new()
         .route("/status", get(api_issuer_status))
         .route("/credentials", get(api_issued_credentials))
+        .route("/statistics", get(api_home_statistics))
+        .route("/enrollment/pending", get(api_pending_remote_enrollments))
+        .route("/enrollment/approve", post(api_approve_remote_enrollment))
         .route("/issue", post(api_issue))
         .route("/revoke", post(api_revoke))
         .route(
@@ -984,13 +1527,146 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
             post(api_rotate_private_key_password),
         )
         .fallback(|| async { StatusCode::NOT_FOUND });
+    #[cfg(feature = "e2e-remote-ui")]
+    let api = api.route(
+        "/test/statistics-flush-failures",
+        get(api_statistics_flush_fault_status).post(api_inject_statistics_flush_faults),
+    );
     let app = Router::new()
         .nest("/api", api)
         .fallback(serve_spa)
         .with_state(state.clone())
         .layer(from_fn_with_state(state.clone(), authorize_issuer_ui));
-    let listener = tokio::net::TcpListener::bind(&state.issuer.listen).await?;
-    info!(address = %state.issuer.listen, "Home Travel issuer UI ready");
+    let listener = tokio::net::TcpListener::bind(&state.config.ui_listen).await?;
+    info!(address = %state.config.ui_listen, "Home UI ready");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[cfg(feature = "e2e-remote-ui")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatisticsFlushFaultRequest {
+    failures: u64,
+}
+
+#[cfg(feature = "e2e-remote-ui")]
+#[derive(Serialize)]
+struct StatisticsFlushFaultResponse {
+    remaining: u64,
+}
+
+#[cfg(feature = "e2e-remote-ui")]
+async fn api_statistics_flush_fault_status(
+    State(state): State<IssuerAppState>,
+) -> Json<StatisticsFlushFaultResponse> {
+    Json(StatisticsFlushFaultResponse {
+        remaining: state.statistics.local.injected_flush_failures_remaining(),
+    })
+}
+
+#[cfg(feature = "e2e-remote-ui")]
+async fn api_inject_statistics_flush_faults(
+    State(state): State<IssuerAppState>,
+    Json(request): Json<StatisticsFlushFaultRequest>,
+) -> ApiResult<StatisticsFlushFaultResponse> {
+    if request.failures > 16 {
+        return Err(api_error(anyhow::anyhow!(
+            "statistics flush failure count exceeds the E2E limit"
+        )));
+    }
+    state
+        .statistics
+        .local
+        .inject_flush_failures(request.failures);
+    Ok(Json(StatisticsFlushFaultResponse {
+        remaining: request.failures,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatisticsQuery {
+    #[serde(default = "default_statistics_period")]
+    period: String,
+}
+
+fn default_statistics_period() -> String {
+    "day".to_owned()
+}
+
+#[derive(Serialize)]
+struct HomeStatisticsResponse {
+    period: String,
+    from_unix_secs: u64,
+    to_unix_secs: u64,
+    dropped_events: u64,
+    overview: Vec<MetricRollup>,
+    breakdowns: Vec<MetricRollup>,
+    points: Vec<MetricPoint>,
+}
+
+async fn api_home_statistics(
+    State(state): State<IssuerAppState>,
+    axum::extract::Query(query): axum::extract::Query<StatisticsQuery>,
+) -> Json<HomeStatisticsResponse> {
+    home_statistics_response(&state.statistics, query).await
+}
+
+async fn home_statistics_response(
+    statistics: &HomeStatistics,
+    query: StatisticsQuery,
+) -> Json<HomeStatisticsResponse> {
+    let now = unix_time_secs().unwrap_or_default();
+    let duration = match query.period.as_str() {
+        "week" => 7 * 24 * 60 * 60,
+        "month" => 31 * 24 * 60 * 60,
+        "year" => 366 * 24 * 60 * 60,
+        _ => 24 * 60 * 60,
+    };
+    let from = now.saturating_sub(duration);
+    let local = Arc::clone(&statistics.local);
+    let points = tokio::task::spawn_blocking(move || local.query(from, now))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    Json(HomeStatisticsResponse {
+        period: query.period,
+        from_unix_secs: from,
+        to_unix_secs: now,
+        dropped_events: statistics.local.dropped_events(),
+        overview: summarize_metric_points(&points, false),
+        breakdowns: summarize_metric_points(&points, true),
+        points,
+    })
+}
+
+async fn run_statistics_only_ui(config: Arc<Config>, statistics: HomeStatistics) -> Result<()> {
+    #[derive(Clone)]
+    struct StatisticsOnlyState {
+        statistics: HomeStatistics,
+    }
+    async fn api(
+        State(state): State<StatisticsOnlyState>,
+        axum::extract::Query(query): axum::extract::Query<StatisticsQuery>,
+    ) -> Json<HomeStatisticsResponse> {
+        home_statistics_response(&state.statistics, query).await
+    }
+    async fn page() -> axum::response::Html<String> {
+        axum::response::Html(statistics_dashboard_html(
+            "Home statistics",
+            "Delivered business traffic, target outcomes, and Relay paths. This Home is serving-only; issuer operations are unavailable.",
+            false,
+        ))
+    }
+    let state = StatisticsOnlyState { statistics };
+    let app = Router::new()
+        .route("/", get(page))
+        .route("/api/statistics", get(api))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(&config.ui_listen).await?;
+    info!(address = %config.ui_listen, "serving-only Home statistics UI ready");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1001,9 +1677,109 @@ async fn api_issuer_status(State(state): State<IssuerAppState>) -> Json<IssuerSt
         home_alias: state.config.alias.clone(),
         default_valid_days: state.issuer.default_valid_days,
         global_authority_available: state.issuer.global_authority.is_some(),
-        private_key_password_rotation_available: issuer_password_rotation_is_local(&state.issuer),
+        private_key_password_rotation_available: issuer_password_rotation_is_local(
+            &state.config,
+            &state.issuer,
+        ),
         services: state.config.services.clone(),
     })
+}
+
+#[derive(Serialize)]
+struct RemoteEnrollmentStatus {
+    request_id: Uuid,
+    travel_id: String,
+    home_id: String,
+    received_at_unix_secs: u64,
+    approved: bool,
+    bootstrap: bool,
+    verification_code: Option<String>,
+}
+
+async fn api_pending_remote_enrollments(
+    State(state): State<IssuerAppState>,
+) -> ApiResult<Vec<RemoteEnrollmentStatus>> {
+    let store = Arc::clone(&state.statistics.store);
+    tokio::task::spawn_blocking(move || {
+        let mut records = store
+            .scan_prefix(Table::EnrollmentInbox, b"")?
+            .into_iter()
+            .map(|(_, value)| {
+                serde_json::from_slice::<RemoteEnrollmentInboxRecord>(&value)
+                    .context("Home enrollment inbox contains an invalid record")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        records.sort_by_key(|record| record.received_at_unix_secs);
+        Ok(records
+            .into_iter()
+            .filter(|record| record.installed_credential_id.is_none())
+            .map(|record| RemoteEnrollmentStatus {
+                request_id: record.request.request_id,
+                travel_id: record.travel_id,
+                home_id: record.home_id,
+                received_at_unix_secs: record.received_at_unix_secs,
+                approved: record.response.is_some(),
+                bootstrap: record.bootstrap_token_sha256.is_some(),
+                verification_code: record.verification_code,
+            })
+            .collect())
+    })
+    .await
+    .context("Home enrollment inbox query task failed")
+    .and_then(|result| result)
+    .map(Json)
+    .map_err(api_error)
+}
+
+async fn api_approve_remote_enrollment(
+    State(state): State<IssuerAppState>,
+    Json(request): Json<ApproveRemoteEnrollmentRequest>,
+) -> ApiResult<IssueResponse> {
+    let result = approve_remote_enrollment(&state, request).await;
+    record_issuer_operation(&state, "issuer_enrollment_approval", result.is_ok());
+    result.map(Json).map_err(api_error)
+}
+
+async fn approve_remote_enrollment(
+    state: &IssuerAppState,
+    request: ApproveRemoteEnrollmentRequest,
+) -> Result<IssueResponse> {
+    let store = Arc::clone(&state.statistics.store);
+    let request_id = request.request_id;
+    let record = tokio::task::spawn_blocking(move || {
+        store
+            .get_json::<RemoteEnrollmentInboxRecord>(Table::EnrollmentInbox, request_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("unknown remote enrollment request"))
+    })
+    .await
+    .context("Home enrollment inbox read task failed")??;
+    if record.travel_id != record.request.travel_id || record.home_id != state.config.id {
+        bail!("remote enrollment inbox record has an invalid identity binding");
+    }
+    let issued = issue_from_home(
+        state,
+        IssueRequest {
+            request: record.request.clone(),
+            valid_days: request.valid_days,
+            valid_minutes: request.valid_minutes,
+            scope: request.scope,
+            password: request.password,
+        },
+    )
+    .await?;
+    let mut updated = record;
+    updated.response = Some(issued.enrollment.clone());
+    let store = Arc::clone(&state.statistics.store);
+    tokio::task::spawn_blocking(move || {
+        store.apply_immediate(WriteBatch::new().put_json(
+            Table::EnrollmentInbox,
+            request_id.as_bytes().to_vec(),
+            &updated,
+        )?)
+    })
+    .await
+    .context("Home enrollment response commit task failed")??;
+    Ok(issued)
 }
 
 async fn api_issued_credentials(
@@ -1051,10 +1827,23 @@ async fn api_issue(
     State(state): State<IssuerAppState>,
     Json(request): Json<IssueRequest>,
 ) -> ApiResult<IssueResponse> {
-    issue_from_home(&state, request)
-        .await
-        .map(Json)
-        .map_err(api_error)
+    let result = issue_from_home(&state, request).await;
+    record_issuer_operation(&state, "issuer_credential_issuance", result.is_ok());
+    result.map(Json).map_err(api_error)
+}
+
+fn record_issuer_operation(state: &IssuerAppState, family: &str, accepted: bool) {
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert(
+        "result".to_owned(),
+        if accepted { "accepted" } else { "rejected" }.to_owned(),
+    );
+    if let Ok(now) = unix_time_secs() {
+        state
+            .statistics
+            .local
+            .record(now, family, dimensions, 1, None);
+    }
 }
 
 async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Result<IssueResponse> {
@@ -1195,7 +1984,7 @@ async fn rotate_issuer_private_key_password(
     state: &IssuerAppState,
     request: RotatePrivateKeyPasswordRequest,
 ) -> Result<RotatePrivateKeyPasswordResponse> {
-    if !issuer_password_rotation_is_local(&state.issuer) {
+    if !issuer_password_rotation_is_local(&state.config, &state.issuer) {
         bail!("Home private-key password rotation is available only on a loopback issuer UI");
     }
     if state.issuer.allow_unencrypted_test_keys {
@@ -1228,9 +2017,9 @@ async fn rotate_issuer_private_key_password(
     Ok(RotatePrivateKeyPasswordResponse { rotated_keys })
 }
 
-fn issuer_password_rotation_is_local(issuer: &IssuerConfig) -> bool {
-    issuer
-        .listen
+fn issuer_password_rotation_is_local(config: &Config, issuer: &IssuerConfig) -> bool {
+    config
+        .ui_listen
         .parse::<SocketAddr>()
         .is_ok_and(|address| address.ip().is_loopback())
         || test_remote_issuer_enabled(issuer)
@@ -1292,12 +2081,63 @@ async fn api_revoke(
     State(state): State<IssuerAppState>,
     Json(request): Json<RevokeRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let result = revoke_from_home(&state, request).await;
+    record_issuer_operation(&state, "issuer_revocation", result.is_ok());
+    result
+}
+
+async fn revoke_from_home(
+    state: &IssuerAppState,
+    request: RevokeRequest,
+) -> ApiResult<serde_json::Value> {
     let reason = request.reason.trim();
     if reason.is_empty() || reason.len() > 256 {
         return Err(api_error(anyhow::anyhow!(
             "revocation reason must contain 1 to 256 bytes"
         )));
     }
+    let _sensitive_permit = Arc::clone(&state.sensitive_operation)
+        .try_acquire_owned()
+        .map_err(|_| {
+            api_error(anyhow::anyhow!(
+                "another sensitive issuer operation is already running"
+            ))
+        })?;
+    let password = Zeroizing::new(request.password);
+    if password.is_empty() && !state.issuer.allow_unencrypted_test_keys {
+        return Err(api_error(anyhow::anyhow!(
+            "issuer password must not be empty"
+        )));
+    }
+    let authorization =
+        state.authorization.tx.borrow().clone().ok_or_else(|| {
+            api_error(anyhow::anyhow!("Travel authorization has not synchronized"))
+        })?;
+    let credential = authorization
+        .credential(request.credential_id)
+        .ok_or_else(|| api_error(anyhow::anyhow!("unknown Travel credential")))?;
+    let authority_key = if credential.authority_id == state.issuer.home_authority.id {
+        state.issuer.home_authority.private_key.clone()
+    } else if let Some(authority) = state
+        .issuer
+        .global_authority
+        .as_ref()
+        .filter(|authority| authority.id == credential.authority_id)
+    {
+        authority.private_key.clone()
+    } else {
+        return Err(api_error(anyhow::anyhow!(
+            "credential was not issued by this Home"
+        )));
+    };
+    let allow_unencrypted = state.issuer.allow_unencrypted_test_keys;
+    tokio::task::spawn_blocking(move || {
+        load_issuer_private_key(&authority_key, Some(password.as_bytes()), allow_unencrypted)
+            .map(|_| ())
+    })
+    .await
+    .map_err(|_| api_error(anyhow::anyhow!("issuer password verification task failed")))?
+    .map_err(api_error)?;
     let (response_tx, response_rx) = oneshot::channel();
     state
         .control_tx
@@ -1339,7 +2179,7 @@ async fn authorize_issuer_ui(
     request: Request,
     next: Next,
 ) -> Response {
-    if local_ui_request_allowed(&request, &state.issuer.listen) {
+    if local_ui_request_allowed(&request, &state.config.ui_listen) {
         return next.run(request).await;
     }
     #[cfg(feature = "e2e-remote-ui")]
@@ -1403,7 +2243,10 @@ fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
 mod tests {
     use axum::{body::Body, extract::Request, http::Method};
 
-    use super::{Config, local_ui_request_allowed, requested_validity_secs};
+    use super::{
+        Config, local_ui_request_allowed, remote_enrollment_capacity_available,
+        remote_enrollment_inbox_expired, requested_validity_secs,
+    };
     use anyhow::Result;
 
     #[test]
@@ -1416,6 +2259,28 @@ mod tests {
         assert!(requested_validity_secs(Some(1), Some(30), 365).is_err());
         assert!(requested_validity_secs(None, Some(0), 365).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn remote_enrollment_inbox_has_bounded_capacity_and_retention() {
+        assert!(remote_enrollment_capacity_available(1023, 1024));
+        assert!(!remote_enrollment_capacity_available(1024, 1024));
+        assert!(!remote_enrollment_inbox_expired(100, None, 100));
+        assert!(remote_enrollment_inbox_expired(
+            100,
+            None,
+            100 + 7 * 24 * 60 * 60
+        ));
+        assert!(!remote_enrollment_inbox_expired(
+            1,
+            Some(200),
+            200 + 24 * 60 * 60 - 1
+        ));
+        assert!(remote_enrollment_inbox_expired(
+            1,
+            Some(200),
+            200 + 24 * 60 * 60
+        ));
     }
 
     #[test]
@@ -1456,7 +2321,6 @@ mod tests {
 id = "home-2"
 alias = "Secondary Home"
 server_control_addr = "127.0.0.1:7443"
-server_data_addr = "127.0.0.1:7444"
 server_name = "server.invalid"
 server_id = "server-1"
 management_cert = "home.crt"
@@ -1468,6 +2332,8 @@ business_ca = "business-ca.crt"
 deployment_root_public_key = "deployment-root.pub"
 deployment_trust = "deployment-trust.json"
 travel_authorization_cache = "authorization-cache.json"
+state_store = "home-state.redb"
+ui_listen = "127.0.0.1:9081"
 
 [[services]]
 id = "ssh"

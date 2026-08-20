@@ -1,5 +1,5 @@
 id = "home-2"
-alias = "E2E Home Two"
+alias = "E2E Home Two Serving Only"
 server_control_addr = "server:7443"
 server_name = "server.flowsplice"
 server_id = "server-1"
@@ -14,7 +14,7 @@ deployment_trust = "/certs/deployment-trust.json"
 server_spki_pins = ["__SERVER_PIN__"]
 travel_authorization_cache = "/state/home2-authorization-cache.json"
 state_store = "/state/home2-state.redb"
-ui_listen = "0.0.0.0:9081"
+ui_listen = "127.0.0.1:9081"
 handshake_timeout_secs = 10
 udp_idle_secs = 10
 carrier_heartbeat_secs = 2
@@ -22,25 +22,8 @@ carrier_timeout_secs = 15
 flow_detach_timeout_secs = 60
 max_unacked_bytes = 1048576
 
-[issuer]
-management_ca_key = "/issuer/management-ca.key"
-business_ca_key = "/issuer/business-ca.key"
-default_valid_days = 365
-test_allow_remote_listen = true
-test_admin_token = "flowsplice-e2e-home-issuer-administrator-token"
-
-[issuer.home_authority]
-id = "home-2-authority"
-private_key = "/issuer/home2-authority.key"
-
 [[services]]
 id = "tcp-echo"
 alias = "TCP Echo"
 protocol = "tcp"
 target = "echo2:7001"
-
-[[services]]
-id = "target-failure"
-alias = "Unavailable Target"
-protocol = "tcp"
-target = "127.0.0.1:65530"

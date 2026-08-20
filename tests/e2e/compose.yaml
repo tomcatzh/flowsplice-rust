@@ -89,6 +89,19 @@ services:
       - "127.0.0.1:29081:9081"
     networks: [flowsplice]
 
+  homeagent2serving:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent2-serving.toml"]
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+    depends_on: [server, echo2]
+    volumes:
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+      - ./generated/state:/state
+    networks: [flowsplice]
+
   travelagent:
     image: flowsplice-e2e:local
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
@@ -105,9 +118,27 @@ services:
       - "127.0.0.1:11081:10081/udp"
       - "127.0.0.1:11082:10082"
       - "127.0.0.1:11083:10083"
+      - "127.0.0.1:11084:10084"
+      - "127.0.0.1:11085:10085"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/travel:/travel
+      - ./generated/state:/state
+    networks: [flowsplice]
+
+  firsttravel:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/first-travel/travelagent.toml"]
+    environment:
+      RUST_LOG: flowsplice_travelagent=debug,info
+      FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
+      FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /first-travel/test-password.txt
+    depends_on: [relay1, relay2, homeagent]
+    ports:
+      - "127.0.0.1:12080:10080"
+    volumes:
+      - ./generated/first-travel:/first-travel
     networks: [flowsplice]
 
 networks:

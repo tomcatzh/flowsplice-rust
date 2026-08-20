@@ -24,6 +24,9 @@ h2 { font-size: 1.55rem; letter-spacing: -0.03em; }
 .eyebrow { color: #7ed9bc; font-size: 0.72rem; font-weight: 750; letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 10px; }
 .agent-id, .panel-heading > span { color: #8ea39c; font-size: 0.82rem; }
 .agent-id { border: 1px solid #1c3b33; border-radius: 999px; padding: 9px 13px; }
+.page-tabs { display: inline-flex; gap: 4px; margin-top: 24px; padding: 4px; border: 1px solid #25463d; border-radius: 10px; background: #091713; }
+.page-tab { min-width: 88px; padding: 8px 15px; color: #879b94; background: transparent; }
+.page-tab.active { color: #07110e; background: #70d8b6; }
 .notice { min-height: 42px; margin: 22px 0 0; padding: 11px 14px; border-radius: 9px; color: transparent; }
 .notice.success { color: #b9f1df; background: #123b30; border: 1px solid #296c58; }
 
@@ -33,8 +36,15 @@ h2 { font-size: 1.55rem; letter-spacing: -0.03em; }
 .metrics strong { font-size: 1.1rem; }
 
 .panel { border: 1px solid #17352d; border-radius: 14px; background: rgba(10, 25, 21, 0.9); overflow: hidden; }
+.panel + .panel { margin-top: 20px; }
 .key-panel { margin-top: 20px; }
 .panel-heading { padding: 22px 24px; border-bottom: 1px solid #17352d; }
+.panel-heading label { color: #789087; font-size: .78rem; }
+.panel-heading select { margin-left: 8px; border: 1px solid #315249; border-radius: 8px; padding: 8px 10px; color: #d8e4df; background: #0a1915; }
+.statistics-cards { margin: 0; border: 0; border-radius: 0; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.statistics-cards article small { color: #657c74; font-size: .75rem; }
+.statistics-controls { display: flex; align-items: flex-end; gap: 10px; }
+.subheading { border-top: 1px solid #17352d; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; text-align: left; }
 th { color: #667e76; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 650; }
@@ -77,5 +87,6 @@ dialog::backdrop { background: rgba(2, 9, 7, .78); backdrop-filter: blur(4px); }
   main { width: min(100% - 24px, 1080px); padding-top: 30px; }
   header { align-items: flex-start; }
   .metrics { grid-template-columns: repeat(2, 1fr); }
+  .panel-heading { align-items: flex-start; flex-direction: column; }
   th, td { padding: 14px 16px; }
 }

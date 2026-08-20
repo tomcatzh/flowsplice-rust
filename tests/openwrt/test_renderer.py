@@ -29,18 +29,39 @@ config_get() {
 		server.control_signing_key) resolved='/etc/flowsplice/server-control.key' ;;
 		server.travel_authorization_state) resolved='/etc/flowsplice/server-authorization.json' ;;
 		server.control_generation_state) resolved='/etc/flowsplice/server-control-generation.json' ;;
+		server.state_store) resolved='/etc/flowsplice/server-state.redb' ;;
+		server.ui_listen) resolved='127.0.0.1:9083' ;;
 		server.handshake_timeout_secs) resolved='10' ;;
 		server.work_ttl_secs) resolved='15' ;;
 		server.max_pending_work) resolved='256' ;;
 		server.control_snapshot_ttl_secs) resolved='120' ;;
 		server.max_control_connections) resolved='256' ;;
-		server.max_data_connections) resolved='1024' ;;
 		home_1.id) resolved='home-1' ;;
 		home_2.id) resolved='home-2' ;;
 		relay_1.id) resolved='relay-1' ;;
 		relay_1.management_addr) resolved='relay-1.example:8443' ;;
+		relay_1.data_public_addr) resolved='relay-1.example:8444' ;;
 		relay_2.id) resolved='relay-2' ;;
 		relay_2.management_addr) resolved='relay-2.example:8443' ;;
+		relay_2.data_public_addr) resolved='relay-2.example:8444' ;;
+		relay_test.id) resolved='relay-test' ;;
+		relay_test.management_listen) resolved='0.0.0.0:8443' ;;
+		relay_test.data_listen) resolved='0.0.0.0:8444' ;;
+		relay_test.data_public_addr) resolved='relay-test.example:8444' ;;
+		relay_test.server_id) resolved='server-1' ;;
+		relay_test.cert) resolved='/etc/flowsplice/relay.crt' ;;
+		relay_test.key) resolved='/etc/flowsplice/relay.key' ;;
+		relay_test.management_ca) resolved='/etc/flowsplice/management-ca.crt' ;;
+		relay_test.deployment_root_public_key) resolved='/etc/flowsplice/deployment-root.pub' ;;
+		relay_test.deployment_trust) resolved='/etc/flowsplice/deployment-trust.json' ;;
+		relay_test.travel_authorization_cache) resolved='/etc/flowsplice/relay-auth.json' ;;
+		relay_test.state_store) resolved='/etc/flowsplice/relay-state.redb' ;;
+		relay_test.ui_listen) resolved='127.0.0.1:9084' ;;
+		relay_test.handshake_timeout_secs) resolved='10' ;;
+		relay_test.route_ttl_secs) resolved='15' ;;
+		relay_test.max_pending_routes) resolved='256' ;;
+		relay_test.max_management_connections) resolved='1024' ;;
+		relay_test.max_data_connections) resolved='2048' ;;
 	esac
 	eval "$variable=\$resolved"
 }
@@ -53,7 +74,7 @@ config_get_bool() {
 config_list_foreach() {
 	local section="$1" option="$2" callback="$3" value
 	case "$section.$option" in
-		server.data_listen) set -- '192.0.2.1:7444' '[2001:db8::1]:7444' ;;
+		relay_test.server_spki_pin) set -- '0123456789abcdef' 'fedcba9876543210' ;;
 		*) set -- ;;
 	esac
 	for value in "$@"; do "$callback" "$value"; done
@@ -78,7 +99,9 @@ config_foreach() {
 
 
 class RendererTest(unittest.TestCase):
-    def run_renderer(self, *, no_homes: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_renderer(
+        self, *arguments: str, no_homes: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -90,10 +113,10 @@ class RendererTest(unittest.TestCase):
         )
         renderer.write_text(source, encoding="utf-8")
         renderer.chmod(0o755)
-        output = root / "server.toml"
+        output = root / f"{arguments[0]}.toml"
         environment = {"FAKE_NO_HOMES": "1"} if no_homes else None
         result = subprocess.run(
-            [str(renderer), "server", str(output)],
+            [str(renderer), *arguments, str(output)],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -103,7 +126,7 @@ class RendererTest(unittest.TestCase):
         return result
 
     def test_server_renders_two_independent_home_tables(self) -> None:
-        result = self.run_renderer()
+        result = self.run_renderer("server")
         self.assertEqual(result.returncode, 0, result.stderr)
         output = result.output_path  # type: ignore[attr-defined]
         config = tomllib.loads(output.read_text(encoding="utf-8"))
@@ -113,11 +136,29 @@ class RendererTest(unittest.TestCase):
         self.assertNotIn("travel_authorities", config)
         self.assertEqual(config["control_snapshot_ttl_secs"], 120)
         self.assertEqual(config["deployment_root_public_key"], "/etc/flowsplice/deployment-root.pub")
+        self.assertEqual(config["state_store"], "/etc/flowsplice/server-state.redb")
+        self.assertEqual(config["ui_listen"], "127.0.0.1:9083")
+        self.assertNotIn("data_listens", config)
+        self.assertEqual(
+            [relay["data_public_addr"] for relay in config["relays"]],
+            ["relay-1.example:8444", "relay-2.example:8444"],
+        )
 
     def test_server_render_fails_without_a_home(self) -> None:
-        result = self.run_renderer(no_homes=True)
+        result = self.run_renderer("server", no_homes=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("at least one home section", result.stderr)
+
+    def test_relay_renders_direct_data_plane_and_redb_state(self) -> None:
+        result = self.run_renderer("relay", "relay_test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.output_path  # type: ignore[attr-defined]
+        config = tomllib.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(config["data_public_addr"], "relay-test.example:8444")
+        self.assertEqual(config["state_store"], "/etc/flowsplice/relay-state.redb")
+        self.assertEqual(config["ui_listen"], "127.0.0.1:9084")
+        self.assertEqual(config["server_spki_pins"], ["0123456789abcdef", "fedcba9876543210"])
+        self.assertNotIn("server_data_addr", config)
 
 
 if __name__ == "__main__":

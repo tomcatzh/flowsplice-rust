@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -13,6 +13,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::{
     rand::{SecureRandom, SystemRandom},
     signature::{EcdsaKeyPair, KeyPair as _},
+};
+use axum::{
+    Json, Router,
+    extract::{Query, State as AxumState},
+    response::{Html, IntoResponse},
+    routing::get,
 };
 use clap::Parser;
 use flowsplice_core::{
@@ -26,18 +32,24 @@ use flowsplice_core::{
     },
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{Catalog, ControlMessage, HomeCatalog, RelayDirectory, RelayEndpoint, Role},
-    route::{RouteSide, read_preface, verify_preface},
-    tls::{
-        identity_client_connector, identity_server_name, load_private_key, peer_identity,
-        require_peer, server_acceptor,
+    protocol::{
+        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, HomeCatalog, RelayDirectory,
+        RelayEndpoint, Role,
     },
+    statistics::{SignedStatisticsReport, statistics_dashboard_html},
+    tls::{
+        PeerIdentity, identity_client_connector, identity_from_certificate_pem,
+        identity_server_name, load_private_key, peer_identity, require_peer, server_acceptor,
+    },
+};
+use flowsplice_storage::{
+    AcceptedReport, MetricRollup, ReportAcceptance, StateStore, accepted_reports_as_metric_points,
+    summarize_metric_points,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::copy_bidirectional,
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
+    sync::{Mutex, RwLock, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{interval, sleep, timeout},
 };
@@ -63,7 +75,6 @@ struct Args {
 struct Config {
     id: String,
     control_listen: String,
-    data_listens: Vec<String>,
     relays: Vec<ConfiguredRelay>,
     cert: PathBuf,
     key: PathBuf,
@@ -74,6 +85,8 @@ struct Config {
     homes: Vec<ConfiguredHome>,
     travel_authorization_state: PathBuf,
     control_generation_state: PathBuf,
+    state_store: PathBuf,
+    ui_listen: String,
     #[serde(default = "default_handshake_timeout")]
     handshake_timeout_secs: u64,
     #[serde(default = "default_work_ttl")]
@@ -82,8 +95,6 @@ struct Config {
     max_pending_work: usize,
     #[serde(default = "default_max_control_connections")]
     max_control_connections: usize,
-    #[serde(default = "default_max_data_connections")]
-    max_data_connections: usize,
     #[serde(default = "default_control_snapshot_ttl")]
     control_snapshot_ttl_secs: u64,
 }
@@ -93,6 +104,7 @@ struct Config {
 struct ConfiguredRelay {
     id: String,
     management_addr: String,
+    data_public_addr: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -115,10 +127,6 @@ const fn default_max_pending_work() -> usize {
 
 const fn default_max_control_connections() -> usize {
     256
-}
-
-const fn default_max_data_connections() -> usize {
-    1_024
 }
 
 const fn default_control_snapshot_ttl() -> u64 {
@@ -246,18 +254,23 @@ impl ControlSigner {
     }
 }
 
-struct PendingWork {
+struct PendingRelayGrant {
+    relay_id: String,
+    work_id: Uuid,
     credential_id: Uuid,
-    home_id: String,
-    secret: Vec<u8>,
+    home: mpsc::Sender<ControlMessage>,
+    open_message: ControlMessage,
     expires: Instant,
-    home: Option<BudgetedSocket>,
-    relay: Option<BudgetedSocket>,
 }
 
-struct BudgetedSocket {
-    stream: TcpStream,
-    _permit: OwnedSemaphorePermit,
+struct PendingEnrollment {
+    relay_id: String,
+    travel_id: String,
+    home_id: String,
+    relay: mpsc::Sender<ControlMessage>,
+    bootstrap: bool,
+    installed: bool,
+    expires: Instant,
 }
 
 struct RouteRequestContext {
@@ -452,11 +465,13 @@ struct State {
     relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
     relay_directory: Mutex<RelayDirectoryRegistry>,
     travel_sessions: Mutex<TravelSessionRegistry>,
-    pending: Mutex<HashMap<Uuid, PendingWork>>,
+    pending_grants: Mutex<HashMap<Uuid, PendingRelayGrant>>,
+    pending_enrollments: Mutex<HashMap<Uuid, PendingEnrollment>>,
     authorization: RwLock<ServerAuthorization>,
     authorization_acks: Mutex<HashMap<String, u64>>,
     authorization_tx: watch::Sender<u64>,
     control_signer: ControlSigner,
+    statistics_store: Arc<StateStore>,
 }
 
 impl State {
@@ -464,6 +479,7 @@ impl State {
         authorization: ServerAuthorization,
         relay_directory_generation: u64,
         control_signer: ControlSigner,
+        statistics_store: StateStore,
     ) -> Self {
         let (authorization_tx, _) = watch::channel(authorization.snapshot().generation);
         Self {
@@ -474,11 +490,13 @@ impl State {
                 endpoints: HashMap::new(),
             }),
             travel_sessions: Mutex::new(TravelSessionRegistry::default()),
-            pending: Mutex::new(HashMap::new()),
+            pending_grants: Mutex::new(HashMap::new()),
+            pending_enrollments: Mutex::new(HashMap::new()),
             authorization: RwLock::new(authorization),
             authorization_acks: Mutex::new(HashMap::new()),
             authorization_tx,
             control_signer,
+            statistics_store: Arc::new(statistics_store),
         }
     }
 }
@@ -502,6 +520,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let control_signer = ControlSigner::load(&config)?;
+    let statistics_store = StateStore::open(&config.state_store)?;
     let authorization = ServerAuthorization::load(
         control_signer.trust.deployment_id.clone(),
         control_signer.trust.travel_authorities.clone(),
@@ -512,14 +531,15 @@ async fn main() -> Result<()> {
         authorization,
         relay_directory_generation,
         control_signer,
+        statistics_store,
     ));
 
     let control = run_home_listeners(config.clone(), Arc::clone(&state));
-    let data = run_data_listeners(config.clone(), Arc::clone(&state));
     let relay = run_relay_connectors(config.clone(), Arc::clone(&state));
     let cleanup = cleanup_pending(Arc::clone(&state));
     let trust_expiry = monitor_trust_expiry(state.control_signer.trust.not_after_unix_secs);
-    tokio::try_join!(control, data, relay, cleanup, trust_expiry)?;
+    let statistics_ui = run_statistics_ui(config.ui_listen.clone(), Arc::clone(&state));
+    tokio::try_join!(control, relay, cleanup, trust_expiry, statistics_ui)?;
     Ok(())
 }
 
@@ -537,7 +557,10 @@ fn validate_config(config: &Config) -> Result<()> {
         bail!("server id must be non-empty");
     }
     validate_listen(&config.control_listen, "control")?;
-    validate_listens(&config.data_listens, "data")?;
+    validate_loopback_listen(&config.ui_listen, "statistics UI")?;
+    if config.state_store.as_os_str().is_empty() {
+        bail!("state_store must be non-empty");
+    }
     let control_signer = ControlSigner::load(config)?;
     validate_homes(&config.homes, &control_signer.trust)?;
     ServerAuthorization::validate(
@@ -550,7 +573,6 @@ fn validate_config(config: &Config) -> Result<()> {
         || config.work_ttl_secs == 0
         || config.max_pending_work == 0
         || config.max_control_connections == 0
-        || config.max_data_connections < 2
         || config.control_snapshot_ttl_secs == 0
         || config.control_snapshot_ttl_secs > MAX_CONTROL_SNAPSHOT_TTL_SECS
     {
@@ -582,22 +604,6 @@ fn trusted_home_management_pins<'a>(
     Ok(&trust.home_endpoint(home_id)?.management_spki_pins)
 }
 
-fn validate_listens(listens: &[String], label: &str) -> Result<()> {
-    if listens.is_empty() {
-        bail!("at least one {label} listener is required");
-    }
-    let mut unique = std::collections::HashSet::new();
-    for address in listens {
-        if address.is_empty() || !unique.insert(address) {
-            bail!("{label} listener addresses must be non-empty and unique");
-        }
-        address
-            .parse::<std::net::SocketAddr>()
-            .with_context(|| format!("invalid {label} listener {address}"))?;
-    }
-    Ok(())
-}
-
 fn validate_listen(address: &str, label: &str) -> Result<()> {
     if address.is_empty() {
         bail!("{label} listener address must be non-empty");
@@ -608,13 +614,27 @@ fn validate_listen(address: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_loopback_listen(address: &str, label: &str) -> Result<()> {
+    let address = address
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid {label} listener {address}"))?;
+    if !address.ip().is_loopback() {
+        bail!("{label} must bind an exact loopback address");
+    }
+    Ok(())
+}
+
 fn validate_relays(relays: &[ConfiguredRelay]) -> Result<()> {
     if relays.is_empty() {
         bail!("at least one relay is required");
     }
     let mut ids = std::collections::HashSet::new();
     for relay in relays {
-        if relay.id.is_empty() || relay.management_addr.is_empty() || !ids.insert(&relay.id) {
+        if relay.id.is_empty()
+            || relay.management_addr.is_empty()
+            || relay.data_public_addr.is_empty()
+            || !ids.insert(&relay.id)
+        {
             bail!("relay ids must be non-empty and unique, with non-empty addresses");
         }
     }
@@ -693,12 +713,19 @@ async fn handle_home(
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Home && id == identity.id => {}
+        ControlMessage::Hello {
+            protocol_version,
+            role,
+            id,
+        } if protocol_version == CONTROL_PROTOCOL_VERSION
+            && role == Role::Home
+            && id == identity.id => {}
         _ => bail!("home HELLO does not match its certificate"),
     }
     write_json(
         &mut writer,
         &ControlMessage::Hello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
             role: Role::Server,
             id: config.id.clone(),
         },
@@ -845,6 +872,52 @@ async fn handle_home(
                             })
                             .await?;
                         }
+                        ControlMessage::StatisticsReport { report } => {
+                            let digest_sha256 = report.digest_sha256().unwrap_or_default();
+                            let result = accept_statistics_report(
+                                &state,
+                                &identity,
+                                report,
+                                false,
+                            )
+                            .await;
+                            tx.send(ControlMessage::StatisticsReportAck {
+                                digest_sha256,
+                                accepted: result.is_ok(),
+                                error: result.err().map(|error| error.to_string()),
+                            })
+                            .await?;
+                        }
+                        ControlMessage::RemoteEnrollmentResult {
+                            request_id,
+                            accepted,
+                            response_json,
+                            error,
+                        } => {
+                            complete_remote_enrollment(
+                                &state,
+                                &identity.id,
+                                request_id,
+                                accepted,
+                                response_json,
+                                error,
+                            )
+                            .await?;
+                        }
+                        ControlMessage::RemoteEnrollmentInstalledAck {
+                            request_id,
+                            accepted,
+                            error,
+                        } => {
+                            complete_remote_enrollment_installed(
+                                &state,
+                                &identity.id,
+                                request_id,
+                                accepted,
+                                error,
+                            )
+                            .await?;
+                        }
                         _ => bail!("unexpected message from home agent"),
                     }
                     if writer_task.is_finished() {
@@ -900,7 +973,7 @@ async fn revoke_home_credential(
     };
     if changed {
         state
-            .pending
+            .pending_grants
             .lock()
             .await
             .retain(|_, work| work.credential_id != credential_id);
@@ -969,9 +1042,10 @@ async fn run_relay_connector(
             let endpoint = RelayEndpoint {
                 id: relay.id.clone(),
                 management_addr: relay.management_addr.clone(),
-                management_spki_sha256: identity.spki_sha256,
+                data_public_addr: relay.data_public_addr.clone(),
+                management_spki_sha256: identity.spki_sha256.clone(),
             };
-            run_relay_session(stream, &config, &relay, endpoint, &state).await
+            run_relay_session(stream, &config, &relay, endpoint, identity, &state).await
         }
         .await;
         if let Err(error) = result {
@@ -993,6 +1067,7 @@ async fn run_relay_session(
     config: &Config,
     relay: &ConfiguredRelay,
     endpoint: RelayEndpoint,
+    relay_identity: PeerIdentity,
     state: &Arc<State>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -1000,6 +1075,7 @@ async fn run_relay_session(
     write_json(
         &mut writer,
         &ControlMessage::Hello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
             role: Role::Server,
             id: config.id.clone(),
         },
@@ -1010,7 +1086,13 @@ async fn run_relay_session(
         .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
         .await?
     {
-        ControlMessage::Hello { role, id } if role == Role::Relay && id == relay.id => {}
+        ControlMessage::Hello {
+            protocol_version,
+            role,
+            id,
+        } if protocol_version == CONTROL_PROTOCOL_VERSION
+            && role == Role::Relay
+            && id == relay.id => {}
         _ => bail!("relay HELLO does not match expected identity"),
     }
 
@@ -1149,10 +1231,14 @@ async fn run_relay_session(
                                 home: home_id,
                             },
                             config,
+                            relay,
                             state,
                             &mut writer,
                         )
                         .await?;
+                    }
+                    ControlMessage::RelayWorkReady { request_id, work_id } => {
+                        complete_relay_work(state, &relay.id, request_id, work_id).await?;
                     }
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -1160,6 +1246,90 @@ async fn run_relay_session(
                     ControlMessage::HeartbeatAck { .. } => {}
                     ControlMessage::TravelAuthorizationAck { generation } => {
                         record_authorization_ack(state, format!("relay:{}", relay.id), generation).await;
+                    }
+                    ControlMessage::StatisticsReport { report } => {
+                        let digest_sha256 = report.digest_sha256().unwrap_or_default();
+                        let result = accept_statistics_report(
+                            state,
+                            &relay_identity,
+                            report,
+                            true,
+                        )
+                        .await;
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::StatisticsReportAck {
+                                digest_sha256,
+                                accepted: result.is_ok(),
+                                error: result.err().map(|error| error.to_string()),
+                            },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::RemoteEnrollmentSubmit {
+                        request_id,
+                        travel_id,
+                        travel_session_id,
+                        credential_id,
+                        home_id,
+                        request_json,
+                    } => {
+                        handle_remote_enrollment_submit(
+                            state,
+                            relay,
+                            &tx,
+                            request_id,
+                            travel_id,
+                            travel_session_id,
+                            credential_id,
+                            home_id,
+                            request_json,
+                            config,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::RemoteEnrollmentInstalled {
+                        request_id,
+                        travel_id,
+                        travel_session_id,
+                        credential_id,
+                        home_id,
+                    } => {
+                        handle_remote_enrollment_installed(
+                            state,
+                            relay,
+                            &tx,
+                            request_id,
+                            travel_id,
+                            travel_session_id,
+                            credential_id,
+                            home_id,
+                            config,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::BootstrapEnrollmentSubmit {
+                        protocol_version,
+                        request_id,
+                        travel_id,
+                        home_id,
+                        retrieval_token,
+                        request_json,
+                    } => {
+                        handle_bootstrap_enrollment_submit(
+                            state,
+                            relay,
+                            &tx,
+                            protocol_version,
+                            request_id,
+                            travel_id,
+                            home_id,
+                            retrieval_token,
+                            request_json,
+                            config,
+                        )
+                        .await?;
                     }
                     _ => bail!("unexpected message from relay"),
                 }
@@ -1178,6 +1348,7 @@ async fn run_relay_session(
 async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     request: RouteRequestContext,
     config: &Config,
+    relay: &ConfiguredRelay,
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
@@ -1203,7 +1374,7 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
         return Ok(());
     }
     let home = state.homes.lock().await.sender(&request.home);
-    if home.is_none() {
+    let Some(home) = home else {
         write_json(
             writer,
             &ControlMessage::RouteDenied {
@@ -1214,14 +1385,15 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
         )
         .await?;
         return Ok(());
-    }
+    };
 
     let work_id = Uuid::new_v4();
     let mut secret = vec![0_u8; 32];
     SystemRandom::new()
         .fill(&mut secret)
         .map_err(|_| anyhow!("AWS-LC random generation failed"))?;
-    let mut pending = state.pending.lock().await;
+    let expires_at_unix_secs = unix_time_secs()?.saturating_add(config.work_ttl_secs);
+    let mut pending = state.pending_grants.lock().await;
     if pending.len() >= config.max_pending_work {
         write_json(
             writer,
@@ -1235,32 +1407,33 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
         return Ok(());
     }
     pending.insert(
-        work_id,
-        PendingWork {
+        request.request,
+        PendingRelayGrant {
+            relay_id: relay.id.clone(),
+            work_id,
             credential_id: request.credential,
-            home_id: request.home.clone(),
-            secret: secret.clone(),
+            home,
+            open_message: ControlMessage::OpenRelayWork {
+                work_id,
+                work_secret: secret.clone(),
+                credential_id: request.credential,
+                relay_id: relay.id.clone(),
+                relay_data_addr: relay.data_public_addr.clone(),
+                expires_at_unix_secs,
+            },
             expires: Instant::now() + Duration::from_secs(config.work_ttl_secs),
-            home: None,
-            relay: None,
         },
     );
     drop(pending);
-    let home = home.ok_or_else(|| anyhow!("home disappeared during route setup"))?;
-    home.send(ControlMessage::OpenWork {
-        work_id,
-        work_secret: secret.clone(),
-        credential_id: request.credential,
-    })
-    .await?;
     write_json(
         writer,
-        &ControlMessage::ServerRouteGrant {
+        &ControlMessage::ServerRelayGrant {
             request_id: request.request,
             work_id,
             work_secret: secret,
             credential_id: request.credential,
             home_id: request.home,
+            expires_at_unix_secs,
         },
         CONTROL_FRAME_LIMIT,
     )
@@ -1268,105 +1441,619 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn run_data_listeners(config: Config, state: Arc<State>) -> Result<()> {
-    let mut listeners = Vec::with_capacity(config.data_listens.len());
-    for address in &config.data_listens {
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("failed to bind data listener {address}"))?;
-        listeners.push((address.clone(), listener));
-    }
-    let mut tasks = JoinSet::new();
-    let permits = Arc::new(Semaphore::new(config.max_data_connections));
-    for (address, listener) in listeners {
-        let state = Arc::clone(&state);
-        let permits = Arc::clone(&permits);
-        tasks.spawn(async move { run_data_accept_loop(listener, address, state, permits).await });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result??;
-    }
-    bail!("all data listeners stopped")
+async fn complete_relay_work(
+    state: &Arc<State>,
+    relay_id: &str,
+    request_id: Uuid,
+    work_id: Uuid,
+) -> Result<()> {
+    let mut grants = state.pending_grants.lock().await;
+    let pending =
+        take_matching_pending_grant(&mut grants, relay_id, request_id, work_id, Instant::now())?;
+    drop(grants);
+    pending
+        .home
+        .send(pending.open_message)
+        .await
+        .map_err(|_| anyhow!("Home control session closed before direct work delivery"))?;
+    Ok(())
 }
 
-async fn run_data_accept_loop(
-    listener: TcpListener,
-    address: String,
-    state: Arc<State>,
-    permits: Arc<Semaphore>,
-) -> Result<()> {
-    info!(%address, "data pairing listener ready");
-    loop {
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("data connection budget closed"))?;
-        let (socket, peer) = listener.accept().await?;
-        let mut socket = BudgetedSocket {
-            stream: socket,
-            _permit: permit,
-        };
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let result = async {
-                let (preface, mac) = timeout(
-                    Duration::from_secs(10),
-                    read_preface(&mut socket.stream),
-                )
-                    .await
-                    .context("route preface timed out")??;
-                let pair = {
-                    let mut pending = state.pending.lock().await;
-                    let entry = pending
-                        .get_mut(&preface.id)
-                        .ok_or_else(|| anyhow!("unknown or expired work id"))?;
-                    if !verify_preface(preface, &mac, &entry.secret) {
-                        bail!("invalid work preface MAC");
-                    }
-                    match preface.side {
-                        RouteSide::Home if entry.home.is_none() => entry.home = Some(socket),
-                        RouteSide::Relay if entry.relay.is_none() => entry.relay = Some(socket),
-                        _ => bail!("duplicate or invalid work side"),
-                    }
-                    if entry.home.is_some() && entry.relay.is_some() {
-                        let mut completed = pending
-                            .remove(&preface.id)
-                            .ok_or_else(|| anyhow!("pending work vanished"))?;
-                        Some((
-                            completed.credential_id,
-                            completed.home_id,
-                            completed
-                                .home
-                                .take()
-                                .ok_or_else(|| anyhow!("missing home"))?,
-                            completed
-                                .relay
-                                .take()
-                                .ok_or_else(|| anyhow!("missing relay"))?,
-                        ))
-                    } else {
-                        None
-                    }
-                };
-                if let Some((credential_id, home_id, mut home, mut relay)) = pair {
-                    info!(work_id = %preface.id, %credential_id, %home_id, "paired opaque server work sockets");
-                    tokio::select! {
-                        result = copy_bidirectional(&mut home.stream, &mut relay.stream) => {
-                            let _ = result?;
-                        }
-                        () = wait_until_credential_inactive(&state, credential_id) => {
-                            info!(event = "revoked_work_closed", work_id = %preface.id, %credential_id, "closed Server data work for inactive Travel credential");
-                        }
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = result {
-                warn!(%peer, %error, "data work connection rejected");
-            }
-        });
+fn take_matching_pending_grant(
+    grants: &mut HashMap<Uuid, PendingRelayGrant>,
+    relay_id: &str,
+    request_id: Uuid,
+    work_id: Uuid,
+    now: Instant,
+) -> Result<PendingRelayGrant> {
+    let pending = grants
+        .get(&request_id)
+        .ok_or_else(|| anyhow!("unknown or expired Relay work readiness"))?;
+    if pending.expires <= now {
+        grants.remove(&request_id);
+        bail!("Relay work readiness expired");
     }
+    if pending.relay_id != relay_id || pending.work_id != work_id {
+        bail!("Relay work readiness does not match the authorized Relay grant");
+    }
+    grants
+        .remove(&request_id)
+        .ok_or_else(|| anyhow!("Relay work readiness vanished"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_remote_enrollment_submit(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    relay_tx: &mpsc::Sender<ControlMessage>,
+    request_id: Uuid,
+    travel_id: String,
+    travel_session_id: Uuid,
+    credential_id: Uuid,
+    home_id: String,
+    request_json: Vec<u8>,
+    config: &Config,
+) -> Result<()> {
+    let result = async {
+        if request_id.is_nil() || request_json.is_empty() || request_json.len() > 512 * 1024 {
+            bail!("remote enrollment request is missing or oversized");
+        }
+        authorize_travel(
+            state,
+            credential_id,
+            &travel_id,
+            travel_session_id,
+            None,
+            Some(&home_id),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let home = state
+            .homes
+            .lock()
+            .await
+            .sender(&home_id)
+            .ok_or_else(|| anyhow!("target Home is unavailable"))?;
+        let mut pending = state.pending_enrollments.lock().await;
+        if pending.len() >= config.max_pending_work {
+            bail!("Server pending enrollment limit reached");
+        }
+        if pending.contains_key(&request_id) {
+            bail!("remote enrollment request is already in flight");
+        }
+        pending.insert(
+            request_id,
+            PendingEnrollment {
+                relay_id: relay.id.clone(),
+                travel_id: travel_id.clone(),
+                home_id: home_id.clone(),
+                relay: relay_tx.clone(),
+                bootstrap: false,
+                installed: false,
+                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+            },
+        );
+        drop(pending);
+        if home
+            .send(ControlMessage::RemoteEnrollmentSubmit {
+                request_id,
+                travel_id,
+                travel_session_id,
+                credential_id,
+                home_id,
+                request_json,
+            })
+            .await
+            .is_err()
+        {
+            state.pending_enrollments.lock().await.remove(&request_id);
+            bail!("Home control session closed during enrollment delivery");
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        relay_tx
+            .send(ControlMessage::RemoteEnrollmentResult {
+                request_id,
+                accepted: false,
+                response_json: None,
+                error: Some(error.to_string()),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_bootstrap_enrollment_submit(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    relay_tx: &mpsc::Sender<ControlMessage>,
+    protocol_version: u32,
+    request_id: Uuid,
+    travel_id: String,
+    home_id: String,
+    retrieval_token: Vec<u8>,
+    request_json: Vec<u8>,
+    config: &Config,
+) -> Result<()> {
+    let result = async {
+        if protocol_version != CONTROL_PROTOCOL_VERSION
+            || request_id.is_nil()
+            || travel_id.is_empty()
+            || home_id.is_empty()
+            || retrieval_token.len() != 32
+            || request_json.is_empty()
+            || request_json.len() > 512 * 1024
+        {
+            bail!("first enrollment request is invalid or oversized");
+        }
+        let home = state
+            .homes
+            .lock()
+            .await
+            .sender(&home_id)
+            .ok_or_else(|| anyhow!("target Home is unavailable"))?;
+        let mut pending = state.pending_enrollments.lock().await;
+        if pending.len() >= config.max_pending_work {
+            bail!("Server pending enrollment limit reached");
+        }
+        if let Some(existing) = pending.get(&request_id) {
+            if existing.relay_id != relay.id
+                || existing.travel_id != travel_id
+                || existing.home_id != home_id
+                || !existing.bootstrap
+            {
+                bail!("conflicting first enrollment request is already in flight");
+            }
+            bail!("first enrollment request is already in flight");
+        }
+        pending.insert(
+            request_id,
+            PendingEnrollment {
+                relay_id: relay.id.clone(),
+                travel_id: travel_id.clone(),
+                home_id: home_id.clone(),
+                relay: relay_tx.clone(),
+                bootstrap: true,
+                installed: false,
+                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+            },
+        );
+        drop(pending);
+        if home
+            .send(ControlMessage::BootstrapEnrollmentSubmit {
+                protocol_version,
+                request_id,
+                travel_id,
+                home_id,
+                retrieval_token,
+                request_json,
+            })
+            .await
+            .is_err()
+        {
+            state.pending_enrollments.lock().await.remove(&request_id);
+            bail!("Home control session closed during first enrollment delivery");
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        relay_tx
+            .send(ControlMessage::BootstrapEnrollmentResult {
+                request_id,
+                accepted: false,
+                response_json: None,
+                seed_relays: Vec::new(),
+                error: Some(error.to_string()),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn complete_remote_enrollment(
+    state: &Arc<State>,
+    home_id: &str,
+    request_id: Uuid,
+    accepted: bool,
+    response_json: Option<Vec<u8>>,
+    error: Option<String>,
+) -> Result<()> {
+    let pending = state
+        .pending_enrollments
+        .lock()
+        .await
+        .remove(&request_id)
+        .ok_or_else(|| anyhow!("unknown or expired remote enrollment request"))?;
+    if pending.home_id != home_id {
+        bail!("remote enrollment response came from the wrong Home");
+    }
+    if pending.installed {
+        bail!("Home returned an enrollment response for an install acknowledgement");
+    }
+    let message = if pending.bootstrap {
+        let seed_relays = state
+            .relay_directory
+            .lock()
+            .await
+            .directory()
+            .relays
+            .into_iter()
+            .map(|relay| relay.management_addr)
+            .collect();
+        ControlMessage::BootstrapEnrollmentResult {
+            request_id,
+            accepted,
+            response_json,
+            seed_relays,
+            error,
+        }
+    } else {
+        ControlMessage::RemoteEnrollmentResult {
+            request_id,
+            accepted,
+            response_json,
+            error,
+        }
+    };
+    pending
+        .relay
+        .send(message)
+        .await
+        .map_err(|_| anyhow!("Relay disconnected before enrollment response delivery"))?;
+    info!(
+        %request_id,
+        travel_id = %pending.travel_id,
+        relay_id = %pending.relay_id,
+        %home_id,
+        accepted,
+        "forwarded remote enrollment response"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_remote_enrollment_installed(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    relay_tx: &mpsc::Sender<ControlMessage>,
+    request_id: Uuid,
+    travel_id: String,
+    travel_session_id: Uuid,
+    credential_id: Uuid,
+    home_id: String,
+    config: &Config,
+) -> Result<()> {
+    let result = async {
+        if request_id.is_nil() {
+            bail!("remote enrollment install acknowledgement is invalid");
+        }
+        authorize_travel(
+            state,
+            credential_id,
+            &travel_id,
+            travel_session_id,
+            None,
+            Some(&home_id),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        {
+            let authorization = state.authorization.read().await;
+            let credential = authorization
+                .verified()
+                .credential(credential_id)
+                .ok_or_else(|| anyhow!("installed Travel credential is unavailable"))?;
+            if credential.enrollment_request_id != request_id {
+                bail!("installed credential does not belong to this enrollment request");
+            }
+        }
+        let home = state
+            .homes
+            .lock()
+            .await
+            .sender(&home_id)
+            .ok_or_else(|| anyhow!("target Home is unavailable"))?;
+        let mut pending = state.pending_enrollments.lock().await;
+        if pending.len() >= config.max_pending_work {
+            bail!("Server pending enrollment limit reached");
+        }
+        if pending.contains_key(&request_id) {
+            bail!("remote enrollment acknowledgement is already in flight");
+        }
+        pending.insert(
+            request_id,
+            PendingEnrollment {
+                relay_id: relay.id.clone(),
+                travel_id: travel_id.clone(),
+                home_id: home_id.clone(),
+                relay: relay_tx.clone(),
+                bootstrap: false,
+                installed: true,
+                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+            },
+        );
+        drop(pending);
+        if home
+            .send(ControlMessage::RemoteEnrollmentInstalled {
+                request_id,
+                travel_id,
+                travel_session_id,
+                credential_id,
+                home_id,
+            })
+            .await
+            .is_err()
+        {
+            state.pending_enrollments.lock().await.remove(&request_id);
+            bail!("Home control session closed during enrollment acknowledgement");
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        relay_tx
+            .send(ControlMessage::RemoteEnrollmentInstalledAck {
+                request_id,
+                accepted: false,
+                error: Some(error.to_string()),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn complete_remote_enrollment_installed(
+    state: &Arc<State>,
+    home_id: &str,
+    request_id: Uuid,
+    accepted: bool,
+    error: Option<String>,
+) -> Result<()> {
+    let pending = state
+        .pending_enrollments
+        .lock()
+        .await
+        .remove(&request_id)
+        .ok_or_else(|| anyhow!("unknown or expired enrollment acknowledgement"))?;
+    if pending.home_id != home_id || !pending.installed {
+        bail!("enrollment acknowledgement came from the wrong Home or lifecycle stage");
+    }
+    pending
+        .relay
+        .send(ControlMessage::RemoteEnrollmentInstalledAck {
+            request_id,
+            accepted,
+            error,
+        })
+        .await
+        .map_err(|_| anyhow!("Relay disconnected before enrollment acknowledgement delivery"))?;
+    Ok(())
+}
+
+async fn accept_statistics_report(
+    state: &Arc<State>,
+    transport_identity: &PeerIdentity,
+    report: SignedStatisticsReport,
+    travel_forwarding_allowed: bool,
+) -> Result<ReportAcceptance> {
+    let report_identity = identity_from_certificate_pem(&report.certificate_pem)?;
+    let verified = report.verify(&report_identity.signing_public_key)?;
+    if verified.payload.deployment_id != state.control_signer.trust.deployment_id
+        || verified.payload.reporter_role != report_identity.role
+        || verified.payload.reporter_id != report_identity.id
+    {
+        bail!("statistics reporter identity is inconsistent");
+    }
+    match report_identity.role {
+        Role::Travel if travel_forwarding_allowed && transport_identity.role == Role::Relay => {
+            let now = unix_time_secs()?;
+            let authorization = state.authorization.read().await;
+            if authorization
+                .verified()
+                .authorize_management_all(&report_identity, now)?
+                .is_empty()
+            {
+                bail!("statistics reporter has no active Travel credential");
+            }
+        }
+        role if role == transport_identity.role
+            && report_identity.id == transport_identity.id
+            && report_identity.certificate_sha256 == transport_identity.certificate_sha256 => {}
+        _ => bail!("statistics report is not bound to the authenticated control peer"),
+    }
+    validate_metric_ownership(report_identity.role, &verified.payload.metric_family)?;
+    let now = unix_time_secs()?;
+    validate_statistics_time_window(verified.payload.bucket_start_unix_secs, now)?;
+    let store = Arc::clone(&state.statistics_store);
+    tokio::task::spawn_blocking(move || store.accept_statistics_report(&verified))
+        .await
+        .context("statistics ingestion task failed")?
+}
+
+fn validate_statistics_time_window(bucket_start_unix_secs: u64, now: u64) -> Result<()> {
+    if bucket_start_unix_secs > now.saturating_add(300)
+        || now.saturating_sub(bucket_start_unix_secs) > 90 * 24 * 60 * 60
+    {
+        bail!("statistics report is outside the accepted time window");
+    }
+    Ok(())
+}
+
+fn validate_metric_ownership(role: Role, family: &str) -> Result<()> {
+    let allowed = match role {
+        Role::Travel => {
+            family.starts_with("delivered_download")
+                || family.starts_with("carrier_")
+                || family.starts_with("travel_flow_")
+        }
+        Role::Relay => family.starts_with("relay_transport_") || family.starts_with("relay_route_"),
+        Role::Home => {
+            family.starts_with("delivered_upload")
+                || family.starts_with("home_flow_")
+                || family.starts_with("target_")
+                || family.starts_with("issuer_")
+        }
+        Role::Server => false,
+    };
+    if !allowed {
+        bail!("statistics metric family is not owned by this reporter role");
+    }
+    Ok(())
+}
+
+fn authoritative_global_metric(report: &AcceptedReport) -> bool {
+    let family = report.payload.metric_family.as_str();
+    match report.payload.reporter_role {
+        Role::Travel => family.starts_with("delivered_download") || family.starts_with("carrier_"),
+        Role::Home => {
+            family.starts_with("delivered_upload")
+                || family.starts_with("home_flow_accepted")
+                || family.starts_with("home_flow_completed")
+                || family.starts_with("home_flow_failed")
+                || family.starts_with("target_")
+                || family.starts_with("issuer_")
+        }
+        Role::Relay => family.starts_with("relay_"),
+        Role::Server => false,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatisticsQuery {
+    #[serde(default = "default_statistics_period")]
+    period: String,
+}
+
+fn default_statistics_period() -> String {
+    "day".to_owned()
+}
+
+#[derive(Serialize)]
+struct ServerStatisticsResponse {
+    period: String,
+    from_unix_secs: u64,
+    to_unix_secs: u64,
+    overview: Vec<MetricRollup>,
+    breakdowns: Vec<MetricRollup>,
+    nodes: Vec<NodeReportStatus>,
+    reports: Vec<AcceptedReport>,
+}
+
+#[derive(Serialize)]
+struct NodeReportStatus {
+    reporter_role: Role,
+    reporter_id: String,
+    report_count: u64,
+    metric_family_count: usize,
+    bucket_count: usize,
+    missing_five_minute_intervals: u64,
+    last_bucket_start_unix_secs: u64,
+    last_report_age_secs: u64,
+    highest_revision: u64,
+}
+
+fn node_report_status(reports: &[AcceptedReport], from: u64, now: u64) -> Vec<NodeReportStatus> {
+    let mut nodes =
+        HashMap::<(Role, String), (u64, BTreeSet<String>, BTreeSet<u64>, u64, u64)>::new();
+    for report in reports {
+        let entry = nodes
+            .entry((
+                report.payload.reporter_role,
+                report.payload.reporter_id.clone(),
+            ))
+            .or_insert_with(|| (0, BTreeSet::new(), BTreeSet::new(), 0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1.insert(report.payload.metric_family.clone());
+        entry.2.insert(report.payload.bucket_start_unix_secs);
+        entry.3 = entry.3.max(report.payload.bucket_start_unix_secs);
+        entry.4 = entry.4.max(report.payload.value.revision);
+    }
+    let expected = now.saturating_sub(from).div_ceil(300);
+    let mut result = nodes
+        .into_iter()
+        .map(
+            |((reporter_role, reporter_id), (report_count, families, buckets, last, revision))| {
+                NodeReportStatus {
+                    reporter_role,
+                    reporter_id,
+                    report_count,
+                    metric_family_count: families.len(),
+                    bucket_count: buckets.len(),
+                    missing_five_minute_intervals: expected.saturating_sub(buckets.len() as u64),
+                    last_bucket_start_unix_secs: last,
+                    last_report_age_secs: now.saturating_sub(last.saturating_add(300)),
+                    highest_revision: revision,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        format!("{:?}", left.reporter_role)
+            .cmp(&format!("{:?}", right.reporter_role))
+            .then_with(|| left.reporter_id.cmp(&right.reporter_id))
+    });
+    result
+}
+
+async fn run_statistics_ui(address: String, state: Arc<State>) -> Result<()> {
+    let listener = TcpListener::bind(&address)
+        .await
+        .with_context(|| format!("failed to bind Server statistics UI {address}"))?;
+    let app = Router::new()
+        .route("/", get(server_statistics_page))
+        .route("/api/statistics", get(server_statistics_api))
+        .with_state(state);
+    info!(%address, "Server statistics UI ready");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn server_statistics_page() -> Html<String> {
+    Html(statistics_dashboard_html(
+        "Global statistics",
+        "Authoritative five-minute business reports collected from Travel, Relay, and Home. Server control traffic is excluded.",
+        true,
+    ))
+}
+
+async fn server_statistics_api(
+    AxumState(state): AxumState<Arc<State>>,
+    Query(query): Query<StatisticsQuery>,
+) -> impl IntoResponse {
+    let now = unix_time_secs().unwrap_or_default();
+    let duration = match query.period.as_str() {
+        "week" => 7 * 24 * 60 * 60,
+        "month" => 31 * 24 * 60 * 60,
+        "year" => 366 * 24 * 60 * 60,
+        _ => 24 * 60 * 60,
+    };
+    let from = now.saturating_sub(duration);
+    let store = Arc::clone(&state.statistics_store);
+    let reports = tokio::task::spawn_blocking(move || store.query_accepted_reports(from, now))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let authoritative_reports = reports
+        .iter()
+        .filter(|report| authoritative_global_metric(report))
+        .cloned()
+        .collect::<Vec<_>>();
+    let points = accepted_reports_as_metric_points(&authoritative_reports);
+    Json(ServerStatisticsResponse {
+        period: query.period,
+        from_unix_secs: from,
+        to_unix_secs: now,
+        overview: summarize_metric_points(&points, false),
+        breakdowns: summarize_metric_points(&points, true),
+        nodes: node_report_status(&reports, from, now),
+        reports,
+    })
 }
 
 async fn cleanup_pending(state: Arc<State>) -> Result<()> {
@@ -1374,13 +2061,24 @@ async fn cleanup_pending(state: Arc<State>) -> Result<()> {
     loop {
         timer.tick().await;
         let now = Instant::now();
-        state.pending.lock().await.retain(|work_id, pending| {
+        state.pending_grants.lock().await.retain(|request_id, pending| {
             let keep = pending.expires > now;
             if !keep {
-                warn!(%work_id, "expired incomplete work pairing");
+                warn!(%request_id, work_id = %pending.work_id, "expired unacknowledged Relay work grant");
             }
             keep
         });
+        state
+            .pending_enrollments
+            .lock()
+            .await
+            .retain(|request_id, pending| {
+                let keep = pending.expires > now;
+                if !keep {
+                    warn!(%request_id, "expired remote enrollment forwarding state");
+                }
+                keep
+            });
         state.travel_sessions.lock().await.prune(now);
     }
 }
@@ -1530,45 +2228,25 @@ async fn broadcast_authorization(state: &Arc<State>, snapshot: TravelAuthorizati
     );
 }
 
-async fn wait_until_credential_inactive(state: &Arc<State>, credential_id: Uuid) {
-    let mut authorization_updates = state.authorization_tx.subscribe();
-    loop {
-        let remaining = {
-            let Ok(now) = unix_time_secs() else { return };
-            let authorization = state.authorization.read().await;
-            if !authorization.verified().is_active(credential_id, now) {
-                return;
-            }
-            let Some(credential) = authorization.verified().credential(credential_id) else {
-                return;
-            };
-            Duration::from_secs(credential.not_after_unix_secs.saturating_sub(now).max(1))
-        };
-        tokio::select! {
-            updated = authorization_updates.changed() => {
-                if updated.is_err() {
-                    return;
-                }
-            }
-            () = sleep(remaining) => return,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
 
     use flowsplice_core::{
         deployment::{DeploymentTrust, HomeEndpointTrust},
-        protocol::{HomeCatalog, RelayEndpoint, Service, ServiceProtocol},
+        protocol::{HomeCatalog, RelayEndpoint, Role, Service, ServiceProtocol},
     };
     use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
     use super::{
-        ConfiguredHome, HomeRegistry, HomeSession, RelayDirectoryRegistry, TRAVEL_SESSION_LEASE,
-        TravelSessionRegistry, trusted_home_management_pins, validate_homes, validate_listens,
+        ConfiguredHome, HomeRegistry, HomeSession, PendingRelayGrant, RelayDirectoryRegistry,
+        TRAVEL_SESSION_LEASE, TravelSessionRegistry, take_matching_pending_grant,
+        trusted_home_management_pins, validate_homes, validate_metric_ownership,
+        validate_statistics_time_window,
     };
 
     fn home_session(session_id: Uuid) -> HomeSession {
@@ -1618,25 +2296,6 @@ mod tests {
             ],
             travel_authorities: Vec::new(),
         }
-    }
-
-    #[test]
-    fn accepts_distinct_ipv4_and_ipv6_listeners() {
-        let listens = vec!["192.0.2.1:7444".to_owned(), "[2001:db8::1]:7444".to_owned()];
-        assert!(validate_listens(&listens, "data").is_ok());
-    }
-
-    #[test]
-    fn rejects_empty_duplicate_and_malformed_listeners() {
-        assert!(validate_listens(&[], "data").is_err());
-        assert!(
-            validate_listens(
-                &["127.0.0.1:7444".to_owned(), "127.0.0.1:7444".to_owned()],
-                "data"
-            )
-            .is_err()
-        );
-        assert!(validate_listens(&["not-an-address".to_owned()], "data").is_err());
     }
 
     #[test]
@@ -1693,6 +2352,7 @@ mod tests {
         let relay_two = RelayEndpoint {
             id: "relay-2".to_owned(),
             management_addr: "192.0.2.2:8443".to_owned(),
+            data_public_addr: "192.0.2.2:8444".to_owned(),
             management_spki_sha256: "22".repeat(32),
         };
         let first = registry.register(relay_two.clone());
@@ -1705,6 +2365,7 @@ mod tests {
         let relay_one = RelayEndpoint {
             id: "relay-1".to_owned(),
             management_addr: "192.0.2.1:8443".to_owned(),
+            data_public_addr: "192.0.2.1:8444".to_owned(),
             management_spki_sha256: "11".repeat(32),
         };
         let complete = registry.register(relay_one);
@@ -1879,5 +2540,79 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(registry.sessions.len(), 1);
+    }
+
+    #[test]
+    fn relay_work_readiness_is_bound_to_session_work_id_expiry_and_one_use() {
+        let request_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let (home, _) = mpsc::channel(1);
+        let now = Instant::now();
+        let mut grants = HashMap::from([(
+            request_id,
+            PendingRelayGrant {
+                relay_id: "relay-1".to_owned(),
+                work_id,
+                credential_id: Uuid::new_v4(),
+                home,
+                open_message: flowsplice_core::protocol::ControlMessage::Heartbeat { nonce: 1 },
+                expires: now + Duration::from_secs(30),
+            },
+        )]);
+
+        assert!(
+            take_matching_pending_grant(&mut grants, "relay-2", request_id, work_id, now,).is_err()
+        );
+        assert!(grants.contains_key(&request_id));
+        assert!(
+            take_matching_pending_grant(&mut grants, "relay-1", request_id, Uuid::new_v4(), now,)
+                .is_err()
+        );
+        assert!(grants.contains_key(&request_id));
+        assert!(
+            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,).is_ok()
+        );
+        assert!(
+            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,).is_err()
+        );
+
+        let expired_request = Uuid::new_v4();
+        let (home, _) = mpsc::channel(1);
+        grants.insert(
+            expired_request,
+            PendingRelayGrant {
+                relay_id: "relay-1".to_owned(),
+                work_id,
+                credential_id: Uuid::new_v4(),
+                home,
+                open_message: flowsplice_core::protocol::ControlMessage::Heartbeat { nonce: 2 },
+                expires: now,
+            },
+        );
+        assert!(
+            take_matching_pending_grant(&mut grants, "relay-1", expired_request, work_id, now,)
+                .is_err()
+        );
+        assert!(!grants.contains_key(&expired_request));
+    }
+
+    #[test]
+    fn statistics_time_window_and_metric_ownership_are_role_bound() {
+        let now = 100 * 24 * 60 * 60;
+        assert!(validate_statistics_time_window(now, now).is_ok());
+        assert!(validate_statistics_time_window(now + 300, now).is_ok());
+        assert!(validate_statistics_time_window(now + 600, now).is_err());
+        assert!(validate_statistics_time_window(now - 90 * 24 * 60 * 60, now).is_ok());
+        assert!(validate_statistics_time_window(now - 90 * 24 * 60 * 60 - 300, now).is_err());
+
+        assert!(validate_metric_ownership(Role::Travel, "delivered_download_bytes").is_ok());
+        assert!(validate_metric_ownership(Role::Travel, "carrier_winner").is_ok());
+        assert!(validate_metric_ownership(Role::Relay, "relay_transport_upload_bytes").is_ok());
+        assert!(validate_metric_ownership(Role::Home, "delivered_upload_bytes").is_ok());
+        assert!(validate_metric_ownership(Role::Home, "target_failure").is_ok());
+        assert!(validate_metric_ownership(Role::Travel, "delivered_upload_bytes").is_err());
+        assert!(validate_metric_ownership(Role::Relay, "home_flow_accepted").is_err());
+        assert!(validate_metric_ownership(Role::Home, "relay_transport_upload_bytes").is_err());
+        assert!(validate_metric_ownership(Role::Server, "server_control_bytes").is_err());
     }
 }

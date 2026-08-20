@@ -111,6 +111,7 @@ pub struct TravelAuthorizationSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationCache {
     pub generation: u64,
+    #[serde(default)]
     pub snapshot_sha256: String,
     pub revoked_credentials: HashSet<Uuid>,
 }
@@ -634,6 +635,7 @@ impl AuthorizationCache {
         }
         if self.generation != 0
             && authorization.generation() == self.generation
+            && !self.snapshot_sha256.is_empty()
             && authorization.snapshot_sha256() != self.snapshot_sha256
         {
             bail!("Travel authorization content changed without a generation increase");
@@ -794,6 +796,7 @@ mod tests {
             id: credential.travel_id.clone(),
             certificate_sha256: credential.management_certificate_sha256.clone(),
             spki_sha256: credential.management_spki_sha256.clone(),
+            signing_public_key: Vec::new(),
             not_before_unix_secs: 100,
             not_after_unix_secs: 200,
         };
@@ -802,6 +805,7 @@ mod tests {
             id: credential.travel_id.clone(),
             certificate_sha256: credential.business_certificate_sha256.clone(),
             spki_sha256: credential.business_spki_sha256.clone(),
+            signing_public_key: Vec::new(),
             not_before_unix_secs: 100,
             not_after_unix_secs: 200,
         };
@@ -900,6 +904,38 @@ mod tests {
             "deployment-1",
         )?;
         assert!(cache.accept(&same_generation_different_content).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_authorization_cache_learns_snapshot_digest_once() -> Result<()> {
+        let (authority, credential, valid) = fixture()?;
+        let authorization = VerifiedAuthorization::verify(
+            &TravelAuthorizationSnapshot {
+                generation: 3,
+                credentials: vec![valid],
+                revocations: vec![TravelRevocation {
+                    credential_id: credential.credential_id,
+                    revoked_at_unix_secs: 150,
+                    reason: "stolen".to_owned(),
+                }],
+            },
+            &[authority],
+            "deployment-1",
+        )?;
+        let legacy = serde_json::from_value::<AuthorizationCache>(serde_json::json!({
+            "generation": 3,
+            "revoked_credentials": [credential.credential_id]
+        }))?;
+        assert!(legacy.snapshot_sha256.is_empty());
+
+        let migrated = legacy.accept(&authorization)?;
+        assert_eq!(migrated.generation, 3);
+        assert_eq!(migrated.snapshot_sha256, authorization.snapshot_sha256());
+        assert_eq!(
+            migrated.revoked_credentials,
+            authorization.revoked_credentials
+        );
         Ok(())
     }
 }

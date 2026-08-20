@@ -60,14 +60,16 @@ require_option() {
 }
 
 write_relay_endpoint() {
-	local section="$1" enabled id management_addr
+	local section="$1" enabled id management_addr data_public_addr
 	config_get_bool enabled "$section" enabled 1
 	[ "$enabled" -eq 1 ] || return 0
 	id="$(require_option "$section" id)"
 	management_addr="$(require_option "$section" management_addr)"
+	data_public_addr="$(require_option "$section" data_public_addr)"
 	printf '\n[[relays]]\n' >>"$RENDER_OUTPUT"
 	write_string id "$id" "$RENDER_OUTPUT"
 	write_string management_addr "$management_addr" "$RENDER_OUTPUT"
+	write_string data_public_addr "$data_public_addr" "$RENDER_OUTPUT"
 	RELAY_ENDPOINT_COUNT=$((RELAY_ENDPOINT_COUNT + 1))
 }
 
@@ -82,8 +84,8 @@ write_home() {
 render_server() {
 	local output="$1" tmp section=server
 	local id control_listen cert key management_ca deployment_root deployment_trust control_signing_key
-	local authorization_state generation_state handshake work_ttl max_pending control_snapshot_ttl
-	local max_control_connections max_data_connections
+	local authorization_state generation_state state_store ui_listen handshake work_ttl max_pending control_snapshot_ttl
+	local max_control_connections
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
@@ -97,15 +99,15 @@ render_server() {
 	control_signing_key="$(require_option "$section" control_signing_key)"
 	authorization_state="$(require_option "$section" travel_authorization_state)"
 	generation_state="$(require_option "$section" control_generation_state)"
+	state_store="$(require_option "$section" state_store)"
+	ui_listen="$(require_option "$section" ui_listen)"
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get work_ttl "$section" work_ttl_secs 15
 	config_get max_pending "$section" max_pending_work 256
 	config_get control_snapshot_ttl "$section" control_snapshot_ttl_secs 120
 	config_get max_control_connections "$section" max_control_connections 256
-	config_get max_data_connections "$section" max_data_connections 1024
 	write_string id "$id" "$tmp"
 	write_string control_listen "$control_listen" "$tmp"
-	write_list "$section" data_listen data_listens "$tmp"
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
 	write_string management_ca "$management_ca" "$tmp"
@@ -114,12 +116,13 @@ render_server() {
 	write_string control_signing_key "$control_signing_key" "$tmp"
 	write_string travel_authorization_state "$authorization_state" "$tmp"
 	write_string control_generation_state "$generation_state" "$tmp"
+	write_string state_store "$state_store" "$tmp"
+	write_string ui_listen "$ui_listen" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer work_ttl_secs "$work_ttl" "$tmp"
 	write_integer max_pending_work "$max_pending" "$tmp"
 	write_integer control_snapshot_ttl_secs "$control_snapshot_ttl" "$tmp"
 	write_integer max_control_connections "$max_control_connections" "$tmp"
-	write_integer max_data_connections "$max_data_connections" "$tmp"
 	RENDER_OUTPUT="$tmp"
 	HOME_COUNT=0
 	config_foreach write_home home
@@ -133,7 +136,7 @@ render_server() {
 
 render_relay() {
 	local section="$1" output="$2" tmp
-	local id management_listen data_listen data_public_addr server_data_addr
+	local id management_listen data_listen data_public_addr state_store ui_listen
 	local server_id cert key management_ca deployment_root deployment_trust
 	local authorization_cache handshake route_ttl max_pending max_management_connections max_data_connections
 	tmp="${output}.tmp.$$"
@@ -143,7 +146,6 @@ render_relay() {
 	management_listen="$(require_option "$section" management_listen)"
 	data_listen="$(require_option "$section" data_listen)"
 	data_public_addr="$(require_option "$section" data_public_addr)"
-	server_data_addr="$(require_option "$section" server_data_addr)"
 	server_id="$(require_option "$section" server_id)"
 	cert="$(require_option "$section" cert)"
 	key="$(require_option "$section" key)"
@@ -151,6 +153,8 @@ render_relay() {
 	deployment_root="$(require_option "$section" deployment_root_public_key)"
 	deployment_trust="$(require_option "$section" deployment_trust)"
 	authorization_cache="$(require_option "$section" travel_authorization_cache)"
+	state_store="$(require_option "$section" state_store)"
+	ui_listen="$(require_option "$section" ui_listen)"
 	config_get handshake "$section" handshake_timeout_secs 10
 	config_get route_ttl "$section" route_ttl_secs 15
 	config_get max_pending "$section" max_pending_routes 256
@@ -160,7 +164,6 @@ render_relay() {
 	write_string management_listen "$management_listen" "$tmp"
 	write_string data_listen "$data_listen" "$tmp"
 	write_string data_public_addr "$data_public_addr" "$tmp"
-	write_string server_data_addr "$server_data_addr" "$tmp"
 	write_string server_id "$server_id" "$tmp"
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
@@ -169,6 +172,8 @@ render_relay() {
 	write_string deployment_trust "$deployment_trust" "$tmp"
 	write_list "$section" server_spki_pin server_spki_pins "$tmp"
 	write_string travel_authorization_cache "$authorization_cache" "$tmp"
+	write_string state_store "$state_store" "$tmp"
+	write_string ui_listen "$ui_listen" "$tmp"
 	write_integer handshake_timeout_secs "$handshake" "$tmp"
 	write_integer route_ttl_secs "$route_ttl" "$tmp"
 	write_integer max_pending_routes "$max_pending" "$tmp"

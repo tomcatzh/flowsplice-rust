@@ -8,9 +8,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 aws-lc-rs.workspace = true
+axum.workspace = true
 clap.workspace = true
 flowsplice-core.workspace = true
 flowsplice-enrollment.workspace = true
+flowsplice-storage.workspace = true
 hex.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

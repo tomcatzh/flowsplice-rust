@@ -6,6 +6,7 @@ pub mod deployment;
 pub mod frame;
 pub mod protocol;
 pub mod route;
+pub mod statistics;
 pub mod tls;
 
 pub const CONTROL_FRAME_LIMIT: usize = 1024 * 1024;

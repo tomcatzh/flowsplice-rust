@@ -13,6 +13,16 @@ RENDERER=/usr/libexec/flowsplice/render-config
 RUNTIME_DIR=/var/run/flowsplice
 VALIDATION_FAILED=0
 
+validate_as_flowsplice() {
+	local binary="$1" config_file="$2" pid_file="$3" result
+	rm -f "$pid_file"
+	start-stop-daemon -S -x "$binary" -p "$pid_file" -m -c flowsplice:flowsplice -- \
+		--config "$config_file" --check-config
+	result=$?
+	rm -f "$pid_file"
+	return "$result"
+}
+
 prepare_runtime() {
 	mkdir -p "$RUNTIME_DIR"
 	mkdir -p /etc/flowsplice/state
@@ -34,13 +44,16 @@ validate_relay_section() {
 			;;
 	esac
 	config_file="$RUNTIME_DIR/relay-${section}.toml"
-	if ! "$RENDERER" relay "$section" "$config_file" ||
-		! "$RELAY_BIN" --config "$config_file" --check-config; then
+	if ! "$RENDERER" relay "$section" "$config_file"; then
 		VALIDATION_FAILED=1
 		return 0
 	fi
 	chown flowsplice:flowsplice "$config_file"
 	chmod 600 "$config_file"
+	if ! validate_as_flowsplice "$RELAY_BIN" "$config_file" \
+		"$RUNTIME_DIR/validate-relay-${section}.pid"; then
+		VALIDATION_FAILED=1
+	fi
 }
 
 validate() {
@@ -51,12 +64,15 @@ validate() {
 	config_get_bool server_enabled server enabled 0
 	if [ "$server_enabled" -eq 1 ]; then
 		server_config="$RUNTIME_DIR/server.toml"
-		if ! "$RENDERER" server "$server_config" ||
-			! "$SERVER_BIN" --config "$server_config" --check-config; then
+		if ! "$RENDERER" server "$server_config"; then
 			VALIDATION_FAILED=1
 		else
 			chown flowsplice:flowsplice "$server_config"
 			chmod 600 "$server_config"
+			if ! validate_as_flowsplice "$SERVER_BIN" "$server_config" \
+				"$RUNTIME_DIR/validate-server.pid"; then
+				VALIDATION_FAILED=1
+			fi
 		fi
 	fi
 	config_foreach validate_relay_section relay

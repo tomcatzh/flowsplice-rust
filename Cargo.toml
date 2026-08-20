@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/flowsplice-core",
     "crates/flowsplice-enrollment",
+    "crates/flowsplice-storage",
     "server",
     "relay",
     "homeagent",
@@ -12,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -25,10 +26,12 @@ axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 flowsplice-core = { path = "crates/flowsplice-core" }
 flowsplice-enrollment = { path = "crates/flowsplice-enrollment" }
+flowsplice-storage = { path = "crates/flowsplice-storage" }
 futures-util = "0.3"
 hex = "0.4"
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+redb = "=4.2.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rpassword = "7.4"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

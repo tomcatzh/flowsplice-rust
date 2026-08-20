@@ -28,9 +28,6 @@ msgstr ""
 msgid "Data listen"
 msgstr ""
 
-msgid "Data listeners"
-msgstr ""
-
 msgid "Enabled"
 msgstr ""
 
@@ -94,9 +91,6 @@ msgstr ""
 msgid "Maximum pending work"
 msgstr ""
 
-msgid "May contain explicit LAN IPv4 and WAN IPv6 socket addresses."
-msgstr ""
-
 msgid "No instances configured."
 msgstr ""
 
@@ -152,9 +146,6 @@ msgstr ""
 msgid "Server SPKI pins"
 msgstr ""
 
-msgid "Server data address"
-msgstr ""
-
 msgid "Service action failed"
 msgstr ""
 
@@ -165,6 +156,15 @@ msgid "Maximum data connections"
 msgstr ""
 
 msgid "Maximum management connections"
+msgstr ""
+
+msgid "Local redb state"
+msgstr ""
+
+msgid "Statistics UI listen"
+msgstr ""
+
+msgid "Keep this listener on loopback or another trusted management address."
 msgstr ""
 
 msgid "Start"

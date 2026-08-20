@@ -1,6 +1,5 @@
 id = "server-1"
 control_listen = "0.0.0.0:7443"
-data_listens = ["0.0.0.0:7444"]
 cert = "/certs/server.crt"
 key = "/certs/server.key"
 management_ca = "/certs/management-ca.crt"
@@ -9,11 +8,12 @@ deployment_trust = "/certs/deployment-trust.json"
 control_signing_key = "/authorization/server-control.key"
 travel_authorization_state = "/state/server-authorization.json"
 control_generation_state = "/state/server-control-generation.json"
+state_store = "/state/server-state.redb"
+ui_listen = "127.0.0.1:9083"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
-control_snapshot_ttl_secs = 120
+control_snapshot_ttl_secs = 15
 max_control_connections = 64
-max_data_connections = 128
 
 [[homes]]
 id = "home-1"
@@ -24,7 +24,9 @@ id = "home-2"
 [[relays]]
 id = "relay-1"
 management_addr = "relay1:8443"
+data_public_addr = "relay1:8444"
 
 [[relays]]
 id = "relay-2"
 management_addr = "relay2:8443"
+data_public_addr = "relay2:8444"

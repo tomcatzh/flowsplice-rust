@@ -1,8 +1,9 @@
 # FlowSplice
 
 FlowSplice is an identity-aware private service access system. It exposes explicitly configured TCP
-and UDP services from one or more Home Agents to enrolled Travel devices while Relay and Server
-forward business traffic without access to its plaintext.
+and UDP services from one or more Home Agents to enrolled Travel devices. Relay forwards the
+end-to-end encrypted business stream directly between Travel and Home; Server stays on the control
+plane and never binds a business-data listener.
 
 > [!WARNING]
 > FlowSplice is under active development and is not generally available. Until a GA release,
@@ -31,13 +32,14 @@ not interchangeable failover replicas.
 
 | Component | Responsibility |
 | --- | --- |
-| `flowsplice-server` | Aggregates Home catalogs, signs Travel-visible control state, coordinates opaque work sockets, and distributes Travel authorization state. |
+| `flowsplice-server` | Aggregates Home catalogs, signs Travel-visible control state, coordinates route admission, distributes Travel authorization state, and ingests signed five-minute statistics summaries. |
 | `flowsplice-relay` | Provides public management/data ingress and opaque forwarding; Linux builds use `splice(2)` for paired data sockets. |
 | `flowsplice-homeagent` | Publishes services, terminates business TLS, connects authorized Flows to local targets, and optionally hosts the local issuer/revocation UI. |
 | `flowsplice-travelagent` | Creates local mappings, verifies signed discovery state, races Relays, and originates end-to-end business TLS. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
 | `flowsplice-core` | Implements shared framing, authorization, deployment trust, TLS identity, and route admission. |
 | `flowsplice-enrollment` | Implements Travel enrollment/import, Home-side issuance, encrypted-key handling, and the offline `flowsplice-trust` utility. |
+| `flowsplice-storage` | Provides redb-backed local state, five-minute statistics buckets/outboxes, Relay history, and remote-enrollment inbox/outbox storage. |
 
 The repository is one Rust workspace. The Home and Travel frontends are TypeScript/Vite SPAs
 embedded into their Rust executables with
@@ -58,8 +60,8 @@ order, persistent anti-rollback state, compromise boundaries, and implementation
 | Layer | Endpoints | Purpose |
 | --- | --- | --- |
 | Management TLS | Home→Server, Server→Relay, Travel→Relay | Mutual authentication for catalogs, heartbeats, route requests, and short-lived secrets. |
-| Route admission | Travel→Relay and Relay/Home→Server data sockets | HMAC-SHA256 proves possession of a single-use route/work secret before sockets are paired. |
-| Business TLS | Travel↔Home through Relay and Server | End-to-end mutual TLS protects the selected service ID, Flow frames, and business plaintext. |
+| Route admission | Travel→Relay and Home→Relay data sockets | HMAC-SHA256 proves possession of a single-use route/work secret before Relay pairs the sockets. |
+| Business TLS | Travel↔Home through one Relay | End-to-end mutual TLS protects the selected service ID, Flow frames, and business plaintext. |
 
 Management and business identities use separate CA roots. Every leaf certificate carries exactly one
 URI identity in the form `flowsplice://identity/<role>/<id>`. TLS chain validation is followed by
@@ -76,9 +78,13 @@ role, stable ID, SPKI, authorization scope, and protocol checks. TLS is restrict
   Travel TOML.
 - A Seed Relay is an untrusted transport address. Relay IDs and SPKIs are learned from the signed
   control snapshot, not entered as Seed configuration.
-- Travel persists deployment/signer epochs, the highest accepted control generation, and that
-  generation's content hash. Rollback, same-generation conflicts, future/expired state, and invalid
-  signatures fail closed across restart.
+- Travel records every Relay from a successfully verified directory as a durable startup candidate.
+  A historical record is discovery only: a Relay cannot carry business traffic until Travel obtains
+  and verifies a fresh signed snapshot that authorizes it.
+- Travel persists deployment/signer epochs, the highest accepted control generation, that
+  generation's content hash, and the latest signed snapshot in redb. Rollback, same-generation
+  conflicts, future/expired state, and invalid signatures fail closed across restart. A legacy
+  `control-trust-state.json` is verified, migrated once, and removed after durable readback.
 
 Server is the final authority for the aggregate Catalog and Relay directory. A compromised certified
 Server control key can omit entries, equivocate, or misdirect availability. It still cannot impersonate
@@ -115,12 +121,13 @@ keys.
 | --- | --- |
 | Travel | Local plaintext, mappings, filtered Catalog, selected Home/service, and Flow state. |
 | Home | Published Catalog, selected service, decrypted Flow data, and the final local target. |
-| Server | Home/Relay/Travel identities, aggregate catalogs, selected Home ID, timing, and byte volume; not business plaintext or selected service ID. |
+| Server | Home/Relay/Travel identities, aggregate catalogs, selected Home ID, and signed five-minute business summaries submitted by nodes; not the business byte stream, plaintext, or selected service ID. |
 | Relay | Server/Travel identities, transported Catalog, selected Home ID, timing, and byte volume; not business plaintext or selected service ID. |
 | Passive observer | Network endpoints, timing, sizes, and visible TLS metadata; not TLS application plaintext. |
 
-Relay and Server can delay, drop, replay, reorder, or corrupt forwarded bytes and can deny service.
-Business TLS detects unauthorized modification but cannot force availability. FlowSplice does not
+Relay can delay, drop, replay, reorder, or corrupt forwarded business bytes and can deny service.
+Server can deny or misdirect new route setup but is not in an established business stream. Business
+TLS detects unauthorized modification but cannot force availability. FlowSplice does not
 hide traffic metadata or protect plaintext after Travel, Home, or the final service endpoint is
 compromised.
 
@@ -145,123 +152,77 @@ make e2e
 - `make e2e` creates disposable test PKI and runs two Homes, two Relays, Server, Travel, TCP/UDP
   targets, and both embedded UIs in Docker.
 
-The E2E suite covers encrypted local enrollment, single-use issuance, three authorization scopes,
-live revocation, password rotation, trust-tamper and response-splicing rejection, durable rollback
-protection, exact multi-Home routing, one-Seed discovery, duplicate-login rejection, Relay
-competition, and same-TCP-connection handover after killing the winning Relay.
+Docker builds reuse local base images and BuildKit cache by default; release and E2E entry points
+pass `--pull=false`. Do not refresh base images during ordinary build, test, or deployment work.
+Only set `FLOWSPLICE_DOCKER_PULL=true` for an explicitly requested and recorded base-image refresh.
+
+The E2E suite covers encrypted local and authenticated remote enrollment, single-use issuance, three
+authorization scopes, live revocation, password rotation, trust-tamper and response-splicing
+rejection, durable rollback protection and Relay discovery history, exact multi-Home routing,
+one-Seed discovery, duplicate-login rejection, Relay competition, same-TCP-connection handover after
+killing the winning Relay, established-flow continuity while Server is stopped, signed statistics
+upload/deduplication, and day/week/month/year reports. It also asserts that Server has no business
+listener.
 
 E2E keys and logs are written below ignored `tests/e2e/generated/`. They are disposable test data and
 must never be used in production. Production logging defaults to `INFO`; component-specific
 `RUST_LOG` filters enable Carrier/ACK/DUP diagnostics without logging business payloads, passwords,
 private keys, bearer tokens, or route/work secrets.
 
-## Enroll a Travel device
+## Travel Quick Start
 
-Enrollment is attended: the Travel device generates and retains its own private keys, while a Home
-operator approves access. Do not copy an enrolled Travel directory to another machine. Generate a
-new Travel ID and keys on each device.
-
-### 1. Generate a request on Travel
-
-Choose a new directory path:
+Use a deployment-specific Travel binary built with the public deployment root, public management
+CA certificate, and at least one bootstrap Relay address embedded. A fresh device does not need a
+TOML file or certificate directory before this command:
 
 ```bash
-flowsplice-travelagent enroll-init \
+mkdir -m 700 ./my-travel
+flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
-  --enrollment-dir ./cert
+  --home-id home-1 \
+  --install-dir ./my-travel \
+  --tcp ssh=127.0.0.1:10022
 ```
 
-Enter a new password of at least 12 characters twice. The directory contains:
+Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
+two encrypted private keys locally, contacts the embedded bootstrap Relays using the embedded public
+CA, and prints a short Home verification code. The command remains running while it retries and
+waits for attended Home approval.
 
-| File | Handling |
-| --- | --- |
-| `travel-management.key` | Encrypted private key; never upload or share. |
-| `travel-business.key` | Encrypted private key; never upload or share. |
-| `enrollment-state.json` | Private local request-binding state; keep it with the keys. |
-| `enrollment-request.json` | The only file sent to the Home operator. |
+On the Home machine, open the issuer page at its loopback `ui_listen` address (normally
+`http://127.0.0.1:9081`). If the Home is remote, reach that loopback page through an authenticated
+administrative tunnel; never publish the issuer HTTP listener on the WAN. Open the pending Travel
+request, compare the verification code with Travel, choose the narrowest scope and validity, click
+approve, and enter the Home issuer password. This password is used only on Home and is never sent to
+Travel, Relay, or Server.
 
-### 2. Issue on Home
-
-Open the Home issuer UI. The example configuration uses:
+After approval, the waiting Travel verifies and installs the returned trust, dual certificates, and
+credential, then atomically creates:
 
 ```text
-http://127.0.0.1:9081
+my-travel/travelagent.toml
+my-travel/cert/
+my-travel/state/travel-state.redb
 ```
 
-The authoritative address is `[issuer].listen` in the Home configuration and should remain
-loopback-only. For a remote Home, use a trusted local tunnel instead of exposing this HTTP UI to WAN.
-
-Upload `enrollment-request.json`, choose the narrowest scope and validity, then enter the **Home
-issuer password**. This password decrypts that Home's CA and authority keys for the signing operation;
-it is not the Travel password or a public key, and FlowSplice does not persist it.
-
-The browser downloads one self-contained response. Home also publishes the signed public grant to
-Server. No Travel private key, issuer private key, or issuer password is uploaded to Server.
-
-### 3. Import on the same Travel device
+No request or response file is transferred manually. The private keys never leave Travel, and the
+generated TOML contains paths and public Relay addresses but no private-key password. Start it:
 
 ```bash
-flowsplice-travelagent enroll-import \
-  --enrollment-dir ./cert \
-  --response ./flowsplice-travel-laptop-response.json
+flowsplice-travelagent --config ./my-travel/travelagent.toml
 ```
 
-Enter the Travel private-key password. Import verifies the embedded deployment root, signed trust,
-original request and nonce, local keys, both CA chains, authority, scope, validity, and certificate
-bindings before installing:
+Enter the same Travel password. The generated mapping and UI bind loopback addresses. The generated
+TOML is already complete; edit it only to add another Home or mapping, change local loopback ports,
+or tune limits. Do not add Home SPKIs or a full Relay authorization list. TOML Relay entries are
+bootstrap addresses only. Travel durably remembers every Relay learned from a verified signed
+directory, but after restart it still requires a fresh signed directory before using any Relay for
+business.
 
-```text
-management-ca.crt
-business-ca.crt
-deployment-trust.json
-travel-management.crt
-travel-business.crt
-enrollment-response.json
-```
+For a detailed Chinese walkthrough, including recovery and replacement enrollment, see
+[Travel Quick Start (简体中文)](docs/QUICK_START.zh-CN.md).
 
-Keep the enrollment directory intact and private.
-
-### 4. Configure and start Travel
-
-Start from [travelagent/config.example.toml](travelagent/config.example.toml). A minimal shape is:
-
-```toml
-id = "travel-laptop"
-management_cert = "./cert/travel-management.crt"
-management_key = "./cert/travel-management.key"
-management_ca = "./cert/management-ca.crt"
-business_cert = "./cert/travel-business.crt"
-business_key = "./cert/travel-business.key"
-business_ca = "./cert/business-ca.crt"
-ui_listen = "127.0.0.1:9080"
-
-[[homes]]
-id = "home-1"
-
-[[seed_relays]]
-management_addr = "relay.example.net:8443"
-
-[[mappings]]
-home_id = "home-1"
-service_id = "ssh"
-protocol = "tcp"
-bind = "127.0.0.1:10022"
-```
-
-The complete example contains timeout, Carrier reevaluation, and resource controls.
-Home SPKIs and the full Relay directory are authenticated state, not operator-entered configuration.
-One reachable Seed address is sufficient; multiple addresses are optional bootstrap redundancy.
-
-Start Travel and enter its private-key password:
-
-```bash
-flowsplice-travelagent --config ./travelagent.toml
-```
-
-Mappings and the Travel UI must bind an explicit `127.0.0.1` address. To use them from another
-machine, keep FlowSplice loopback-only and provide a separately authenticated local tunnel.
-
-### 5. Test, rotate, and revoke
+### Test, rotate, replace, and revoke
 
 For a Foobar mapping on `127.0.0.1:10080`:
 
@@ -280,6 +241,22 @@ password store.
 Revoke a credential from the issuing Home UI. Revocation is irreversible. It blocks new authorization
 immediately and prevents a revoked Carrier from reattaching; a local TCP socket already waiting for
 recovery can remain until Travel's shorter recovery deadline expires.
+
+An already enrolled and authenticated Travel can request replacement enrollment through its local
+UI without manually transferring request/response files. The request is relayed over the existing
+authenticated control path to the selected Home. A Home operator must still click approval and enter
+the issuer password; after the signed response returns, the Travel operator enters the local key
+password to install it. Restart activates the replacement identity; the new process confirms
+installation to Home, after which both durable lifecycle records are retired.
+
+The older `enroll-init` / Home manual signer / `enroll-import` workflow remains an explicit recovery
+path. It is not required by the normal first-device Quick Start.
+
+Travel, Relay, and Home keep only locally observed business metrics in five-minute redb buckets and
+serve loopback statistics pages with rolling day/week/month/year report windows. Nodes sign summaries with their
+management identity and retry them from a durable outbox. Server certificate-binds and idempotently
+deduplicates those summaries; it does not infer business volume from control messages or from a
+business forwarding path, because it has no such path.
 
 ## Configuration and deployment
 
@@ -345,8 +322,11 @@ The script uses the lockfile and produces:
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
-contained in single executables. Current macOS artifacts are not yet Developer ID signed or
-notarized; Gatekeeper may block first launch on another Mac. Public distribution should use
+contained in single executables. The release builder explicitly applies and verifies free ad-hoc
+signatures with stable `io.zxf.flowsplice.*` identifiers (using the reverse-DNS form of the
+project owner's `zxf.io` domain) and the hardened runtime. Ad-hoc signing seals
+each exact binary but carries no developer identity. Current macOS artifacts are not Developer ID
+signed or notarized, so Gatekeeper may block a quarantined download on another Mac. Public distribution should use
 [Apple Developer ID signing and notarization](https://developer.apple.com/developer-id/).
 
 ## Current limits
@@ -360,7 +340,7 @@ notarized; Gatekeeper may block first launch on another Mac. Public distribution
 - Signed control state protects integrity and rollback, not availability or Server equivocation.
 - Unattended signing, automatic certificate renewal, CRL/OCSP, HSM-backed keys, cross-process Flow
   recovery, authenticated automatic updates, and GA compatibility guarantees are not implemented.
-- Current release artifacts do not yet provide Developer ID notarization, update anti-rollback,
+- Current release artifacts provide only ad-hoc macOS signing, not Developer ID notarization, update anti-rollback,
   reproducible-build attestation, or published release hashes.
 - The project has not undergone a professional third-party security audit and should not be treated
   as a certified security product.
@@ -368,7 +348,7 @@ notarized; Gatekeeper may block first launch on another Mac. Public distribution
 ## Repository layout
 
 ```text
-crates/       shared core and enrollment crates
+crates/       shared core, enrollment, and redb storage crates
 server/       Server application
 relay/        Relay application
 homeagent/    Home Agent and issuer UI

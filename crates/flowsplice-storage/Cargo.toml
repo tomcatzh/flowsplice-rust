@@ -1,27 +1,24 @@
 [package]
-name = "flowsplice-relay"
+name = "flowsplice-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+fault-injection = []
+
 [dependencies]
 anyhow.workspace = true
 aws-lc-rs.workspace = true
-axum.workspace = true
-clap.workspace = true
 flowsplice-core.workspace = true
-flowsplice-storage.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-splice = "0.2.1"
+[dev-dependencies]
+tempfile = "3.20"
 
 [lints]
 workspace = true

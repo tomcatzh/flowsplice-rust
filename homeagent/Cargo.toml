@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-e2e-remote-ui = []
+e2e-remote-ui = ["flowsplice-storage/fault-injection"]
 
 [dependencies]
 anyhow.workspace = true
@@ -16,6 +16,7 @@ clap.workspace = true
 embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }
 flowsplice-core.workspace = true
 flowsplice-enrollment.workspace = true
+flowsplice-storage.workspace = true
 hex.workspace = true
 rust-embed = { version = "8.7", features = ["debug-embed", "deterministic-timestamps"] }
 serde.workspace = true

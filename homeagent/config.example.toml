@@ -1,7 +1,6 @@
 id = "home-1"
 alias = "My Home"
 server_control_addr = "127.0.0.1:7443"
-server_data_addr = "127.0.0.1:7444"
 server_name = "server.home.example"
 server_id = "server-1"
 management_cert = "/etc/flowsplice/home-management.crt"
@@ -14,6 +13,8 @@ deployment_root_public_key = "/etc/flowsplice/deployment-root.pub"
 deployment_trust = "/etc/flowsplice/deployment-trust.json"
 server_spki_pins = ["replace-with-server-spki-sha256-hex"]
 travel_authorization_cache = "/var/lib/flowsplice/home-authorization-cache.json"
+state_store = "/var/lib/flowsplice/home-state.redb"
+ui_listen = "127.0.0.1:9081"
 handshake_timeout_secs = 10
 udp_idle_secs = 60
 max_active_flows = 128
@@ -26,7 +27,6 @@ max_carriers_per_flow = 16
 
 # Omit this entire section on a secondary Home that must not issue Travel credentials.
 [issuer]
-listen = "127.0.0.1:9081"
 management_ca_key = "/etc/flowsplice/issuer/management-ca.key"
 business_ca_key = "/etc/flowsplice/issuer/business-ca.key"
 default_valid_days = 365

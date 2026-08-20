@@ -163,9 +163,6 @@ return view.extend({
 		o = required(s.taboption('general', form.Value, 'control_listen', _('Home control listener'),
 			_('Use LAN addresses only; do not expose the Server control listener to WAN.')));
 		o.placeholder = '192.0.2.1:7443';
-		o = required(s.taboption('general', form.DynamicList, 'data_listen', _('Data listeners'),
-			_('May contain explicit LAN IPv4 and WAN IPv6 socket addresses.')));
-		o.placeholder = '[2001:db8::1]:7444';
 		addPathOption(s, 'trust', 'cert', _('Management certificate'));
 		addPathOption(s, 'trust', 'key', _('Management private key'), _('The file must be readable by the flowsplice service user.'));
 		addPathOption(s, 'trust', 'management_ca', _('Management CA'));
@@ -174,6 +171,10 @@ return view.extend({
 		addPathOption(s, 'trust', 'control_signing_key', _('Server control signing key'), _('The deployment root must certify its public key.'));
 		addPathOption(s, 'trust', 'travel_authorization_state', _('Travel authorization state'));
 		addPathOption(s, 'trust', 'control_generation_state', _('Control generation state'));
+		addPathOption(s, 'trust', 'state_store', _('Local redb state'));
+		o = required(s.taboption('general', form.Value, 'ui_listen', _('Statistics UI listen'),
+			_('Keep this listener on loopback or another trusted management address.')));
+		o.placeholder = '127.0.0.1:9083';
 		o = required(s.taboption('limits', form.Value, 'handshake_timeout_secs', _('Handshake timeout (seconds)')));
 		o.datatype = 'uinteger';
 		o.default = '10';
@@ -189,9 +190,6 @@ return view.extend({
 		o = required(s.taboption('limits', form.Value, 'max_control_connections', _('Maximum control connections')));
 		o.datatype = 'uinteger';
 		o.default = '256';
-		o = required(s.taboption('limits', form.Value, 'max_data_connections', _('Maximum data connections')));
-		o.datatype = 'uinteger';
-		o.default = '1024';
 
 		s = m.section(form.GridSection, 'home', _('Trusted Home Agents'),
 			_('Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home.'));
@@ -214,8 +212,6 @@ return view.extend({
 		o.modalonly = true;
 		o = required(s.option(form.Value, 'data_public_addr', _('Advertised data address')));
 		o.modalonly = true;
-		o = required(s.option(form.Value, 'server_data_addr', _('Server data address')));
-		o.modalonly = true;
 		o = required(s.option(form.Value, 'server_id', _('Server ID')));
 		o.modalonly = true;
 		[ [ 'cert', _('Management certificate') ], [ 'key', _('Management private key') ], [ 'management_ca', _('Management CA') ], [ 'deployment_root_public_key', _('Deployment root public key') ], [ 'deployment_trust', _('Signed deployment trust') ] ].forEach(function(item) {
@@ -227,6 +223,10 @@ return view.extend({
 			pinOption.modalonly = true;
 		});
 		o = required(s.option(form.Value, 'travel_authorization_cache', _('Persistent revocation cache')));
+		o.modalonly = true;
+		o = required(s.option(form.Value, 'state_store', _('Local redb state')));
+		o.modalonly = true;
+		o = required(s.option(form.Value, 'ui_listen', _('Statistics UI listen')));
 		o.modalonly = true;
 		[ [ 'handshake_timeout_secs', _('Handshake timeout'), '10' ], [ 'route_ttl_secs', _('Route TTL'), '15' ], [ 'max_pending_routes', _('Maximum pending routes'), '256' ], [ 'max_management_connections', _('Maximum management connections'), '1024' ], [ 'max_data_connections', _('Maximum data connections'), '2048' ] ].forEach(function(item) {
 			var limitOption = required(s.option(form.Value, item[0], item[1]));
@@ -245,6 +245,7 @@ return view.extend({
 		o.rmempty = false;
 		required(s.option(form.Value, 'id', _('Relay ID')));
 		required(s.option(form.Value, 'management_addr', _('Management address')));
+		required(s.option(form.Value, 'data_public_addr', _('Advertised data address')));
 
 		return m.render();
 	}

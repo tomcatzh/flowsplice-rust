@@ -223,6 +223,30 @@ impl SignedControlSnapshot {
             digest_sha256: hex::encode(digest::digest(&digest::SHA256, &payload_bytes).as_ref()),
         })
     }
+
+    /// Verifies that this snapshot was cryptographically valid when it was issued.
+    ///
+    /// This is intentionally restricted to one-time persistence migration. A value returned by
+    /// this method must never be used as current control authorization because its validity window
+    /// may already have expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed contents or when the snapshot was not valid at its own
+    /// issuance time.
+    pub fn verify_at_issuance_for_migration(
+        &self,
+        root_public_key: &str,
+    ) -> Result<VerifiedControlSnapshot> {
+        let payload_bytes = hex::decode(&self.payload_hex)
+            .context("control snapshot payload must be hexadecimal")?;
+        if payload_bytes.len() > MAX_CONTROL_SNAPSHOT_PAYLOAD_BYTES {
+            bail!("control snapshot payload exceeds the signed-frame budget");
+        }
+        let payload: ControlSnapshotPayload = serde_json::from_slice(&payload_bytes)
+            .context("control snapshot payload is invalid")?;
+        self.verify(root_public_key, payload.issued_at_unix_secs)
+    }
 }
 
 impl DeploymentTrust {
@@ -423,6 +447,8 @@ pub fn validate_relay_directory(directory: &RelayDirectory) -> Result<()> {
             || relay.id.len() > MAX_ID_BYTES
             || relay.management_addr.is_empty()
             || relay.management_addr.len() > MAX_DISPLAY_OR_TARGET_BYTES
+            || relay.data_public_addr.is_empty()
+            || relay.data_public_addr.len() > MAX_DISPLAY_OR_TARGET_BYTES
             || !ids.insert(&relay.id)
             || !addresses.insert(&relay.management_addr)
         {
@@ -571,6 +597,7 @@ mod tests {
                     relays: vec![crate::protocol::RelayEndpoint {
                         id: "relay-1".to_owned(),
                         management_addr: "127.0.0.1:8443".to_owned(),
+                        data_public_addr: "127.0.0.1:8444".to_owned(),
                         management_spki_sha256: "11".repeat(32),
                     }],
                 },
@@ -647,6 +674,7 @@ mod tests {
                 relays: vec![crate::protocol::RelayEndpoint {
                     id: "relay-1".to_owned(),
                     management_addr: "127.0.0.1:8443".to_owned(),
+                    data_public_addr: "127.0.0.1:8444".to_owned(),
                     management_spki_sha256: "11".repeat(32),
                 }],
             },

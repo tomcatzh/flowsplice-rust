@@ -1,6 +1,5 @@
 id = "server-1"
 control_listen = "192.0.2.10:7443"
-data_listens = ["192.0.2.10:7444", "[2001:db8::10]:7444"]
 cert = "/etc/flowsplice/server.crt"
 key = "/etc/flowsplice/server.key"
 management_ca = "/etc/flowsplice/management-ca.crt"
@@ -9,12 +8,13 @@ deployment_trust = "/etc/flowsplice/deployment-trust.json"
 control_signing_key = "/etc/flowsplice/server-control.key"
 travel_authorization_state = "/var/lib/flowsplice/server-authorization.json"
 control_generation_state = "/var/lib/flowsplice/server-control-generation.json"
+state_store = "/var/lib/flowsplice/server-state.redb"
+ui_listen = "127.0.0.1:9083"
 handshake_timeout_secs = 10
 work_ttl_secs = 15
 max_pending_work = 256
 control_snapshot_ttl_secs = 120
 max_control_connections = 256
-max_data_connections = 1024
 
 [[homes]]
 id = "home-1"
@@ -25,7 +25,9 @@ id = "home-2"
 [[relays]]
 id = "relay-1"
 management_addr = "relay-1.example.net:8443"
+data_public_addr = "relay-1.example.net:8444"
 
 [[relays]]
 id = "relay-2"
 management_addr = "relay-2.example.net:8443"
+data_public_addr = "relay-2.example.net:8444"

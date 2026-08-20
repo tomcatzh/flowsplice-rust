@@ -1,0 +1,144 @@
+# FlowSplice 0.2 Travel 快速开始
+
+## 准备
+
+使用为 `zxf.io` 这套部署构建的 0.2 Travel 正式二进制。它只内置公开材料：部署根公钥、Management CA 公共证书和一组 Relay bootstrap 地址；不会内置任何私钥、Home 签发密码或 Travel 密码。
+
+macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。免费签名是 ad-hoc codesign：它能校验文件未被签名后修改，但不提供 Apple Developer ID 身份，也没有 notarization。若文件经浏览器下载而被 Gatekeeper 隔离，仍可能需要在 macOS 的“隐私与安全性”页面由用户明确允许。
+
+给二进制增加执行权限，并验证 ad-hoc 签名：
+
+```bash
+chmod 755 ./flowsplice-travelagent
+codesign --verify --strict --verbose=2 ./flowsplice-travelagent
+```
+
+## 第一次远程注册：开始时不需要 TOML 和 cert 目录
+
+选择一个全新的 Travel ID 和一个空安装目录。下面把 Home 的 `ssh` 业务映射到本机 `127.0.0.1:10022`：
+
+```bash
+mkdir -m 700 ./my-travel
+./flowsplice-travelagent enroll-remote \
+  --travel-id travel-laptop \
+  --home-id home-1 \
+  --install-dir ./my-travel \
+  --tcp ssh=127.0.0.1:10022
+```
+
+命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
+
+1. 在 Travel 本机生成两把独立、加密保存的 Management/Business 私钥；
+2. 使用二进制内置的公开 CA 和 bootstrap Relay 建立只验证服务器身份的首次注册 TLS 通道；
+3. 把只有公钥和 proof-of-possession 的 enrollment 请求送到指定 Home；
+4. 在终端显示 `Home verification code`；
+5. 保持运行并重试，等待 Home 上的人工批准。
+
+私钥不会上传。此时命令等待远程返回是正常状态，但不会自动批准或签发。
+
+## 在 Home 本地批准
+
+Home 签发页面默认是：
+
+```text
+http://127.0.0.1:9081
+```
+
+这个 HTTP 页面必须保持 loopback-only。若 Home 在远端，通过你已有的安全管理通道把远端 loopback 转到本机，例如：
+
+```bash
+ssh -L 9081:127.0.0.1:9081 <user>@<home-host>.zxf.io
+```
+
+然后在本机浏览器打开 `http://127.0.0.1:9081`：
+
+1. 打开收到的远程 Travel 请求；
+2. 对比页面与 Travel 终端显示的 verification code；
+3. 选择最小必要授权范围：指定业务、当前 Home 或确有必要时的全局授权；
+4. 选择有效期；
+5. 在正式审批对话框中输入 Home 签发密码，点击“批准并远程返回”。
+
+Home 签发密码只在 Home 本机解锁签发密钥，不会发送给 Server、Relay 或 Travel。错误密码不会生成凭据。
+
+当前 Home 只有在部署信任配置了独立全局授权密钥时才显示“全局超级授权”。普通第二 Home 只能批准自己的 Home 或自己的指定业务；serving-only Home 不显示批准、签发或撤销入口。
+
+## 自动安装结果
+
+Home 批准后，等待中的 `enroll-remote` 会验证部署信任、请求/响应绑定、双证书链、Travel 身份、两把公钥、授权范围和有效期，然后创建：
+
+```text
+my-travel/
+├── travelagent.toml
+├── cert/
+│   ├── travel-management.crt
+│   ├── travel-management.key
+│   ├── travel-business.crt
+│   ├── travel-business.key
+│   ├── management-ca.crt
+│   ├── business-ca.crt
+│   ├── deployment-trust.json
+│   └── enrollment-response.json
+└── state/
+    └── travel-state.redb
+```
+
+`travelagent.toml` 不保存 Travel 私钥密码。正常流程不需要下载、复制或上传 `enrollment-request.json` / `enrollment-response.json`。
+
+## 启动 Travel
+
+```bash
+./flowsplice-travelagent --config ./my-travel/travelagent.toml
+```
+
+输入刚才设置的 Travel 私钥密码。随后：
+
+- `127.0.0.1:10022` 是上例的本地业务入口；
+- `http://127.0.0.1:9080` 是 Travel 本地页面；
+- 页面可查看当前业务、Relay、五分钟统计和日/周/月/年报表；
+- 启动后 Travel 会向 Home 确认新凭据已经真正启用，双方随后清理 enrollment 生命周期记录。
+
+## TOML 什么时候需要修改
+
+第一次远程注册已经生成完整 TOML。通常只修改以下内容：
+
+- 增加 `[[homes]]`；
+- 增加或调整 `[[mappings]]` 的 `home_id`、`service_id`、`protocol` 和本地 `bind`；
+- 调整本地 `ui_listen` 或容量/超时参数；
+- 在确有 bootstrap 可用性需要时增加 `[[seed_relays]]`。
+
+不要把 Home SPKI、完整 Relay 授权名单或密码手工写进 TOML。`[[seed_relays]]` 只是首次取得签名目录的联系地址。Travel 会把历史上从有效签名目录中验证过的 Relay 长期保存在 `travel-state.redb`，以后重启时把它们也当成 bootstrap 候选；旧记录永远不能代替新的 Server 签名目录授权。
+
+一个映射示例：
+
+```toml
+[[homes]]
+id = "home-1"
+
+[[mappings]]
+home_id = "home-1"
+service_id = "ssh"
+protocol = "tcp"
+bind = "127.0.0.1:10022"
+```
+
+## 换发和撤销
+
+已注册 Travel 可在 `http://127.0.0.1:9080` 发起远程换发。Home 仍需在本地页面人工选择范围、点击批准并输入 Home 签发密码。响应返回后，Travel 端输入 Travel 私钥密码安装；重启 Travel 后新身份生效并向 Home 回执。
+
+删除/撤销凭据必须在签发它的 Home 页面执行，并再次输入 Home 签发密码。错误密码不改变状态。成功操作产生不可回滚的签名撤销记录；界面隐藏活动凭据不代表删除审计与防回滚历史。
+
+## 手工恢复路径
+
+只有远程 bootstrap 确实不可用时，才使用旧的恢复流程：
+
+```bash
+./flowsplice-travelagent enroll-init \
+  --travel-id travel-laptop \
+  --enrollment-dir ./cert
+
+./flowsplice-travelagent enroll-import \
+  --enrollment-dir ./cert \
+  --response ./enrollment-response.json
+```
+
+这条路径需要人工传递公开 enrollment 请求和签名响应；仍然不得传递 Travel 私钥或 Home 签发密码。

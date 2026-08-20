@@ -4,7 +4,7 @@ use aws_lc_rs::hmac;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"FSLCRTE1";
+const MAGIC: &[u8; 8] = b"FSLCRTE2";
 const SIGNED_LEN: usize = 8 + 1 + 16;
 const MAC_LEN: usize = 32;
 
@@ -12,8 +12,7 @@ const MAC_LEN: usize = 32;
 #[repr(u8)]
 pub enum RouteSide {
     Travel = 1,
-    Relay = 2,
-    Home = 3,
+    Home = 2,
 }
 
 impl TryFrom<u8> for RouteSide {
@@ -22,8 +21,7 @@ impl TryFrom<u8> for RouteSide {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Travel),
-            2 => Ok(Self::Relay),
-            3 => Ok(Self::Home),
+            2 => Ok(Self::Home),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid route side",
@@ -115,7 +113,7 @@ mod tests {
     use tokio::io::duplex;
     use uuid::Uuid;
 
-    use super::{RouteSide, read_preface, verify_preface, write_preface};
+    use super::{RoutePreface, RouteSide, read_preface, verify_preface, write_preface};
 
     #[tokio::test]
     async fn signed_preface_round_trip_and_tamper_rejection() {
@@ -130,6 +128,23 @@ mod tests {
         writer.await.unwrap().unwrap();
         assert_eq!(preface.id, id);
         assert!(verify_preface(preface, &mac, &secret));
+        assert!(!verify_preface(
+            RoutePreface {
+                side: RouteSide::Home,
+                id,
+            },
+            &mac,
+            &secret
+        ));
+        assert!(!verify_preface(
+            RoutePreface {
+                side: RouteSide::Travel,
+                id: Uuid::new_v4(),
+            },
+            &mac,
+            &secret
+        ));
+        assert!(!verify_preface(preface, &mac, &[9_u8; 32]));
         mac[0] ^= 1;
         assert!(!verify_preface(preface, &mac, &secret));
     }

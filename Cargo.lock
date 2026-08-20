@@ -528,7 +528,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "flowsplice-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-echo"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-enrollment"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-foobar"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-homeagent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -604,6 +604,7 @@ dependencies = [
  "embedded-spa",
  "flowsplice-core",
  "flowsplice-enrollment",
+ "flowsplice-storage",
  "hex",
  "rust-embed",
  "serde",
@@ -620,13 +621,16 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-relay"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
+ "axum",
  "clap",
  "flowsplice-core",
+ "flowsplice-storage",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-splice",
@@ -637,13 +641,15 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
+ "axum",
  "clap",
  "flowsplice-core",
  "flowsplice-enrollment",
+ "flowsplice-storage",
  "hex",
  "rustls-pki-types",
  "serde",
@@ -656,8 +662,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowsplice-storage"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "flowsplice-core",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "flowsplice-travelagent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -666,13 +686,17 @@ dependencies = [
  "embedded-spa",
  "flowsplice-core",
  "flowsplice-enrollment",
+ "flowsplice-storage",
+ "hex",
  "rpassword",
  "rust-embed",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1237,6 +1261,15 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

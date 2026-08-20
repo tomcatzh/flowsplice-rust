@@ -1,6 +1,7 @@
 import "./style.css";
 
 type Protocol = "tcp" | "udp";
+type Page = "overview" | "statistics";
 
 interface Mapping {
   home_id: string;
@@ -41,6 +42,64 @@ interface RotatePasswordResult {
   rotated_keys: number;
 }
 
+interface EnrollmentStatus {
+  request_id: string;
+  home_id: string;
+  created_at_unix_secs: number;
+  response_received: boolean;
+  restart_required: boolean;
+}
+
+interface MetricRollup {
+  metric_family: string;
+  dimensions: Record<string, string>;
+  count: number;
+  sum: number;
+  weighted_average: number;
+  average_per_five_minutes: number;
+}
+
+interface RelayDiscovery {
+  relay_id?: string;
+  management_addr: string;
+  configured_seed: boolean;
+  learned: boolean;
+  current_member: boolean;
+  last_success_unix_secs?: number;
+  consecutive_failures: number;
+}
+
+interface Statistics {
+  period: "day" | "week" | "month" | "year";
+  dropped_events: number;
+  active_flows: number;
+  overview: MetricRollup[];
+  breakdowns: MetricRollup[];
+  relay_discovery: RelayDiscovery[];
+}
+
+async function createEnrollment(homeId: string): Promise<void> {
+  const password = window.prompt("New Travel private-key password (at least 12 characters):");
+  if (password === null) return;
+  await requestJson<EnrollmentStatus>("/api/enrollment", {
+    method: "POST",
+    body: JSON.stringify({ home_id: homeId, password }),
+  });
+  noticeMessage = `Enrollment request sent to ${homeId}; approve it in that Home page.`;
+  await render();
+}
+
+async function installEnrollment(requestId: string): Promise<void> {
+  const password = window.prompt("Enter the new Travel private-key password:");
+  if (password === null) return;
+  await requestJson("/api/enrollment/install", {
+    method: "POST",
+    body: JSON.stringify({ request_id: requestId, password }),
+  });
+  noticeMessage = "The new identity is installed. Restart Travel to activate it.";
+  await render();
+}
+
 const root = document.querySelector<HTMLElement>("#app");
 
 if (!root) {
@@ -49,6 +108,8 @@ if (!root) {
 const app: HTMLElement = root;
 let passwordDialogOpen = false;
 let noticeMessage = "";
+let statisticsPeriod: Statistics["period"] = "day";
+let currentPage: Page = "overview";
 
 function escapeHtml(value: string): string {
   const span = document.createElement("span");
@@ -60,6 +121,18 @@ function formatUptime(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   return `${hours}h ${minutes}m`;
+}
+
+function metricLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function dimensionsLabel(value: Record<string, string>): string {
+  return Object.entries(value).map(([key, item]) => `${key}=${item}`).join(" · ") || "all business";
+}
+
+function number(value: number): string {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value);
 }
 
 function businessKey(homeId: string, serviceId: string, protocol: Protocol): string {
@@ -135,11 +208,62 @@ async function rotatePrivateKeyPassword(): Promise<void> {
   }
 }
 
+function pageTabs(): string {
+  return `<nav class="page-tabs" aria-label="Pages">
+    <button type="button" class="page-tab ${currentPage === "overview" ? "active" : ""}" data-page="overview">Agent</button>
+    <button type="button" class="page-tab ${currentPage === "statistics" ? "active" : ""}" data-page="statistics">Statistics</button>
+  </nav>`;
+}
+
+function bindPageTabs(): void {
+  document.querySelectorAll<HTMLButtonElement>(".page-tab").forEach((button) => {
+    button.addEventListener("click", () => {
+      const page = button.dataset.page as Page | undefined;
+      if (!page || page === currentPage) return;
+      currentPage = page;
+      void render();
+    });
+  });
+}
+
+async function renderStatisticsPage(): Promise<void> {
+  const [status, statistics] = await Promise.all([
+    fetchJson<Status>("/api/status"),
+    fetchJson<Statistics>(`/api/statistics?period=${statisticsPeriod}`),
+  ]);
+  const statisticCards = statistics.overview.map((item) => `<article><span>${escapeHtml(metricLabel(item.metric_family))}</span><strong>${number(item.sum)}</strong><small>${number(item.average_per_five_minutes)} per 5 min · ${number(item.count)} observations</small></article>`).join("");
+  const statisticRows = statistics.breakdowns.map((item) => `<tr><td>${escapeHtml(metricLabel(item.metric_family))}</td><td>${escapeHtml(dimensionsLabel(item.dimensions))}</td><td>${number(item.sum)}</td><td>${number(item.count)}</td><td>${number(item.weighted_average)}</td><td>${number(item.average_per_five_minutes)}</td></tr>`).join("");
+  const relayRows = statistics.relay_discovery.map((relay) => `<tr><td><strong>${escapeHtml(relay.relay_id ?? "Unresolved seed")}</strong><small>${escapeHtml(relay.management_addr)}</small></td><td>${relay.configured_seed ? "TOML seed" : "—"}</td><td>${relay.learned ? "Verified history" : "—"}</td><td><span class="state ${relay.current_member ? "ready" : "waiting"}">${relay.current_member ? "Current signed directory" : "Bootstrap only"}</span></td><td>${relay.last_success_unix_secs ? new Date(relay.last_success_unix_secs * 1000).toLocaleString() : "—"}</td><td>${relay.consecutive_failures}</td></tr>`).join("");
+  app.innerHTML = `<header>
+    <div><p class="eyebrow">Private service access</p><h1>FlowSplice</h1></div>
+    <span class="agent-id">${escapeHtml(status.travel_id)}</span>
+  </header>
+  ${pageTabs()}
+  <section class="panel statistics-panel"><div class="panel-heading"><div><p class="eyebrow">Business statistics</p><h2>Delivered traffic and Relay paths</h2></div><div class="statistics-controls"><label>Window <select id="statistics-period"><option value="day" ${statisticsPeriod === "day" ? "selected" : ""}>Day</option><option value="week" ${statisticsPeriod === "week" ? "selected" : ""}>Week</option><option value="month" ${statisticsPeriod === "month" ? "selected" : ""}>Month</option><option value="year" ${statisticsPeriod === "year" ? "selected" : ""}>Year</option></select></label><button id="refresh-statistics" type="button" class="secondary">Refresh</button></div></div>
+    <section class="metrics statistics-cards">${statisticCards || '<article><span>No business observations</span><strong>0</strong><small>The current five-minute bucket will appear after traffic.</small></article>'}</section>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Business / Relay dimensions</th><th>Total</th><th>Observations</th><th>Weighted average</th><th>5-minute average</th></tr></thead><tbody>${statisticRows || '<tr><td colspan="6" class="empty">No statistics in this window</td></tr>'}</tbody></table></div>
+    <div class="panel-heading subheading"><div><p class="eyebrow">Discovery</p><h2>Configured and learned Relays</h2></div><span>${statistics.dropped_events} dropped statistic events</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Relay</th><th>Configured</th><th>History</th><th>Authorization state</th><th>Last success</th><th>Failures</th></tr></thead><tbody>${relayRows || '<tr><td colspan="6" class="empty">No Relay candidates</td></tr>'}</tbody></table></div>
+  </section>
+  <footer>Statistics are read only after this page is opened, its window changes, or Refresh is clicked.</footer>`;
+  bindPageTabs();
+  document.querySelector<HTMLSelectElement>("#statistics-period")?.addEventListener("change", (event) => {
+    statisticsPeriod = (event.target as HTMLSelectElement).value as Statistics["period"];
+    void renderStatisticsPage();
+  });
+  document.querySelector<HTMLButtonElement>("#refresh-statistics")?.addEventListener("click", () => void renderStatisticsPage());
+}
+
 async function render(): Promise<void> {
   try {
-    const [status, catalog] = await Promise.all([
+    if (currentPage === "statistics") {
+      await renderStatisticsPage();
+      return;
+    }
+    const [status, catalog, enrollments] = await Promise.all([
       fetchJson<Status>("/api/status"),
       fetchJson<Catalog>("/api/catalog"),
+      fetchJson<EnrollmentStatus[]>("/api/enrollment"),
     ]);
     const homeById = new Map(catalog.homes.map((home) => [home.home_id, home]));
     const serviceByBusiness = new Map(
@@ -165,17 +289,21 @@ async function render(): Promise<void> {
         </tr>`;
       })
       .join("");
-
+    const enrollmentRows = enrollments.map((item) => `<tr><td><code>${escapeHtml(item.request_id)}</code></td><td>${escapeHtml(item.home_id)}</td><td>${item.restart_required ? "Restart required" : item.response_received ? "Ready to install" : "Awaiting Home approval"}</td><td>${item.response_received && !item.restart_required ? `<button class="install-enrollment" data-id="${escapeHtml(item.request_id)}">Install</button>` : ""}</td></tr>`).join("");
     app.innerHTML = `<header>
       <div><p class="eyebrow">Private service access</p><h1>FlowSplice</h1></div>
       <span class="agent-id">${escapeHtml(status.travel_id)}</span>
     </header>
+    ${pageTabs()}
     <div id="notice" class="notice ${noticeMessage ? "success" : ""}">${escapeHtml(noticeMessage)}</div>
     <section class="metrics">
       <article><span>Homes</span><strong>${catalog.homes.length || "Connecting"}</strong></article>
       <article><span>Active flows</span><strong>${status.active_flows}</strong></article>
       <article><span>Uptime</span><strong>${formatUptime(status.uptime_secs)}</strong></article>
       <article><span>Catalog</span><strong>v${status.catalog_generation}</strong></article>
+    </section>
+    <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Remote enrollment</p><h2>Travel certificates</h2></div><div>${catalog.homes.map((home) => `<button class="secondary create-enrollment" data-home="${escapeHtml(home.home_id)}">Request from ${escapeHtml(home.home_alias)}</button>`).join(" ")}</div></div>
+      <div class="table-wrap"><table><thead><tr><th>Request</th><th>Home</th><th>Status</th><th>Action</th></tr></thead><tbody>${enrollmentRows || '<tr><td colspan="4" class="empty">No remote enrollment requests</td></tr>'}</tbody></table></div>
     </section>
     <section class="panel">
       <div class="panel-heading"><div><p class="eyebrow">Local listeners</p><h2>Service mappings</h2></div><span>${status.mappings.length} configured</span></div>
@@ -193,6 +321,7 @@ async function render(): Promise<void> {
       <div class="dialog-actions"><button id="close-password-dialog" type="button" class="secondary">Cancel</button><button id="rotate-password" type="submit">Rotate password</button></div>
     </form></dialog>
     <footer>Every logical service is pinned to its configured Home Agent with mutual authentication and end-to-end encryption.</footer>`;
+    bindPageTabs();
     const passwordDialog = document.querySelector<HTMLDialogElement>("#password-dialog");
     document.querySelector<HTMLButtonElement>("#open-password-dialog")?.addEventListener("click", () => {
       clearPasswordDialog();
@@ -211,6 +340,8 @@ async function render(): Promise<void> {
         if (notice) notice.textContent = friendlyError(error);
       });
     });
+    document.querySelectorAll<HTMLButtonElement>(".create-enrollment").forEach((button) => button.addEventListener("click", () => void createEnrollment(button.dataset.home ?? "").catch((error) => { noticeMessage = friendlyError(error); void render(); })));
+    document.querySelectorAll<HTMLButtonElement>(".install-enrollment").forEach((button) => button.addEventListener("click", () => void installEnrollment(button.dataset.id ?? "").catch((error) => { noticeMessage = friendlyError(error); void render(); })));
   } catch (error) {
     app.innerHTML = `<section class="error"><p class="eyebrow">Local agent unavailable</p><h1>Unable to load status</h1><p>${escapeHtml(String(error))}</p><button type="button">Retry</button></section>`;
     app.querySelector("button")?.addEventListener("click", () => void render());
@@ -219,5 +350,5 @@ async function render(): Promise<void> {
 
 void render();
 window.setInterval(() => {
-  if (!passwordDialogOpen) void render();
+  if (!passwordDialogOpen && currentPage === "overview") void render();
 }, 5000);
