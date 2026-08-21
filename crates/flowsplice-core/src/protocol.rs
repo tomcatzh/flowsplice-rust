@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::authorization::{SignedTravelCredential, TravelAuthorizationSnapshot};
-use crate::deployment::SignedControlSnapshot;
+use crate::deployment::{SignedControlSnapshot, SignedHomeEndpointCredential};
 use crate::statistics::SignedStatisticsReport;
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
@@ -67,6 +67,8 @@ pub struct Service {
 pub struct HomeCatalog {
     pub home_id: String,
     pub home_alias: String,
+    #[serde(default)]
+    pub endpoint_credential: Option<SignedHomeEndpointCredential>,
     pub services: Vec<Service>,
 }
 
@@ -254,6 +256,31 @@ pub enum ControlMessage {
         accepted: bool,
         response_json: Option<Vec<u8>>,
         seed_relays: Vec<String>,
+        error: Option<String>,
+    },
+    HomeBootstrapEnrollmentSubmit {
+        protocol_version: u32,
+        request_id: Uuid,
+        home_id: String,
+        retrieval_token: Vec<u8>,
+        request_json: Vec<u8>,
+    },
+    HomeBootstrapEnrollmentResult {
+        request_id: Uuid,
+        accepted: bool,
+        response_json: Option<Vec<u8>>,
+        error: Option<String>,
+    },
+    HomeEnrollmentSubmit {
+        request_id: Uuid,
+        home_id: String,
+        retrieval_token: Vec<u8>,
+        request_json: Vec<u8>,
+    },
+    HomeEnrollmentResult {
+        request_id: Uuid,
+        accepted: bool,
+        response_json: Option<Vec<u8>>,
         error: Option<String>,
     },
     RemoteEnrollmentInstalled {
@@ -454,11 +481,13 @@ mod tests {
                     home_id: "home-1".to_owned(),
                     home_alias: "Home One".to_owned(),
                     services: vec![service("127.0.0.1:22")],
+                    endpoint_credential: None,
                 },
                 HomeCatalog {
                     home_id: "home-2".to_owned(),
                     home_alias: "Home Two".to_owned(),
                     services: vec![service("127.0.0.1:22")],
+                    endpoint_credential: None,
                 },
             ],
         };

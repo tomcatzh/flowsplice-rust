@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::{
+    digest,
     rand::{SecureRandom, SystemRandom},
     signature::{EcdsaKeyPair, KeyPair as _},
 };
@@ -39,9 +40,11 @@ use flowsplice_core::{
     statistics::{SignedStatisticsReport, statistics_dashboard_html},
     tls::{
         PeerIdentity, identity_client_connector, identity_from_certificate_pem,
-        identity_server_name, load_private_key, peer_identity, require_peer, server_acceptor,
+        identity_server_name, load_private_key, optional_client_server_acceptor, peer_identity,
+        require_peer,
     },
 };
+use flowsplice_enrollment::home::{HomeEnrollmentRequest, HomeEnrollmentResponse};
 use flowsplice_storage::{
     AcceptedReport, MetricRollup, ReportAcceptance, StateStore, accepted_reports_as_metric_points,
     summarize_metric_points,
@@ -49,7 +52,7 @@ use flowsplice_storage::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, Semaphore, mpsc, watch},
+    sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::{interval, sleep, timeout},
 };
@@ -273,6 +276,16 @@ struct PendingEnrollment {
     expires: Instant,
 }
 
+struct PendingHomeEnrollment {
+    home_id: String,
+    request_digest_sha256: String,
+    remaining_responders: usize,
+    any_accepted: bool,
+    response: Option<oneshot::Sender<ControlMessage>>,
+    last_error: Option<String>,
+    expires: Instant,
+}
+
 struct RouteRequestContext {
     request: Uuid,
     travel: String,
@@ -467,6 +480,7 @@ struct State {
     travel_sessions: Mutex<TravelSessionRegistry>,
     pending_grants: Mutex<HashMap<Uuid, PendingRelayGrant>>,
     pending_enrollments: Mutex<HashMap<Uuid, PendingEnrollment>>,
+    pending_home_enrollments: Mutex<HashMap<Uuid, PendingHomeEnrollment>>,
     authorization: RwLock<ServerAuthorization>,
     authorization_acks: Mutex<HashMap<String, u64>>,
     authorization_tx: watch::Sender<u64>,
@@ -492,6 +506,7 @@ impl State {
             travel_sessions: Mutex::new(TravelSessionRegistry::default()),
             pending_grants: Mutex::new(HashMap::new()),
             pending_enrollments: Mutex::new(HashMap::new()),
+            pending_home_enrollments: Mutex::new(HashMap::new()),
             authorization: RwLock::new(authorization),
             authorization_acks: Mutex::new(HashMap::new()),
             authorization_tx,
@@ -521,9 +536,8 @@ async fn main() -> Result<()> {
     }
     let control_signer = ControlSigner::load(&config)?;
     let statistics_store = StateStore::open(&config.state_store)?;
-    let authorization = ServerAuthorization::load(
-        control_signer.trust.deployment_id.clone(),
-        control_signer.trust.travel_authorities.clone(),
+    let authorization = ServerAuthorization::load_with_trust(
+        control_signer.trust.clone(),
         config.travel_authorization_state.clone(),
     )?;
     let relay_directory_generation = 1;
@@ -563,9 +577,8 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     let control_signer = ControlSigner::load(config)?;
     validate_homes(&config.homes, &control_signer.trust)?;
-    ServerAuthorization::validate(
-        control_signer.trust.deployment_id,
-        control_signer.trust.travel_authorities,
+    ServerAuthorization::validate_with_trust(
+        control_signer.trust,
         config.travel_authorization_state.clone(),
     )?;
     validate_relays(&config.relays)?;
@@ -578,7 +591,7 @@ fn validate_config(config: &Config) -> Result<()> {
     {
         bail!("server timeout and pending-work limits must be positive");
     }
-    let _ = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let _ = optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
     let _ = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
     Ok(())
 }
@@ -595,13 +608,6 @@ fn validate_homes(homes: &[ConfiguredHome], trust: &DeploymentTrust) -> Result<(
         trust.home_endpoint(&home.id)?;
     }
     Ok(())
-}
-
-fn trusted_home_management_pins<'a>(
-    trust: &'a DeploymentTrust,
-    home_id: &str,
-) -> Result<&'a [String]> {
-    Ok(&trust.home_endpoint(home_id)?.management_spki_pins)
 }
 
 fn validate_listen(address: &str, label: &str) -> Result<()> {
@@ -642,7 +648,8 @@ fn validate_relays(relays: &[ConfiguredRelay]) -> Result<()> {
 }
 
 async fn run_home_listeners(config: Config, state: Arc<State>) -> Result<()> {
-    let acceptor = server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let acceptor =
+        optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
     let address = config.control_listen.clone();
     let listener = TcpListener::bind(&address)
         .await
@@ -676,7 +683,16 @@ async fn run_home_accept_loop(
                 let stream = timeout(timeout_duration, acceptor.accept(socket))
                     .await
                     .context("home TLS handshake timed out")??;
-                handle_home(stream, state, &config).await
+                if stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .is_some_and(|certs| !certs.is_empty())
+                {
+                    handle_home(stream, state, &config).await
+                } else {
+                    handle_home_bootstrap(stream, state, &config).await
+                }
             }
             .await;
             if let Err(error) = result {
@@ -686,6 +702,242 @@ async fn run_home_accept_loop(
     }
 }
 
+async fn handle_home_bootstrap(
+    stream: TlsStream<TcpStream>,
+    state: Arc<State>,
+    config: &Config,
+) -> Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    let message = reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?;
+    let ControlMessage::HomeBootstrapEnrollmentSubmit {
+        protocol_version,
+        request_id,
+        home_id,
+        retrieval_token,
+        request_json,
+    } = message
+    else {
+        bail!("anonymous Home connection attempted a non-bootstrap operation");
+    };
+    let result = dispatch_home_enrollment(
+        &state,
+        config,
+        protocol_version,
+        request_id,
+        home_id,
+        retrieval_token,
+        request_json,
+    )
+    .await;
+    let response = match result {
+        Ok(receiver) => timeout(
+            Duration::from_secs(config.handshake_timeout_secs.saturating_mul(2)),
+            receiver,
+        )
+        .await
+        .context("timed out waiting for Home enrollment issuers")?
+        .context("Home enrollment response channel closed")?,
+        Err(error) => ControlMessage::HomeBootstrapEnrollmentResult {
+            request_id,
+            accepted: false,
+            response_json: None,
+            error: Some(error.to_string()),
+        },
+    };
+    write_json(&mut writer, &response, CONTROL_FRAME_LIMIT).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_home_enrollment(
+    state: &Arc<State>,
+    config: &Config,
+    protocol_version: u32,
+    request_id: Uuid,
+    home_id: String,
+    retrieval_token: Vec<u8>,
+    request_json: Vec<u8>,
+) -> Result<oneshot::Receiver<ControlMessage>> {
+    if protocol_version != CONTROL_PROTOCOL_VERSION
+        || request_id.is_nil()
+        || home_id.is_empty()
+        || retrieval_token.len() != 32
+        || request_json.is_empty()
+        || request_json.len() > 512 * 1024
+    {
+        bail!("Home bootstrap enrollment request is invalid or oversized");
+    }
+    let request: HomeEnrollmentRequest = serde_json::from_slice(&request_json)
+        .context("Home bootstrap enrollment request JSON is invalid")?;
+    if request.request_id != request_id || request.home_id != home_id {
+        bail!("Home bootstrap envelope does not match its signed-key request");
+    }
+    flowsplice_enrollment::home::parse_home_enrollment_request(&request, unix_time_secs()?)?;
+    let request_digest_sha256 =
+        hex::encode(digest::digest(&digest::SHA256, &request_json).as_ref());
+    let eligible = {
+        let global_homes = state.authorization.read().await.global_issuer_home_ids();
+        state
+            .homes
+            .lock()
+            .await
+            .senders()
+            .into_iter()
+            .filter(|(candidate, _)| global_homes.contains(candidate))
+            .collect::<Vec<_>>()
+    };
+    if eligible.is_empty() {
+        bail!("no global Home issuer is currently online");
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    {
+        let mut pending = state.pending_home_enrollments.lock().await;
+        if pending.contains_key(&request_id) {
+            bail!("Home bootstrap enrollment request is already being dispatched");
+        }
+        pending.insert(
+            request_id,
+            PendingHomeEnrollment {
+                home_id: home_id.clone(),
+                request_digest_sha256,
+                remaining_responders: eligible.len(),
+                any_accepted: false,
+                response: Some(response_tx),
+                last_error: None,
+                expires: Instant::now()
+                    + Duration::from_secs(config.handshake_timeout_secs.saturating_mul(2)),
+            },
+        );
+    }
+    let message = ControlMessage::HomeEnrollmentSubmit {
+        request_id,
+        home_id,
+        retrieval_token,
+        request_json,
+    };
+    for (_issuer_home_id, sender) in eligible {
+        if sender.send(message.clone()).await.is_err() {
+            complete_home_enrollment(
+                state,
+                "disconnected-super-home",
+                request_id,
+                false,
+                None,
+                Some("global Home disconnected during enrollment dispatch".to_owned()),
+            )
+            .await?;
+        }
+    }
+    Ok(response_rx)
+}
+
+async fn complete_home_enrollment(
+    state: &Arc<State>,
+    issuer_home_id: &str,
+    request_id: Uuid,
+    accepted: bool,
+    response_json: Option<Vec<u8>>,
+    error: Option<String>,
+) -> Result<()> {
+    if !state
+        .authorization
+        .read()
+        .await
+        .global_issuer_home_ids()
+        .contains(issuer_home_id)
+        && issuer_home_id != "disconnected-super-home"
+    {
+        bail!("non-global Home attempted to approve a Home enrollment");
+    }
+    let mut pending = state.pending_home_enrollments.lock().await;
+    let Some(record) = pending.get_mut(&request_id) else {
+        return Ok(());
+    };
+    if let Some(response_json) = response_json {
+        if !accepted || response_json.len() > 900 * 1024 {
+            bail!("Home enrollment response is invalid or oversized");
+        }
+        let response: HomeEnrollmentResponse = serde_json::from_slice(&response_json)
+            .context("Home enrollment response JSON is invalid")?;
+        if response.approval.request.request_id != request_id
+            || response.approval.request.home_id != record.home_id
+            || hex::encode(
+                digest::digest(
+                    &digest::SHA256,
+                    &serde_json::to_vec(&response.approval.request)?,
+                )
+                .as_ref(),
+            ) != record.request_digest_sha256
+        {
+            bail!("Home enrollment response does not match the dispatched request");
+        }
+        let root_public_key = &state.control_signer.root_public_key;
+        let (endpoint, _) = flowsplice_enrollment::home::validate_home_enrollment_response(
+            &response,
+            root_public_key,
+            unix_time_secs()?,
+        )?;
+        if endpoint.home_id != record.home_id {
+            bail!("Home enrollment response authorizes a different Home");
+        }
+        let response_sender = record.response.take();
+        drop(pending);
+        let snapshot = {
+            let mut authorization = state.authorization.write().await;
+            authorization.import_home_endpoint(
+                &state.control_signer.trust,
+                response.signed_endpoint_credential.clone(),
+            )?;
+            authorization.snapshot()
+        };
+        broadcast_authorization(state, snapshot).await;
+        state
+            .pending_home_enrollments
+            .lock()
+            .await
+            .remove(&request_id);
+        if let Some(sender) = response_sender {
+            let _ = sender.send(ControlMessage::HomeBootstrapEnrollmentResult {
+                request_id,
+                accepted: true,
+                response_json: Some(response_json),
+                error: None,
+            });
+        }
+        info!(%request_id, %issuer_home_id, home_id = %endpoint.home_id, "accepted remote Home enrollment");
+        return Ok(());
+    }
+    record.any_accepted |= accepted;
+    if let Some(error) = error {
+        record.last_error = Some(error);
+    }
+    record.remaining_responders = record.remaining_responders.saturating_sub(1);
+    if record.remaining_responders == 0 {
+        let response_sender = record.response.take();
+        let accepted = record.any_accepted;
+        let error = (!accepted).then(|| {
+            record
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "all global Homes rejected enrollment".to_owned())
+        });
+        pending.remove(&request_id);
+        if let Some(sender) = response_sender {
+            let _ = sender.send(ControlMessage::HomeBootstrapEnrollmentResult {
+                request_id,
+                accepted,
+                response_json: None,
+                error,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_home(
     stream: TlsStream<TcpStream>,
@@ -693,18 +945,27 @@ async fn handle_home(
     config: &Config,
 ) -> Result<()> {
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    let configured_home = config
-        .homes
-        .iter()
-        .find(|home| home.id == identity.id)
-        .ok_or_else(|| anyhow!("Home {} is not configured", identity.id))?;
-    let trusted_home_pins =
-        trusted_home_management_pins(&state.control_signer.trust, &configured_home.id)?;
+    let endpoint_credential = state
+        .authorization
+        .read()
+        .await
+        .home_endpoint_credential(&identity.id, &state.control_signer.trust)?;
+    if endpoint_credential.is_none() && !config.homes.iter().any(|home| home.id == identity.id) {
+        bail!(
+            "Home {} has no static or enrolled endpoint authorization",
+            identity.id
+        );
+    }
+    let trusted_home = state.control_signer.trust.resolve_home_endpoint(
+        &identity.id,
+        endpoint_credential.as_ref(),
+        unix_time_secs()?,
+    )?;
     require_peer(
         &identity,
         Role::Home,
-        Some(&configured_home.id),
-        trusted_home_pins,
+        Some(&identity.id),
+        &trusted_home.management_spki_pins,
     )?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
@@ -741,6 +1002,9 @@ async fn handle_home(
     };
     if home.home_id != identity.id {
         bail!("catalog home id does not match the authenticated home");
+    }
+    if home.endpoint_credential != endpoint_credential {
+        bail!("catalog Home endpoint credential does not match Server authorization state");
     }
     validate_catalog(&Catalog {
         generation: 1,
@@ -816,6 +1080,9 @@ async fn handle_home(
                         ControlMessage::HomeRegister { home } => {
                             if home.home_id != identity.id {
                                 bail!("catalog home id does not match the authenticated home");
+                            }
+                            if home.endpoint_credential != endpoint_credential {
+                                bail!("updated catalog changed the authenticated Home endpoint credential");
                             }
                             validate_catalog(&Catalog {
                                 generation: 1,
@@ -914,6 +1181,22 @@ async fn handle_home(
                                 &identity.id,
                                 request_id,
                                 accepted,
+                                error,
+                            )
+                            .await?;
+                        }
+                        ControlMessage::HomeEnrollmentResult {
+                            request_id,
+                            accepted,
+                            response_json,
+                            error,
+                        } => {
+                            complete_home_enrollment(
+                                &state,
+                                &identity.id,
+                                request_id,
+                                accepted,
+                                response_json,
                                 error,
                             )
                             .await?;
@@ -2079,6 +2362,25 @@ async fn cleanup_pending(state: Arc<State>) -> Result<()> {
                 }
                 keep
             });
+        let mut home_enrollments = state.pending_home_enrollments.lock().await;
+        let expired = home_enrollments
+            .iter()
+            .filter_map(|(request_id, pending)| (pending.expires <= now).then_some(*request_id))
+            .collect::<Vec<_>>();
+        for request_id in expired {
+            if let Some(mut pending) = home_enrollments.remove(&request_id) {
+                if let Some(sender) = pending.response.take() {
+                    let _ = sender.send(ControlMessage::HomeBootstrapEnrollmentResult {
+                        request_id,
+                        accepted: false,
+                        response_json: None,
+                        error: Some("Home enrollment issuer response timed out".to_owned()),
+                    });
+                }
+                warn!(%request_id, "expired Home enrollment forwarding state");
+            }
+        }
+        drop(home_enrollments);
         state.travel_sessions.lock().await.prune(now);
     }
 }
@@ -2157,6 +2459,12 @@ fn catalog_for_credentials(
         .homes
         .iter()
         .filter_map(|home| {
+            if !credentials
+                .iter()
+                .any(|credential| credential.allows_home(&home.home_id))
+            {
+                return None;
+            }
             let services = home
                 .services
                 .iter()
@@ -2167,9 +2475,10 @@ fn catalog_for_credentials(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            (!services.is_empty()).then(|| HomeCatalog {
+            Some(HomeCatalog {
                 home_id: home.home_id.clone(),
                 home_alias: home.home_alias.clone(),
+                endpoint_credential: home.endpoint_credential.clone(),
                 services,
             })
         })
@@ -2236,16 +2545,17 @@ mod tests {
     };
 
     use flowsplice_core::{
+        authorization::{TravelCredential, TravelCredentialScope},
         deployment::{DeploymentTrust, HomeEndpointTrust},
-        protocol::{HomeCatalog, RelayEndpoint, Role, Service, ServiceProtocol},
+        protocol::{Catalog, HomeCatalog, RelayEndpoint, Role, Service, ServiceProtocol},
     };
     use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
     use super::{
         ConfiguredHome, HomeRegistry, HomeSession, PendingRelayGrant, RelayDirectoryRegistry,
-        TRAVEL_SESSION_LEASE, TravelSessionRegistry, take_matching_pending_grant,
-        trusted_home_management_pins, validate_homes, validate_metric_ownership,
+        TRAVEL_SESSION_LEASE, TravelSessionRegistry, catalog_for_credentials,
+        take_matching_pending_grant, validate_homes, validate_metric_ownership,
         validate_statistics_time_window,
     };
 
@@ -2269,7 +2579,53 @@ mod tests {
                 protocol: ServiceProtocol::Tcp,
                 target: target.to_owned(),
             }],
+            endpoint_credential: None,
         }
+    }
+
+    fn travel_credential(scope: TravelCredentialScope) -> TravelCredential {
+        TravelCredential {
+            version: 1,
+            object_type: "flowsplice.travel_credential".to_owned(),
+            deployment_id: "deployment-1".to_owned(),
+            deployment_trust_sha256: "11".repeat(32),
+            credential_id: Uuid::new_v4(),
+            authority_id: "authority-1".to_owned(),
+            authority_epoch: 1,
+            enrollment_request_id: Uuid::new_v4(),
+            enrollment_nonce: "22".repeat(32),
+            enrollment_request_sha256: "33".repeat(32),
+            travel_id: "travel-1".to_owned(),
+            management_spki_sha256: "44".repeat(32),
+            business_spki_sha256: "55".repeat(32),
+            management_ca_sha256: "66".repeat(32),
+            business_ca_sha256: "77".repeat(32),
+            management_certificate_sha256: "88".repeat(32),
+            business_certificate_sha256: "99".repeat(32),
+            scope,
+            not_before_unix_secs: 1,
+            not_after_unix_secs: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn authorized_home_without_services_keeps_endpoint_metadata_in_catalog() {
+        let endpoint = home_catalog("dynamic-home", "127.0.0.1:1001");
+        let catalog = Catalog {
+            generation: 1,
+            homes: vec![HomeCatalog {
+                services: Vec::new(),
+                ..endpoint
+            }],
+        };
+        let filtered = catalog_for_credentials(
+            &catalog,
+            &[travel_credential(TravelCredentialScope::Global)],
+        );
+
+        assert_eq!(filtered.homes.len(), 1);
+        assert!(filtered.homes[0].services.is_empty());
+        assert_eq!(filtered.homes[0].home_id, "dynamic-home");
     }
 
     fn deployment_trust() -> DeploymentTrust {
@@ -2294,6 +2650,7 @@ mod tests {
                     business_spki_pins: vec!["44".repeat(32)],
                 },
             ],
+            home_enrollment_authorities: Vec::new(),
             travel_authorities: Vec::new(),
         }
     }
@@ -2336,10 +2693,13 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            trusted_home_management_pins(&trust, "home-1").unwrap_or_default(),
-            &["11".repeat(32)]
+            trust
+                .resolve_home_endpoint("home-1", None, 2)
+                .map(|endpoint| endpoint.management_spki_pins)
+                .unwrap_or_default(),
+            vec!["11".repeat(32)]
         );
-        assert!(trusted_home_management_pins(&trust, "home-3").is_err());
+        assert!(trust.resolve_home_endpoint("home-3", None, 2).is_err());
         assert!(
             serde_json::from_str::<ConfiguredHome>(r#"{"id":"home-1","spki_pins":["obsolete"]}"#)
                 .is_err()

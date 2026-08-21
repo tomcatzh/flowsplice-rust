@@ -2,15 +2,21 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fs::{self, OpenOptions},
+    io::Write,
     io::{self, IsTerminal},
-    net::SocketAddr,
-    path::PathBuf,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use aws_lc_rs::{digest, signature::EcdsaKeyPair};
+use aws_lc_rs::{
+    digest,
+    rand::{SecureRandom, SystemRandom},
+    signature::EcdsaKeyPair,
+};
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -19,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
@@ -29,7 +35,7 @@ use flowsplice_core::{
         store_json_atomic, unix_time_secs,
     },
     config::load_toml,
-    deployment::{DeploymentTrust, SignedDeploymentTrust},
+    deployment::{DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential},
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{
@@ -39,9 +45,17 @@ use flowsplice_core::{
     route::{RouteSide, write_preface},
     statistics::{statistics_dashboard_html, statistics_signing_key},
     tls::{
-        client_connector, load_private_key as load_management_private_key, peer_identity,
-        require_peer, server_acceptor, server_name, validate_spki_pins,
+        client_connector, identity_server_auth_connector_from_ca_pem, identity_server_name,
+        load_private_key as load_management_private_key, peer_identity, require_peer,
+        server_acceptor, server_name, validate_spki_pins,
     },
+};
+use flowsplice_enrollment::home::{
+    HOME_BUSINESS_CERT_FILE, HOME_BUSINESS_KEY_FILE, HOME_ENDPOINT_CREDENTIAL_FILE,
+    HOME_MANAGEMENT_CERT_FILE, HOME_MANAGEMENT_KEY_FILE, HOME_REQUEST_FILE, HomeEnrollmentProfile,
+    HomeEnrollmentRequest, HomeEnrollmentResponse, HomeIssuerMaterial,
+    create_home_enrollment_request, install_home_enrollment_response, issue_home_enrollment,
+    parse_home_enrollment_request, prepare_home_enrollment_approval,
 };
 use flowsplice_enrollment::{
     DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentRequest, TravelEnrollmentResponse,
@@ -89,9 +103,75 @@ static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
 });
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "homeagent.toml")]
     config: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Initialize and enroll this Home with only the Server IP.
+    Init {
+        #[arg(long)]
+        server: IpAddr,
+    },
+}
+
+const HOME_BOOTSTRAP_STATE_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HomeBootstrapState {
+    version: u32,
+    request_id: Uuid,
+    home_id: String,
+    retrieval_token_hex: String,
+}
+
+#[derive(Serialize)]
+struct InstalledHomeConfig {
+    id: String,
+    alias: String,
+    server_control_addr: String,
+    server_name: String,
+    server_id: String,
+    management_cert: PathBuf,
+    management_key: PathBuf,
+    management_ca: PathBuf,
+    business_cert: PathBuf,
+    business_key: PathBuf,
+    business_ca: PathBuf,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
+    endpoint_credential: PathBuf,
+    server_spki_pins: Vec<String>,
+    travel_authorization_cache: PathBuf,
+    state_store: PathBuf,
+    ui_listen: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer: Option<InstalledIssuerConfig>,
+    services: Vec<Service>,
+}
+
+#[derive(Serialize)]
+struct InstalledIssuerConfig {
+    management_ca_key: PathBuf,
+    business_ca_key: PathBuf,
+    default_valid_days: u32,
+    home_authority: InstalledSigningAuthority,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    global_authority: Option<InstalledSigningAuthority>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_enrollment_authority: Option<InstalledSigningAuthority>,
+}
+
+#[derive(Serialize)]
+struct InstalledSigningAuthority {
+    id: String,
+    private_key: PathBuf,
 }
 
 #[derive(Clone, Deserialize)]
@@ -110,6 +190,8 @@ struct Config {
     business_ca: PathBuf,
     deployment_root_public_key: PathBuf,
     deployment_trust: PathBuf,
+    #[serde(default)]
+    endpoint_credential: Option<PathBuf>,
     #[serde(default)]
     server_spki_pins: Vec<String>,
     travel_authorization_cache: PathBuf,
@@ -146,6 +228,8 @@ struct IssuerConfig {
     home_authority: SigningAuthorityConfig,
     #[serde(default)]
     global_authority: Option<SigningAuthorityConfig>,
+    #[serde(default)]
+    home_enrollment_authority: Option<SigningAuthorityConfig>,
     #[serde(default = "default_travel_valid_days")]
     default_valid_days: u32,
     #[cfg(feature = "e2e-remote-ui")]
@@ -214,22 +298,18 @@ struct TlsMaterial {
 struct TravelAuthorizationState {
     tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
     cache: Mutex<AuthorizationCache>,
-    authorities: Arc<Vec<TrustedTravelAuthority>>,
+    trust: Arc<DeploymentTrust>,
     deployment_id: Arc<String>,
 }
 
 impl TravelAuthorizationState {
-    fn new(
-        cache: AuthorizationCache,
-        deployment_id: String,
-        authorities: Vec<TrustedTravelAuthority>,
-    ) -> Arc<Self> {
+    fn new(cache: AuthorizationCache, trust: DeploymentTrust) -> Arc<Self> {
         let (tx, _) = watch::channel(None);
         Arc::new(Self {
             tx,
             cache: Mutex::new(cache),
-            authorities: Arc::new(authorities),
-            deployment_id: Arc::new(deployment_id),
+            deployment_id: Arc::new(trust.deployment_id.clone()),
+            trust: Arc::new(trust),
         })
     }
 }
@@ -250,6 +330,7 @@ enum IssuerControlRequest {
 struct IssuerAppState {
     config: Arc<Config>,
     issuer: Arc<IssuerConfig>,
+    endpoint_credential: Option<Arc<SignedHomeEndpointCredential>>,
     authorization: Arc<TravelAuthorizationState>,
     control_tx: mpsc::Sender<IssuerControlRequest>,
     key_operation: Arc<Mutex<()>>,
@@ -327,6 +408,44 @@ struct ApproveRemoteEnrollmentRequest {
     password: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HomeEnrollmentInboxRecord {
+    version: u32,
+    home_id: String,
+    received_at_unix_secs: u64,
+    request: HomeEnrollmentRequest,
+    response: Option<HomeEnrollmentResponse>,
+    retrieval_token_sha256: String,
+    verification_code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveHomeEnrollmentRequest {
+    request_id: Uuid,
+    profile: HomeEnrollmentProfile,
+    valid_days: Option<u32>,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct HomeEnrollmentStatus {
+    request_id: Uuid,
+    home_id: String,
+    received_at_unix_secs: u64,
+    approved: bool,
+    verification_code: String,
+    profile: Option<HomeEnrollmentProfile>,
+}
+
+#[derive(Serialize)]
+struct ApproveHomeEnrollmentResponse {
+    request_id: Uuid,
+    home_id: String,
+    profile: HomeEnrollmentProfile,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RotatePrivateKeyPasswordRequest {
@@ -345,6 +464,7 @@ struct IssuerStatus {
     home_alias: String,
     default_valid_days: u32,
     global_authority_available: bool,
+    home_enrollment_available: bool,
     private_key_password_rotation_available: bool,
     services: Vec<Service>,
 }
@@ -379,13 +499,35 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    let config: Config = load_toml(&args.config)?;
+    match args.command {
+        Some(Command::Init { server }) => run_home_init(server).await,
+        None => run_home_agent(args.config).await,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_home_agent(config_path: PathBuf) -> Result<()> {
+    let config: Config = load_toml(&config_path)?;
     validate_home_ui_config(&config)?;
     validate_services(&config.services)?;
     validate_spki_pins(&config.server_spki_pins, "server")?;
     let (_, deployment_trust) = load_home_trust(&config)?;
+    let endpoint_credential = if let Some(path) = config.endpoint_credential.as_deref() {
+        let signed: SignedHomeEndpointCredential = load_json(path)?;
+        let endpoint = signed.verify(&deployment_trust, unix_time_secs()?)?;
+        if endpoint.home_id != config.id {
+            bail!("Home endpoint credential belongs to a different Home");
+        }
+        Some((signed, endpoint.not_after_unix_secs))
+    } else {
+        None
+    };
     if let Some(issuer) = &config.issuer {
-        validate_issuer_config(&config, issuer)?;
+        validate_issuer_config(
+            &config,
+            issuer,
+            endpoint_credential.as_ref().map(|(signed, _)| signed),
+        )?;
         if !issuer.allow_unencrypted_test_keys
             && recover_private_key_password_rotation(&issuer_key_targets(issuer))?
         {
@@ -436,11 +578,8 @@ async fn main() -> Result<()> {
     } else {
         AuthorizationCache::default()
     };
-    let authorization = TravelAuthorizationState::new(
-        authorization_cache,
-        deployment_trust.deployment_id,
-        deployment_trust.travel_authorities,
-    );
+    let authorization =
+        TravelAuthorizationState::new(authorization_cache, deployment_trust.clone());
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let tcp_flows = TcpFlowRegistry::new(
         Arc::clone(&permits),
@@ -459,6 +598,9 @@ async fn main() -> Result<()> {
             Some(IssuerAppState {
                 config: Arc::clone(&config),
                 issuer: Arc::new(issuer.clone()),
+                endpoint_credential: endpoint_credential
+                    .as_ref()
+                    .map(|(signed, _)| Arc::new(signed.clone())),
                 authorization: Arc::clone(&authorization),
                 control_tx: issuer_control_tx,
                 key_operation: Arc::new(Mutex::new(())),
@@ -480,7 +622,13 @@ async fn main() -> Result<()> {
         issuer_control_rx,
         statistics.clone(),
     );
-    let trust_expiry = monitor_trust_expiry(deployment_trust.not_after_unix_secs);
+    let trust_expiry = monitor_trust_expiry(
+        endpoint_credential
+            .as_ref()
+            .map_or(deployment_trust.not_after_unix_secs, |(_, not_after)| {
+                deployment_trust.not_after_unix_secs.min(*not_after)
+            }),
+    );
     if let Some(issuer_state) = issuer_state {
         tokio::try_join!(control, run_issuer_ui(issuer_state), trust_expiry)?;
     } else {
@@ -489,6 +637,431 @@ async fn main() -> Result<()> {
             run_statistics_only_ui(Arc::clone(&config), statistics),
             trust_expiry
         )?;
+    }
+    Ok(())
+}
+
+fn embedded_deployment_root_public_key() -> Result<&'static str> {
+    option_env!("FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("this Home binary has no embedded deployment root public key")
+        })
+}
+
+fn embedded_management_ca_certificate() -> Result<&'static str> {
+    option_env!("FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("this Home binary has no embedded management CA"))
+}
+
+fn embedded_server_id() -> &'static str {
+    option_env!("FLOWSPLICE_SERVER_ID")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("server-1")
+}
+
+fn embedded_server_name() -> Result<&'static str> {
+    let name = option_env!("FLOWSPLICE_SERVER_NAME")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("server.flowsplice");
+    server_name(name).context("embedded Server certificate name is invalid")?;
+    Ok(name)
+}
+
+fn embedded_server_port() -> Result<u16> {
+    option_env!("FLOWSPLICE_SERVER_CONTROL_PORT")
+        .unwrap_or("7443")
+        .parse::<u16>()
+        .context("embedded Server control port is invalid")
+}
+
+fn default_home_install_root() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("FLOWSPLICE_HOME_INSTALL_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the current user's home directory"))?;
+    Ok(home.join("Library/Application Support/FlowSplice/Home"))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_home_init(server: IpAddr) -> Result<()> {
+    let deployment_root_public_key = embedded_deployment_root_public_key()?;
+    let management_ca = embedded_management_ca_certificate()?;
+    let server_address = SocketAddr::new(server, embedded_server_port()?);
+    let install_root = default_home_install_root()?;
+    if install_root.exists() && !install_root.is_dir() {
+        bail!(
+            "Home install path is not a directory: {}",
+            install_root.display()
+        );
+    }
+    fs::create_dir_all(&install_root)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &install_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let install_root = install_root.canonicalize()?;
+    let enrollment_directory = install_root.join("cert");
+    let bootstrap_state_path = install_root.join("home-bootstrap.json");
+    let config_path = install_root.join("homeagent.toml");
+    if config_path.exists() {
+        #[cfg(target_os = "macos")]
+        {
+            let installed: Config = load_toml(&config_path)?;
+            if installed.server_control_addr != server_address.to_string() {
+                bail!(
+                    "Home is already initialized for a different Server: {}",
+                    installed.server_control_addr
+                );
+            }
+            install_and_start_macos_home(&install_root, &config_path, &installed.id)?;
+            if bootstrap_state_path.exists() {
+                let bootstrap: HomeBootstrapState = load_json(&bootstrap_state_path)?;
+                if bootstrap.home_id != installed.id {
+                    bail!("installed Home configuration conflicts with bootstrap state");
+                }
+                fs::remove_file(&bootstrap_state_path)?;
+            }
+            println!("Home is already initialized: {}", config_path.display());
+            println!("Home page: http://{}/", installed.ui_listen);
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("Home is already initialized: {}", config_path.display());
+    }
+    let (request, retrieval_token) = if bootstrap_state_path.exists() {
+        let state: HomeBootstrapState = load_json(&bootstrap_state_path)?;
+        if state.version != HOME_BOOTSTRAP_STATE_VERSION {
+            bail!("existing Home bootstrap state has an unsupported version");
+        }
+        let request: HomeEnrollmentRequest =
+            load_json(&enrollment_directory.join(HOME_REQUEST_FILE))?;
+        if request.request_id != state.request_id || request.home_id != state.home_id {
+            bail!("existing Home bootstrap state conflicts with its local request");
+        }
+        let token = hex::decode(&state.retrieval_token_hex)
+            .context("Home bootstrap retrieval token is invalid")?;
+        if token.len() != 32 {
+            bail!("Home bootstrap retrieval token has an invalid length");
+        }
+        (request, token)
+    } else {
+        if enrollment_directory.exists() {
+            bail!(
+                "Home enrollment directory exists without resumable bootstrap state: {}",
+                enrollment_directory.display()
+            );
+        }
+        let suffix = Uuid::new_v4().simple().to_string();
+        let home_id = format!("home-{}", &suffix[..12]);
+        let request =
+            create_home_enrollment_request(&home_id, &enrollment_directory, unix_time_secs()?)?;
+        let mut token = vec![0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut token)
+            .map_err(|_| anyhow::anyhow!("failed to generate Home bootstrap retrieval token"))?;
+        flowsplice_enrollment::write_json_private(
+            &bootstrap_state_path,
+            &HomeBootstrapState {
+                version: HOME_BOOTSTRAP_STATE_VERSION,
+                request_id: request.request_id,
+                home_id: request.home_id.clone(),
+                retrieval_token_hex: hex::encode(&token),
+            },
+        )?;
+        (request, token)
+    };
+    let request_json = serde_json::to_vec(&request)?;
+    let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
+    println!("Home id: {}", request.home_id);
+    println!("Home verification code: {verification_code}");
+    println!("Waiting for approval on any online global Home page...");
+    io::stdout()
+        .flush()
+        .context("failed to flush Home enrollment status")?;
+    let connector = identity_server_auth_connector_from_ca_pem(management_ca)?;
+    let mut last_error = None;
+    let (response, server_spki_pin) = loop {
+        match poll_home_bootstrap_server(
+            server_address,
+            &connector,
+            &request,
+            &retrieval_token,
+            &request_json,
+        )
+        .await
+        {
+            Ok(Some(response)) => break response,
+            Ok(None) => last_error = None,
+            Err(error) => {
+                let current = error.to_string();
+                if last_error.as_deref() != Some(current.as_str()) {
+                    println!("Still waiting: {current}");
+                }
+                last_error = Some(current);
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    };
+    let (endpoint, _) = flowsplice_enrollment::home::validate_home_enrollment_response(
+        &response,
+        deployment_root_public_key,
+        unix_time_secs()?,
+    )?;
+    if endpoint.home_id != request.home_id {
+        bail!("approved Home identity changed during enrollment");
+    }
+    install_home_enrollment_response(
+        &enrollment_directory,
+        &response,
+        deployment_root_public_key,
+        unix_time_secs()?,
+    )?;
+    write_or_verify_private(
+        &enrollment_directory.join("deployment-root.pub"),
+        format!("{}\n", deployment_root_public_key.trim()).as_bytes(),
+    )?;
+    let issuer = installed_issuer_config(&install_root, &response);
+    let ui_port = option_env!("FLOWSPLICE_HOME_UI_PORT")
+        .unwrap_or("9082")
+        .parse::<u16>()
+        .context("embedded Home UI port is invalid")?;
+    let suffix = request
+        .home_id
+        .strip_prefix("home-")
+        .unwrap_or(&request.home_id);
+    let generated = InstalledHomeConfig {
+        id: request.home_id.clone(),
+        alias: format!("Home {suffix}"),
+        server_control_addr: server_address.to_string(),
+        server_name: embedded_server_name()?.to_owned(),
+        server_id: embedded_server_id().to_owned(),
+        management_cert: enrollment_directory.join(HOME_MANAGEMENT_CERT_FILE),
+        management_key: enrollment_directory.join(HOME_MANAGEMENT_KEY_FILE),
+        management_ca: enrollment_directory.join(flowsplice_enrollment::MANAGEMENT_CA_FILE),
+        business_cert: enrollment_directory.join(HOME_BUSINESS_CERT_FILE),
+        business_key: enrollment_directory.join(HOME_BUSINESS_KEY_FILE),
+        business_ca: enrollment_directory.join(flowsplice_enrollment::BUSINESS_CA_FILE),
+        deployment_root_public_key: enrollment_directory.join("deployment-root.pub"),
+        deployment_trust: enrollment_directory.join(flowsplice_enrollment::DEPLOYMENT_TRUST_FILE),
+        endpoint_credential: enrollment_directory.join(HOME_ENDPOINT_CREDENTIAL_FILE),
+        server_spki_pins: vec![server_spki_pin],
+        travel_authorization_cache: install_root.join("state/travel-authorization-cache.json"),
+        state_store: install_root.join("state/home-state.redb"),
+        ui_listen: format!("127.0.0.1:{ui_port}"),
+        issuer,
+        services: Vec::new(),
+    };
+    let encoded = toml::to_string_pretty(&generated).context("failed to encode Home TOML")?;
+    write_new_private(&config_path, encoded.as_bytes())?;
+    let _ = StateStore::open(&generated.state_store)?;
+    #[cfg(target_os = "macos")]
+    install_and_start_macos_home(&install_root, &config_path, &request.home_id)?;
+    fs::remove_file(&bootstrap_state_path)?;
+    println!(
+        "Home enrollment installed with profile {:?}",
+        response.approval.profile
+    );
+    println!("configuration: {}", config_path.display());
+    println!("Home page: http://127.0.0.1:{ui_port}/");
+    #[cfg(not(target_os = "macos"))]
+    println!(
+        "start: flowsplice-homeagent --config {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+async fn poll_home_bootstrap_server(
+    address: SocketAddr,
+    connector: &TlsConnector,
+    request: &HomeEnrollmentRequest,
+    retrieval_token: &[u8],
+    request_json: &[u8],
+) -> Result<Option<(HomeEnrollmentResponse, String)>> {
+    let socket = timeout(Duration::from_secs(10), TcpStream::connect(address))
+        .await
+        .context("Server bootstrap TCP connection timed out")??;
+    let mut stream = timeout(
+        Duration::from_secs(10),
+        connector.connect(identity_server_name()?, socket),
+    )
+    .await
+    .context("Server bootstrap TLS handshake timed out")??;
+    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    require_peer(&identity, Role::Server, Some(embedded_server_id()), &[])?;
+    write_json(
+        &mut stream,
+        &ControlMessage::HomeBootstrapEnrollmentSubmit {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: request.request_id,
+            home_id: request.home_id.clone(),
+            retrieval_token: retrieval_token.to_vec(),
+            request_json: request_json.to_vec(),
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
+    let response = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT)
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(25))
+        .await?;
+    let ControlMessage::HomeBootstrapEnrollmentResult {
+        request_id,
+        accepted,
+        response_json,
+        error,
+    } = response
+    else {
+        bail!("Server returned an unexpected Home enrollment response");
+    };
+    if request_id != request.request_id {
+        bail!("Server returned the wrong Home enrollment request id");
+    }
+    if !accepted {
+        bail!(error.unwrap_or_else(|| "Home enrollment was rejected".to_owned()));
+    }
+    response_json
+        .map(|json| {
+            let response = serde_json::from_slice(&json)
+                .context("Home enrollment response JSON is invalid")?;
+            Ok((response, identity.spki_sha256.clone()))
+        })
+        .transpose()
+}
+
+fn installed_issuer_config(
+    install_root: &Path,
+    response: &HomeEnrollmentResponse,
+) -> Option<InstalledIssuerConfig> {
+    let Some(bundle) = &response.issuer_bundle else {
+        return None;
+    };
+    let issuer_root = install_root.join("issuer");
+    Some(InstalledIssuerConfig {
+        management_ca_key: issuer_root
+            .join(flowsplice_enrollment::home::HOME_ISSUER_MANAGEMENT_CA_KEY_FILE),
+        business_ca_key: issuer_root
+            .join(flowsplice_enrollment::home::HOME_ISSUER_BUSINESS_CA_KEY_FILE),
+        default_valid_days: DEFAULT_VALID_DAYS,
+        home_authority: InstalledSigningAuthority {
+            id: bundle.home_authority_id.clone(),
+            private_key: issuer_root
+                .join(flowsplice_enrollment::home::HOME_ISSUER_HOME_AUTHORITY_KEY_FILE),
+        },
+        global_authority: bundle
+            .global_authority_id
+            .as_ref()
+            .map(|id| InstalledSigningAuthority {
+                id: id.clone(),
+                private_key: issuer_root
+                    .join(flowsplice_enrollment::home::HOME_ISSUER_GLOBAL_AUTHORITY_KEY_FILE),
+            }),
+        home_enrollment_authority: bundle.home_enrollment_authority_key_pem.as_ref().map(|_| {
+            InstalledSigningAuthority {
+                id: response.approval.authority_id.clone(),
+                private_key: issuer_root
+                    .join(flowsplice_enrollment::home::HOME_ISSUER_ENROLLMENT_AUTHORITY_KEY_FILE),
+            }
+        }),
+    })
+}
+
+fn write_new_private(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_or_verify_private(path: &Path, data: &[u8]) -> Result<()> {
+    if path.exists() {
+        if fs::read(path)? != data {
+            bail!("refusing to replace conflicting file {}", path.display());
+        }
+        return Ok(());
+    }
+    write_new_private(path, data)
+}
+
+#[cfg(target_os = "macos")]
+fn install_and_start_macos_home(
+    install_root: &Path,
+    config_path: &Path,
+    home_id: &str,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current_executable = std::env::current_exe()?.canonicalize()?;
+    let bin_directory = install_root.join("bin");
+    fs::create_dir_all(&bin_directory)?;
+    let executable = bin_directory.join("flowsplice-homeagent");
+    if current_executable != executable {
+        write_or_verify_private(&executable, &fs::read(&current_executable)?)?;
+    }
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine macOS user home"))?;
+    let launch_agents = user_home.join("Library/LaunchAgents");
+    fs::create_dir_all(&launch_agents)?;
+    let label = format!("io.zxf.flowsplice.homeagent.{home_id}");
+    let plist_path = launch_agents.join(format!("{label}.plist"));
+    let xml_escape = |value: &Path| {
+        value
+            .to_string_lossy()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>--config</string><string>{}</string></array><key>WorkingDirectory</key><string>{}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>{}/homeagent.log</string><key>StandardErrorPath</key><string>{}/homeagent-error.log</string></dict></plist>\n",
+        xml_escape(&executable),
+        xml_escape(config_path),
+        xml_escape(install_root),
+        xml_escape(install_root),
+        xml_escape(install_root),
+    );
+    write_or_verify_private(&plist_path, plist.as_bytes())?;
+    let domain = format!("gui/{}", rustix::process::geteuid().as_raw());
+    let service = format!("{domain}/{label}");
+    let loaded = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(&service)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?
+        .success();
+    if !loaded {
+        let status = std::process::Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(&plist_path)
+            .status()?;
+        if !status.success() {
+            bail!("launchctl could not install the initialized Home service");
+        }
+    }
+    let status = std::process::Command::new("launchctl")
+        .arg("kickstart")
+        .arg("-k")
+        .arg(&service)
+        .status()?;
+    if !status.success() {
+        bail!("launchctl could not start the initialized Home service");
     }
     Ok(())
 }
@@ -529,7 +1102,11 @@ async fn run_control_loop(
     }
 }
 
-fn validate_issuer_config(config: &Config, issuer: &IssuerConfig) -> Result<()> {
+fn validate_issuer_config(
+    config: &Config,
+    issuer: &IssuerConfig,
+    endpoint_credential: Option<&SignedHomeEndpointCredential>,
+) -> Result<()> {
     let listen = config
         .ui_listen
         .parse::<SocketAddr>()
@@ -548,14 +1125,30 @@ fn validate_issuer_config(config: &Config, issuer: &IssuerConfig) -> Result<()> 
     {
         bail!("Home issuer CA certificates do not match deployment trust");
     }
-    validate_signing_authority(
-        config,
-        &trust.travel_authorities,
-        &issuer.home_authority,
-        false,
-    )?;
+    let endpoint_credentials = endpoint_credential.into_iter().cloned().collect::<Vec<_>>();
+    let authorities =
+        trust.travel_authorities_with_home_delegations(&endpoint_credentials, unix_time_secs()?)?;
+    validate_signing_authority(config, &authorities, &issuer.home_authority, false)?;
     if let Some(authority) = &issuer.global_authority {
-        validate_signing_authority(config, &trust.travel_authorities, authority, true)?;
+        validate_signing_authority(config, &authorities, authority, true)?;
+        if issuer.home_enrollment_authority.is_none() {
+            bail!("global Home issuer must configure Home enrollment authority material");
+        }
+    }
+    if let Some(authority) = &issuer.home_enrollment_authority {
+        let trusted = trust
+            .home_enrollment_authorities
+            .iter()
+            .find(|trusted| trusted.id == authority.id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Home enrollment authority {} is not trusted", authority.id)
+            })?;
+        let dynamically_global = authorities.iter().any(|authority| {
+            matches!(authority, TrustedTravelAuthority::Global { home_id, .. } if home_id == &config.id)
+        });
+        if trusted.issuer_home_id != config.id && !dynamically_global {
+            bail!("Home enrollment authority is not assigned to this Home");
+        }
     }
     if issuer.allow_unencrypted_test_keys
         && std::env::var("FLOWSPLICE_ALLOW_UNENCRYPTED_TEST_KEYS").as_deref() != Ok("1")
@@ -648,6 +1241,12 @@ fn issuer_key_targets(issuer: &IssuerConfig) -> Vec<PrivateKeyRotationTarget<'_>
     if let Some(authority) = &issuer.global_authority {
         targets.push(PrivateKeyRotationTarget {
             label: "global authorization",
+            path: &authority.private_key,
+        });
+    }
+    if let Some(authority) = &issuer.home_enrollment_authority {
+        targets.push(PrivateKeyRotationTarget {
+            label: "Home enrollment authorization",
             path: &authority.private_key,
         });
     }
@@ -750,6 +1349,11 @@ async fn run_control_session(
             home: HomeCatalog {
                 home_id: config.id.clone(),
                 home_alias: config.alias.clone(),
+                endpoint_credential: config
+                    .endpoint_credential
+                    .as_deref()
+                    .map(load_json)
+                    .transpose()?,
                 services: config.services.clone(),
             },
         },
@@ -921,6 +1525,42 @@ async fn run_control_session(
                         )
                         .await?;
                     }
+                    ControlMessage::HomeEnrollmentSubmit {
+                        request_id,
+                        home_id,
+                        retrieval_token,
+                        request_json,
+                    } => {
+                        let result = persist_home_enrollment_request(
+                            &statistics,
+                            request_id,
+                            home_id,
+                            retrieval_token,
+                            request_json,
+                        )
+                        .await;
+                        let (accepted, response_json, error) = match result {
+                            Ok(response) => (
+                                true,
+                                response
+                                    .map(|response| serde_json::to_vec(&response))
+                                    .transpose()?,
+                                None,
+                            ),
+                            Err(error) => (false, None, Some(error.to_string())),
+                        };
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::HomeEnrollmentResult {
+                                request_id,
+                                accepted,
+                                response_json,
+                                error,
+                            },
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
                     ControlMessage::RemoteEnrollmentInstalled {
                         request_id,
                         travel_id,
@@ -1079,6 +1719,70 @@ async fn persist_remote_enrollment_request(
     .context("Home enrollment inbox task failed")?
 }
 
+async fn persist_home_enrollment_request(
+    statistics: &HomeStatistics,
+    request_id: Uuid,
+    home_id: String,
+    retrieval_token: Vec<u8>,
+    request_json: Vec<u8>,
+) -> Result<Option<HomeEnrollmentResponse>> {
+    if request_id.is_nil()
+        || home_id.is_empty()
+        || retrieval_token.len() != 32
+        || request_json.is_empty()
+        || request_json.len() > 512 * 1024
+    {
+        bail!("Home enrollment request is invalid or oversized");
+    }
+    let request: HomeEnrollmentRequest =
+        serde_json::from_slice(&request_json).context("Home enrollment request is invalid")?;
+    if request.request_id != request_id || request.home_id != home_id {
+        bail!("Home enrollment transport identity does not match its request");
+    }
+    parse_home_enrollment_request(&request, unix_time_secs()?)?;
+    let retrieval_token_sha256 =
+        hex::encode(digest::digest(&digest::SHA256, &retrieval_token).as_ref());
+    let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
+    let store = Arc::clone(&statistics.store);
+    tokio::task::spawn_blocking(move || {
+        let key = request_id.as_bytes();
+        if let Some(existing) =
+            store.get_json::<HomeEnrollmentInboxRecord>(Table::HomeEnrollmentInbox, key)?
+        {
+            if existing.version != flowsplice_enrollment::home::HOME_ENROLLMENT_VERSION
+                || existing.home_id != home_id
+                || existing.request != request
+                || existing.retrieval_token_sha256 != retrieval_token_sha256
+            {
+                bail!("conflicting reuse of Home enrollment request id");
+            }
+            return Ok(existing.response);
+        }
+        if store.scan_prefix(Table::HomeEnrollmentInbox, b"")?.len()
+            >= MAX_REMOTE_ENROLLMENT_INBOX_RECORDS
+        {
+            bail!("Home enrollment inbox capacity is exhausted");
+        }
+        let record = HomeEnrollmentInboxRecord {
+            version: flowsplice_enrollment::home::HOME_ENROLLMENT_VERSION,
+            home_id,
+            received_at_unix_secs: unix_time_secs()?,
+            request,
+            response: None,
+            retrieval_token_sha256,
+            verification_code,
+        };
+        store.apply_immediate(WriteBatch::new().put_json(
+            Table::HomeEnrollmentInbox,
+            request_id.as_bytes().to_vec(),
+            &record,
+        )?)?;
+        Ok(None)
+    })
+    .await
+    .context("Home enrollment inbox task failed")?
+}
+
 async fn acknowledge_remote_enrollment_installed(
     statistics: &HomeStatistics,
     config: &Config,
@@ -1153,6 +1857,19 @@ fn prune_remote_enrollment_inbox_store(store: &StateStore, now: u64) -> Result<(
         );
         if expired {
             batch = batch.delete(Table::EnrollmentInbox, key);
+        }
+    }
+    for (key, value) in store.scan_prefix(Table::HomeEnrollmentInbox, b"")? {
+        let Ok(record) = serde_json::from_slice::<HomeEnrollmentInboxRecord>(&value) else {
+            continue;
+        };
+        let retention = if record.response.is_some() {
+            REMOTE_ENROLLMENT_INSTALLED_RETENTION_SECS
+        } else {
+            REMOTE_ENROLLMENT_PENDING_RETENTION_SECS
+        };
+        if now.saturating_sub(record.received_at_unix_secs) >= retention {
+            batch = batch.delete(Table::HomeEnrollmentInbox, key);
         }
     }
     if batch.is_empty() {
@@ -1490,8 +2207,12 @@ async fn apply_authorization_snapshot(
     config: &Config,
     snapshot: TravelAuthorizationSnapshot,
 ) -> Result<u64> {
+    let authorities = state.trust.travel_authorities_with_home_delegations(
+        &snapshot.home_endpoint_credentials,
+        unix_time_secs()?,
+    )?;
     let authorization =
-        VerifiedAuthorization::verify(&snapshot, &state.authorities, &state.deployment_id)?;
+        VerifiedAuthorization::verify(&snapshot, &authorities, &state.deployment_id)?;
     let mut cache = state.cache.lock().await;
     let proposed_cache = cache.accept(&authorization)?;
     if proposed_cache != *cache {
@@ -1520,6 +2241,14 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
         .route("/statistics", get(api_home_statistics))
         .route("/enrollment/pending", get(api_pending_remote_enrollments))
         .route("/enrollment/approve", post(api_approve_remote_enrollment))
+        .route(
+            "/home-enrollment/pending",
+            get(api_pending_home_enrollments),
+        )
+        .route(
+            "/home-enrollment/approve",
+            post(api_approve_home_enrollment),
+        )
         .route("/issue", post(api_issue))
         .route("/revoke", post(api_revoke))
         .route(
@@ -1677,6 +2406,7 @@ async fn api_issuer_status(State(state): State<IssuerAppState>) -> Json<IssuerSt
         home_alias: state.config.alias.clone(),
         default_valid_days: state.issuer.default_valid_days,
         global_authority_available: state.issuer.global_authority.is_some(),
+        home_enrollment_available: state.issuer.home_enrollment_authority.is_some(),
         private_key_password_rotation_available: issuer_password_rotation_is_local(
             &state.config,
             &state.issuer,
@@ -1738,6 +2468,147 @@ async fn api_approve_remote_enrollment(
     let result = approve_remote_enrollment(&state, request).await;
     record_issuer_operation(&state, "issuer_enrollment_approval", result.is_ok());
     result.map(Json).map_err(api_error)
+}
+
+async fn api_pending_home_enrollments(
+    State(state): State<IssuerAppState>,
+) -> ApiResult<Vec<HomeEnrollmentStatus>> {
+    if state.issuer.global_authority.is_none() || state.issuer.home_enrollment_authority.is_none() {
+        return Err(api_error(anyhow::anyhow!(
+            "this Home is not a global Home enrollment issuer"
+        )));
+    }
+    let store = Arc::clone(&state.statistics.store);
+    tokio::task::spawn_blocking(move || {
+        let mut records = store
+            .scan_prefix(Table::HomeEnrollmentInbox, b"")?
+            .into_iter()
+            .map(|(_, value)| {
+                serde_json::from_slice::<HomeEnrollmentInboxRecord>(&value)
+                    .context("Home enrollment inbox contains an invalid record")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        records.sort_by_key(|record| record.received_at_unix_secs);
+        Ok(records
+            .into_iter()
+            .map(|record| HomeEnrollmentStatus {
+                request_id: record.request.request_id,
+                home_id: record.home_id,
+                received_at_unix_secs: record.received_at_unix_secs,
+                approved: record.response.is_some(),
+                verification_code: record.verification_code,
+                profile: record.response.map(|response| response.approval.profile),
+            })
+            .collect())
+    })
+    .await
+    .context("Home enrollment inbox query task failed")
+    .and_then(|result| result)
+    .map(Json)
+    .map_err(api_error)
+}
+
+async fn api_approve_home_enrollment(
+    State(state): State<IssuerAppState>,
+    Json(request): Json<ApproveHomeEnrollmentRequest>,
+) -> ApiResult<ApproveHomeEnrollmentResponse> {
+    let result = approve_home_enrollment(&state, request).await;
+    record_issuer_operation(&state, "issuer_home_enrollment_approval", result.is_ok());
+    result.map(Json).map_err(api_error)
+}
+
+async fn approve_home_enrollment(
+    state: &IssuerAppState,
+    request: ApproveHomeEnrollmentRequest,
+) -> Result<ApproveHomeEnrollmentResponse> {
+    if state.issuer.global_authority.is_none() {
+        bail!("only a global Home issuer may approve new Homes");
+    }
+    let enrollment_authority = state
+        .issuer
+        .home_enrollment_authority
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Home enrollment authority is not configured"))?;
+    let store = Arc::clone(&state.statistics.store);
+    let request_id = request.request_id;
+    let mut record = tokio::task::spawn_blocking(move || {
+        store
+            .get_json::<HomeEnrollmentInboxRecord>(
+                Table::HomeEnrollmentInbox,
+                request_id.as_bytes(),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("unknown Home enrollment request"))
+    })
+    .await
+    .context("Home enrollment inbox read task failed")??;
+    if let Some(existing) = &record.response {
+        if existing.approval.profile != request.profile {
+            bail!("Home enrollment was already approved with a different profile");
+        }
+        return Ok(ApproveHomeEnrollmentResponse {
+            request_id,
+            home_id: record.home_id,
+            profile: request.profile,
+        });
+    }
+    let valid_days = request
+        .valid_days
+        .unwrap_or(state.issuer.default_valid_days);
+    if valid_days == 0 || valid_days > MAX_VALID_DAYS {
+        bail!("Home validity must be between 1 and {MAX_VALID_DAYS} days");
+    }
+    let password = Zeroizing::new(request.password);
+    if password.is_empty() && !state.issuer.allow_unencrypted_test_keys {
+        bail!("issuer password must not be empty");
+    }
+    let approval = prepare_home_enrollment_approval(
+        record.request.clone(),
+        u64::from(valid_days) * 86_400,
+        enrollment_authority.id.clone(),
+        request.profile,
+        unix_time_secs()?,
+    )?;
+    let protected = |path| ProtectedKey {
+        path,
+        password: Some(password.as_bytes()),
+        allow_unencrypted: state.issuer.allow_unencrypted_test_keys,
+    };
+    let deployment_root_public_key =
+        std::fs::read_to_string(&state.config.deployment_root_public_key)?;
+    let deployment_trust: SignedDeploymentTrust = load_json(&state.config.deployment_trust)?;
+    let material = HomeIssuerMaterial {
+        deployment_trust: &deployment_trust,
+        deployment_root_public_key: deployment_root_public_key.trim(),
+        management_ca_certificate: &state.config.management_ca,
+        management_ca_key: protected(&state.issuer.management_ca_key),
+        business_ca_certificate: &state.config.business_ca,
+        business_ca_key: protected(&state.issuer.business_ca_key),
+        home_enrollment_authority_key: protected(&enrollment_authority.private_key),
+    };
+    let _sensitive_permit = Arc::clone(&state.sensitive_operation)
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("another sensitive issuer operation is already running"))?;
+    let key_operation = state.key_operation.lock().await;
+    recover_private_key_password_rotation(&issuer_key_targets(&state.issuer))?;
+    let response = issue_home_enrollment(approval, &material, unix_time_secs()?)?;
+    drop(key_operation);
+    record.response = Some(response);
+    let home_id = record.home_id.clone();
+    let store = Arc::clone(&state.statistics.store);
+    tokio::task::spawn_blocking(move || {
+        store.apply_immediate(WriteBatch::new().put_json(
+            Table::HomeEnrollmentInbox,
+            request_id.as_bytes().to_vec(),
+            &record,
+        )?)
+    })
+    .await
+    .context("Home enrollment response commit task failed")??;
+    Ok(ApproveHomeEnrollmentResponse {
+        request_id,
+        home_id,
+        profile: request.profile,
+    })
 }
 
 async fn approve_remote_enrollment(
@@ -1915,6 +2786,7 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
     let material = IssuerMaterial {
         deployment_trust: &deployment_trust,
         deployment_root_public_key: deployment_root_public_key.trim(),
+        home_endpoint_credential: state.endpoint_credential.as_deref(),
         management_ca_certificate: &state.config.management_ca,
         management_ca_key: protected(&state.issuer.management_ca_key),
         business_ca_certificate: &state.config.business_ca,

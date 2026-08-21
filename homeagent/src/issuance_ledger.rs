@@ -280,6 +280,7 @@ mod tests {
                 payload_hex: "deployment trust".to_owned(),
                 signature_hex: "root signature".to_owned(),
             },
+            home_endpoint_credential: None,
             management_certificate_pem: "management certificate".to_owned(),
             business_certificate_pem: "business certificate".to_owned(),
             signed_credential: SignedTravelCredential {

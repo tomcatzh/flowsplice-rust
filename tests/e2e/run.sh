@@ -14,6 +14,12 @@ if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
 fi
 
 mkdir -p "${generated_dir}"
+rm -rf \
+  "${generated_dir}/dynamic-home-serving" \
+  "${generated_dir}/dynamic-home-issuer" \
+  "${generated_dir}/dynamic-home-global" \
+  "${generated_dir}/dynamic-home-third" \
+  "${generated_dir}/dynamic-travel"
 
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
   "${repo_root}/tests/e2e/generate-certs.sh" prepare
@@ -25,7 +31,7 @@ else
     "${generated_dir}/offline/.flowsplice-issued-enrollments.json" \
     "${generated_dir}/offline-home2/.flowsplice-issued-enrollments.json"
   printf '%s\n' \
-    '{"version":1,"snapshot":{"generation":1,"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
+    '{"version":1,"snapshot":{"generation":1,"home_endpoint_credentials":[],"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
     >"${generated_dir}/state/server-authorization.json"
   printf '{"next_generation":1}\n' \
     >"${generated_dir}/state/server-control-generation.json"
@@ -57,12 +63,17 @@ teardown() {
 }
 
 first_enroll_pid=""
+dynamic_home_init_pid=""
 finish() {
   status=$?
   set +e
   if [[ -n "${first_enroll_pid}" ]]; then
     kill "${first_enroll_pid}" >/dev/null 2>&1 || true
     wait "${first_enroll_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${dynamic_home_init_pid}" ]]; then
+    kill "${dynamic_home_init_pid}" >/dev/null 2>&1 || true
+    wait "${dynamic_home_init_pid}" >/dev/null 2>&1 || true
   fi
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
   if (( status != 0 )); then
@@ -98,6 +109,186 @@ if (( home_issuer_ready == 0 )); then
 fi
 
 printf '%s\n' 'wrong-flowsplice-e2e-password' >"${generated_dir}/offline/wrong-password.txt"
+
+server_container_id="$(docker compose -f "${compose_file}" ps -q server)"
+server_container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${server_container_id}")"
+if [[ -z "${server_container_ip}" ]]; then
+  echo 'Could not resolve the running E2E Server container IP' >&2
+  exit 1
+fi
+
+enroll_dynamic_home() {
+  local service="$1"
+  local profile="$2"
+  local directory="$3"
+  local approving_port="${4:-19081}"
+  local log_path="${directory}/init.log"
+  mkdir -p "${directory}"
+  docker compose -f "${compose_file}" run --no-deps --rm "${service}" \
+    /usr/local/bin/flowsplice-homeagent init --server "${server_container_ip}" \
+    >"${log_path}" 2>&1 &
+  dynamic_home_init_pid=$!
+  local home_id=""
+  for _ in $(seq 1 90); do
+    home_id="$(sed -n 's/^Home id: //p' "${log_path}" | head -n 1)"
+    if [[ -n "${home_id}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "${home_id}" ]]; then
+    echo "${service} init did not publish its Home id" >&2
+    exit 1
+  fi
+  local pending
+  pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" home-pending \
+    --port "${approving_port}" \
+    --home-id "${home_id}" \
+    --wait-secs 120)"
+  local request_id
+  request_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["request_id"])' "${pending}")"
+  local verification_code
+  verification_code="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["verification_code"])' "${pending}")"
+  if ! grep -Fq "Home verification code: ${verification_code}" "${log_path}"; then
+    echo "${service} and approving Home verification codes did not match" >&2
+    exit 1
+  fi
+  if [[ "${profile}" == "serving_only" ]]; then
+    python3 "${repo_root}/tests/e2e/home-issuer-client.py" home-approve \
+      --port "${approving_port}" \
+      --request-id "${request_id}" \
+      --password-file "${generated_dir}/offline/wrong-password.txt" \
+      --profile "${profile}" \
+      --valid-days 365 \
+      --expect-failure >/dev/null
+  fi
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" home-approve \
+    --port "${approving_port}" \
+    --request-id "${request_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --profile "${profile}" \
+    --valid-days 365 >/dev/null
+  wait "${dynamic_home_init_pid}"
+  dynamic_home_init_pid=""
+  for required in \
+    homeagent.toml \
+    cert/home-management.crt \
+    cert/home-management.key \
+    cert/home-business.crt \
+    cert/home-business.key \
+    cert/home-endpoint-credential.json \
+    state/home-state.redb; do
+    if [[ ! -s "${directory}/${required}" ]]; then
+      echo "${service} init did not create ${required}" >&2
+      exit 1
+    fi
+  done
+  if [[ -e "${directory}/home-bootstrap.json" ]]; then
+    echo "${service} retained its bootstrap retrieval token after installation" >&2
+    exit 1
+  fi
+  case "${profile}" in
+    serving_only)
+      if grep -Fq '[issuer]' "${directory}/homeagent.toml"; then
+        echo 'serving-only Home unexpectedly received issuer material' >&2
+        exit 1
+      fi
+      ;;
+    home_issuer)
+      grep -Fq '[issuer.home_authority]' "${directory}/homeagent.toml"
+      if grep -Eq '\[issuer\.(global_authority|home_enrollment_authority)\]' "${directory}/homeagent.toml"; then
+        echo 'Home-scoped issuer unexpectedly received global issuer material' >&2
+        exit 1
+      fi
+      ;;
+    global_issuer)
+      grep -Fq '[issuer.home_authority]' "${directory}/homeagent.toml"
+      grep -Fq '[issuer.global_authority]' "${directory}/homeagent.toml"
+      grep -Fq '[issuer.home_enrollment_authority]' "${directory}/homeagent.toml"
+      ;;
+  esac
+  printf '%s\n' "${home_id}"
+}
+
+dynamic_serving_home_id="$(enroll_dynamic_home \
+  dynamichome-serving serving_only "${generated_dir}/dynamic-home-serving")"
+dynamic_issuer_home_id="$(enroll_dynamic_home \
+  dynamichome-issuer home_issuer "${generated_dir}/dynamic-home-issuer")"
+dynamic_global_home_id="$(enroll_dynamic_home \
+  dynamichome-global global_issuer "${generated_dir}/dynamic-home-global")"
+
+for directory in dynamic-home-issuer dynamic-home-global; do
+  python3 -c 'from pathlib import Path; p=Path(__import__("sys").argv[1]); s=p.read_text(); s=s.replace("ui_listen = \"127.0.0.1:9082\"", "ui_listen = \"0.0.0.0:9082\""); s=s.replace("[issuer]\n", "[issuer]\ntest_allow_remote_listen = true\ntest_admin_token = \"flowsplice-e2e-home-issuer-administrator-token\"\n", 1); p.write_text(s)' \
+    "${generated_dir}/${directory}/homeagent.toml"
+done
+docker compose -f "${compose_file}" up -d \
+  dynamichome-serving dynamichome-issuer dynamichome-global
+for port in 39083 39084; do
+  dynamic_home_ready=0
+  for _ in $(seq 1 60); do
+    if python3 "${repo_root}/tests/e2e/home-issuer-client.py" status \
+      --port "${port}" >/dev/null 2>&1; then
+      dynamic_home_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( dynamic_home_ready == 0 )); then
+    echo "Dynamic Home issuer on port ${port} did not become ready" >&2
+    exit 1
+  fi
+done
+python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is (p == "39084"); assert s["home_enrollment_available"] is (p == "39084")' \
+  39083 "${repo_root}/tests/e2e/home-issuer-client.py"
+python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is True; assert s["home_enrollment_available"] is True' \
+  39084 "${repo_root}/tests/e2e/home-issuer-client.py"
+
+dynamic_third_home_id="$(enroll_dynamic_home \
+  dynamichome-third serving_only "${generated_dir}/dynamic-home-third" 39084)"
+if [[ -z "${dynamic_third_home_id}" ]]; then
+  echo 'Dynamic Global Home did not approve the third Home' >&2
+  exit 1
+fi
+printf '{"checkpoint": "dynamic-global-home-approved-third-home", "home_id": "%s"}\n' \
+  "${dynamic_third_home_id}"
+
+mkdir -p "${generated_dir}/dynamic-travel"
+cp "${generated_dir}/offline/test-password.txt" \
+  "${generated_dir}/dynamic-travel/test-password.txt"
+chmod 600 "${generated_dir}/dynamic-travel/test-password.txt"
+docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
+  /usr/local/bin/flowsplice-travelagent enroll-remote \
+  --travel-id dynamic-home-issued-travel \
+  --home-id "${dynamic_global_home_id}" \
+  --install-dir /dynamic-travel \
+  --test-allow-remote-listen \
+  --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
+  --test-password-file /dynamic-travel/test-password.txt \
+  --wait-timeout-secs 180 \
+  >"${generated_dir}/dynamic-travel/enroll.log" 2>&1 &
+first_enroll_pid=$!
+dynamic_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+  --port 39084 \
+  --travel-id dynamic-home-issued-travel \
+  --wait-secs 120)"
+dynamic_travel_request_id="$(python3 -c \
+  'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+  "${dynamic_travel_pending}")"
+python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+  --port 39084 \
+  --request-id "${dynamic_travel_request_id}" \
+  --password-file "${generated_dir}/offline/test-password.txt" \
+  --scope global \
+  --valid-days 180 >/dev/null
+wait "${first_enroll_pid}"
+first_enroll_pid=""
+printf '\n[[homes]]\nid = "home-1"\n\n[[mappings]]\nhome_id = "home-1"\nservice_id = "tcp-echo"\nprotocol = "tcp"\nbind = "0.0.0.0:10080"\n' \
+  >>"${generated_dir}/dynamic-travel/travelagent.toml"
+docker compose -f "${compose_file}" up -d dynamictravel
+python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+  --port 13080 \
+  --payload dynamic-home-global-issuer-business \
+  --wait-secs 90
 
 mkdir -p "${generated_dir}/first-travel"
 cp "${generated_dir}/offline/test-password.txt" \
@@ -147,7 +338,7 @@ python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --scope global \
   --valid-days 365 \
-  --output "${generated_dir}/first-travel/approval.json"
+  --output "${generated_dir}/first-travel/approval.json" >/dev/null
 wait "${first_enroll_pid}"
 first_enroll_pid=""
 for required in \

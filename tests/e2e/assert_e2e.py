@@ -147,7 +147,7 @@ def wait_ready() -> dict:
                 homes = {home["home_id"]: home for home in catalog["homes"]}
                 if (
                     state["ok"]
-                    and set(homes) == {"home-1", "home-2"}
+                    and {"home-1", "home-2"}.issubset(homes)
                     and homes["home-1"]["home_alias"] == "E2E Home"
                     and homes["home-2"]["home_alias"] == "E2E Home Two"
                     and {service["id"] for service in homes["home-1"]["services"]}
@@ -162,6 +162,10 @@ def wait_ready() -> dict:
                     == expected_relay_pins
                 ):
                     return state
+                last_error = (
+                    "Travel API was reachable but its signed catalog or Relay directory "
+                    f"had not converged: homes={sorted(homes)}, directory={directory}"
+                )
         except Exception as error:  # startup polling deliberately records all transport failures
             last_error = error
         time.sleep(1)
@@ -227,10 +231,13 @@ def wait_catalog_homes(expected: set[str]) -> dict:
         status, _, body = http_get("/api/catalog", {"Accept": "application/json"})
         if status == 200:
             last = json.loads(body)
-            if {home["home_id"] for home in last["homes"]} == expected:
+            business_homes = {
+                home["home_id"] for home in last["homes"] if home["services"]
+            }
+            if business_homes == expected:
                 return last
         time.sleep(0.2)
-    raise AssertionError(f"catalog did not reach Home set {expected}: {last}")
+    raise AssertionError(f"catalog did not reach business Home set {expected}: {last}")
 
 
 def expect_mapping_unavailable_without_cross_home_fallback(port: int) -> None:
@@ -565,7 +572,8 @@ def check_embedded_spa() -> None:
     assert issuer_asset_headers.get("content-encoding") == "gzip"
     if issuer_asset.endswith(".js"):
         issuer_javascript = gzip.decompress(issuer_asset_body)
-        assert "旅行端凭据签发".encode() in issuer_javascript
+        assert "后台管理".encode() in issuer_javascript
+        assert "旅行端凭据签发".encode() not in issuer_javascript
         assert "更改 Home 签发密码".encode() in issuer_javascript
         assert "此前已经签发".encode() in issuer_javascript
         assert "业务统计".encode() in issuer_javascript
@@ -846,12 +854,21 @@ def check_private_key_password_rotation(
         "/api/private-key-password",
         {"current_password": old_password, "new_password": new_password},
     )
+    home_password_path = generated / "offline/test-password.txt"
+    home_password_path.write_text(new_password + "\n")
+    home_password_path.chmod(0o600)
     travel_result = travel_request(
         "POST",
         "/api/private-key-password",
         {"current_password": old_password, "new_password": new_password},
     )
-    assert home_result["rotated_keys"] == 4, home_result
+    travel_password_path = generated / "travel/test-password.txt"
+    travel_password_path.write_text(new_password + "\n")
+    travel_password_path.chmod(0o600)
+    # management CA, business CA, Home Travel authority, global Travel authority, and the
+    # Home-enrollment authority must move as one password-rotation transaction. The restart and
+    # duplicate-issuance checks below prove every rotated key remains usable with the new password.
+    assert home_result["rotated_keys"] == 5, home_result
     assert travel_result["rotated_keys"] == 2, travel_result
 
     issuer_request(
@@ -868,12 +885,6 @@ def check_private_key_password_rotation(
         expect_ok=False,
     )
 
-    for path in [
-        generated / "offline/test-password.txt",
-        generated / "travel/test-password.txt",
-    ]:
-        path.write_text(new_password + "\n")
-        path.chmod(0o600)
     before_restart = read_control_high_water()
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent", "travelagent"],
@@ -1640,6 +1651,7 @@ checks = [
     "home-catalog-removal-and-return",
     "home-two-serving-only-profile",
     "home-two-serving-only-has-no-issuer-routes-or-keys",
+    "dynamic-global-home-approved-third-home",
     "home-two-state-persists-across-issuer-to-serving-only-restart",
     "same-tcp-flow-relay-failover",
     "home-two-same-tcp-flow-relay-failover",

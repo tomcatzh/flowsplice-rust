@@ -47,6 +47,14 @@ def main() -> None:
                 "business_spki_pins": [args.home2_business_pin],
             },
         ],
+        "home_enrollment_authorities": [
+            {
+                "id": "operator-home-enrollment-authority",
+                "epoch": 1,
+                "issuer_home_id": "home-1",
+                "public_key": read(args.authorization_dir / "home-enrollment-authority-public-key.txt").strip(),
+            }
+        ],
         "travel_authorities": [
             {
                 "kind": "home",

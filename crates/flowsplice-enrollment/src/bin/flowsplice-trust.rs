@@ -50,6 +50,15 @@ enum Command {
         #[arg(long, hide = true)]
         allow_unencrypted_test_key: bool,
     },
+    /// Generate one encrypted issuer authority after validating any existing issuer keys.
+    AuthorityInit {
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long = "verify-key")]
+        verify_keys: Vec<PathBuf>,
+        #[arg(long, hide = true)]
+        test_password_file: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -72,7 +81,82 @@ fn main() -> Result<()> {
             test_password_file.as_deref(),
             allow_unencrypted_test_key,
         ),
+        Command::AuthorityInit {
+            output_dir,
+            verify_keys,
+            test_password_file,
+        } => authority_init(&output_dir, &verify_keys, test_password_file.as_deref()),
     }
+}
+
+fn authority_init(
+    output_dir: &Path,
+    verify_keys: &[PathBuf],
+    test_password_file: Option<&Path>,
+) -> Result<()> {
+    let password = password_with_prompt(
+        test_password_file,
+        true,
+        "Issuer private-key password: ",
+        "Confirm issuer private-key password: ",
+    )?;
+    authority_init_with_password(output_dir, verify_keys, password.as_bytes())
+}
+
+fn authority_init_with_password(
+    output_dir: &Path,
+    verify_keys: &[PathBuf],
+    password: &[u8],
+) -> Result<()> {
+    if output_dir.exists() {
+        bail!("issuer-authority output directory already exists");
+    }
+    let password_text =
+        std::str::from_utf8(password).context("issuer private-key password must be valid UTF-8")?;
+    if password_text.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
+        bail!(
+            "issuer private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
+        );
+    }
+    for path in verify_keys {
+        let private_key = Zeroizing::new(
+            load_private_key(path, Some(password), false).with_context(|| {
+                format!("failed to decrypt existing issuer key {}", path.display())
+            })?,
+        );
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, private_key.secret_der())
+            .map_err(|_| {
+                anyhow!(
+                    "existing issuer key {} is not a P-256 PKCS#8 key",
+                    path.display()
+                )
+            })?;
+    }
+
+    let generated = generate_encrypted_private_key(password)?;
+    let public_key = EcdsaKeyPair::from_pkcs8(
+        &ECDSA_P256_SHA256_ASN1_SIGNING,
+        &generated.key_pair.serialize_der(),
+    )
+    .map_err(|_| anyhow!("generated issuer authority is not a P-256 PKCS#8 key"))?;
+    fs::create_dir(output_dir)?;
+    fs::set_permissions(output_dir, fs::Permissions::from_mode(0o700))?;
+    write_new(
+        &output_dir.join("issuer-authority.key"),
+        generated.encrypted_pem.as_bytes(),
+        0o600,
+    )?;
+    write_new(
+        &output_dir.join("issuer-authority.pub"),
+        format!("{}\n", hex::encode(public_key.public_key().as_ref())).as_bytes(),
+        0o644,
+    )?;
+    println!(
+        "created encrypted issuer authority in {} after validating {} existing key(s)",
+        output_dir.display(),
+        verify_keys.len()
+    );
+    Ok(())
 }
 
 fn root_init(output_dir: &Path, test_password_file: Option<&Path>) -> Result<()> {
@@ -148,6 +232,20 @@ fn sign(
 }
 
 fn password(path: Option<&Path>, confirm: bool) -> Result<Zeroizing<String>> {
+    password_with_prompt(
+        path,
+        confirm,
+        "Deployment-root password: ",
+        "Confirm password: ",
+    )
+}
+
+fn password_with_prompt(
+    path: Option<&Path>,
+    confirm: bool,
+    prompt: &str,
+    confirmation_prompt: &str,
+) -> Result<Zeroizing<String>> {
     if let Some(path) = path {
         if std::env::var("FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE").as_deref() != Ok("1") {
             bail!("test password files are disabled outside explicit tests");
@@ -158,14 +256,14 @@ fn password(path: Option<&Path>, confirm: bool) -> Result<Zeroizing<String>> {
         }
         return Ok(value);
     }
-    let value = Zeroizing::new(rpassword::prompt_password("Deployment-root password: ")?);
+    let value = Zeroizing::new(rpassword::prompt_password(prompt)?);
     if value.is_empty() {
-        bail!("deployment-root password must not be empty");
+        bail!("private-key password must not be empty");
     }
     if confirm {
-        let confirmation = Zeroizing::new(rpassword::prompt_password("Confirm password: ")?);
+        let confirmation = Zeroizing::new(rpassword::prompt_password(confirmation_prompt)?);
         if value.as_bytes() != confirmation.as_bytes() {
-            bail!("deployment-root passwords do not match");
+            bail!("private-key passwords do not match");
         }
     }
     Ok(value)
@@ -181,4 +279,52 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authority_init_validates_existing_keys_and_reuses_their_password() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let password = b"correct horse battery staple";
+        let existing = generate_encrypted_private_key(password)?;
+        let existing_path = temporary.path().join("existing.key");
+        write_new(&existing_path, existing.encrypted_pem.as_bytes(), 0o600)?;
+        let output = temporary.path().join("authority");
+
+        authority_init_with_password(&output, std::slice::from_ref(&existing_path), password)?;
+
+        let private_key =
+            load_private_key(&output.join("issuer-authority.key"), Some(password), false)?;
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, private_key.secret_der())
+                .map_err(|_| anyhow!("generated authority is not P-256"))?;
+        assert_eq!(
+            fs::read_to_string(output.join("issuer-authority.pub"))?.trim(),
+            hex::encode(key_pair.public_key().as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authority_init_wrong_password_creates_no_output() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let existing = generate_encrypted_private_key(b"correct horse battery staple")?;
+        let existing_path = temporary.path().join("existing.key");
+        write_new(&existing_path, existing.encrypted_pem.as_bytes(), 0o600)?;
+        let output = temporary.path().join("authority");
+
+        assert!(
+            authority_init_with_password(
+                &output,
+                std::slice::from_ref(&existing_path),
+                b"wrong password value",
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        Ok(())
+    }
 }

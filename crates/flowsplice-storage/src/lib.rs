@@ -40,6 +40,8 @@ const REPORT_OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("repor
 const ACCEPTED_REPORTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accepted_reports");
 const ENROLLMENT_OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("enrollment_outbox");
 const ENROLLMENT_INBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("enrollment_inbox");
+const HOME_ENROLLMENT_INBOX: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("home_enrollment_inbox");
 
 const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 
@@ -54,6 +56,7 @@ pub enum Table {
     AcceptedReports,
     EnrollmentOutbox,
     EnrollmentInbox,
+    HomeEnrollmentInbox,
 }
 
 impl Table {
@@ -68,6 +71,7 @@ impl Table {
             Self::AcceptedReports => ACCEPTED_REPORTS,
             Self::EnrollmentOutbox => ENROLLMENT_OUTBOX,
             Self::EnrollmentInbox => ENROLLMENT_INBOX,
+            Self::HomeEnrollmentInbox => HOME_ENROLLMENT_INBOX,
         }
     }
 }
@@ -182,6 +186,7 @@ impl StateStore {
             Table::AcceptedReports,
             Table::EnrollmentOutbox,
             Table::EnrollmentInbox,
+            Table::HomeEnrollmentInbox,
         ] {
             drop(write.open_table(table.definition())?);
         }

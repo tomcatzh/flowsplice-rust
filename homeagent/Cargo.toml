@@ -25,12 +25,13 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"
-toml.workspace = true

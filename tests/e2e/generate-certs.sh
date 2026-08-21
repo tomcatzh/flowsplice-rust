@@ -103,7 +103,7 @@ home_management_pin="$(spki_pin home-management)"
 home_business_pin="$(spki_pin home-business)"
 home2_management_pin="$(spki_pin home2-management)"
 home2_business_pin="$(spki_pin home2-business)"
-for authority in home1-authority home2-authority global-authority; do
+for authority in home1-authority home2-authority global-authority home-enrollment-authority; do
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
     -aes-256-cbc -pass "file:${password_file}" \
     -out "${offline_dir}/${authority}.key" >/dev/null 2>&1
@@ -153,7 +153,7 @@ server_pin="$(spki_pin server)"
 relay1_pin="$(spki_pin relay1)"
 relay2_pin="$(spki_pin relay2)"
 printf '%s\n' \
-  '{"version":1,"snapshot":{"generation":1,"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
+  '{"version":1,"snapshot":{"generation":1,"home_endpoint_credentials":[],"credentials":[],"revocations":[]},"used_enrollment_requests":[]}' \
   >"${state_dir}/server-authorization.json"
 printf '{"next_generation":1}\n' >"${state_dir}/server-control-generation.json"
 printf '{"relay-1":"%s","relay-2":"%s"}\n' \

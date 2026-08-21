@@ -39,6 +39,11 @@ private_key = "/etc/flowsplice/issuer/home-authority.key"
 id = "operator-global-authority"
 private_key = "/etc/flowsplice/issuer/global-authority.key"
 
+# Required, together with global_authority, for approving Home 2 and later Homes.
+[issuer.home_enrollment_authority]
+id = "operator-home-enrollment-authority"
+private_key = "/etc/flowsplice/issuer/home-enrollment-authority.key"
+
 [[services]]
 id = "ssh"
 alias = "Home SSH"

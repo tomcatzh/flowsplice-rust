@@ -102,6 +102,59 @@ services:
       - ./generated/state:/state
     networks: [flowsplice]
 
+  dynamichome-serving:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
+    depends_on: [server]
+    volumes:
+      - ./generated/dynamic-home-serving:/dynamic-home
+    networks: [flowsplice]
+
+  dynamichome-issuer:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
+    depends_on: [server]
+    ports:
+      - "127.0.0.1:39083:9082"
+    volumes:
+      - ./generated/dynamic-home-issuer:/dynamic-home
+      - ./generated:/generated:ro
+    networks: [flowsplice]
+
+  dynamichome-global:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
+    depends_on: [server]
+    ports:
+      - "127.0.0.1:39084:9082"
+    volumes:
+      - ./generated/dynamic-home-global:/dynamic-home
+      - ./generated:/generated:ro
+    networks: [flowsplice]
+
+  dynamichome-third:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    environment:
+      RUST_LOG: flowsplice_homeagent=debug,info
+      FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
+    depends_on: [server]
+    volumes:
+      - ./generated/dynamic-home-third:/dynamic-home
+    networks: [flowsplice]
+
   travelagent:
     image: flowsplice-e2e:local
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
@@ -139,6 +192,21 @@ services:
       - "127.0.0.1:12080:10080"
     volumes:
       - ./generated/first-travel:/first-travel
+    networks: [flowsplice]
+
+  dynamictravel:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/dynamic-travel/travelagent.toml"]
+    environment:
+      RUST_LOG: flowsplice_travelagent=debug,info
+      FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
+      FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /dynamic-travel/test-password.txt
+    depends_on: [relay1, relay2, homeagent, dynamichome-global]
+    ports:
+      - "127.0.0.1:13080:10080"
+    volumes:
+      - ./generated/dynamic-travel:/dynamic-travel
     networks: [flowsplice]
 
 networks:

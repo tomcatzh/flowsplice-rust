@@ -2,35 +2,22 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-serving_config="${repo_root}/homeagent/config.home2-serving.example.toml"
-issuer_config="${repo_root}/homeagent/config.home2-issuer.example.toml"
 quick_start="${repo_root}/docs/HOME2_QUICK_START.zh-CN.md"
 package_script="${repo_root}/scripts/build-home2-macos-package.sh"
 
-for path in "${serving_config}" "${issuer_config}" "${quick_start}" "${package_script}"; do
+for path in "${quick_start}" "${package_script}"; do
   [[ -f "${path}" ]] || { printf 'Missing Home 2 package input: %s\n' "${path}" >&2; exit 1; }
 done
 
-grep -q '^id = "home-2"$' "${serving_config}"
-grep -q '^id = "home-2"$' "${issuer_config}"
-grep -q '__HOME2_ROOT__/state/home2-state.redb' "${serving_config}"
-grep -q '__HOME2_ROOT__/state/home2-state.redb' "${issuer_config}"
-grep -q '^ui_listen = "127.0.0.1:9082"$' "${serving_config}"
-grep -q '^ui_listen = "127.0.0.1:9082"$' "${issuer_config}"
-if grep -q '^\[issuer\]' "${serving_config}"; then
-  printf 'Serving-only Home 2 configuration unexpectedly enables issuer operations.\n' >&2
-  exit 1
-fi
-grep -q '^\[issuer\]' "${issuer_config}"
-grep -q '^\[issuer.home_authority\]' "${issuer_config}"
-if grep -q '^\[issuer.global_authority\]' "${issuer_config}"; then
-  printf 'Home 2 issuer example must not provision global authority by default.\n' >&2
-  exit 1
-fi
+grep -q 'init --server <SERVER_IP>' "${quick_start}"
 grep -q 'Serving-only' "${quick_start}"
-grep -q 'Home-2 issuer' "${quick_start}"
-grep -q 'deployment trust' "${quick_start}"
+grep -q 'Home issuer' "${quick_start}"
+grep -q 'Global issuer' "${quick_start}"
+grep -q 'Library/Application Support/FlowSplice/Home' "${quick_start}"
 grep -q 'io.zxf.flowsplice.homeagent' "${package_script}"
+grep -q 'FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=' "${package_script}"
+grep -q 'FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM=' "${package_script}"
+grep -q 'FLOWSPLICE_SERVER_NAME=' "${package_script}"
 
 if [[ $# -eq 0 ]]; then
   printf 'Home 2 macOS package inputs are consistent.\n'
@@ -58,9 +45,6 @@ package_root="$(find "${tmp_dir}" -mindepth 1 -maxdepth 1 -type d -name 'flowspl
 
 for relative in \
   bin/flowsplice-homeagent \
-  config/homeagent-serving-only.toml \
-  config/homeagent-issuer.toml \
-  launchd/io.zxf.flowsplice.home2.plist \
   QUICK_START.zh-CN.md \
   SHA256SUMS; do
   [[ -f "${package_root}/${relative}" ]] || {
@@ -68,6 +52,11 @@ for relative in \
     exit 1
   }
 done
+
+if [[ -e "${package_root}/config" || -e "${package_root}/launchd" ]]; then
+  printf 'One-command Home package must not ship manual TOML or launchd templates.\n' >&2
+  exit 1
+fi
 
 if find "${package_root}" -type f \( -name '*.key' -o -name '*.crt' -o -name '*.pem' \) -print -quit | grep -q .; then
   printf 'Home 2 package must not contain certificates or private keys.\n' >&2
@@ -85,5 +74,4 @@ fi
   cd "${package_root}"
   shasum -a 256 -c SHA256SUMS
 )
-plutil -lint "${package_root}/launchd/io.zxf.flowsplice.home2.plist" >/dev/null
 printf 'Home 2 macOS package verified: %s\n' "${archive}"

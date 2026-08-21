@@ -607,6 +607,7 @@ dependencies = [
  "flowsplice-storage",
  "hex",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

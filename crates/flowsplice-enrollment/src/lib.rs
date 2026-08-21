@@ -19,7 +19,7 @@ use flowsplice_core::authorization::{
     TravelCredential, TravelCredentialScope, TrustedTravelAuthority,
 };
 use flowsplice_core::{
-    deployment::{DeploymentTrust, SignedDeploymentTrust},
+    deployment::{DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential},
     protocol::Role,
     tls::{peer_identity, require_peer},
 };
@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+pub mod home;
 pub mod issuer;
 pub mod key;
 
@@ -81,6 +82,8 @@ pub struct TravelEnrollmentResponse {
     pub version: u32,
     pub approval: TravelEnrollmentApproval,
     pub deployment_trust: SignedDeploymentTrust,
+    #[serde(default)]
+    pub home_endpoint_credential: Option<SignedHomeEndpointCredential>,
     pub management_certificate_pem: String,
     pub business_certificate_pem: String,
     pub signed_credential: SignedTravelCredential,
@@ -284,7 +287,27 @@ pub fn validate_enrollment_response(
     if response.signed_credential.authority_id != response.approval.authority_id {
         bail!("signed Travel credential has the wrong authority id");
     }
-    let authority = trust.travel_authority_by_id(&response.approval.authority_id)?;
+    let endpoint_credentials = response
+        .home_endpoint_credential
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(endpoint) = &response.home_endpoint_credential {
+        let endpoint = endpoint.verify(&trust, now)?;
+        if response.approval.not_after_unix_secs > endpoint.not_after_unix_secs {
+            bail!("enrollment validity exceeds the issuing Home endpoint validity");
+        }
+    }
+    let authorities = trust.travel_authorities_with_home_delegations(&endpoint_credentials, now)?;
+    let authority = authorities
+        .iter()
+        .find(|authority| authority.id() == response.approval.authority_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "Travel authority {} is not trusted",
+                response.approval.authority_id
+            )
+        })?;
     let actual = response.signed_credential.verify(authority)?;
     let expected = expected_credential(
         &response.approval,
@@ -552,7 +575,7 @@ fn validate_travel_id(travel_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -598,7 +621,7 @@ fn validate_local_key(
     Ok(())
 }
 
-fn certificate_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
+pub(crate) fn certificate_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
     let mut certificates = CertificateDer::pem_slice_iter(pem.as_bytes());
     let certificate = certificates
         .next()
@@ -611,7 +634,7 @@ fn certificate_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
     Ok(certificate)
 }
 
-fn verify_client_chain(
+pub(crate) fn verify_client_chain(
     certificate: &CertificateDer<'_>,
     ca_pem: &str,
     now: u64,
@@ -639,7 +662,7 @@ fn verify_client_chain(
     Ok(())
 }
 
-fn write_or_verify(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_or_verify(path: &Path, data: &[u8]) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() || fs::read(path)? != data {

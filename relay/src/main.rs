@@ -24,8 +24,8 @@ use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
     authorization::{
-        AuthorizationCache, TravelAuthorizationSnapshot, TrustedTravelAuthority,
-        VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
+        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization, load_json,
+        store_json_atomic, unix_time_secs,
     },
     config::load_toml,
     deployment::{DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust},
@@ -179,8 +179,7 @@ struct State {
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
     authorization_tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
     authorization_cache: Mutex<AuthorizationCache>,
-    travel_authorities: Arc<Vec<TrustedTravelAuthority>>,
-    deployment_id: Arc<String>,
+    deployment_trust: Arc<DeploymentTrust>,
     route_permits: Arc<Semaphore>,
     statistics: Arc<LocalStatistics>,
     statistics_signer: Arc<EcdsaKeyPair>,
@@ -196,8 +195,7 @@ struct State {
 impl State {
     fn new(
         authorization_cache: AuthorizationCache,
-        deployment_id: String,
-        travel_authorities: Vec<TrustedTravelAuthority>,
+        deployment_trust: DeploymentTrust,
         max_pending_routes: usize,
         statistics: LocalStatistics,
         statistics_signer: EcdsaKeyPair,
@@ -211,8 +209,7 @@ impl State {
             routes: Mutex::new(HashMap::new()),
             authorization_tx,
             authorization_cache: Mutex::new(authorization_cache),
-            travel_authorities: Arc::new(travel_authorities),
-            deployment_id: Arc::new(deployment_id),
+            deployment_trust: Arc::new(deployment_trust),
             route_permits: Arc::new(Semaphore::new(max_pending_routes)),
             statistics: Arc::new(statistics),
             statistics_signer: Arc::new(statistics_signer),
@@ -256,8 +253,7 @@ async fn main() -> Result<()> {
     let statistics_signer = statistics_signing_key(&statistics_private_key)?;
     let state = Arc::new(State::new(
         authorization_cache,
-        deployment_trust.deployment_id,
-        deployment_trust.travel_authorities,
+        deployment_trust.clone(),
         config.max_pending_routes,
         statistics,
         statistics_signer,
@@ -714,7 +710,7 @@ async fn flush_and_send_relay_statistics<W: tokio::io::AsyncWrite + Unpin>(
     report_keys: &mut HashMap<String, Vec<u8>>,
 ) -> Result<()> {
     let statistics = Arc::clone(&state.statistics);
-    let deployment_id = Arc::clone(&state.deployment_id);
+    let deployment_id = state.deployment_trust.deployment_id.clone();
     let certificate_pem = Arc::clone(&state.statistics_certificate_pem);
     let signer = Arc::clone(&state.statistics_signer);
     tokio::task::spawn_blocking(move || {
@@ -758,7 +754,7 @@ async fn forward_travel_statistics(
         || report_identity.certificate_sha256 != transport_identity.certificate_sha256
         || verified.payload.reporter_role != Role::Travel
         || verified.payload.reporter_id != transport_identity.id
-        || verified.payload.deployment_id.as_str() != state.deployment_id.as_str()
+        || verified.payload.deployment_id.as_str() != state.deployment_trust.deployment_id.as_str()
     {
         bail!("Travel statistics report is not bound to its authenticated session");
     }
@@ -1869,8 +1865,17 @@ async fn apply_authorization_snapshot(
     config: &Config,
     snapshot: TravelAuthorizationSnapshot,
 ) -> Result<u64> {
-    let authorization =
-        VerifiedAuthorization::verify(&snapshot, &state.travel_authorities, &state.deployment_id)?;
+    let authorities = state
+        .deployment_trust
+        .travel_authorities_with_home_delegations(
+            &snapshot.home_endpoint_credentials,
+            unix_time_secs()?,
+        )?;
+    let authorization = VerifiedAuthorization::verify(
+        &snapshot,
+        &authorities,
+        &state.deployment_trust.deployment_id,
+    )?;
     let mut cache = state.authorization_cache.lock().await;
     let proposed_cache = cache.accept(&authorization)?;
     if proposed_cache != *cache {

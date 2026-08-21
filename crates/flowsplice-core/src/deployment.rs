@@ -11,6 +11,7 @@ use aws_lc_rs::{
 };
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     authorization::{TrustedTravelAuthority, validate_trusted_authorities},
@@ -21,6 +22,8 @@ use crate::{
 pub const DEPLOYMENT_TRUST_VERSION: u32 = 1;
 pub const CONTROL_SNAPSHOT_VERSION: u32 = 1;
 pub const CONTROL_SNAPSHOT_OBJECT_TYPE: &str = "flowsplice.control_snapshot";
+pub const HOME_ENDPOINT_CREDENTIAL_VERSION: u32 = 1;
+pub const HOME_ENDPOINT_CREDENTIAL_OBJECT_TYPE: &str = "flowsplice.home_endpoint_credential";
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const MAX_CONTROL_SNAPSHOT_TTL_SECS: u64 = 300;
 const MAX_RELAY_ENDPOINTS: usize = 64;
@@ -48,6 +51,44 @@ pub struct HomeEndpointTrust {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct TrustedHomeEnrollmentAuthority {
+    pub id: String,
+    pub epoch: u64,
+    pub issuer_home_id: String,
+    pub public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeEndpointCredential {
+    pub version: u32,
+    pub object_type: String,
+    pub deployment_id: String,
+    pub credential_id: Uuid,
+    pub authority_id: String,
+    pub authority_epoch: u64,
+    pub enrollment_request_id: Uuid,
+    pub home_id: String,
+    pub management_spki_sha256: String,
+    pub business_spki_sha256: String,
+    #[serde(default)]
+    pub delegated_travel_authorities: Vec<TrustedTravelAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_bundle_sha256: Option<String>,
+    pub not_before_unix_secs: u64,
+    pub not_after_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedHomeEndpointCredential {
+    pub authority_id: String,
+    pub payload_hex: String,
+    pub signature_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentTrust {
     pub version: u32,
     pub deployment_id: String,
@@ -58,6 +99,8 @@ pub struct DeploymentTrust {
     pub business_ca_certificate_pem: String,
     pub server_control_keys: Vec<ServerControlKey>,
     pub home_endpoints: Vec<HomeEndpointTrust>,
+    #[serde(default)]
+    pub home_enrollment_authorities: Vec<TrustedHomeEnrollmentAuthority>,
     pub travel_authorities: Vec<TrustedTravelAuthority>,
 }
 
@@ -307,6 +350,90 @@ impl DeploymentTrust {
             .ok_or_else(|| anyhow!("Home {home_id} endpoint is not deployment-trusted"))
     }
 
+    /// Returns the root-certified authority allowed to approve new Home endpoint identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authority id/epoch pair is not deployment-trusted.
+    pub fn home_enrollment_authority(
+        &self,
+        authority_id: &str,
+        authority_epoch: u64,
+    ) -> Result<&TrustedHomeEnrollmentAuthority> {
+        self.home_enrollment_authorities
+            .iter()
+            .find(|authority| {
+                authority.id == authority_id && authority.epoch == authority_epoch
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "Home enrollment authority {authority_id} epoch {authority_epoch} is not deployment-trusted"
+                )
+            })
+    }
+
+    /// Resolves one Home's management and business pins. A valid dynamically signed endpoint
+    /// credential takes precedence over the static baseline, enabling secure first installation
+    /// and rotation without giving Server signing authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither a valid dynamic credential nor a static endpoint exists.
+    pub fn resolve_home_endpoint(
+        &self,
+        home_id: &str,
+        credential: Option<&SignedHomeEndpointCredential>,
+        now: u64,
+    ) -> Result<HomeEndpointTrust> {
+        if let Some(credential) = credential {
+            let verified = credential.verify(self, now)?;
+            if verified.home_id != home_id {
+                bail!("Home endpoint credential belongs to a different Home");
+            }
+            return Ok(HomeEndpointTrust {
+                home_id: verified.home_id,
+                management_spki_pins: vec![verified.management_spki_sha256],
+                business_spki_pins: vec![verified.business_spki_sha256],
+            });
+        }
+        Ok(self.home_endpoint(home_id)?.clone())
+    }
+
+    /// Combines root-listed Travel authorities with authority keys delegated inside verified Home
+    /// endpoint credentials. Authority ids remain globally unique across both sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a bad endpoint signature, an invalid delegation, or a duplicate id.
+    pub fn travel_authorities_with_home_delegations(
+        &self,
+        credentials: &[SignedHomeEndpointCredential],
+        _now: u64,
+    ) -> Result<Vec<TrustedTravelAuthority>> {
+        let mut authorities = self.travel_authorities.clone();
+        let mut ids = authorities
+            .iter()
+            .map(|authority| authority.id().to_owned())
+            .collect::<HashSet<_>>();
+        for signed in credentials {
+            // Delegated authority keys remain necessary to verify historical Travel credentials
+            // after the parent Home endpoint expires. Current Home access still uses `verify`,
+            // and dynamically issued Travel credentials are bounded by the endpoint expiry.
+            let endpoint = signed.verify_trust_binding(self)?;
+            for authority in endpoint.delegated_travel_authorities {
+                if !ids.insert(authority.id().to_owned()) {
+                    bail!(
+                        "duplicate static or delegated Travel authority {}",
+                        authority.id()
+                    );
+                }
+                authorities.push(authority);
+            }
+        }
+        validate_trusted_authorities(&authorities)?;
+        Ok(authorities)
+    }
+
     fn validate_shape(&self) -> Result<()> {
         if self.version != DEPLOYMENT_TRUST_VERSION
             || self.deployment_id.is_empty()
@@ -350,6 +477,20 @@ impl DeploymentTrust {
                 validate_spki_pin(pin, "Home business")?;
             }
         }
+        let mut home_authority_epochs = HashSet::new();
+        for authority in &self.home_enrollment_authorities {
+            if authority.id.is_empty()
+                || authority.epoch == 0
+                || authority.issuer_home_id.is_empty()
+                || !home_ids.contains(authority.issuer_home_id.as_str())
+                || !home_authority_epochs.insert((authority.id.as_str(), authority.epoch))
+            {
+                bail!(
+                    "Home enrollment authority id/epoch must be unique and its issuer Home must be statically trusted"
+                );
+            }
+            decode_p256_public_key(&authority.public_key, "Home enrollment authority")?;
+        }
         validate_trusted_authorities(&self.travel_authorities)?;
         for authority in &self.travel_authorities {
             if authority
@@ -369,6 +510,124 @@ impl DeploymentTrust {
         }
         if now >= self.not_after_unix_secs {
             bail!("deployment trust is expired");
+        }
+        Ok(())
+    }
+}
+
+impl SignedHomeEndpointCredential {
+    /// Signs a bounded Home endpoint credential with a root-certified enrollment authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed payloads or a signing failure.
+    pub fn sign(payload: &HomeEndpointCredential, key: &EcdsaKeyPair) -> Result<Self> {
+        payload.validate_shape()?;
+        let bytes =
+            serde_json::to_vec(payload).context("failed to encode Home endpoint credential")?;
+        let signature = key
+            .sign(&SystemRandom::new(), &bytes)
+            .map_err(|_| anyhow!("failed to sign Home endpoint credential"))?;
+        Ok(Self {
+            authority_id: payload.authority_id.clone(),
+            payload_hex: hex::encode(bytes),
+            signature_hex: hex::encode(signature.as_ref()),
+        })
+    }
+
+    /// Verifies a Home endpoint credential against deployment-root-bound authority material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tampering, an untrusted authority, identity mismatch, or expiry.
+    pub fn verify(&self, trust: &DeploymentTrust, now: u64) -> Result<HomeEndpointCredential> {
+        let payload = self.verify_trust_binding(trust)?;
+        payload.validate_time(now)?;
+        Ok(payload)
+    }
+
+    fn verify_trust_binding(&self, trust: &DeploymentTrust) -> Result<HomeEndpointCredential> {
+        let payload_bytes = hex::decode(&self.payload_hex)
+            .context("Home endpoint credential payload must be hexadecimal")?;
+        if payload_bytes.len() > 16 * 1_024 {
+            bail!("Home endpoint credential exceeds the signed payload limit");
+        }
+        let payload: HomeEndpointCredential = serde_json::from_slice(&payload_bytes)
+            .context("Home endpoint credential payload is invalid")?;
+        payload.validate_trust_binding(trust)?;
+        if self.authority_id != payload.authority_id {
+            bail!("Home endpoint credential authority id is inconsistent");
+        }
+        let authority =
+            trust.home_enrollment_authority(&payload.authority_id, payload.authority_epoch)?;
+        let public_key =
+            decode_p256_public_key(&authority.public_key, "Home enrollment authority")?;
+        let signature = hex::decode(&self.signature_hex)
+            .context("Home endpoint credential signature must be hexadecimal")?;
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+            .verify(&payload_bytes, &signature)
+            .map_err(|_| anyhow!("Home endpoint credential has an invalid signature"))?;
+        Ok(payload)
+    }
+}
+
+impl HomeEndpointCredential {
+    fn validate_shape(&self) -> Result<()> {
+        if self.version != HOME_ENDPOINT_CREDENTIAL_VERSION
+            || self.object_type != HOME_ENDPOINT_CREDENTIAL_OBJECT_TYPE
+            || self.deployment_id.is_empty()
+            || self.credential_id.is_nil()
+            || self.authority_id.is_empty()
+            || self.authority_epoch == 0
+            || self.enrollment_request_id.is_nil()
+            || self.home_id.is_empty()
+            || self.home_id.len() > MAX_ID_BYTES
+            || self.not_before_unix_secs >= self.not_after_unix_secs
+        {
+            bail!("unsupported or invalid Home endpoint credential");
+        }
+        validate_spki_pin(&self.management_spki_sha256, "Home management")?;
+        validate_spki_pin(&self.business_spki_sha256, "Home business")?;
+        if self.delegated_travel_authorities.len() > 2 {
+            bail!("Home endpoint credential delegates too many Travel authorities");
+        }
+        if !self.delegated_travel_authorities.is_empty() {
+            validate_trusted_authorities(&self.delegated_travel_authorities)?;
+            for authority in &self.delegated_travel_authorities {
+                if authority.home_id() != Some(self.home_id.as_str()) {
+                    bail!("delegated Travel authority belongs to a different Home");
+                }
+            }
+        }
+        match &self.issuer_bundle_sha256 {
+            Some(digest) => validate_spki_pin(digest, "Home issuer bundle")?,
+            None if !self.delegated_travel_authorities.is_empty() => {
+                bail!("delegated Travel authorities require a signed issuer-bundle digest");
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn validate_trust_binding(&self, trust: &DeploymentTrust) -> Result<()> {
+        self.validate_shape()?;
+        if self.deployment_id != trust.deployment_id {
+            bail!("Home endpoint credential belongs to a different deployment");
+        }
+        if self.not_before_unix_secs < trust.not_before_unix_secs
+            || self.not_after_unix_secs > trust.not_after_unix_secs
+        {
+            bail!("Home endpoint credential is outside deployment trust validity");
+        }
+        Ok(())
+    }
+
+    fn validate_time(&self, now: u64) -> Result<()> {
+        if now.saturating_add(MAX_CLOCK_SKEW_SECS) < self.not_before_unix_secs {
+            bail!("Home endpoint credential is not yet valid");
+        }
+        if now >= self.not_after_unix_secs {
+            bail!("Home endpoint credential is expired");
         }
         Ok(())
     }
@@ -557,6 +816,7 @@ mod tests {
                 management_spki_pins: vec!["44".repeat(32)],
                 business_spki_pins: vec!["55".repeat(32)],
             }],
+            home_enrollment_authorities: vec![],
             travel_authorities: vec![TrustedTravelAuthority::Home {
                 id: "home-1-authority".to_owned(),
                 epoch: 1,
@@ -646,6 +906,79 @@ mod tests {
     }
 
     #[test]
+    fn expired_home_endpoint_retains_historical_travel_verification_authority() -> Result<()> {
+        let (root, server, static_travel) = keys()?;
+        let enrollment = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("Home enrollment key generation failed"))?;
+        let delegated = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("delegated Travel key generation failed"))?;
+        let trust = DeploymentTrust {
+            version: DEPLOYMENT_TRUST_VERSION,
+            deployment_id: "deployment-1".to_owned(),
+            generation: 1,
+            not_before_unix_secs: 1,
+            not_after_unix_secs: 1_000,
+            management_ca_certificate_pem: ca_pem("management")?,
+            business_ca_certificate_pem: ca_pem("business")?,
+            server_control_keys: vec![ServerControlKey {
+                server_id: "server-1".to_owned(),
+                epoch: 1,
+                public_key: hex::encode(server.public_key().as_ref()),
+            }],
+            home_endpoints: vec![HomeEndpointTrust {
+                home_id: "home-1".to_owned(),
+                management_spki_pins: vec!["44".repeat(32)],
+                business_spki_pins: vec!["55".repeat(32)],
+            }],
+            home_enrollment_authorities: vec![TrustedHomeEnrollmentAuthority {
+                id: "home-enrollment-1".to_owned(),
+                epoch: 1,
+                issuer_home_id: "home-1".to_owned(),
+                public_key: hex::encode(enrollment.public_key().as_ref()),
+            }],
+            travel_authorities: vec![TrustedTravelAuthority::Home {
+                id: "home-1-travel".to_owned(),
+                epoch: 1,
+                home_id: "home-1".to_owned(),
+                public_key: hex::encode(static_travel.public_key().as_ref()),
+            }],
+        };
+        SignedDeploymentTrust::sign(&trust, &root)?;
+
+        let delegated_authority = TrustedTravelAuthority::Home {
+            id: "home-2-travel".to_owned(),
+            epoch: 1,
+            home_id: "home-2".to_owned(),
+            public_key: hex::encode(delegated.public_key().as_ref()),
+        };
+        let signed_endpoint = SignedHomeEndpointCredential::sign(
+            &HomeEndpointCredential {
+                version: HOME_ENDPOINT_CREDENTIAL_VERSION,
+                object_type: HOME_ENDPOINT_CREDENTIAL_OBJECT_TYPE.to_owned(),
+                deployment_id: trust.deployment_id.clone(),
+                credential_id: Uuid::from_u128(1),
+                authority_id: "home-enrollment-1".to_owned(),
+                authority_epoch: 1,
+                enrollment_request_id: Uuid::from_u128(2),
+                home_id: "home-2".to_owned(),
+                management_spki_sha256: "66".repeat(32),
+                business_spki_sha256: "77".repeat(32),
+                delegated_travel_authorities: vec![delegated_authority.clone()],
+                issuer_bundle_sha256: Some("88".repeat(32)),
+                not_before_unix_secs: 100,
+                not_after_unix_secs: 200,
+            },
+            &enrollment,
+        )?;
+
+        assert!(signed_endpoint.verify(&trust, 200).is_err());
+        let authorities =
+            trust.travel_authorities_with_home_delegations(&[signed_endpoint], 200)?;
+        assert!(authorities.contains(&delegated_authority));
+        Ok(())
+    }
+
+    #[test]
     fn signed_control_snapshot_rejects_aggregate_catalog_over_frame_budget() -> Result<()> {
         let now = 1_800_000_000;
         let (root_public, server, trust) = fixture(now)?;
@@ -685,11 +1018,13 @@ mod tests {
                         home_id: "home-1".to_owned(),
                         home_alias: "Home One".to_owned(),
                         services: services.clone(),
+                        endpoint_credential: None,
                     },
                     HomeCatalog {
                         home_id: "home-2".to_owned(),
                         home_alias: "Home Two".to_owned(),
                         services,
+                        endpoint_credential: None,
                     },
                 ],
             },

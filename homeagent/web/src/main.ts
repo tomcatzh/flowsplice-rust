@@ -13,6 +13,7 @@ interface Status {
   home_alias: string;
   default_valid_days: number;
   global_authority_available: boolean;
+  home_enrollment_available: boolean;
   private_key_password_rotation_available: boolean;
   services: Service[];
 }
@@ -28,6 +29,8 @@ interface Credential {
 interface IssueResult { generation: number; enrollment: unknown; reused: boolean }
 interface RotatePasswordResult { rotated_keys: number }
 interface PendingEnrollment { request_id: string; travel_id: string; home_id: string; received_at_unix_secs: number; approved: boolean; bootstrap: boolean; verification_code?: string }
+type HomeProfile = "serving_only" | "home_issuer" | "global_issuer";
+interface PendingHomeEnrollment { request_id: string; home_id: string; received_at_unix_secs: number; approved: boolean; verification_code: string; profile?: HomeProfile }
 interface MetricRollup { metric_family: string; dimensions: Record<string, string>; count: number; sum: number; weighted_average: number; average_per_five_minutes: number }
 interface Statistics { period: "day" | "week" | "month" | "year"; dropped_events: number; overview: MetricRollup[]; breakdowns: MetricRollup[] }
 
@@ -39,6 +42,7 @@ let enrollmentRequest: unknown;
 let statisticsPeriod: Statistics["period"] = "day";
 let currentPage: Page = "overview";
 let pendingRequestId: string | null = null;
+let pendingHomeRequestId: string | null = null;
 let revokeCredentialId: string | null = null;
 
 function escapeHtml(value: string): string {
@@ -299,6 +303,61 @@ async function renderPending(): Promise<void> {
   table.querySelectorAll<HTMLButtonElement>(".approve-remote").forEach((button) => button.addEventListener("click", () => openApprovalDialog(button.dataset.id ?? "", button.dataset.travelId ?? "", button.dataset.verificationCode || undefined)));
 }
 
+function homeProfileLabel(profile?: HomeProfile): string {
+  if (profile === "global_issuer") return "全局签发者";
+  if (profile === "home_issuer") return "本 Home 签发者";
+  return "仅承载业务";
+}
+
+function clearHomeApprovalDialog(): void {
+  pendingHomeRequestId = null;
+  document.querySelector<HTMLFormElement>("#home-approval-form")?.reset();
+  const days = document.querySelector<HTMLInputElement>("#home-approval-days");
+  if (days) days.value = String(status.default_valid_days);
+  const notice = document.querySelector<HTMLElement>("#home-approval-dialog-notice");
+  if (notice) notice.textContent = "";
+}
+
+function openHomeApprovalDialog(requestId: string, homeId: string, verificationCode: string): void {
+  pendingHomeRequestId = requestId;
+  const target = document.querySelector<HTMLElement>("#home-approval-target");
+  if (target) target.textContent = homeId;
+  const code = document.querySelector<HTMLElement>("#home-approval-verification-code");
+  if (code) code.textContent = verificationCode;
+  document.querySelector<HTMLDialogElement>("#home-approval-dialog")?.showModal();
+}
+
+async function approveHomeRemote(): Promise<void> {
+  if (!pendingHomeRequestId) throw new Error("未选择待批准的 Home");
+  const profile = document.querySelector<HTMLInputElement>('input[name="home-approval-profile"]:checked')?.value as HomeProfile | undefined;
+  if (!profile) throw new Error("请选择新 Home 的权限");
+  const password = document.querySelector<HTMLInputElement>("#home-approval-password")?.value ?? "";
+  if (!password) throw new Error("请输入当前 Home 签发密码");
+  const validDays = Number(document.querySelector<HTMLInputElement>("#home-approval-days")?.value ?? status.default_valid_days);
+  const button = document.querySelector<HTMLButtonElement>("#confirm-home-approval");
+  if (button) button.disabled = true;
+  try {
+    await json("/api/home-enrollment/approve", {
+      method: "POST",
+      body: JSON.stringify({ request_id: pendingHomeRequestId, profile, valid_days: validDays, password }),
+    });
+    document.querySelector<HTMLDialogElement>("#home-approval-dialog")?.close();
+    flash("新 Home 已批准；对方会通过 Server 自动取回证书、信任与完整配置。 ");
+    await renderPendingHomes();
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function renderPendingHomes(): Promise<void> {
+  if (!status.home_enrollment_available) return;
+  const pending = await json<PendingHomeEnrollment[]>("/api/home-enrollment/pending");
+  const table = document.querySelector<HTMLElement>("#pending-homes");
+  if (!table) return;
+  table.innerHTML = pending.length ? pending.map((item) => `<tr><td><strong>${escapeHtml(item.home_id)}</strong><small>${escapeHtml(item.request_id)}</small><small>校验码：<code>${escapeHtml(item.verification_code)}</code></small></td><td>${new Date(item.received_at_unix_secs * 1000).toLocaleString("zh-CN")}</td><td>${item.approved ? `<span class="state active">已批准 · ${escapeHtml(homeProfileLabel(item.profile))}</span>` : '<span class="state inactive">等待批准</span>'}</td><td>${item.approved ? "" : `<button class="approve-home" data-id="${escapeHtml(item.request_id)}" data-home-id="${escapeHtml(item.home_id)}" data-verification-code="${escapeHtml(item.verification_code)}">审核并批准</button>`}</td></tr>`).join("") : '<tr><td colspan="4" class="empty">暂无新 Home 申请</td></tr>';
+  table.querySelectorAll<HTMLButtonElement>(".approve-home").forEach((button) => button.addEventListener("click", () => openHomeApprovalDialog(button.dataset.id ?? "", button.dataset.homeId ?? "", button.dataset.verificationCode ?? "")));
+}
+
 function pageTabs(): string {
   return `<nav class="page-tabs" aria-label="页面">
     <button type="button" class="page-tab ${currentPage === "overview" ? "active" : ""}" data-page="overview">管理</button>
@@ -325,7 +384,7 @@ async function renderStatisticsPage(): Promise<void> {
   const statistics = await json<Statistics>(`/api/statistics?period=${statisticsPeriod}`);
   const statisticCards = statistics.overview.map((item) => `<article class="stat-card"><span>${escapeHtml(metricLabel(item.metric_family))}</span><strong>${number(item.sum)}</strong><small>${number(item.average_per_five_minutes)} / 5 分钟 · ${number(item.count)} 次观测</small></article>`).join("");
   const statisticRows = statistics.breakdowns.map((item) => `<tr><td>${escapeHtml(metricLabel(item.metric_family))}</td><td>${escapeHtml(dimensionsLabel(item.dimensions))}</td><td>${number(item.sum)}</td><td>${number(item.count)}</td><td>${number(item.weighted_average)}</td><td>${number(item.average_per_five_minutes)}</td></tr>`).join("");
-  app.innerHTML = `<header><div><p class="eyebrow">HOME AUTHORITY</p><h1>旅行端凭据签发</h1><p class="subtitle">${escapeHtml(status.home_alias)} · ${escapeHtml(status.home_id)}</p></div><span class="local">本地管理页面</span></header>
+  app.innerHTML = `<header><div><p class="eyebrow">HOME AUTHORITY</p><h1>Home ${escapeHtml(status.home_id)} 后台管理</h1><p class="subtitle">${escapeHtml(status.home_alias)}</p></div><span class="local">本地管理页面</span></header>
   ${pageTabs()}
   <section class="panel statistics-panel"><div class="panel-title"><div><p class="eyebrow">业务统计</p><h2>交付流量与 Relay 路径</h2></div><div class="stats-controls"><label class="period-label">报表周期<select id="statistics-period"><option value="day" ${statisticsPeriod === "day" ? "selected" : ""}>日</option><option value="week" ${statisticsPeriod === "week" ? "selected" : ""}>周</option><option value="month" ${statisticsPeriod === "month" ? "selected" : ""}>月</option><option value="year" ${statisticsPeriod === "year" ? "selected" : ""}>年</option></select></label><button id="refresh-statistics" type="button" class="secondary">刷新</button></div></div>
     <section class="stats-grid">${statisticCards || '<article class="stat-card"><span>暂无业务观测</span><strong>0</strong><small>产生流量后会写入当前五分钟桶。</small></article>'}</section>
@@ -352,12 +411,26 @@ async function render(): Promise<void> {
   const serviceOptions = status.services.map((service) =>
     `<option value="${escapeHtml(`${service.id}\u0000${service.protocol}`)}">${escapeHtml(service.alias)} · ${service.protocol.toUpperCase()}</option>`,
   ).join("");
-  app.innerHTML = `<header><div><p class="eyebrow">HOME AUTHORITY</p><h1>旅行端凭据签发</h1><p class="subtitle">${escapeHtml(status.home_alias)} · ${escapeHtml(status.home_id)}</p></div><span class="local">本地管理页面</span></header>
+  app.innerHTML = `<header><div><p class="eyebrow">HOME AUTHORITY</p><h1>Home ${escapeHtml(status.home_id)} 后台管理</h1><p class="subtitle">${escapeHtml(status.home_alias)}</p></div><span class="local">本地管理页面</span></header>
   ${pageTabs()}
   <div id="notice" class="notice"></div>
   <section class="panel"><div class="panel-title"><div><p class="eyebrow">远程申请</p><h2>等待本机批准</h2></div><button id="refresh-pending" class="secondary">刷新</button></div>
     <div class="table-wrap"><table><thead><tr><th>旅行端</th><th>收到时间</th><th>状态</th><th></th></tr></thead><tbody id="pending-enrollments"></tbody></table></div>
   </section>
+  ${status.home_enrollment_available ? `<section class="panel"><div class="panel-title"><div><p class="eyebrow">新 Home 加入</p><h2>分配运行权限</h2></div><button id="refresh-pending-homes" class="secondary">刷新</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Home</th><th>收到时间</th><th>状态</th><th></th></tr></thead><tbody id="pending-homes"></tbody></table></div>
+  </section>
+  <dialog id="home-approval-dialog" class="wide-dialog"><form id="home-approval-form" autocomplete="off"><div class="dialog-title"><p class="eyebrow">新 Home 加入</p><h2>批准 <span id="home-approval-target"></span></h2><p class="verification-line">请先与新 Home 核对校验码：<code id="home-approval-verification-code"></code></p></div>
+    <div id="home-approval-dialog-notice" class="dialog-notice"></div>
+    <div class="dialog-scope-grid">
+      <label class="scope"><input type="radio" name="home-approval-profile" value="serving_only" checked><strong>仅承载业务</strong><small>可以运行本 Home 的业务，不能签发 Travel，也不能批准其他 Home</small></label>
+      <label class="scope"><input type="radio" name="home-approval-profile" value="home_issuer"><strong>本 Home 签发者</strong><small>可以运行业务，并为访问本 Home 的 Travel 签发凭据</small></label>
+      <label class="scope super"><input type="radio" name="home-approval-profile" value="global_issuer"><strong>全局签发者</strong><small>可以签发全局 Travel 凭据，也可以批准以后加入的新 Home</small></label>
+    </div>
+    <label>有效期（天）<input id="home-approval-days" type="number" min="1" max="3650" value="${status.default_valid_days}"></label>
+    <label>当前 Home 签发密码<input id="home-approval-password" type="password" autocomplete="current-password" placeholder="只在本机解锁签发密钥"><small>密码不会保存，也不会发送给 Server、Relay 或新 Home。</small></label>
+    <div class="dialog-actions"><button id="close-home-approval-dialog" type="button" class="secondary">取消</button><button id="confirm-home-approval" type="submit">批准并远程返回</button></div>
+  </form></dialog>` : ""}
   <details class="panel issue-panel"><summary class="issue-summary"><span class="issue-summary-copy"><span class="eyebrow">手动签发</span><span class="issue-summary-title">上传申请文件</span></span><span class="issue-summary-action"><span class="issue-summary-closed">展开</span><span class="issue-summary-open">收起</span><span class="issue-summary-chevron" aria-hidden="true"></span></span></summary>
     <div class="scope-grid">
       <label class="scope"><input type="radio" name="manual-scope" value="home" checked><strong>当前 Home</strong><small>可访问此 Home 当前及以后发布的全部业务</small></label>
@@ -418,6 +491,17 @@ async function render(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#issue")?.addEventListener("click", () => void issue().catch((error) => flash(friendlyError(error), true)));
   document.querySelector<HTMLButtonElement>("#refresh")?.addEventListener("click", () => void renderCredentials().catch((error) => flash(friendlyError(error), true)));
   document.querySelector<HTMLButtonElement>("#refresh-pending")?.addEventListener("click", () => void renderPending().catch((error) => flash(friendlyError(error), true)));
+  document.querySelector<HTMLButtonElement>("#refresh-pending-homes")?.addEventListener("click", () => void renderPendingHomes().catch((error) => flash(friendlyError(error), true)));
+  const homeApprovalDialog = document.querySelector<HTMLDialogElement>("#home-approval-dialog");
+  document.querySelector<HTMLButtonElement>("#close-home-approval-dialog")?.addEventListener("click", () => homeApprovalDialog?.close());
+  homeApprovalDialog?.addEventListener("close", clearHomeApprovalDialog);
+  document.querySelector<HTMLFormElement>("#home-approval-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void approveHomeRemote().catch((error) => {
+      const notice = document.querySelector<HTMLElement>("#home-approval-dialog-notice");
+      if (notice) notice.textContent = friendlyError(error);
+    });
+  });
   const approvalDialog = document.querySelector<HTMLDialogElement>("#approval-dialog");
   document.querySelector<HTMLButtonElement>("#close-approval-dialog")?.addEventListener("click", () => approvalDialog?.close());
   approvalDialog?.addEventListener("close", clearApprovalDialog);
@@ -459,6 +543,7 @@ async function render(): Promise<void> {
   updateServiceField();
   await renderCredentials();
   await renderPending();
+  await renderPendingHomes();
 }
 
 void render().catch((error) => { app.innerHTML = `<section class="fatal"><h1>无法打开签发页面</h1><p>${escapeHtml(String(error))}</p></section>`; });

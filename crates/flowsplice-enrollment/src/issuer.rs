@@ -5,7 +5,10 @@ use aws_lc_rs::{
     rand::SystemRandom,
     signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _},
 };
-use flowsplice_core::{authorization::SignedTravelCredential, deployment::SignedDeploymentTrust};
+use flowsplice_core::{
+    authorization::SignedTravelCredential,
+    deployment::{SignedDeploymentTrust, SignedHomeEndpointCredential},
+};
 use rcgen::{Issuer, KeyPair, PublicKeyData};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use x509_parser::parse_x509_certificate;
@@ -26,6 +29,7 @@ pub struct ProtectedKey<'a> {
 pub struct IssuerMaterial<'a> {
     pub deployment_trust: &'a SignedDeploymentTrust,
     pub deployment_root_public_key: &'a str,
+    pub home_endpoint_credential: Option<&'a SignedHomeEndpointCredential>,
     pub management_ca_certificate: &'a Path,
     pub management_ca_key: ProtectedKey<'a>,
     pub business_ca_certificate: &'a Path,
@@ -42,6 +46,7 @@ pub struct IssuerMaterial<'a> {
 ///
 /// Returns an error for an invalid or stale approval, wrong key passwords, CA/key mismatches,
 /// an unexpected authorization key, or signing failures.
+#[allow(clippy::too_many_lines)]
 pub fn issue_enrollment(
     approval: TravelEnrollmentApproval,
     material: &IssuerMaterial<'_>,
@@ -56,7 +61,22 @@ pub fn issue_enrollment(
     {
         bail!("enrollment validity is outside the deployment-trusted authority window");
     }
-    let authority = trust.travel_authority_by_id(&approval.authority_id)?;
+    let endpoint_credentials = material
+        .home_endpoint_credential
+        .iter()
+        .map(|credential| (*credential).clone())
+        .collect::<Vec<_>>();
+    if let Some(endpoint) = material.home_endpoint_credential {
+        let endpoint = endpoint.verify(&trust, now)?;
+        if approval.not_after_unix_secs > endpoint.not_after_unix_secs {
+            bail!("enrollment validity exceeds the issuing Home endpoint validity");
+        }
+    }
+    let authorities = trust.travel_authorities_with_home_delegations(&endpoint_credentials, now)?;
+    let authority = authorities
+        .iter()
+        .find(|authority| authority.id() == approval.authority_id)
+        .ok_or_else(|| anyhow!("Travel authority {} is not trusted", approval.authority_id))?;
     let parsed = parse_enrollment_request(&approval.request, now)?;
 
     let management_issuer = load_ca_issuer(
@@ -141,13 +161,14 @@ pub fn issue_enrollment(
         version: crate::ENROLLMENT_VERSION,
         approval,
         deployment_trust: material.deployment_trust.clone(),
+        home_endpoint_credential: material.home_endpoint_credential.cloned(),
         management_certificate_pem,
         business_certificate_pem,
         signed_credential,
     })
 }
 
-fn load_ca_issuer(
+pub(crate) fn load_ca_issuer(
     certificate_path: &Path,
     protected_key: &ProtectedKey<'_>,
     label: &str,
@@ -291,6 +312,7 @@ mod tests {
                     management_spki_pins: vec!["11".repeat(32)],
                     business_spki_pins: vec!["22".repeat(32)],
                 }],
+                home_enrollment_authorities: vec![],
                 travel_authorities: vec![TrustedTravelAuthority::Home {
                     id: "home-1-authority".to_owned(),
                     epoch: 1,
@@ -318,6 +340,7 @@ mod tests {
         let material = IssuerMaterial {
             deployment_trust: &deployment_trust,
             deployment_root_public_key: &root_public_key,
+            home_endpoint_credential: None,
             management_ca_certificate: &management_ca.certificate,
             management_ca_key: ProtectedKey {
                 path: &management_ca.key,

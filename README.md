@@ -222,9 +222,16 @@ before using any Relay for business.
 For a detailed Chinese walkthrough, including recovery and replacement enrollment, see
 [Travel Quick Start (简体中文)](docs/QUICK_START.zh-CN.md).
 
-For a separate macOS arm64 Home 2, including serving-only and explicitly authorized issuer profiles,
-control-plane prerequisites, installation, launchd, and acceptance checks, see
+For a separate macOS arm64 Home 2, run one deployment-bound binary with
+`flowsplice-homeagent init --server <SERVER_IP>`. It generates its identity locally, waits for an
+existing global Home to approve one of the three permission profiles, then installs certificates,
+TOML, redb state, the binary, and launchd automatically. See
 [Second Home macOS Quick Start (简体中文)](docs/HOME2_QUICK_START.zh-CN.md).
+
+To create an entirely new deployment rather than add one endpoint, follow the standalone
+[Whole-system Cold Start guide (简体中文)](docs/COLD_START.zh-CN.md). It covers the offline root, both
+CAs, initial Server/Relay/global Home, deployment-bound packages, empty-directory Travel and Home
+bootstrap, acceptance, backup, and recovery without publishing real deployment secrets.
 
 ### Test, rotate, replace, and revoke
 
@@ -327,9 +334,10 @@ The script uses the lockfile and produces:
 
 `make home2-macos-package` builds and verifies the dedicated
 `dist/macos-arm64/flowsplice-home2-0.2.0-macos-arm64.tar.gz` bundle. It contains the same HomeAgent
-binary used by every Home plus separate serving-only and issuer configuration templates, a launchd
-template, the Chinese Quick Start, and internal SHA-256 checksums. It contains no certificate,
-private key, password, production address, or Server SPKI.
+binary used by every Home, the Chinese Quick Start, and internal SHA-256 checksums. The binary embeds
+only the deployment root public key, public Management CA certificate, Server identity/certificate
+name/control port, and local Home UI port needed by the one-command bootstrap. The archive contains no private key,
+password, generated Home certificate, TOML, production Server IP, or Server SPKI.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc

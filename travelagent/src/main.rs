@@ -1244,7 +1244,14 @@ fn load_initial_control_trust_state(
     let runtime_trust = cached
         .as_ref()
         .map_or(trust, |snapshot| snapshot.trust.clone());
-    configured_homes_are_trusted(&config.homes, &runtime_trust)?;
+    if let Some(snapshot) = cached.as_ref() {
+        configured_homes_are_trusted(
+            &config.homes,
+            &runtime_trust,
+            &snapshot.payload.catalog,
+            now,
+        )?;
+    }
     let mut batch = WriteBatch::new().put_json(
         Table::TravelControlState,
         CONTROL_STATE_KEY.to_vec(),
@@ -2048,7 +2055,13 @@ async fn open_business_on(
         .ok_or_else(|| anyhow!("Home {home_id} is not configured"))?;
     let home_spki_pins = {
         let trust = state.deployment_trust.read().await;
-        trusted_home_business_pins(&trust, &home.id)?.to_vec()
+        let catalog = state.catalog.read().await;
+        let endpoint_credential = catalog
+            .homes
+            .iter()
+            .find(|candidate| candidate.home_id == home.id)
+            .and_then(|home| home.endpoint_credential.as_ref());
+        trusted_home_business_pins(&trust, &home.id, endpoint_credential, unix_time_secs()?)?
     };
     let (grant, relay_id) = request_route(state, relay, home_id).await?;
     let mut socket = timeout(
@@ -2207,7 +2220,12 @@ async fn apply_control_snapshot(
 ) -> Result<()> {
     let verified = snapshot.verify(&state.deployment_root_public_key, unix_time_secs()?)?;
     require_control_snapshot_subject(&verified, &state.config.id, &state.management_spki_sha256)?;
-    configured_homes_are_trusted(&state.config.homes, &verified.trust)?;
+    configured_homes_are_trusted(
+        &state.config.homes,
+        &verified.trust,
+        &verified.payload.catalog,
+        unix_time_secs()?,
+    )?;
     require_authenticated_relay_in_snapshot(
         &verified,
         authenticated_relay_id,
@@ -2366,18 +2384,35 @@ fn require_control_snapshot_subject(
     Ok(())
 }
 
-fn configured_homes_are_trusted(homes: &[ConfiguredHome], trust: &DeploymentTrust) -> Result<()> {
+fn configured_homes_are_trusted(
+    homes: &[ConfiguredHome],
+    trust: &DeploymentTrust,
+    catalog: &Catalog,
+    now: u64,
+) -> Result<()> {
     for home in homes {
-        trust.home_endpoint(&home.id)?;
+        let catalog_home = catalog
+            .homes
+            .iter()
+            .find(|candidate| candidate.home_id == home.id);
+        trust.resolve_home_endpoint(
+            &home.id,
+            catalog_home.and_then(|home| home.endpoint_credential.as_ref()),
+            now,
+        )?;
     }
     Ok(())
 }
 
-fn trusted_home_business_pins<'a>(
-    trust: &'a DeploymentTrust,
+fn trusted_home_business_pins(
+    trust: &DeploymentTrust,
     home_id: &str,
-) -> Result<&'a [String]> {
-    Ok(&trust.home_endpoint(home_id)?.business_spki_pins)
+    endpoint_credential: Option<&flowsplice_core::deployment::SignedHomeEndpointCredential>,
+    now: u64,
+) -> Result<Vec<String>> {
+    Ok(trust
+        .resolve_home_endpoint(home_id, endpoint_credential, now)?
+        .business_spki_pins)
 }
 
 fn require_authenticated_relay_in_snapshot(
@@ -3160,6 +3195,7 @@ mod tests {
                 business_ca_certificate_pem: String::new(),
                 server_control_keys: Vec::new(),
                 home_endpoints: Vec::new(),
+                home_enrollment_authorities: Vec::new(),
                 travel_authorities: Vec::<TrustedTravelAuthority>::new(),
             },
             trust_digest_sha256: format!("trust-{trust_generation}"),
@@ -3241,7 +3277,9 @@ mod tests {
                 &[ConfiguredHome {
                     id: "home-1".to_owned(),
                 }],
-                &snapshot.trust
+                &snapshot.trust,
+                &snapshot.payload.catalog,
+                2,
             )
             .is_ok()
         );
@@ -3250,15 +3288,17 @@ mod tests {
                 &[ConfiguredHome {
                     id: "home-2".to_owned(),
                 }],
-                &snapshot.trust
+                &snapshot.trust,
+                &snapshot.payload.catalog,
+                2,
             )
             .is_err()
         );
         assert_eq!(
-            trusted_home_business_pins(&snapshot.trust, "home-1").unwrap_or_default(),
-            &["22".repeat(32)]
+            trusted_home_business_pins(&snapshot.trust, "home-1", None, 2).unwrap_or_default(),
+            vec!["22".repeat(32)]
         );
-        assert!(trusted_home_business_pins(&snapshot.trust, "home-2").is_err());
+        assert!(trusted_home_business_pins(&snapshot.trust, "home-2", None, 2).is_err());
     }
 
     #[test]

@@ -37,6 +37,10 @@ private_key = "/issuer/home1-authority.key"
 id = "operator-global-authority"
 private_key = "/issuer/global-authority.key"
 
+[issuer.home_enrollment_authority]
+id = "operator-home-enrollment-authority"
+private_key = "/issuer/home-enrollment-authority.key"
+
 [[services]]
 id = "tcp-echo"
 alias = "TCP Echo"

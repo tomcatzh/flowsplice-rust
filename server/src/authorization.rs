@@ -1,11 +1,12 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use flowsplice_core::authorization::{
     SignedTravelCredential, TravelAuthorizationSnapshot, TravelRevocation, TrustedTravelAuthority,
     VerifiedAuthorization, load_json, store_json_atomic, unix_time_secs,
     validate_trusted_authorities,
 };
+use flowsplice_core::deployment::{DeploymentTrust, SignedHomeEndpointCredential};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,6 +24,7 @@ impl Default for PersistentAuthorizationState {
             version: AUTHORIZATION_STATE_VERSION,
             snapshot: TravelAuthorizationSnapshot {
                 generation: 1,
+                home_endpoint_credentials: Vec::new(),
                 credentials: Vec::new(),
                 revocations: Vec::new(),
             },
@@ -46,14 +48,7 @@ pub struct ServerAuthorization {
 }
 
 impl ServerAuthorization {
-    pub fn validate(
-        deployment_id: String,
-        authorities: Vec<TrustedTravelAuthority>,
-        state_path: PathBuf,
-    ) -> Result<()> {
-        Self::load_inner(deployment_id, authorities, state_path).map(|_| ())
-    }
-
+    #[cfg(test)]
     pub fn load(
         deployment_id: String,
         authorities: Vec<TrustedTravelAuthority>,
@@ -62,18 +57,54 @@ impl ServerAuthorization {
         Self::load_inner(deployment_id, authorities, state_path)
     }
 
+    pub fn validate_with_trust(trust: DeploymentTrust, state_path: PathBuf) -> Result<()> {
+        let state = load_state(&state_path)?;
+        let authorities = trust.travel_authorities_with_home_delegations(
+            &state.snapshot.home_endpoint_credentials,
+            unix_time_secs()?,
+        )?;
+        Self::from_state(trust.deployment_id, authorities, state_path, state).map(|_| ())
+    }
+
+    pub fn load_with_trust(trust: DeploymentTrust, state_path: PathBuf) -> Result<Self> {
+        let (mut state, legacy_snapshot_encoding) = load_state_with_format(&state_path)?;
+        migrate_legacy_snapshot_generation(&mut state, legacy_snapshot_encoding)?;
+        let authorities = trust.travel_authorities_with_home_delegations(
+            &state.snapshot.home_endpoint_credentials,
+            unix_time_secs()?,
+        )?;
+        let authorization = Self::from_state(trust.deployment_id, authorities, state_path, state)?;
+        if legacy_snapshot_encoding {
+            authorization.persist(
+                &authorization.snapshot,
+                &authorization.used_enrollment_requests,
+            )?;
+            tracing::info!(
+                event = "travel_authorization_schema_migrated",
+                generation = authorization.snapshot.generation,
+                "migrated legacy Travel authorization snapshot with a generation increase"
+            );
+        }
+        Ok(authorization)
+    }
+
+    #[cfg(test)]
     fn load_inner(
         deployment_id: String,
         authorities: Vec<TrustedTravelAuthority>,
         state_path: PathBuf,
     ) -> Result<Self> {
+        let state = load_state(&state_path)?;
+        Self::from_state(deployment_id, authorities, state_path, state)
+    }
+
+    fn from_state(
+        deployment_id: String,
+        authorities: Vec<TrustedTravelAuthority>,
+        state_path: PathBuf,
+        state: PersistentAuthorizationState,
+    ) -> Result<Self> {
         validate_trusted_authorities(&authorities)?;
-        let state: PersistentAuthorizationState = load_json(&state_path).map_err(|error| {
-            anyhow!(
-                "authorization state {} is missing or invalid; initialize an empty state explicitly: {error}",
-                state_path.display()
-            )
-        })?;
         if state.version != AUTHORIZATION_STATE_VERSION {
             bail!("unsupported authorization state version {}", state.version);
         }
@@ -103,6 +134,75 @@ impl ServerAuthorization {
 
     pub const fn verified(&self) -> &VerifiedAuthorization {
         &self.verified
+    }
+
+    pub fn global_issuer_home_ids(&self) -> HashSet<String> {
+        self.authorities
+            .iter()
+            .filter_map(|authority| match authority {
+                TrustedTravelAuthority::Global { home_id, .. } => Some(home_id.clone()),
+                TrustedTravelAuthority::Home { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn home_endpoint_credential(
+        &self,
+        home_id: &str,
+        trust: &DeploymentTrust,
+    ) -> Result<Option<SignedHomeEndpointCredential>> {
+        let now = unix_time_secs()?;
+        Ok(self
+            .snapshot
+            .home_endpoint_credentials
+            .iter()
+            .find(|credential| {
+                credential
+                    .verify(trust, now)
+                    .is_ok_and(|endpoint| endpoint.home_id == home_id)
+            })
+            .cloned())
+    }
+
+    pub fn import_home_endpoint(
+        &mut self,
+        trust: &DeploymentTrust,
+        signed: SignedHomeEndpointCredential,
+    ) -> Result<bool> {
+        let now = unix_time_secs()?;
+        let endpoint = signed.verify(trust, now)?;
+        if let Some(existing) = self
+            .snapshot
+            .home_endpoint_credentials
+            .iter()
+            .find(|existing| {
+                existing
+                    .verify(trust, now)
+                    .is_ok_and(|value| value.home_id == endpoint.home_id)
+            })
+        {
+            if existing == &signed {
+                return Ok(false);
+            }
+            bail!(
+                "Home {} already has different endpoint authorization",
+                endpoint.home_id
+            );
+        }
+        let mut proposed = self.snapshot.clone();
+        proposed.generation = proposed
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Travel authorization generation exhausted"))?;
+        proposed.home_endpoint_credentials.push(signed);
+        let authorities = trust
+            .travel_authorities_with_home_delegations(&proposed.home_endpoint_credentials, now)?;
+        let verified = VerifiedAuthorization::verify(&proposed, &authorities, &self.deployment_id)?;
+        self.persist(&proposed, &self.used_enrollment_requests)?;
+        self.snapshot = proposed;
+        self.authorities = authorities;
+        self.verified = verified;
+        Ok(true)
     }
 
     pub fn revoke_from_home(
@@ -224,7 +324,8 @@ impl ServerAuthorization {
 }
 
 fn validate_state_size(state: &PersistentAuthorizationState) -> Result<()> {
-    if state.snapshot.credentials.len() > MAX_CREDENTIALS
+    if state.snapshot.home_endpoint_credentials.len() > 64
+        || state.snapshot.credentials.len() > MAX_CREDENTIALS
         || state.snapshot.revocations.len() > MAX_REVOCATIONS
     {
         bail!(
@@ -236,6 +337,46 @@ fn validate_state_size(state: &PersistentAuthorizationState) -> Result<()> {
         bail!("authorization state exceeds {MAX_STATE_BYTES} bytes");
     }
     Ok(())
+}
+
+fn load_state(state_path: &std::path::Path) -> Result<PersistentAuthorizationState> {
+    load_json(state_path).map_err(|error| {
+        anyhow!(
+            "authorization state {} is missing or invalid; initialize an empty state explicitly: {error}",
+            state_path.display()
+        )
+    })
+}
+
+fn load_state_with_format(
+    state_path: &std::path::Path,
+) -> Result<(PersistentAuthorizationState, bool)> {
+    let bytes =
+        fs::read(state_path).with_context(|| format!("failed to read {}", state_path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    let legacy_snapshot_encoding = value
+        .get("snapshot")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|snapshot| !snapshot.contains_key("home_endpoint_credentials"));
+    let state = serde_json::from_value(value)
+        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    Ok((state, legacy_snapshot_encoding))
+}
+
+fn migrate_legacy_snapshot_generation(
+    state: &mut PersistentAuthorizationState,
+    legacy_snapshot_encoding: bool,
+) -> Result<bool> {
+    if !legacy_snapshot_encoding {
+        return Ok(false);
+    }
+    state.snapshot.generation = state
+        .snapshot
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Travel authorization generation exhausted"))?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -323,6 +464,7 @@ mod tests {
                 version: AUTHORIZATION_STATE_VERSION,
                 snapshot: TravelAuthorizationSnapshot {
                     generation: 1,
+                    home_endpoint_credentials: Vec::new(),
                     credentials,
                     revocations: Vec::new(),
                 },
@@ -472,6 +614,40 @@ mod tests {
             ServerAuthorization::load("deployment-1".to_owned(), authorities(&key), missing,)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_snapshot_field_addition_requires_and_persists_a_generation_increase() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("flowsplice-schema-migration-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory)?;
+        let state_path = directory.join("authorization.json");
+        let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("failed to generate fixture key"))?;
+        store_state_with_key(&state_path, &key, Vec::new())?;
+
+        let mut legacy: serde_json::Value = load_json(&state_path)?;
+        legacy
+            .get_mut("snapshot")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| anyhow!("fixture snapshot is missing"))?
+            .remove("home_endpoint_credentials");
+        fs::write(&state_path, serde_json::to_vec_pretty(&legacy)?)?;
+
+        let (mut state, legacy_snapshot_encoding) = load_state_with_format(&state_path)?;
+        assert!(legacy_snapshot_encoding);
+        assert!(migrate_legacy_snapshot_generation(
+            &mut state,
+            legacy_snapshot_encoding
+        )?);
+        assert_eq!(state.snapshot.generation, 2);
+        store_json_atomic(&state_path, &state)?;
+
+        let (persisted, legacy_snapshot_encoding) = load_state_with_format(&state_path)?;
+        assert!(!legacy_snapshot_encoding);
+        assert_eq!(persisted.snapshot.generation, 2);
+        fs::remove_dir_all(directory)?;
         Ok(())
     }
 }

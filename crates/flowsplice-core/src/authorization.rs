@@ -103,6 +103,8 @@ pub struct TravelRevocation {
 #[serde(deny_unknown_fields)]
 pub struct TravelAuthorizationSnapshot {
     pub generation: u64,
+    #[serde(default)]
+    pub home_endpoint_credentials: Vec<crate::deployment::SignedHomeEndpointCredential>,
     pub credentials: Vec<SignedTravelCredential>,
     pub revocations: Vec<TravelRevocation>,
 }
@@ -789,6 +791,7 @@ mod tests {
             generation: 1,
             credentials: vec![signed],
             revocations: vec![],
+            home_endpoint_credentials: vec![],
         };
         let authorization = VerifiedAuthorization::verify(&snapshot, &[authority], "deployment-1")?;
         let management = PeerIdentity {
@@ -857,6 +860,7 @@ mod tests {
                     generation: 1,
                     credentials: vec![valid],
                     revocations: vec![wrong_revocation],
+                    home_endpoint_credentials: vec![],
                 },
                 &[authority],
                 "deployment-1",
@@ -874,6 +878,7 @@ mod tests {
                     revoked_at_unix_secs: 150,
                     reason: "stolen".to_owned(),
                 }],
+                home_endpoint_credentials: vec![],
             },
             std::slice::from_ref(&authority),
             "deployment-1",
@@ -884,6 +889,7 @@ mod tests {
                 generation: 2,
                 credentials: vec![valid],
                 revocations: vec![],
+                home_endpoint_credentials: vec![],
             },
             &[authority],
             "deployment-1",
@@ -899,6 +905,7 @@ mod tests {
                     revoked_at_unix_secs: 151,
                     reason: "different signed state".to_owned(),
                 }],
+                home_endpoint_credentials: vec![],
             },
             std::slice::from_ref(&same_authority),
             "deployment-1",
@@ -919,6 +926,7 @@ mod tests {
                     revoked_at_unix_secs: 150,
                     reason: "stolen".to_owned(),
                 }],
+                home_endpoint_credentials: vec![],
             },
             &[authority],
             "deployment-1",
