@@ -125,18 +125,4 @@ bind = "127.0.0.1:10080"
 
 删除/撤销凭据必须在签发它的 Home 页面执行，并再次输入 Home 签发密码。错误密码不改变状态。成功操作产生不可回滚的签名撤销记录；界面隐藏活动凭据不代表删除审计与防回滚历史。
 
-## 手工恢复路径
-
-只有远程 bootstrap 确实不可用时，才使用旧的恢复流程：
-
-```bash
-./flowsplice-travelagent enroll-init \
-  --travel-id travel-laptop \
-  --enrollment-dir ./cert
-
-./flowsplice-travelagent enroll-import \
-  --enrollment-dir ./cert \
-  --response ./enrollment-response.json
-```
-
-这条路径需要人工传递公开 enrollment 请求和签名响应；仍然不得传递 Travel 私钥或 Home 签发密码。
+Home 后台只提供远程审批，不再提供上传申请文件、下载签发结果的手工入口。首次注册和换发都通过现有控制连接自动传输公开申请与签名响应。

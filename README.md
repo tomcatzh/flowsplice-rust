@@ -260,8 +260,8 @@ the issuer password; after the signed response returns, the Travel operator ente
 password to install it. Restart activates the replacement identity; the new process confirms
 installation to Home, after which both durable lifecycle records are retired.
 
-The older `enroll-init` / Home manual signer / `enroll-import` workflow remains an explicit recovery
-path. It is not required by the normal first-device Quick Start.
+The Home UI exposes only remote approval. It has no request-file upload/download signer; enrollment
+and replacement responses travel through the authenticated control path.
 
 Travel, Relay, and Home keep only locally observed business metrics in five-minute redb buckets and
 serve loopback statistics pages with rolling day/week/month/year report windows. Nodes sign summaries with their

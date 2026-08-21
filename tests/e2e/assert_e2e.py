@@ -66,6 +66,25 @@ def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True)
     return decoded
 
 
+def issuer_raw_status(port: int, method: str, path: str, body=None) -> int:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
+    encoded = None if body is None else json.dumps(body).encode()
+    connection.request(
+        method,
+        path,
+        body=encoded,
+        headers={
+            "Authorization": ISSUER_AUTHORIZATION,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    response = connection.getresponse()
+    response.read()
+    connection.close()
+    return response.status
+
+
 def travel_request(method: str, path: str, body=None, expect_ok=True):
     connection = http.client.HTTPConnection("127.0.0.1", 19080, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
@@ -558,7 +577,7 @@ def check_embedded_spa() -> None:
     assert issuer_status == 200
     if issuer_headers.get("content-encoding") == "gzip":
         issuer_body = gzip.decompress(issuer_body)
-    assert "FlowSplice · 旅行端签发".encode() in issuer_body
+    assert "FlowSplice · Home 后台管理".encode() in issuer_body
 
     issuer_asset_match = re.search(
         rb'(?:src|href)="(/assets/[^"]+\.(?:js|css))"', issuer_body
@@ -575,11 +594,12 @@ def check_embedded_spa() -> None:
         assert "后台管理".encode() in issuer_javascript
         assert "旅行端凭据签发".encode() not in issuer_javascript
         assert "更改 Home 签发密码".encode() in issuer_javascript
-        assert "此前已经签发".encode() in issuer_javascript
         assert "业务统计".encode() in issuer_javascript
         assert "交付流量与 Relay 路径".encode() in issuer_javascript
-        assert b'<details class="panel issue-panel">' in issuer_javascript
-        assert "手动签发".encode() in issuer_javascript
+        assert b'<details class="panel issue-panel">' not in issuer_javascript
+        assert "手动签发".encode() not in issuer_javascript
+        assert "上传申请文件".encode() not in issuer_javascript
+        assert b'"/api/issue"' not in issuer_javascript
         assert "批准使用下方".encode() not in issuer_javascript
         assert "批准并远程返回".encode() in issuer_javascript
         assert "必须用签发密码确认".encode() in issuer_javascript
@@ -587,8 +607,13 @@ def check_embedded_spa() -> None:
         assert b'class="stat-card"' in issuer_javascript
         assert b'class="stats-note"' in issuer_javascript
         assert b'class="statistics-cards"' not in issuer_javascript
-        assert b'data-page="overview"' in issuer_javascript
+        assert b'data-page="approvals"' in issuer_javascript
+        assert b'data-page="credentials"' in issuer_javascript
         assert b'data-page="statistics"' in issuer_javascript
+        assert "首页只显示仍需人工处理的申请".encode() in issuer_javascript
+        assert "凭据历史只在打开本页".encode() in issuer_javascript
+        assert b"page_size" in issuer_javascript
+        assert b"document.title" in issuer_javascript
         assert "统计数据只在打开本页".encode() in issuer_javascript
         assert b"window.prompt" not in issuer_javascript
 
@@ -619,6 +644,52 @@ def check_embedded_spa() -> None:
     )
     assert issuer_api_status == 404
     assert issuer_missing_asset_status == 404
+    assert issuer_raw_status(19081, "POST", "/api/issue", {}) == 404
+
+    pending_travel = issuer_request(
+        19081, "GET", "/api/enrollment/pending?page=1&page_size=20"
+    )
+    pending_home = issuer_request(
+        19081, "GET", "/api/home-enrollment/pending?page=1&page_size=20"
+    )
+    for pending in (pending_travel, pending_home):
+        assert pending["page"] == 1 and pending["page_size"] == 20, pending
+        assert pending["total"] == len(pending["items"]), pending
+        assert pending["total_pages"] == 1, pending
+        assert all(record["approved"] is False for record in pending["items"]), pending
+
+    credentials = issuer_request(
+        19081, "GET", "/api/credentials?status=all&page=1&page_size=1"
+    )
+    assert credentials["page"] == 1 and credentials["page_size"] == 1, credentials
+    assert credentials["total"] >= 1 and len(credentials["items"]) == 1, credentials
+    last_credentials_page = issuer_request(
+        19081, "GET", "/api/credentials?status=all&page=999&page_size=1"
+    )
+    assert last_credentials_page["page"] == last_credentials_page["total_pages"]
+    known_travel_id = credentials["items"][0]["travel_id"]
+    matching_credentials = issuer_request(
+        19081,
+        "GET",
+        f"/api/credentials?status=all&page=1&page_size=20&search={known_travel_id}",
+    )
+    assert matching_credentials["total"] >= 1, matching_credentials
+    assert all(
+        known_travel_id in credential["travel_id"]
+        for credential in matching_credentials["items"]
+    ), matching_credentials
+    issuer_request(
+        19081,
+        "GET",
+        "/api/credentials?status=unknown&page=1&page_size=20",
+        expect_ok=False,
+    )
+    issuer_request(
+        19081,
+        "GET",
+        "/api/credentials?status=all&page=1&page_size=101",
+        expect_ok=False,
+    )
 
 
 def check_duplicate_travel_login_is_rejected() -> None:
@@ -663,7 +734,7 @@ def issue_scope(
     result = issuer_request(
         port,
         "POST",
-        "/api/issue",
+        "/api/test/issue",
         {
             "request": request,
             **validity,
@@ -710,7 +781,12 @@ def revoke_with_wrong_password(port: int, credential_id: str) -> dict:
 
 
 def issued_credentials(port: int) -> list[dict]:
-    return issuer_request(port, "GET", "/api/credentials")
+    response = issuer_request(
+        port, "GET", "/api/credentials?status=all&page=1&page_size=100"
+    )
+    assert response["page"] == 1 and response["page_size"] == 100, response
+    assert response["total"] == len(response["items"]), response
+    return response["items"]
 
 
 def container_pid(service: str) -> int:
@@ -789,7 +865,7 @@ def check_duplicate_enrollment_issue_is_idempotent(
     result = issuer_request(
         19081,
         "POST",
-        "/api/issue",
+        "/api/test/issue",
         {
             "request": json.loads(
                 (generated / "travel/enrollment-request.json").read_text()
@@ -809,7 +885,7 @@ def check_duplicate_enrollment_issue_is_idempotent(
     changed_scope = issuer_request(
         19081,
         "POST",
-        "/api/issue",
+        "/api/test/issue",
         {
             "request": json.loads(
                 (generated / "travel/enrollment-request.json").read_text()
@@ -931,7 +1007,7 @@ def prepare_remote_enrollment() -> tuple[str, str]:
     deadline = time.monotonic() + 90
     pending = None
     while time.monotonic() < deadline:
-        records = issuer_request(19081, "GET", "/api/enrollment/pending")
+        records = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
         pending = next(
             (record for record in records if record["request_id"] == request_id), None
         )
@@ -954,7 +1030,7 @@ def prepare_remote_enrollment() -> tuple[str, str]:
     )
     pending_after_wrong_password = next(
         record
-        for record in issuer_request(19081, "GET", "/api/enrollment/pending")
+        for record in issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
         if record["request_id"] == request_id
     )
     assert pending_after_wrong_password["approved"] is False
@@ -1001,7 +1077,7 @@ def activate_remote_enrollment(request_id: str, password: str) -> tuple[dict, st
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         travel_pending = travel_request("GET", "/api/enrollment")
-        home_pending = issuer_request(19081, "GET", "/api/enrollment/pending")
+        home_pending = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
         if (
             all(record["request_id"] != request_id for record in travel_pending)
             and all(record["request_id"] != request_id for record in home_pending)
@@ -1022,8 +1098,8 @@ def check_home2_remote_enrollment(password: str) -> str:
     deadline = time.monotonic() + 90
     pending = None
     while time.monotonic() < deadline:
-        home_one_records = issuer_request(19081, "GET", "/api/enrollment/pending")
-        home_two_records = issuer_request(29081, "GET", "/api/enrollment/pending")
+        home_one_records = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
+        home_two_records = issuer_request(29081, "GET", "/api/enrollment/pending")["items"]
         assert all(record["request_id"] != request_id for record in home_one_records)
         pending = next(
             (record for record in home_two_records if record["request_id"] == request_id),
@@ -1096,7 +1172,7 @@ def check_home2_remote_enrollment(password: str) -> str:
             )
             and all(
                 record["request_id"] != request_id
-                for record in issuer_request(29081, "GET", "/api/enrollment/pending")
+                for record in issuer_request(29081, "GET", "/api/enrollment/pending")["items"]
             )
         ):
             break
@@ -1483,7 +1559,7 @@ def check_scoped_authorization_and_home_revocation(
     revoked_retry = issuer_request(
         19081,
         "POST",
-        "/api/issue",
+        "/api/test/issue",
         {
             "request": json.loads(
                 (generated / "travel/enrollment-request.json").read_text()
@@ -1670,6 +1746,9 @@ checks = [
     "independent-enrollment-nonce-bound",
     "single-file-enrollment-response-includes-ca-roots",
     "home-embedded-issuer-ui",
+    "home-action-inbox-excludes-history",
+    "home-credential-history-pagination-filter-and-search",
+    "home-manual-issuance-route-removed",
     "home-dual-ca-issuance",
     "duplicate-enrollment-issue-is-idempotent",
     "enrollment-request-is-single-use",

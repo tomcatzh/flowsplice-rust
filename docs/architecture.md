@@ -80,7 +80,7 @@ in a redb-backed inbox. The response returns along the reverse authenticated pat
 and requires the local private-key password before installation, then activates the replacement
 identity on restart. The new authenticated process sends an install acknowledgement bound to the
 new credential; Home retires the response and Travel retires its outbox only after the acknowledgement
-returns. The manual file workflow remains a recovery path, not the normal first-device workflow.
+returns. The Home product UI has no manual request/response file workflow.
 
 Every outer frame and payload has a hard bound. The stateful frame decoder is safe to resume after cancellation and all pre-trust/setup reads and writes have deadlines. Catalog/Relay counts, pending work/routes, control/data connections, active Home/Travel flows, Carriers globally and per Flow, unacknowledged byte buffers, and authorization state all have explicit ceilings. Carrier tasks acquire process and per-Flow permits before admission, and byte permits are held until the logical data has been acknowledged or discarded.
 

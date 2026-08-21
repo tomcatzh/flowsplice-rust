@@ -19,7 +19,7 @@ use aws_lc_rs::{
 };
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{Method, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
@@ -475,9 +475,38 @@ struct IssuedCredentialStatus {
     travel_id: String,
     authority_id: String,
     scope: TravelCredentialScope,
+    not_before_unix_secs: u64,
     not_after_unix_secs: u64,
     revoked: bool,
     active: bool,
+}
+
+const DEFAULT_LIST_PAGE_SIZE: usize = 20;
+const MAX_LIST_PAGE_SIZE: usize = 100;
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialListQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    status: Option<String>,
+    search: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PagedResponse<T> {
+    items: Vec<T>,
+    page: usize,
+    page_size: usize,
+    total: usize,
+    total_pages: usize,
 }
 
 #[derive(Serialize)]
@@ -2249,7 +2278,6 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
             "/home-enrollment/approve",
             post(api_approve_home_enrollment),
         )
-        .route("/issue", post(api_issue))
         .route("/revoke", post(api_revoke))
         .route(
             "/private-key-password",
@@ -2257,7 +2285,7 @@ async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
         )
         .fallback(|| async { StatusCode::NOT_FOUND });
     #[cfg(feature = "e2e-remote-ui")]
-    let api = api.route(
+    let api = api.route("/test/issue", post(api_issue)).route(
         "/test/statistics-flush-failures",
         get(api_statistics_flush_fault_status).post(api_inject_statistics_flush_faults),
     );
@@ -2426,9 +2454,37 @@ struct RemoteEnrollmentStatus {
     verification_code: Option<String>,
 }
 
+fn pagination_values(page: Option<usize>, page_size: Option<usize>) -> Result<(usize, usize)> {
+    let page = page.unwrap_or(1);
+    let page_size = page_size.unwrap_or(DEFAULT_LIST_PAGE_SIZE);
+    if page == 0 {
+        bail!("page must be at least 1");
+    }
+    if !(1..=MAX_LIST_PAGE_SIZE).contains(&page_size) {
+        bail!("page_size must be between 1 and {MAX_LIST_PAGE_SIZE}");
+    }
+    Ok((page, page_size))
+}
+
+fn paginate<T>(items: Vec<T>, page: usize, page_size: usize) -> PagedResponse<T> {
+    let total = items.len();
+    let total_pages = total.div_ceil(page_size).max(1);
+    let page = page.min(total_pages);
+    let start = (page - 1) * page_size;
+    PagedResponse {
+        items: items.into_iter().skip(start).take(page_size).collect(),
+        page,
+        page_size,
+        total,
+        total_pages,
+    }
+}
+
 async fn api_pending_remote_enrollments(
     State(state): State<IssuerAppState>,
-) -> ApiResult<Vec<RemoteEnrollmentStatus>> {
+    Query(query): Query<ListQuery>,
+) -> ApiResult<PagedResponse<RemoteEnrollmentStatus>> {
+    let (page, page_size) = pagination_values(query.page, query.page_size).map_err(api_error)?;
     let store = Arc::clone(&state.statistics.store);
     tokio::task::spawn_blocking(move || {
         let mut records = store
@@ -2440,19 +2496,20 @@ async fn api_pending_remote_enrollments(
             })
             .collect::<Result<Vec<_>>>()?;
         records.sort_by_key(|record| record.received_at_unix_secs);
-        Ok(records
+        let pending = records
             .into_iter()
-            .filter(|record| record.installed_credential_id.is_none())
+            .filter(|record| record.response.is_none() && record.installed_credential_id.is_none())
             .map(|record| RemoteEnrollmentStatus {
                 request_id: record.request.request_id,
                 travel_id: record.travel_id,
                 home_id: record.home_id,
                 received_at_unix_secs: record.received_at_unix_secs,
-                approved: record.response.is_some(),
+                approved: false,
                 bootstrap: record.bootstrap_token_sha256.is_some(),
                 verification_code: record.verification_code,
             })
-            .collect())
+            .collect();
+        Ok(paginate(pending, page, page_size))
     })
     .await
     .context("Home enrollment inbox query task failed")
@@ -2472,12 +2529,14 @@ async fn api_approve_remote_enrollment(
 
 async fn api_pending_home_enrollments(
     State(state): State<IssuerAppState>,
-) -> ApiResult<Vec<HomeEnrollmentStatus>> {
+    Query(query): Query<ListQuery>,
+) -> ApiResult<PagedResponse<HomeEnrollmentStatus>> {
     if state.issuer.global_authority.is_none() || state.issuer.home_enrollment_authority.is_none() {
         return Err(api_error(anyhow::anyhow!(
             "this Home is not a global Home enrollment issuer"
         )));
     }
+    let (page, page_size) = pagination_values(query.page, query.page_size).map_err(api_error)?;
     let store = Arc::clone(&state.statistics.store);
     tokio::task::spawn_blocking(move || {
         let mut records = store
@@ -2489,17 +2548,19 @@ async fn api_pending_home_enrollments(
             })
             .collect::<Result<Vec<_>>>()?;
         records.sort_by_key(|record| record.received_at_unix_secs);
-        Ok(records
+        let pending = records
             .into_iter()
+            .filter(|record| record.response.is_none())
             .map(|record| HomeEnrollmentStatus {
                 request_id: record.request.request_id,
                 home_id: record.home_id,
                 received_at_unix_secs: record.received_at_unix_secs,
-                approved: record.response.is_some(),
+                approved: false,
                 verification_code: record.verification_code,
-                profile: record.response.map(|response| response.approval.profile),
+                profile: None,
             })
-            .collect())
+            .collect();
+        Ok(paginate(pending, page, page_size))
     })
     .await
     .context("Home enrollment inbox query task failed")
@@ -2655,7 +2716,26 @@ async fn approve_remote_enrollment(
 
 async fn api_issued_credentials(
     State(state): State<IssuerAppState>,
-) -> Json<Vec<IssuedCredentialStatus>> {
+    Query(query): Query<CredentialListQuery>,
+) -> ApiResult<PagedResponse<IssuedCredentialStatus>> {
+    let (page, page_size) = pagination_values(query.page, query.page_size).map_err(api_error)?;
+    let requested_status = query.status.as_deref().unwrap_or("active");
+    if !matches!(requested_status, "active" | "revoked" | "expired" | "all") {
+        return Err(api_error(anyhow::anyhow!(
+            "status must be active, revoked, expired, or all"
+        )));
+    }
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    if search.as_ref().is_some_and(|value| value.len() > 128) {
+        return Err(api_error(anyhow::anyhow!(
+            "credential search must not exceed 128 bytes"
+        )));
+    }
     let now = unix_time_secs().unwrap_or_default();
     let authority_ids = [
         Some(state.issuer.home_authority.id.as_str()),
@@ -2669,7 +2749,7 @@ async fn api_issued_credentials(
     .flatten()
     .collect::<std::collections::HashSet<_>>();
     let Some(authorization) = state.authorization.tx.borrow().clone() else {
-        return Json(Vec::new());
+        return Ok(Json(paginate(Vec::new(), page, page_size)));
     };
     let mut credentials = authorization
         .credentials()
@@ -2679,21 +2759,43 @@ async fn api_issued_credentials(
             travel_id: credential.travel_id.clone(),
             authority_id: credential.authority_id.clone(),
             scope: credential.scope.clone(),
+            not_before_unix_secs: credential.not_before_unix_secs,
             not_after_unix_secs: credential.not_after_unix_secs,
             revoked: authorization
                 .revoked_credentials()
                 .contains(&credential.credential_id),
             active: authorization.is_active(credential.credential_id, now),
         })
+        .filter(|credential| match requested_status {
+            "active" => credential.active,
+            "revoked" => credential.revoked,
+            "expired" => !credential.active && !credential.revoked,
+            "all" => true,
+            _ => unreachable!(),
+        })
+        .filter(|credential| {
+            search.as_ref().is_none_or(|search| {
+                credential.travel_id.to_lowercase().contains(search)
+                    || credential
+                        .credential_id
+                        .to_string()
+                        .to_lowercase()
+                        .contains(search)
+            })
+        })
         .collect::<Vec<_>>();
     credentials.sort_by(|left, right| {
-        left.travel_id
-            .cmp(&right.travel_id)
+        right
+            .active
+            .cmp(&left.active)
+            .then_with(|| right.not_before_unix_secs.cmp(&left.not_before_unix_secs))
+            .then_with(|| left.travel_id.cmp(&right.travel_id))
             .then_with(|| left.credential_id.cmp(&right.credential_id))
     });
-    Json(credentials)
+    Ok(Json(paginate(credentials, page, page_size)))
 }
 
+#[cfg(feature = "e2e-remote-ui")]
 async fn api_issue(
     State(state): State<IssuerAppState>,
     Json(request): Json<IssueRequest>,
@@ -3116,8 +3218,9 @@ mod tests {
     use axum::{body::Body, extract::Request, http::Method};
 
     use super::{
-        Config, local_ui_request_allowed, remote_enrollment_capacity_available,
-        remote_enrollment_inbox_expired, requested_validity_secs,
+        Config, local_ui_request_allowed, paginate, pagination_values,
+        remote_enrollment_capacity_available, remote_enrollment_inbox_expired,
+        requested_validity_secs,
     };
     use anyhow::Result;
 
@@ -3156,6 +3259,25 @@ mod tests {
     }
 
     #[test]
+    fn list_pagination_is_bounded_and_clamps_after_removal() -> Result<()> {
+        assert_eq!(pagination_values(None, None)?, (1, 20));
+        assert!(pagination_values(Some(0), Some(20)).is_err());
+        assert!(pagination_values(Some(1), Some(101)).is_err());
+
+        let second = paginate((0..45).collect::<Vec<_>>(), 2, 20);
+        assert_eq!(second.page, 2);
+        assert_eq!(second.total, 45);
+        assert_eq!(second.total_pages, 3);
+        assert_eq!(second.items, (20..40).collect::<Vec<_>>());
+
+        let clamped = paginate(vec![7], 9, 20);
+        assert_eq!(clamped.page, 1);
+        assert_eq!(clamped.total_pages, 1);
+        assert_eq!(clamped.items, vec![7]);
+        Ok(())
+    }
+
+    #[test]
     fn issuer_ui_requires_exact_loopback_host_and_origin() -> Result<()> {
         let get = Request::builder()
             .uri("http://127.0.0.1:9081/")
@@ -3171,7 +3293,7 @@ mod tests {
 
         let post = Request::builder()
             .method(Method::POST)
-            .uri("http://127.0.0.1:9081/api/issue")
+            .uri("http://127.0.0.1:9081/api/revoke")
             .header("host", "127.0.0.1:9081")
             .header("origin", "http://127.0.0.1:9081")
             .body(Body::empty())?;
@@ -3179,7 +3301,7 @@ mod tests {
 
         let missing_origin = Request::builder()
             .method(Method::POST)
-            .uri("http://127.0.0.1:9081/api/issue")
+            .uri("http://127.0.0.1:9081/api/revoke")
             .header("host", "127.0.0.1:9081")
             .body(Body::empty())?;
         assert!(!local_ui_request_allowed(&missing_origin, "127.0.0.1:9081"));

@@ -73,7 +73,7 @@ def main() -> int:
     if args.action == "pending":
         deadline = time.monotonic() + args.wait_secs
         while True:
-            records = request(args.port, "GET", "/api/enrollment/pending")
+            records = request(args.port, "GET", "/api/enrollment/pending")["items"]
             if args.travel_id:
                 record = next(
                     (item for item in records if item["travel_id"] == args.travel_id),
@@ -94,7 +94,7 @@ def main() -> int:
     if args.action == "home-pending":
         deadline = time.monotonic() + args.wait_secs
         while True:
-            records = request(args.port, "GET", "/api/home-enrollment/pending")
+            records = request(args.port, "GET", "/api/home-enrollment/pending")["items"]
             if args.home_id:
                 record = next(
                     (item for item in records if item["home_id"] == args.home_id),
@@ -218,7 +218,7 @@ def main() -> int:
         result = request(
             args.port,
             "POST",
-            "/api/issue",
+            "/api/test/issue",
             {
                 "request": json.loads(Path(args.request).read_text()),
                 **validity,

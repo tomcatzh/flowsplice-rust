@@ -218,8 +218,8 @@ trusted channel carrying the replacement root.
 
 ### Request creation
 
-The normal `enroll-remote` bootstrap and the manual-recovery `enroll-init` path both create a new
-mode-`0700` directory and refuse conflicting reuse. They generate distinct P-256 management and
+The normal `enroll-remote` bootstrap creates a new mode-`0700` directory and refuses conflicting
+reuse. It generates distinct P-256 management and
 business keys and write both as mode-`0600`
 password-encrypted PKCS#8 files. They also generate:
 
