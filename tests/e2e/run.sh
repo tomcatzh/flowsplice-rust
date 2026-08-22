@@ -12,6 +12,14 @@ if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2
   exit 1
 fi
+rust_mirror_url="${RUST_MIRROR_URL-http://host.docker.internal:18787}"
+rustup_dist_server=''
+rustup_update_root=''
+# Set RUST_MIRROR_URL=off (or an empty value) to use the official upstream servers.
+if [[ -n "${rust_mirror_url}" && "${rust_mirror_url}" != "off" ]]; then
+  rustup_dist_server="${rust_mirror_url%/}"
+  rustup_update_root="${rustup_dist_server}/rustup"
+fi
 
 mkdir -p "${generated_dir}"
 rm -rf \
@@ -49,6 +57,9 @@ for template in "${repo_root}"/tests/e2e/config/*.toml; do
 done
 docker build \
   --pull="${docker_pull}" \
+  --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
+  --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
+  --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
   -f "${repo_root}/docker/e2e.Dockerfile" \
   -t flowsplice-e2e:local \
   "${repo_root}"

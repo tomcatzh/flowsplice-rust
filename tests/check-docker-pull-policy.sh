@@ -7,6 +7,11 @@ for script in "${repo_root}/scripts/build-release.sh" "${repo_root}/tests/e2e/ru
   grep -Fq 'docker_pull="${FLOWSPLICE_DOCKER_PULL:-false}"' "${script}"
   grep -Fq -- '--pull="${docker_pull}"' "${script}"
   grep -Fq 'FLOWSPLICE_DOCKER_PULL must be true or false.' "${script}"
+  grep -Fq 'rust_mirror_url="${RUST_MIRROR_URL-http://host.docker.internal:18787}"' "${script}"
+  grep -Fq '"${rust_mirror_url}" != "off"' "${script}"
+  grep -Fq -- '--build-arg "RUST_MIRROR_URL=${rust_mirror_url}"' "${script}"
+  grep -Fq -- '--build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}"' "${script}"
+  grep -Fq -- '--build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}"' "${script}"
 done
 
 for dockerfile in "${repo_root}/docker/e2e.Dockerfile" "${repo_root}/docker/release.Dockerfile"; do
@@ -16,6 +21,16 @@ for dockerfile in "${repo_root}/docker/e2e.Dockerfile" "${repo_root}/docker/rele
     exit 1
   fi
   grep -Fq 'ENV RUSTUP_TOOLCHAIN=1.97.1' "${dockerfile}"
+  grep -Fq 'ARG TARGETARCH' "${dockerfile}"
+  grep -Fq 'ARG RUST_MIRROR_URL' "${dockerfile}"
+  grep -Fq 'ARG RUSTUP_DIST_SERVER' "${dockerfile}"
+  grep -Fq 'ARG RUSTUP_UPDATE_ROOT' "${dockerfile}"
+  grep -Fq 'source.crates-io.replace-with="flowsplice-mirror"' "${dockerfile}"
+  grep -Fq 'source.flowsplice-mirror.registry=' "${dockerfile}"
+  grep -Fq '${RUST_MIRROR_URL%/}/index/' "${dockerfile}"
+  grep -Eq 'id=flowsplice-[^,]+-cargo-registry-\$\{TARGETARCH\}' "${dockerfile}"
+  grep -Eq 'id=flowsplice-[^,]+-cargo-git-\$\{TARGETARCH\}' "${dockerfile}"
+  grep -Eq 'id=flowsplice-[^,]+-cargo-target-\$\{TARGETARCH\}' "${dockerfile}"
 done
 
 grep -Fq 'channel = "1.97.1"' "${repo_root}/rust-toolchain.toml"

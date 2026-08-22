@@ -8,6 +8,14 @@ if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2
   exit 1
 fi
+rust_mirror_url="${RUST_MIRROR_URL-http://host.docker.internal:18787}"
+rustup_dist_server=''
+rustup_update_root=''
+# Set RUST_MIRROR_URL=off (or an empty value) to use the official upstream servers.
+if [[ -n "${rust_mirror_url}" && "${rust_mirror_url}" != "off" ]]; then
+  rustup_dist_server="${rust_mirror_url%/}"
+  rustup_update_root="${rustup_dist_server}/rustup"
+fi
 mkdir -p "${dist_dir}/macos-arm64"
 
 (cd "${repo_root}/travelagent/web" && npm ci && npm run build)
@@ -46,6 +54,9 @@ for spec in "amd64:x86_64-unknown-linux-musl" "arm64:aarch64-unknown-linux-musl"
     --pull="${docker_pull}" \
     --platform "linux/${arch}" \
     --build-arg "RUST_TARGET=${target}" \
+    --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
+    --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
+    --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
     --file "${repo_root}/docker/release.Dockerfile" \
     --output "type=local,dest=${dist_dir}/linux-${arch}" \
     "${repo_root}"
