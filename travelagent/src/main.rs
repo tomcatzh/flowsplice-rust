@@ -29,9 +29,10 @@ use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::unix_time_secs,
-    config::load_toml,
+    config::{load_toml, resolve_path},
     deployment::{
         DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust, VerifiedControlSnapshot,
+        load_verified_deployment_trust,
     },
     frame::{JsonFrameReader, write_json},
     init_crypto,
@@ -101,6 +102,10 @@ enum Command {
     EnrollInit(EnrollInitArgs),
     EnrollImport(EnrollImportArgs),
     EnrollRemote(EnrollRemoteArgs),
+    CheckBootstrapConfig {
+        #[arg(long, default_value = "travel-bootstrap.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(clap::Args)]
@@ -119,6 +124,8 @@ struct EnrollImportArgs {
     enrollment_dir: PathBuf,
     #[arg(long)]
     response: PathBuf,
+    #[arg(long, default_value = "travel-bootstrap.toml")]
+    bootstrap_config: PathBuf,
     #[arg(long, hide = true)]
     test_password_file: Option<PathBuf>,
 }
@@ -131,10 +138,8 @@ struct EnrollRemoteArgs {
     home_id: String,
     #[arg(long)]
     install_dir: PathBuf,
-    #[arg(long = "bootstrap-relay")]
-    bootstrap_relays: Vec<String>,
-    #[arg(long, default_value = "127.0.0.1:9080")]
-    ui_listen: String,
+    #[arg(long, default_value = "travel-bootstrap.toml")]
+    bootstrap_config: PathBuf,
     #[arg(long, default_value_t = 900)]
     wait_timeout_secs: u64,
     #[cfg(feature = "e2e-remote-ui")]
@@ -153,6 +158,8 @@ struct Config {
     id: String,
     seed_relays: Vec<SeedRelay>,
     homes: Vec<ConfiguredHome>,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
     management_cert: PathBuf,
     management_key: PathBuf,
     management_ca: PathBuf,
@@ -194,6 +201,23 @@ struct Config {
     max_carrier_reevaluate_secs: u64,
     #[serde(default = "default_max_unacked_bytes")]
     max_unacked_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TravelBootstrapConfig {
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
+    bootstrap_relays: Vec<String>,
+    ui_listen: String,
+}
+
+struct VerifiedTravelBootstrap {
+    deployment_root_public_key: String,
+    signed_trust: SignedDeploymentTrust,
+    trust: DeploymentTrust,
+    bootstrap_relays: Vec<String>,
+    ui_listen: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -256,6 +280,8 @@ struct BootstrapEnrollmentState {
 #[derive(Serialize)]
 struct InstalledTravelConfig {
     id: String,
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
     management_cert: PathBuf,
     management_key: PathBuf,
     management_ca: PathBuf,
@@ -566,7 +592,15 @@ async fn main() -> Result<()> {
     validate_config(&config)?;
     let state_store = StateStore::open(&config.state_store)?;
     apply_active_identity_directory(&mut config, &state_store)?;
-    let deployment_root_public_key = embedded_deployment_root_public_key()?.to_owned();
+    let deployment_root_public_key = fs::read_to_string(&config.deployment_root_public_key)
+        .with_context(|| {
+            format!(
+                "failed to read deployment root public key {}",
+                config.deployment_root_public_key.display()
+            )
+        })?
+        .trim()
+        .to_owned();
     let management_identity = local_certificate_identity(&config.management_cert)?;
     require_peer(&management_identity, Role::Travel, Some(&config.id), &[])?;
     let legacy_control_trust_state_path =
@@ -688,90 +722,146 @@ async fn run_command(command: Command) -> Result<()> {
             );
             Ok(())
         }
-        Command::EnrollImport(args) => {
-            let deployment_root_public_key = embedded_deployment_root_public_key()?;
-            let password = if let Some(path) = args.test_password_file.as_deref() {
-                test_password(path)?
-            } else {
-                Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?)
-            };
-            if password.is_empty() {
-                bail!("private-key password must not be empty");
-            }
-            let response: TravelEnrollmentResponse = load_json(&args.response)?;
-            let trust = response
-                .deployment_trust
-                .verify(deployment_root_public_key, unix_time_secs()?)?;
-            let control_trust_state_path = args.enrollment_dir.join(CONTROL_TRUST_STATE_FILE);
-            let mut control_trust_state = if control_trust_state_path.exists() {
-                flowsplice_core::authorization::load_json(&control_trust_state_path)?
-            } else {
-                ControlTrustState::new()
-            };
-            control_trust_state.validate_shape()?;
-            if control_trust_state
-                .deployment_id
-                .as_deref()
-                .is_some_and(|deployment_id| deployment_id != trust.deployment_id)
-            {
-                bail!("Enrollment Response belongs to a different deployment");
-            }
-            if trust.generation < control_trust_state.trust_generation {
-                bail!("Enrollment Response would roll back deployment trust");
-            }
-            let trust_digest_sha256 = response.deployment_trust.payload_digest_sha256()?;
-            if trust.generation == control_trust_state.trust_generation
-                && control_trust_state.trust_digest_sha256.is_some()
-                && control_trust_state.trust_digest_sha256.as_deref() != Some(&trust_digest_sha256)
-            {
-                bail!("Enrollment Response conflicts with installed deployment trust");
-            }
-            let credential = install_enrollment_response(
-                &args.enrollment_dir,
-                &response,
-                deployment_root_public_key,
-                password.as_bytes(),
-                unix_time_secs()?,
-            )?;
-            control_trust_state.deployment_id = Some(trust.deployment_id);
-            control_trust_state.trust_generation = trust.generation;
-            control_trust_state.trust_digest_sha256 = Some(trust_digest_sha256);
-            flowsplice_core::authorization::store_json_atomic(
-                &control_trust_state_path,
-                &control_trust_state,
-            )?;
+        Command::EnrollImport(args) => run_enroll_import(&args),
+        Command::EnrollRemote(args) => run_remote_enrollment(args).await,
+        Command::CheckBootstrapConfig { config } => {
+            let bootstrap = load_travel_bootstrap(&config)?;
             println!(
-                "installed Travel credential {} for {}",
-                credential.credential_id, credential.travel_id
+                "Travel bootstrap configuration is valid for deployment {} generation {} with {} Relay(s)",
+                bootstrap.trust.deployment_id,
+                bootstrap.trust.generation,
+                bootstrap.bootstrap_relays.len()
             );
             Ok(())
         }
-        Command::EnrollRemote(args) => run_remote_enrollment(args).await,
     }
 }
 
-fn embedded_deployment_root_public_key() -> Result<&'static str> {
-    option_env!("FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("this Travel binary has no embedded deployment root public key"))
+fn run_enroll_import(args: &EnrollImportArgs) -> Result<()> {
+    let bootstrap = load_travel_bootstrap(&args.bootstrap_config)?;
+    let deployment_root_public_key = bootstrap.deployment_root_public_key.as_str();
+    let password = if let Some(path) = args.test_password_file.as_deref() {
+        test_password(path)?
+    } else {
+        Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?)
+    };
+    if password.is_empty() {
+        bail!("private-key password must not be empty");
+    }
+    let response: TravelEnrollmentResponse = load_json(&args.response)?;
+    let trust = response
+        .deployment_trust
+        .verify(deployment_root_public_key, unix_time_secs()?)?;
+    validate_bootstrap_trust_continuity(
+        &bootstrap.signed_trust,
+        &bootstrap.trust,
+        &response.deployment_trust,
+        &trust,
+    )?;
+    let control_trust_state_path = args.enrollment_dir.join(CONTROL_TRUST_STATE_FILE);
+    let mut control_trust_state = if control_trust_state_path.exists() {
+        flowsplice_core::authorization::load_json(&control_trust_state_path)?
+    } else {
+        ControlTrustState::new()
+    };
+    control_trust_state.validate_shape()?;
+    if control_trust_state
+        .deployment_id
+        .as_deref()
+        .is_some_and(|deployment_id| deployment_id != trust.deployment_id)
+    {
+        bail!("Enrollment Response belongs to a different deployment");
+    }
+    if trust.generation < control_trust_state.trust_generation {
+        bail!("Enrollment Response would roll back deployment trust");
+    }
+    let trust_digest_sha256 = response.deployment_trust.payload_digest_sha256()?;
+    if trust.generation == control_trust_state.trust_generation
+        && control_trust_state.trust_digest_sha256.is_some()
+        && control_trust_state.trust_digest_sha256.as_deref() != Some(&trust_digest_sha256)
+    {
+        bail!("Enrollment Response conflicts with installed deployment trust");
+    }
+    let credential = install_enrollment_response(
+        &args.enrollment_dir,
+        &response,
+        deployment_root_public_key,
+        password.as_bytes(),
+        unix_time_secs()?,
+    )?;
+    write_or_verify_private(
+        &args.enrollment_dir.join("deployment-root.pub"),
+        format!("{}\n", deployment_root_public_key.trim()).as_bytes(),
+    )?;
+    control_trust_state.deployment_id = Some(trust.deployment_id);
+    control_trust_state.trust_generation = trust.generation;
+    control_trust_state.trust_digest_sha256 = Some(trust_digest_sha256);
+    flowsplice_core::authorization::store_json_atomic(
+        &control_trust_state_path,
+        &control_trust_state,
+    )?;
+    println!(
+        "installed Travel credential {} for {}",
+        credential.credential_id, credential.travel_id
+    );
+    Ok(())
 }
 
-fn embedded_management_ca_certificate() -> Result<&'static str> {
-    option_env!("FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("this Travel binary has no embedded bootstrap management CA"))
+fn load_travel_bootstrap(path: &Path) -> Result<VerifiedTravelBootstrap> {
+    let configured: TravelBootstrapConfig = load_toml(path)?;
+    let deployment_root_public_key_path =
+        resolve_path(path, &configured.deployment_root_public_key);
+    let deployment_trust_path = resolve_path(path, &configured.deployment_trust);
+    let (deployment_root_public_key, signed_trust, trust) = load_verified_deployment_trust(
+        &deployment_root_public_key_path,
+        &deployment_trust_path,
+        unix_time_secs()?,
+    )?;
+    let ui_listen: SocketAddr = configured
+        .ui_listen
+        .parse()
+        .context("invalid Travel bootstrap UI listener")?;
+    if ui_listen != SocketAddr::from(([127, 0, 0, 1], ui_listen.port())) {
+        bail!("Travel bootstrap UI must listen directly on 127.0.0.1");
+    }
+    let mut bootstrap_relays = configured.bootstrap_relays;
+    bootstrap_relays.sort();
+    bootstrap_relays.dedup();
+    if bootstrap_relays.is_empty() {
+        bail!("Travel bootstrap configuration has no Relay address");
+    }
+    for relay in &bootstrap_relays {
+        if !valid_connect_address(relay) {
+            bail!("invalid bootstrap Relay address {relay}");
+        }
+    }
+    Ok(VerifiedTravelBootstrap {
+        deployment_root_public_key,
+        signed_trust,
+        trust,
+        bootstrap_relays,
+        ui_listen: configured.ui_listen,
+    })
 }
 
-fn embedded_bootstrap_relays() -> Vec<String> {
-    option_env!("FLOWSPLICE_BOOTSTRAP_RELAYS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+fn validate_bootstrap_trust_continuity(
+    baseline_signed: &SignedDeploymentTrust,
+    baseline: &DeploymentTrust,
+    candidate_signed: &SignedDeploymentTrust,
+    candidate: &DeploymentTrust,
+) -> Result<()> {
+    if candidate.deployment_id != baseline.deployment_id {
+        bail!("enrollment response belongs to a different deployment");
+    }
+    if candidate.generation < baseline.generation {
+        bail!("enrollment response would roll back bootstrap deployment trust");
+    }
+    if candidate.generation == baseline.generation
+        && candidate_signed.payload_digest_sha256()? != baseline_signed.payload_digest_sha256()?
+    {
+        bail!("enrollment response conflicts with bootstrap deployment trust");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -779,27 +869,10 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
     if args.wait_timeout_secs == 0 {
         bail!("wait-timeout-secs must be positive");
     }
-    let _: SocketAddr = args
-        .ui_listen
-        .parse()
-        .context("invalid Travel UI listener")?;
-    let root_public_key = embedded_deployment_root_public_key()?;
-    let management_ca = embedded_management_ca_certificate()?;
-    let mut bootstrap_relays = if args.bootstrap_relays.is_empty() {
-        embedded_bootstrap_relays()
-    } else {
-        args.bootstrap_relays.clone()
-    };
-    bootstrap_relays.sort();
-    bootstrap_relays.dedup();
-    if bootstrap_relays.is_empty() {
-        bail!("no bootstrap Relay is embedded or provided");
-    }
-    for relay in &bootstrap_relays {
-        if !valid_connect_address(relay) {
-            bail!("invalid bootstrap Relay address {relay}");
-        }
-    }
+    let bootstrap = load_travel_bootstrap(&args.bootstrap_config)?;
+    let root_public_key = bootstrap.deployment_root_public_key.as_str();
+    let management_ca = &bootstrap.trust.management_ca_certificate_pem;
+    let bootstrap_relays = bootstrap.bootstrap_relays.clone();
 
     if args.install_dir.exists() && !args.install_dir.is_dir() {
         bail!(
@@ -930,6 +1003,12 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
 
     let (credential, trust) =
         validate_enrollment_response(&response, root_public_key, unix_time_secs()?)?;
+    validate_bootstrap_trust_continuity(
+        &bootstrap.signed_trust,
+        &bootstrap.trust,
+        &response.deployment_trust,
+        &trust,
+    )?;
     if trust.management_ca_certificate_pem.trim() != management_ca.trim() {
         info!("deployment trust rotated the bootstrap management CA during enrollment");
     }
@@ -943,6 +1022,10 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
     if installed != credential {
         bail!("installed first-enrollment credential changed after verification");
     }
+    write_or_verify_private(
+        &enrollment_dir.join("deployment-root.pub"),
+        format!("{}\n", root_public_key.trim()).as_bytes(),
+    )?;
     seed_relays.retain(|relay| valid_connect_address(relay));
     if seed_relays.is_empty() {
         seed_relays = bootstrap_relays;
@@ -953,6 +1036,8 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
     let state_store_path = install_root.join("state/travel-state.redb");
     let generated = InstalledTravelConfig {
         id: args.travel_id.clone(),
+        deployment_root_public_key: enrollment_dir.join("deployment-root.pub"),
+        deployment_trust: enrollment_dir.join(DEPLOYMENT_TRUST_FILE),
         management_cert: enrollment_dir.join(MANAGEMENT_CERT_FILE),
         management_key: enrollment_dir.join(MANAGEMENT_KEY_FILE),
         management_ca: enrollment_dir.join(MANAGEMENT_CA_FILE),
@@ -961,7 +1046,7 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
         business_ca: enrollment_dir.join(BUSINESS_CA_FILE),
         state_store: state_store_path.clone(),
         enrollment_work_dir: install_root.join("state/enrollment"),
-        ui_listen: args.ui_listen,
+        ui_listen: bootstrap.ui_listen,
         #[cfg(feature = "e2e-remote-ui")]
         test_allow_remote_listen: args.test_allow_remote_listen,
         #[cfg(feature = "e2e-remote-ui")]
@@ -1028,6 +1113,31 @@ fn valid_connect_address(value: &str) -> bool {
         return false;
     };
     !host.trim().is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+}
+
+fn write_or_verify_private(path: &Path, data: &[u8]) -> Result<()> {
+    if path.exists() {
+        if fs::read(path)? != data {
+            bail!(
+                "existing file conflicts with bootstrap configuration: {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 async fn poll_bootstrap_relay(
@@ -1137,8 +1247,7 @@ fn load_initial_control_trust_state(
     DeploymentTrust,
     Option<VerifiedControlSnapshot>,
 )> {
-    let trust_path = enrollment_sibling(&config.management_cert, DEPLOYMENT_TRUST_FILE);
-    let signed: SignedDeploymentTrust = load_json(&trust_path)?;
+    let signed: SignedDeploymentTrust = load_json(&config.deployment_trust)?;
     let now = unix_time_secs()?;
     let trust = signed.verify(deployment_root_public_key, now)?;
     let trust_digest = signed.payload_digest_sha256()?;

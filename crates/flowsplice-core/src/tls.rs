@@ -294,13 +294,13 @@ pub fn identity_client_connector_with_private_key(
 /// This connector deliberately sends no client certificate. It is intended only for first-device
 /// enrollment transport, before a Travel identity exists. The application must still validate the
 /// Relay URI role and must cryptographically validate every enrollment response against the
-/// embedded deployment root.
+/// deployment root selected by verified configuration.
 ///
 /// # Errors
 ///
 /// Returns an error when the CA certificate is malformed.
 pub fn identity_server_auth_connector_from_ca_pem(ca_pem: &str) -> Result<TlsConnector> {
-    let roots = roots_from_pem(ca_pem, "embedded management CA")?;
+    let roots = roots_from_pem(ca_pem, "configured management CA")?;
     let signature_algorithms =
         rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
     let verifier = CertificateChainVerifier {

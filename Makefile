@@ -1,4 +1,4 @@
-.PHONY: web fmt check test e2e release home2-macos-package openwrt-check openwrt-ipk policy-check
+.PHONY: web fmt check test e2e release home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
 
 web:
 	cd travelagent/web && npm ci && npm run build
@@ -24,12 +24,17 @@ release:
 home2-macos-package:
 	./scripts/build-home2-macos-package.sh
 
+travel-macos-package:
+	./scripts/build-travel-macos-package.sh
+
 openwrt-check:
 	./tests/openwrt/check.sh
 
 policy-check:
 	bash ./tests/check-docker-pull-policy.sh
 	bash ./tests/check-home2-macos-package.sh
+	bash ./tests/check-travel-macos-package.sh
+	bash ./tests/check-runtime-configuration-boundary.sh
 
 openwrt-ipk:
 	python3 scripts/build-openwrt-ipk.py \

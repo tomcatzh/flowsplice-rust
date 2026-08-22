@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::{
@@ -194,6 +194,42 @@ impl SignedDeploymentTrust {
         trust.validate_at(now)?;
         Ok(trust)
     }
+}
+
+/// Loads a deployment root and signed deployment-trust document from separate configuration
+/// files, then verifies the trust document before returning it.
+///
+/// # Errors
+///
+/// Returns an error when either file cannot be read, the signed document is malformed, or its
+/// signature, shape, or validity interval is unacceptable.
+pub fn load_verified_deployment_trust(
+    deployment_root_public_key_path: &Path,
+    deployment_trust_path: &Path,
+    now: u64,
+) -> Result<(String, SignedDeploymentTrust, DeploymentTrust)> {
+    let deployment_root_public_key = fs::read_to_string(deployment_root_public_key_path)
+        .with_context(|| {
+            format!(
+                "failed to read deployment root public key {}",
+                deployment_root_public_key_path.display()
+            )
+        })?;
+    let deployment_root_public_key = deployment_root_public_key.trim().to_owned();
+    let bytes = fs::read(deployment_trust_path).with_context(|| {
+        format!(
+            "failed to read deployment trust {}",
+            deployment_trust_path.display()
+        )
+    })?;
+    let signed: SignedDeploymentTrust = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse deployment trust {}",
+            deployment_trust_path.display()
+        )
+    })?;
+    let trust = signed.verify(&deployment_root_public_key, now)?;
+    Ok((deployment_root_public_key, signed, trust))
 }
 
 impl SignedControlSnapshot {
@@ -795,12 +831,15 @@ mod tests {
         Ok(params.self_signed(&key)?.pem())
     }
 
-    fn fixture(now: u64) -> Result<(String, EcdsaKeyPair, SignedDeploymentTrust)> {
+    fn fixture_for(
+        now: u64,
+        deployment_id: &str,
+    ) -> Result<(String, EcdsaKeyPair, SignedDeploymentTrust)> {
         let (root, server, authority) = keys()?;
         let root_public = hex::encode(root.public_key().as_ref());
         let trust = DeploymentTrust {
             version: DEPLOYMENT_TRUST_VERSION,
-            deployment_id: "deployment-1".to_owned(),
+            deployment_id: deployment_id.to_owned(),
             generation: 7,
             not_before_unix_secs: now - 1,
             not_after_unix_secs: now + 3_600,
@@ -829,6 +868,42 @@ mod tests {
             server,
             SignedDeploymentTrust::sign(&trust, &root)?,
         ))
+    }
+
+    fn fixture(now: u64) -> Result<(String, EcdsaKeyPair, SignedDeploymentTrust)> {
+        fixture_for(now, "deployment-1")
+    }
+
+    #[test]
+    fn selected_trust_files_support_multiple_deployments_without_code_changes() -> Result<()> {
+        let now = 1_800_000_000;
+        let directory = std::env::temp_dir().join(format!(
+            "flowsplice-deployment-config-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&directory)?;
+
+        let (root_one, _, trust_one) = fixture_for(now, "deployment-one")?;
+        let (root_two, _, trust_two) = fixture_for(now, "deployment-two")?;
+        let root_one_path = directory.join("root-one.pub");
+        let root_two_path = directory.join("root-two.pub");
+        let trust_one_path = directory.join("trust-one.json");
+        let trust_two_path = directory.join("trust-two.json");
+        fs::write(&root_one_path, format!("{root_one}\n"))?;
+        fs::write(&root_two_path, format!("{root_two}\n"))?;
+        fs::write(&trust_one_path, serde_json::to_vec_pretty(&trust_one)?)?;
+        fs::write(&trust_two_path, serde_json::to_vec_pretty(&trust_two)?)?;
+
+        let (_, _, loaded_one) =
+            load_verified_deployment_trust(&root_one_path, &trust_one_path, now)?;
+        let (_, _, loaded_two) =
+            load_verified_deployment_trust(&root_two_path, &trust_two_path, now)?;
+        assert_eq!(loaded_one.deployment_id, "deployment-one");
+        assert_eq!(loaded_two.deployment_id, "deployment-two");
+        assert!(load_verified_deployment_trust(&root_one_path, &trust_two_path, now).is_err());
+
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     fn snapshot(

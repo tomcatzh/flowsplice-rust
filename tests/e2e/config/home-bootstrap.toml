@@ -1,0 +1,6 @@
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
+server_id = "server-1"
+server_name = "server.flowsplice"
+server_control_port = 7443
+ui_listen = "127.0.0.1:9082"

@@ -20,11 +20,8 @@ done
 
 grep -Fq 'channel = "1.97.1"' "${repo_root}/rust-toolchain.toml"
 
-for variable in \
-  FLOWSPLICE_SERVER_ID \
-  FLOWSPLICE_SERVER_NAME \
-  FLOWSPLICE_SERVER_CONTROL_PORT \
-  FLOWSPLICE_HOME_UI_PORT; do
-  grep -Fq "ARG ${variable}" "${repo_root}/docker/release.Dockerfile"
-  grep -Fq -- "--build-arg \"${variable}=" "${repo_root}/scripts/build-release.sh"
-done
+if rg -n 'FLOWSPLICE_(DEPLOYMENT_ROOT_PUBLIC_KEY|MANAGEMENT_CA_CERTIFICATE_PEM|BOOTSTRAP_RELAYS|SERVER_ID|SERVER_NAME|SERVER_CONTROL_PORT|HOME_UI_PORT)' \
+  "${repo_root}/docker" "${repo_root}/scripts/build-release.sh" "${repo_root}/tests/e2e/run.sh"; then
+  printf 'Release and E2E builds must be deployment-neutral.\n' >&2
+  exit 1
+fi

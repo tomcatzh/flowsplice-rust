@@ -72,8 +72,9 @@ role, stable ID, SPKI, authorization scope, and protocol checks. TLS is restrict
 - A password-encrypted, offline P-256 deployment root signs a versioned deployment-trust document.
 - The document binds both CA roots, Server control-signing key epochs, every Home endpoint's
   management/business SPKIs, and Home/global Travel authorities with their scopes and validity.
-- A Travel binary embeds only the deployment-root **public** key. The root private key and password
-  are never runtime inputs.
+- Home and Travel executables contain no deployment root, CA, topology, identity, address, domain,
+  port, or production path. The public root and root-signed trust are separate configuration files;
+  the root private key and password are never runtime inputs.
 - Home SPKIs are read from verified deployment trust; operators do not repeat them in Server or
   Travel TOML.
 - A Seed Relay is an untrusted transport address. Relay IDs and SPKIs are learned from the signed
@@ -171,22 +172,22 @@ private keys, bearer tokens, or route/work secrets.
 
 ## Travel Quick Start
 
-Use a deployment-specific Travel binary built with the public deployment root, public management
-CA certificate, and at least one bootstrap Relay address embedded. A fresh device does not need a
-TOML file or certificate directory before this command:
+Use the deployment-neutral Travel binary together with the package's separate
+`travel-bootstrap.toml`, `deployment-root.pub`, and root-signed `deployment-trust.json`. A fresh
+device does not need a generated runtime TOML or certificate directory before this command:
 
 ```bash
 mkdir -m 700 ./my-travel
-flowsplice-travelagent enroll-remote \
+./bin/flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel
 ```
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
-two encrypted private keys locally, contacts the embedded bootstrap Relays using the embedded public
-CA, and prints a short Home verification code. The command remains running while it retries and
-waits for attended Home approval.
+two encrypted private keys locally, validates the configured signed deployment trust, contacts the
+Relays listed in `travel-bootstrap.toml` using the verified Management CA, and prints a short Home
+verification code. The command remains running while it retries and waits for attended Home approval.
 
 Leave `enroll-remote` running on the Travel machine. On the separate machine that runs Home, open the
 issuer page locally at its loopback `ui_listen` address (normally `http://127.0.0.1:9081`). Open the
@@ -222,7 +223,8 @@ before using any Relay for business.
 For a detailed Chinese walkthrough, including recovery and replacement enrollment, see
 [Travel Quick Start (简体中文)](docs/QUICK_START.zh-CN.md).
 
-For a separate macOS arm64 Home 2, run one deployment-bound binary with
+For a separate macOS arm64 Home 2, use the same deployment-neutral binary plus its separate
+bootstrap configuration and run
 `flowsplice-homeagent init --server <SERVER_IP>`. It generates its identity locally, waits for an
 existing global Home to approve one of the three permission profiles, then installs certificates,
 TOML, redb state, the binary, and launchd automatically. See
@@ -230,7 +232,7 @@ TOML, redb state, the binary, and launchd automatically. See
 
 To create an entirely new deployment rather than add one endpoint, follow the standalone
 [Whole-system Cold Start guide (简体中文)](docs/COLD_START.zh-CN.md). It covers the offline root, both
-CAs, initial Server/Relay/global Home, deployment-bound packages, empty-directory Travel and Home
+CAs, initial Server/Relay/global Home, deployment configuration packages, empty-directory Travel and Home
 bootstrap, acceptance, backup, and recovery without publishing real deployment secrets.
 
 ### Test, rotate, replace, and revoke
@@ -322,9 +324,9 @@ device ABI and preserve a rollback snapshot before installation.
 
 ## Release artifacts
 
-`scripts/build-release.sh` expects `cert/deployment-root.pub` by default. Set
-`FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY_FILE` to another path. The public key is embedded in the Travel
-binary, making that artifact deployment-specific without embedding a signing secret.
+`scripts/build-release.sh` builds deployment-neutral executables. It accepts no deployment root,
+CA, Relay, Server identity, address, domain, or port input. Those values belong only in separate
+runtime or package configuration files.
 
 The script uses the lockfile and produces:
 
@@ -332,12 +334,15 @@ The script uses the lockfile and produces:
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
-`make home2-macos-package` builds and verifies the dedicated
+`make home2-macos-package` and `make travel-macos-package` build and verify the dedicated
 `dist/macos-arm64/flowsplice-home2-0.2.0-macos-arm64.tar.gz` bundle. It contains the same HomeAgent
-binary used by every Home, the Chinese Quick Start, and internal SHA-256 checksums. The binary embeds
-only the deployment root public key, public Management CA certificate, Server identity/certificate
-name/control port, and local Home UI port needed by the one-command bootstrap. The archive contains no private key,
-password, generated Home certificate, TOML, production Server IP, or Server SPKI.
+binary used by every Home, a separate bootstrap TOML, root public key, signed deployment trust, the
+Chinese Quick Start, and internal SHA-256 checksums. The matching Travel package has the same
+configuration boundary. Set `FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE` or
+`FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE` to a prepared package configuration whose directory also
+contains `deployment-root.pub` and `deployment-trust.json`. Neither binary contains deployment
+configuration; neither archive may contain a private key, password, generated endpoint certificate,
+credential, or token.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc

@@ -1,4 +1,6 @@
 id = "travel-1"
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/travel/deployment-trust.json"
 management_cert = "/travel/travel-management.crt"
 management_key = "/travel/travel-management.key"
 management_ca = "/travel/management-ca.crt"

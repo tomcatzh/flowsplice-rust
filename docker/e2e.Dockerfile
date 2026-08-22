@@ -29,12 +29,6 @@ COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
 COPY --from=travel-web /src/travelagent/web/dist/ travelagent/web/dist/
 COPY --from=home-web /src/homeagent/web/dist/ homeagent/web/dist/
-ARG FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY
-ARG FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM
-ARG FLOWSPLICE_BOOTSTRAP_RELAYS
-ENV FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY}
-ENV FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM=${FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM}
-ENV FLOWSPLICE_BOOTSTRAP_RELAYS=${FLOWSPLICE_BOOTSTRAP_RELAYS}
 RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=flowsplice-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=flowsplice-e2e-cargo-target,target=/src/target,sharing=locked \

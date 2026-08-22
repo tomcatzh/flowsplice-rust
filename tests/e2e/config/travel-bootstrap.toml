@@ -1,0 +1,4 @@
+deployment_root_public_key = "/certs/deployment-root.pub"
+deployment_trust = "/certs/deployment-trust.json"
+bootstrap_relays = ["relay1:8443", "relay2:8443"]
+ui_listen = "127.0.0.1:9080"

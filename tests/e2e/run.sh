@@ -46,16 +46,99 @@ for template in "${repo_root}"/tests/e2e/config/*.toml; do
   output="${generated_dir}/config/$(basename -- "${template}")"
   sed -e "s/__SERVER_PIN__/${server_pin}/g" "${template}" >"${output}"
 done
-deployment_root_public_key="$(tr -d '\r\n' <"${generated_dir}/certs/deployment-root.pub")"
-management_ca_certificate="$(cat "${generated_dir}/certs/management-ca.crt")"
 docker build \
   --pull="${docker_pull}" \
-  --build-arg "FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${deployment_root_public_key}" \
-  --build-arg "FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM=${management_ca_certificate}" \
-  --build-arg "FLOWSPLICE_BOOTSTRAP_RELAYS=relay1:8443,relay2:8443" \
   -f "${repo_root}/docker/e2e.Dockerfile" \
   -t flowsplice-e2e:local \
   "${repo_root}"
+
+binary_audit_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-e2e-binary-audit.XXXXXX")"
+binary_audit_container="$(docker create flowsplice-e2e:local /bin/true)"
+docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-homeagent" \
+  "${binary_audit_dir}/flowsplice-homeagent"
+docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-travelagent" \
+  "${binary_audit_dir}/flowsplice-travelagent"
+docker rm "${binary_audit_container}" >/dev/null
+deployment_root_public_key="$(tr -d '\r\n' <"${generated_dir}/certs/deployment-root.pub")"
+deployment_payload_file="$(mktemp "${TMPDIR:-/tmp}/flowsplice-e2e-deployment-payload.XXXXXX")"
+jq -r '.payload_hex' "${generated_dir}/certs/deployment-trust.json" \
+  | xxd -r -p >"${deployment_payload_file}"
+deployment_id="$(jq -r '.deployment_id' "${deployment_payload_file}")"
+server_id="$(jq -r '.server_control_keys[0].server_id' "${deployment_payload_file}")"
+management_ca_body_line="$(sed -n '2p' "${generated_dir}/certs/management-ca.crt")"
+for binary in flowsplice-homeagent flowsplice-travelagent; do
+  if grep -aFq "${deployment_root_public_key}" "${binary_audit_dir}/${binary}"; then
+    echo "${binary} contains the configured deployment root" >&2
+    exit 1
+  fi
+done
+for value in \
+  "${deployment_id}" \
+  "${server_id}" \
+  "${management_ca_body_line}" \
+  relay1:8443 \
+  relay2:8443 \
+  server.flowsplice; do
+  if grep -aFq "${value}" "${binary_audit_dir}/flowsplice-travelagent" \
+    || grep -aFq "${value}" "${binary_audit_dir}/flowsplice-homeagent"; then
+    echo "client binary contains deployment configuration ${value}" >&2
+    exit 1
+  fi
+done
+rm -rf -- "${binary_audit_dir}"
+rm -f -- "${deployment_payload_file}"
+
+if docker run --rm flowsplice-e2e:local \
+  /usr/local/bin/flowsplice-homeagent init \
+  --server 192.0.2.1 \
+  --bootstrap-config /missing-home-bootstrap.toml; then
+  echo 'Home accepted a missing bootstrap configuration' >&2
+  exit 1
+fi
+invalid_bootstrap_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-invalid-bootstrap.XXXXXX")"
+cp "${generated_dir}/config/home-bootstrap.toml" "${invalid_bootstrap_dir}/home-bootstrap.toml"
+cp "${generated_dir}/config/travel-bootstrap.toml" "${invalid_bootstrap_dir}/travel-bootstrap.toml"
+cp "${generated_dir}/certs/deployment-root.pub" "${invalid_bootstrap_dir}/deployment-root.pub"
+cp "${generated_dir}/certs/deployment-trust.json" "${invalid_bootstrap_dir}/deployment-trust.json"
+sed -i.bak 's#/certs/deployment-root.pub#deployment-root.pub#; s#/certs/deployment-trust.json#deployment-trust.json#' \
+  "${invalid_bootstrap_dir}/home-bootstrap.toml" \
+  "${invalid_bootstrap_dir}/travel-bootstrap.toml"
+rm -f "${invalid_bootstrap_dir}/home-bootstrap.toml.bak" \
+  "${invalid_bootstrap_dir}/travel-bootstrap.toml.bak"
+python3 -c \
+  'import json,sys; p=sys.argv[1]; d=json.load(open(p)); s=d["signature_hex"]; d["signature_hex"]=("0" if s[0] != "0" else "1")+s[1:]; open(p,"w").write(json.dumps(d)+"\n")' \
+  "${invalid_bootstrap_dir}/deployment-trust.json"
+for spec in \
+  'flowsplice-homeagent home-bootstrap.toml' \
+  'flowsplice-travelagent travel-bootstrap.toml'; do
+  set -- ${spec}
+  if docker run --rm \
+    -v "${invalid_bootstrap_dir}:/bootstrap:ro" \
+    flowsplice-e2e:local \
+    "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"; then
+    echo "$1 accepted deployment trust with an invalid root signature" >&2
+    exit 1
+  fi
+done
+rm -rf -- "${invalid_bootstrap_dir}"
+if docker run --rm \
+  --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+  -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
+  -v "${generated_dir}/config:/config:ro" \
+  -v "${generated_dir}/certs:/certs:ro" \
+  -v "${generated_dir}/offline:/offline:ro" \
+  -v "${generated_dir}/state:/invalid-travel" \
+  flowsplice-e2e:local \
+  /usr/local/bin/flowsplice-travelagent enroll-remote \
+  --travel-id invalid-config-travel \
+  --home-id home-1 \
+  --install-dir /invalid-travel \
+  --bootstrap-config /missing-travel-bootstrap.toml \
+  --test-password-file /offline/test-password.txt; then
+  echo 'Travel accepted a missing bootstrap configuration' >&2
+  exit 1
+fi
+printf '%s\n' '{"checkpoint": "runtime-bootstrap-config-boundary"}'
 "${repo_root}/tests/e2e/generate-certs.sh" enroll-only
 
 teardown() {
@@ -126,6 +209,7 @@ enroll_dynamic_home() {
   mkdir -p "${directory}"
   docker compose -f "${compose_file}" run --no-deps --rm "${service}" \
     /usr/local/bin/flowsplice-homeagent init --server "${server_container_ip}" \
+    --bootstrap-config /config/home-bootstrap.toml \
     >"${log_path}" 2>&1 &
   dynamic_home_init_pid=$!
   local home_id=""
@@ -261,6 +345,7 @@ docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
   --travel-id dynamic-home-issued-travel \
   --home-id "${dynamic_global_home_id}" \
   --install-dir /dynamic-travel \
+  --bootstrap-config /config/travel-bootstrap.toml \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
   --test-password-file /dynamic-travel/test-password.txt \
@@ -304,6 +389,7 @@ docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
   --travel-id first-remote-e2e \
   --home-id home-1 \
   --install-dir /first-travel \
+  --bootstrap-config /config/travel-bootstrap.toml \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-first-remote-administrator-token \
   --test-password-file /first-travel/test-password.txt \
@@ -394,7 +480,9 @@ if (( bootstrap_acknowledged == 0 )); then
   exit 1
 fi
 first_travel_outbox="$(docker compose -f "${compose_file}" exec -T firsttravel \
-  wget -qO- http://127.0.0.1:9080/api/enrollment)"
+  wget -qO- \
+    --header='Authorization: Bearer flowsplice-e2e-first-remote-administrator-token' \
+    http://127.0.0.1:9080/api/enrollment)"
 python3 -c \
   'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
   "${first_travel_outbox}" "${bootstrap_request_id}"
@@ -446,10 +534,13 @@ for invalid_response in \
     -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
     -v "${generated_dir}/travel:/travel" \
     -v "${generated_dir}/authorization:/authorization:ro" \
+    -v "${generated_dir}/config:/config:ro" \
+    -v "${generated_dir}/certs:/certs:ro" \
     flowsplice-e2e:local \
     /usr/local/bin/flowsplice-travelagent enroll-import \
     --enrollment-dir /travel \
     --response "/authorization/${invalid_response}" \
+    --bootstrap-config /config/travel-bootstrap.toml \
     --test-password-file /travel/test-password.txt; then
     echo "Travel accepted tampered Enrollment Response ${invalid_response}" >&2
     exit 1
@@ -461,10 +552,13 @@ docker run --rm \
   -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
   -v "${generated_dir}/travel:/travel" \
   -v "${generated_dir}/authorization:/authorization:ro" \
+  -v "${generated_dir}/config:/config:ro" \
+  -v "${generated_dir}/certs:/certs:ro" \
   flowsplice-e2e:local \
   /usr/local/bin/flowsplice-travelagent enroll-import \
   --enrollment-dir /travel \
   --response /authorization/enrollment-response.json \
+  --bootstrap-config /config/travel-bootstrap.toml \
   --test-password-file /travel/test-password.txt
 
 docker compose -f "${compose_file}" up -d travelagent

@@ -112,6 +112,8 @@ services:
     depends_on: [server]
     volumes:
       - ./generated/dynamic-home-serving:/dynamic-home
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
   dynamichome-issuer:
@@ -127,6 +129,8 @@ services:
     volumes:
       - ./generated/dynamic-home-issuer:/dynamic-home
       - ./generated:/generated:ro
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
   dynamichome-global:
@@ -142,6 +146,8 @@ services:
     volumes:
       - ./generated/dynamic-home-global:/dynamic-home
       - ./generated:/generated:ro
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
   dynamichome-third:
@@ -153,6 +159,8 @@ services:
     depends_on: [server]
     volumes:
       - ./generated/dynamic-home-third:/dynamic-home
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
   travelagent:
@@ -175,6 +183,7 @@ services:
       - "127.0.0.1:11085:10085"
     volumes:
       - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
       - ./generated/travel:/travel
       - ./generated/state:/state
     networks: [flowsplice]
@@ -192,6 +201,8 @@ services:
       - "127.0.0.1:12080:10080"
     volumes:
       - ./generated/first-travel:/first-travel
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
   dynamictravel:
@@ -207,6 +218,8 @@ services:
       - "127.0.0.1:13080:10080"
     volumes:
       - ./generated/dynamic-travel:/dynamic-travel
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
     networks: [flowsplice]
 
 networks:

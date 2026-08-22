@@ -277,7 +277,7 @@ certificate_pin nodes/home-1-business.crt
   --output ./flowsplice-cold-start/public/deployment-trust.json
 ```
 
-`sign` 拒绝覆盖已有结果。续期或变更 trust 时必须提高 generation，写入新文件，验证后再原子替换。使用同一根公钥签署更高 generation 不要求重发 Travel 包；更换 deployment root 才需要重建所有内置该根公钥的 Travel/Home bootstrap 二进制。
+`sign` 拒绝覆盖已有结果。续期或变更 trust 时必须提高 generation，写入新文件，验证后再原子替换。使用同一根公钥签署更高 generation 只需替换独立的 trust 文件。更换 deployment root 必须走明确的 current/next 根迁移与带外指纹验证，但仍不得重新编译 Home/Travel 二进制。
 
 ## 8. 初始化 Server 持久状态
 
@@ -370,32 +370,69 @@ curl --fail http://127.0.0.1:9081/
 
 macOS 用 `lsof -nP -iTCP -sTCP:LISTEN` 代替 `ss`。确认 Server 只有控制端口和 loopback UI；Relay 有 management/data 与 loopback UI；Home 只有 loopback UI 和主动出站连接。
 
-## 11. 构建部署绑定的正式包
+## 11. 构建与部署无关的正式程序和独立配置包
 
-正式 Travel/Home bootstrap 二进制只内置公共材料：deployment root 公钥、Management CA 公共证书、公开 bootstrap 地址；绝不内置私钥或密码。
+正式 Home/Travel/Server/Relay 可执行文件不得包含 deployment root、CA、节点 ID、IP、域名、端口或 Relay 列表。所有部署值都必须位于独立配置文件；修改配置不得重新编译程序。
+
+先构建一次通用程序：
 
 ```bash
 export FLOWSPLICE_DOCKER_PULL=false
-export FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY_FILE="$PWD/flowsplice-cold-start/offline-root/deployment-root.pub"
-export FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_FILE="$PWD/flowsplice-cold-start/public/management-ca.crt"
-export FLOWSPLICE_BOOTSTRAP_RELAYS='relay-1.example.net:8443'
-export FLOWSPLICE_SERVER_ID='server-1'
-export FLOWSPLICE_SERVER_NAME='server.example.net'
-export FLOWSPLICE_SERVER_CONTROL_PORT='7443'
-export FLOWSPLICE_HOME_UI_PORT='9082'
 ./scripts/build-release.sh
-./scripts/build-home2-macos-package.sh
 ```
 
-两条构建命令必须使用同一组 Server 元数据；否则 Linux Home 的一键 init 与 macOS Home 包会绑定到不同证书名。仓库的 Dockerfile 还必须把 frontend 和所有基础镜像锁到不可变 digest。`FLOWSPLICE_DOCKER_PULL=false` 禁止主动更新；如果本机缺少该 digest，应停止并安排一次明确的缓存准备，不能在普通发布或部署时临时下载新层。
+再分别准备 Home 和 Travel 的发布配置目录。两个目录都包含 `deployment-root.pub` 和同一份根签名 `deployment-trust.json`，但 bootstrap TOML 各自保存角色需要的拓扑：
+
+```text
+package-config/home/
+├── home-bootstrap.toml
+├── deployment-root.pub
+└── deployment-trust.json
+
+package-config/travel/
+├── travel-bootstrap.toml
+├── deployment-root.pub
+└── deployment-trust.json
+```
+
+`home-bootstrap.toml`：
+
+```toml
+deployment_root_public_key = "deployment-root.pub"
+deployment_trust = "deployment-trust.json"
+server_id = "server-1"
+server_name = "server.example.net"
+server_control_port = 7443
+ui_listen = "127.0.0.1:9082"
+```
+
+`travel-bootstrap.toml`：
+
+```toml
+deployment_root_public_key = "deployment-root.pub"
+deployment_trust = "deployment-trust.json"
+bootstrap_relays = ["relay-1.example.net:8443"]
+ui_listen = "127.0.0.1:9080"
+```
+
+构建配置化 macOS 包：
+
+```bash
+export FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/home/home-bootstrap.toml"
+export FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/travel/travel-bootstrap.toml"
+./scripts/build-home2-macos-package.sh
+./scripts/build-travel-macos-package.sh
+```
+
+仓库的 Dockerfile 还必须把 frontend 和所有基础镜像锁到不可变 digest。`FLOWSPLICE_DOCKER_PULL=false` 禁止主动更新；如果本机缺少该 digest，应停止并安排一次明确的缓存准备，不能在普通发布或部署时临时下载新层。
 
 macOS 文件使用免费的 ad-hoc codesign 与稳定的 `io.zxf.flowsplice.*` identifier。它能校验签名后未被修改，但没有 Apple Developer ID 身份，也未 notarize；公开分发时必须如实说明 Gatekeeper 限制。
 
-记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。发布包不得包含 `*.key`、密码、生产 TOML、真实 Server IP 或 Server SPKI。
+记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。客户端包应包含公开 bootstrap TOML、root 公钥和签名 trust，但不得包含 `*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。用 `strings` 检查二进制不得出现配置中的 root、公网 Relay、Server ID/域名或 CA PEM。
 
 ## 12. 首个 Travel 从空目录注册
 
-Travel 机器不预先创建 TOML 或 cert：
+Travel 机器不预先创建运行期 TOML 或 cert；从包含 `travel-bootstrap.toml` 的包目录执行：
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -411,7 +448,7 @@ Travel 本机输入并确认自己的私钥密码，终端随后保持等待。�
 
 ## 13. Home 2、Home 3 及后续 Home
 
-使用与当前部署绑定的 Home macOS 包。在空 Apple Silicon Mac 上只运行：
+使用包含独立 `home-bootstrap.toml` 和 trust 文件的 Home macOS 包。在空 Apple Silicon Mac 的包目录只运行：
 
 ```bash
 ./bin/flowsplice-homeagent init --server 192.0.2.10
@@ -429,10 +466,11 @@ Travel 本机输入并确认自己的私钥密码，终端随后保持等待。�
 2. Server 无业务 listener；业务路径为 `Travel ↔ Relay ↔ Home`。
 3. Travel 从真正空目录远程注册，Home 错误签发密码被拒绝，正确密码后自动生成证书/TOML/redb。
 4. Home 2 从真正空环境只执行一次 `init --server <IP>`，批准后三种权限与文件权限符合预期；重跑同一命令可幂等恢复安装。
-5. Travel 通过映射访问 Home 的真实 TCP 业务，并核对请求/响应内容，而不只检查端口连通。
-6. 至少两个 Relay 时，停止当前 Relay 后同一 TCP Flow 切换并继续；不是新建连接掩盖失败。
-7. 停止 Server 后，已经建立的业务 Flow 继续；新路由可以失败，但不得存在隐藏的 Server data fallback。
-8. 恢复 Server/Relay 后控制目录、Catalog 与授权 generation 单调恢复。
+5. 同一个 Home/Travel 二进制分别使用两套不同的测试 bootstrap 配置，不重新构建即可选择不同拓扑；二进制字符串中不存在任一配置的 root、CA、节点身份、地址、域名或端口。
+6. Travel 通过映射访问 Home 的真实 TCP 业务，并核对请求/响应内容，而不只检查端口连通。
+7. 至少两个 Relay 时，停止当前 Relay 后同一 TCP Flow 切换并继续；不是新建连接掩盖失败。
+8. 停止 Server 后，已经建立的业务 Flow 继续；新路由可以失败，但不得存在隐藏的 Server data fallback。
+9. 恢复 Server/Relay 后控制目录、Catalog 与授权 generation 单调恢复。
 9. Travel 重启从 redb 得到历史 Relay 启动候选，但在新鲜签名目录到达前不能用于业务授权。
 10. Travel、Relay、Home 的统计只在各自第二页点击后加载；Server 只接收签名五分钟汇总并幂等去重，日/周/月/年窗口可查询。
 11. 撤销 Travel 凭据必须再次输入签发密码；在线与重启后均拒绝已撤销凭据。
@@ -459,6 +497,8 @@ Docker 验收使用同一功能边界，但只能使用 `tests/e2e/generated/` �
 4. 离线签署新文件；
 5. 先在隔离副本运行配置验证，再备份并分发；
 6. 确认所有节点接受更高 generation 后才归档旧文件。
+
+本次部署配置边界修正不重新签发现有 Home/Travel 证书，也不更换 deployment root 或 CA。Home 运行配置已经显式引用 root/trust，可直接替换二进制；较早 0.2 Travel 运行配置在替换二进制前必须补充显式 `deployment_trust` 路径。首次 Home/Travel 包始终携带独立 bootstrap TOML、公共 root 和根签名 trust。不得为兼容旧开发包恢复任何编译期部署默认值。
 
 0.1 授权 JSON 没有 `home_endpoint_credentials` 字段。0.2 Server 第一次正常启动读取这种旧格式时，会在开放 listener 之前自动把 Travel authorization generation 提高一次、补齐字段并原子写回；`--check-config` 仍然只读。滚动升级必须先升级能读取新字段的 Relay、Home 与 Travel，再启动新 Server。不要手工只改 JSON 数字；先对生产状态副本执行迁移演练，并以 `travel_authorization_schema_migrated` 和所有节点对新 generation 的 ack 作为验收证据。
 

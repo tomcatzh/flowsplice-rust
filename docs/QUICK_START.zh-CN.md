@@ -2,15 +2,32 @@
 
 ## 准备
 
-使用为 `zxf.io` 这套部署构建的 0.2 Travel 正式二进制。它只内置公开材料：部署根公钥、Management CA 公共证书和一组 Relay bootstrap 地址；不会内置任何私钥、Home 签发密码或 Travel 密码。
+使用 0.2 Travel 正式包。`flowsplice-travelagent` 是与具体部署无关的通用二进制；部署根公钥、签名 deployment trust、Management CA 和 Relay bootstrap 地址都不在二进制里，而是由包内独立配置提供。
+
+包内必须包含：
+
+```text
+flowsplice-travel-0.2.0-macos-arm64/
+├── bin/flowsplice-travelagent
+├── travel-bootstrap.toml
+├── deployment-root.pub
+├── deployment-trust.json
+├── QUICK_START.zh-CN.md
+└── SHA256SUMS
+```
+
+`travel-bootstrap.toml` 明确配置根公钥文件、签名 trust 文件、首次联系的 Relay 列表和本地 UI 地址。程序先用根公钥验证 `deployment-trust.json`，再从已验证 trust 中读取 Management CA 建立首次 TLS；不会信任 TOML 中裸放的 CA 内容。
 
 macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。免费签名是 ad-hoc codesign：它能校验文件未被签名后修改，但不提供 Apple Developer ID 身份，也没有 notarization。若文件经浏览器下载而被 Gatekeeper 隔离，仍可能需要在 macOS 的“隐私与安全性”页面由用户明确允许。
 
-给二进制增加执行权限，并验证 ad-hoc 签名：
+ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256，或至少核对 `deployment-root.pub` 的 SHA-256 指纹；不要只依赖同一个下载包内自带的校验值。
+
+解包后进入包目录，验证全部文件和 ad-hoc 签名：
 
 ```bash
-chmod 755 ./flowsplice-travelagent
-codesign --verify --strict --verbose=2 ./flowsplice-travelagent
+shasum -a 256 -c SHA256SUMS
+chmod 755 ./bin/flowsplice-travelagent
+codesign --verify --strict --verbose=2 ./bin/flowsplice-travelagent
 ```
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
@@ -19,7 +36,7 @@ codesign --verify --strict --verbose=2 ./flowsplice-travelagent
 
 ```bash
 mkdir -m 700 ./my-travel
-./flowsplice-travelagent enroll-remote \
+./bin/flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel
@@ -28,7 +45,7 @@ mkdir -m 700 ./my-travel
 命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
 
 1. 在 Travel 本机生成两把独立、加密保存的 Management/Business 私钥；
-2. 使用二进制内置的公开 CA 和 bootstrap Relay 建立只验证服务器身份的首次注册 TLS 通道；
+2. 读取 `travel-bootstrap.toml`，验证根签名 trust，并依次尝试配置中的 Relay 建立首次注册 TLS 通道；
 3. 把只有公钥和 proof-of-possession 的 enrollment 请求送到指定 Home；
 4. 在终端显示 `Home verification code`；
 5. 保持运行并重试，等待 Home 上的人工批准。
@@ -67,6 +84,7 @@ Home 批准后，签发结果通过 `Home -> Server -> Relay -> Travel` 返回�
 my-travel/
 ├── travelagent.toml
 ├── cert/
+│   ├── deployment-root.pub
 │   ├── travel-management.crt
 │   ├── travel-management.key
 │   ├── travel-business.crt
@@ -81,10 +99,12 @@ my-travel/
 
 `travelagent.toml` 不保存 Travel 私钥密码。正常流程不需要下载、复制或上传 `enrollment-request.json` / `enrollment-response.json`。
 
+如果从较早的 0.2 开发包替换二进制，现有 Travel 证书和私钥无需重发，但运行 TOML 必须显式包含 `deployment_trust = ".../deployment-trust.json"`。不要让程序根据证书目录或固定文件名猜测 trust 路径。0.1.1 与 0.2 的协议升级仍按整体升级边界处理。
+
 ## 启动 Travel
 
 ```bash
-./flowsplice-travelagent --config ./my-travel/travelagent.toml
+./bin/flowsplice-travelagent --config ./my-travel/travelagent.toml
 ```
 
 输入刚才设置的 Travel 私钥密码。随后：
@@ -95,7 +115,7 @@ my-travel/
 
 ## TOML 什么时候需要修改
 
-第一次远程注册已经生成身份、信任、Home、Relay bootstrap 和本地状态所需的完整 TOML。首次注册不要求业务映射；获得凭据后，再按实际需要增加 `[[mappings]]`。
+第一次远程注册已经生成身份、根公钥路径、信任、Home、Relay seed 和本地状态所需的完整 TOML。首次注册不要求业务映射；获得凭据后，再按实际需要增加 `[[mappings]]`。
 
 通常只修改以下内容：
 
@@ -105,6 +125,8 @@ my-travel/
 - 在确有 bootstrap 可用性需要时增加 `[[seed_relays]]`。
 
 不要把 Home SPKI、完整 Relay 授权名单或密码手工写进 TOML。`[[seed_relays]]` 只是首次取得签名目录的联系地址。Travel 会把历史上从有效签名目录中验证过的 Relay 长期保存在 `travel-state.redb`，以后重启时把它们也当成 bootstrap 候选；旧记录永远不能代替新的 Server 签名目录授权。
+
+首次 enrollment 具体连接哪个 Relay，完全由 `travel-bootstrap.toml` 的 `bootstrap_relays` 决定。程序会规范化、排序、去重后逐一轮询；一个 Relay 失败会继续尝试下一个。Relay 地址变化只修改并重新分发配置文件，不重新编译二进制。
 
 例如，注册完成后再增加一个 Foobar TCP 映射：
 

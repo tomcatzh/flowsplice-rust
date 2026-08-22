@@ -34,8 +34,11 @@ use flowsplice_core::{
         TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization, load_json,
         store_json_atomic, unix_time_secs,
     },
-    config::load_toml,
-    deployment::{DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential},
+    config::{load_toml, resolve_path},
+    deployment::{
+        DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential,
+        load_verified_deployment_trust,
+    },
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{
@@ -117,6 +120,13 @@ enum Command {
     Init {
         #[arg(long)]
         server: IpAddr,
+        #[arg(long, default_value = "home-bootstrap.toml")]
+        bootstrap_config: PathBuf,
+    },
+    /// Validate bootstrap configuration without connecting or writing local state.
+    CheckBootstrapConfig {
+        #[arg(long, default_value = "home-bootstrap.toml")]
+        config: PathBuf,
     },
 }
 
@@ -129,6 +139,27 @@ struct HomeBootstrapState {
     request_id: Uuid,
     home_id: String,
     retrieval_token_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeBootstrapConfig {
+    deployment_root_public_key: PathBuf,
+    deployment_trust: PathBuf,
+    server_id: String,
+    server_name: String,
+    server_control_port: u16,
+    ui_listen: String,
+}
+
+struct VerifiedHomeBootstrap {
+    deployment_root_public_key: String,
+    signed_trust: SignedDeploymentTrust,
+    trust: DeploymentTrust,
+    server_id: String,
+    server_name: String,
+    server_control_port: u16,
+    ui_listen: String,
 }
 
 #[derive(Serialize)]
@@ -529,7 +560,18 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     match args.command {
-        Some(Command::Init { server }) => run_home_init(server).await,
+        Some(Command::Init {
+            server,
+            bootstrap_config,
+        }) => run_home_init(server, &bootstrap_config).await,
+        Some(Command::CheckBootstrapConfig { config }) => {
+            let bootstrap = load_home_bootstrap(&config)?;
+            println!(
+                "Home bootstrap configuration is valid for deployment {} generation {} and Server {}",
+                bootstrap.trust.deployment_id, bootstrap.trust.generation, bootstrap.server_id
+            );
+            Ok(())
+        }
         None => run_home_agent(args.config).await,
     }
 }
@@ -670,43 +712,69 @@ async fn run_home_agent(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn embedded_deployment_root_public_key() -> Result<&'static str> {
-    option_env!("FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("this Home binary has no embedded deployment root public key")
-        })
+fn load_home_bootstrap(path: &Path) -> Result<VerifiedHomeBootstrap> {
+    let configured: HomeBootstrapConfig = load_toml(path)?;
+    if configured.server_id.is_empty() {
+        bail!("Home bootstrap Server id must be non-empty");
+    }
+    if configured.server_control_port == 0 {
+        bail!("Home bootstrap Server control port must be positive");
+    }
+    server_name(&configured.server_name).context("Home bootstrap Server name is invalid")?;
+    let ui_listen = configured
+        .ui_listen
+        .parse::<SocketAddr>()
+        .context("Home bootstrap UI listener is invalid")?;
+    if !ui_listen.ip().is_loopback() {
+        bail!("Home bootstrap UI must listen directly on a loopback address");
+    }
+    let deployment_root_public_key_path =
+        resolve_path(path, &configured.deployment_root_public_key);
+    let deployment_trust_path = resolve_path(path, &configured.deployment_trust);
+    let (deployment_root_public_key, signed_trust, trust) = load_verified_deployment_trust(
+        &deployment_root_public_key_path,
+        &deployment_trust_path,
+        unix_time_secs()?,
+    )?;
+    if !trust
+        .server_control_keys
+        .iter()
+        .any(|key| key.server_id == configured.server_id)
+    {
+        bail!(
+            "Home bootstrap Server {} is absent from deployment trust",
+            configured.server_id
+        );
+    }
+    Ok(VerifiedHomeBootstrap {
+        deployment_root_public_key,
+        signed_trust,
+        trust,
+        server_id: configured.server_id,
+        server_name: configured.server_name,
+        server_control_port: configured.server_control_port,
+        ui_listen: configured.ui_listen,
+    })
 }
 
-fn embedded_management_ca_certificate() -> Result<&'static str> {
-    option_env!("FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("this Home binary has no embedded management CA"))
-}
-
-fn embedded_server_id() -> &'static str {
-    option_env!("FLOWSPLICE_SERVER_ID")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("server-1")
-}
-
-fn embedded_server_name() -> Result<&'static str> {
-    let name = option_env!("FLOWSPLICE_SERVER_NAME")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("server.flowsplice");
-    server_name(name).context("embedded Server certificate name is invalid")?;
-    Ok(name)
-}
-
-fn embedded_server_port() -> Result<u16> {
-    option_env!("FLOWSPLICE_SERVER_CONTROL_PORT")
-        .unwrap_or("7443")
-        .parse::<u16>()
-        .context("embedded Server control port is invalid")
+fn validate_bootstrap_trust_continuity(
+    baseline_signed: &SignedDeploymentTrust,
+    baseline: &DeploymentTrust,
+    candidate_signed: &SignedDeploymentTrust,
+    candidate: &DeploymentTrust,
+) -> Result<()> {
+    if candidate.deployment_id != baseline.deployment_id {
+        bail!("Home enrollment response belongs to a different deployment");
+    }
+    if candidate.generation < baseline.generation {
+        bail!("Home enrollment response would roll back bootstrap deployment trust");
+    }
+    if candidate.generation == baseline.generation
+        && candidate_signed.payload_digest_sha256()? != baseline_signed.payload_digest_sha256()?
+    {
+        bail!("Home enrollment response conflicts with bootstrap deployment trust");
+    }
+    Ok(())
 }
 
 fn default_home_install_root() -> Result<PathBuf> {
@@ -720,10 +788,11 @@ fn default_home_install_root() -> Result<PathBuf> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_home_init(server: IpAddr) -> Result<()> {
-    let deployment_root_public_key = embedded_deployment_root_public_key()?;
-    let management_ca = embedded_management_ca_certificate()?;
-    let server_address = SocketAddr::new(server, embedded_server_port()?);
+async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<()> {
+    let bootstrap = load_home_bootstrap(bootstrap_config_path)?;
+    let deployment_root_public_key = bootstrap.deployment_root_public_key.as_str();
+    let management_ca = &bootstrap.trust.management_ca_certificate_pem;
+    let server_address = SocketAddr::new(server, bootstrap.server_control_port);
     let install_root = default_home_install_root()?;
     if install_root.exists() && !install_root.is_dir() {
         bail!(
@@ -825,6 +894,7 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
             &request,
             &retrieval_token,
             &request_json,
+            &bootstrap.server_id,
         )
         .await
         {
@@ -845,6 +915,15 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
         deployment_root_public_key,
         unix_time_secs()?,
     )?;
+    let response_trust = response
+        .deployment_trust
+        .verify(deployment_root_public_key, unix_time_secs()?)?;
+    validate_bootstrap_trust_continuity(
+        &bootstrap.signed_trust,
+        &bootstrap.trust,
+        &response.deployment_trust,
+        &response_trust,
+    )?;
     if endpoint.home_id != request.home_id {
         bail!("approved Home identity changed during enrollment");
     }
@@ -859,10 +938,6 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
         format!("{}\n", deployment_root_public_key.trim()).as_bytes(),
     )?;
     let issuer = installed_issuer_config(&install_root, &response);
-    let ui_port = option_env!("FLOWSPLICE_HOME_UI_PORT")
-        .unwrap_or("9082")
-        .parse::<u16>()
-        .context("embedded Home UI port is invalid")?;
     let suffix = request
         .home_id
         .strip_prefix("home-")
@@ -871,8 +946,8 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
         id: request.home_id.clone(),
         alias: format!("Home {suffix}"),
         server_control_addr: server_address.to_string(),
-        server_name: embedded_server_name()?.to_owned(),
-        server_id: embedded_server_id().to_owned(),
+        server_name: bootstrap.server_name,
+        server_id: bootstrap.server_id,
         management_cert: enrollment_directory.join(HOME_MANAGEMENT_CERT_FILE),
         management_key: enrollment_directory.join(HOME_MANAGEMENT_KEY_FILE),
         management_ca: enrollment_directory.join(flowsplice_enrollment::MANAGEMENT_CA_FILE),
@@ -885,7 +960,7 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
         server_spki_pins: vec![server_spki_pin],
         travel_authorization_cache: install_root.join("state/travel-authorization-cache.json"),
         state_store: install_root.join("state/home-state.redb"),
-        ui_listen: format!("127.0.0.1:{ui_port}"),
+        ui_listen: bootstrap.ui_listen,
         issuer,
         services: Vec::new(),
     };
@@ -900,7 +975,7 @@ async fn run_home_init(server: IpAddr) -> Result<()> {
         response.approval.profile
     );
     println!("configuration: {}", config_path.display());
-    println!("Home page: http://127.0.0.1:{ui_port}/");
+    println!("Home page: http://{}/", generated.ui_listen);
     #[cfg(not(target_os = "macos"))]
     println!(
         "start: flowsplice-homeagent --config {}",
@@ -915,6 +990,7 @@ async fn poll_home_bootstrap_server(
     request: &HomeEnrollmentRequest,
     retrieval_token: &[u8],
     request_json: &[u8],
+    server_id: &str,
 ) -> Result<Option<(HomeEnrollmentResponse, String)>> {
     let socket = timeout(Duration::from_secs(10), TcpStream::connect(address))
         .await
@@ -926,7 +1002,7 @@ async fn poll_home_bootstrap_server(
     .await
     .context("Server bootstrap TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Server, Some(embedded_server_id()), &[])?;
+    require_peer(&identity, Role::Server, Some(server_id), &[])?;
     write_json(
         &mut stream,
         &ControlMessage::HomeBootstrapEnrollmentSubmit {

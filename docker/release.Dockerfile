@@ -31,20 +31,6 @@ COPY foobar/ foobar/
 COPY tests/fixtures/echo/ tests/fixtures/echo/
 COPY --from=travel-web /src/travelagent/web/dist/ travelagent/web/dist/
 COPY --from=home-web /src/homeagent/web/dist/ homeagent/web/dist/
-ARG FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY
-ARG FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM
-ARG FLOWSPLICE_BOOTSTRAP_RELAYS
-ARG FLOWSPLICE_SERVER_ID
-ARG FLOWSPLICE_SERVER_NAME
-ARG FLOWSPLICE_SERVER_CONTROL_PORT
-ARG FLOWSPLICE_HOME_UI_PORT
-ENV FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY=${FLOWSPLICE_DEPLOYMENT_ROOT_PUBLIC_KEY}
-ENV FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM=${FLOWSPLICE_MANAGEMENT_CA_CERTIFICATE_PEM}
-ENV FLOWSPLICE_BOOTSTRAP_RELAYS=${FLOWSPLICE_BOOTSTRAP_RELAYS}
-ENV FLOWSPLICE_SERVER_ID=${FLOWSPLICE_SERVER_ID}
-ENV FLOWSPLICE_SERVER_NAME=${FLOWSPLICE_SERVER_NAME}
-ENV FLOWSPLICE_SERVER_CONTROL_PORT=${FLOWSPLICE_SERVER_CONTROL_PORT}
-ENV FLOWSPLICE_HOME_UI_PORT=${FLOWSPLICE_HOME_UI_PORT}
 RUN --mount=type=cache,id=flowsplice-release-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=flowsplice-release-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=flowsplice-release-cargo-target-${RUST_TARGET},target=/src/target,sharing=locked \

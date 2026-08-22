@@ -1,4 +1,6 @@
 id = "travel-1"
+deployment_root_public_key = "/etc/flowsplice/deployment-root.pub"
+deployment_trust = "/etc/flowsplice/deployment-trust.json"
 management_cert = "/etc/flowsplice/travel-management.crt"
 management_key = "/etc/flowsplice/travel-management.key"
 management_ca = "/etc/flowsplice/management-ca.crt"

@@ -642,7 +642,7 @@ pub(crate) fn verify_client_chain(
 ) -> Result<()> {
     let roots = CertificateDer::pem_slice_iter(ca_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to parse embedded {label} CA"))?;
+        .with_context(|| format!("failed to parse configured {label} CA"))?;
     let mut store = RootCertStore::empty();
     let root_count = roots.len();
     let (added, ignored) = store.add_parsable_certificates(roots);

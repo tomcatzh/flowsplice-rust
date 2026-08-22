@@ -23,18 +23,19 @@ This principle also defines what may be distributed safely. Certificates, CA cer
 keys, signed trust documents, signed credentials, and a deployment-root public key are public
 material. Private keys, passwords, bearer tokens, and short-lived route/work secrets are not.
 
-### One bootstrap trust point, not a pile of manual pins
+### One configured bootstrap trust point, not executable deployment data
 
-A personal Travel binary contains one deployment-root public key, the public Management CA
-certificate needed to authenticate a first-enrollment Relay, and bootstrap Relay addresses. The
-root public key verifies a signed
+A Travel package contains separate `travel-bootstrap.toml`, `deployment-root.pub`, and
+`deployment-trust.json` files. The binary contains none of those deployment values. The
+root public-key file verifies a signed
 deployment-trust document, which in turn binds the management and business CAs, Server control keys,
 Home endpoint keys, and scoped Travel authorities. Relay identities and Home SPKIs are learned from
 authenticated state instead of being copied into each Travel configuration.
 
-The configured or embedded Seed Relay is therefore transport, not authority. Reaching a Seed cannot
-change what Travel trusts. The embedded Management CA prevents first contact from becoming
-trust-on-first-use; the deployment root remains the authority for the returned complete trust state.
+The configured Seed Relay is therefore transport, not authority. Reaching a Seed cannot change what
+Travel trusts. The Management CA obtained from the verified signed trust prevents first contact from
+becoming trust-on-first-use; the configured deployment root remains the authority for the returned
+complete trust state.
 
 ### Separate keys and channels for separate powers
 
@@ -131,7 +132,7 @@ DER `SubjectPublicKeyInfo` and are always exactly 32 SHA-256 bytes.
 
 | Material | Private material resides at | Public binding or distribution | Power and rotation boundary |
 | --- | --- | --- | --- |
-| Deployment root | Offline, password-encrypted `deployment-root.key` | Public point is embedded in Travel and installed for Server/Relay/Home | Can replace every subordinate trust domain; changing it requires an independently trusted software/configuration update |
+| Deployment root | Offline, password-encrypted `deployment-root.key` | Public point is a separate configured trust file for Home/Travel/Server/Relay | Can replace every subordinate trust domain; changing it requires an independently authenticated configuration migration, never an executable rebuild |
 | Management CA | Issuer-side encrypted private key; CA certificate is public | Exact CA certificate is root-bound in deployment trust and carried in enrollment responses | Issues management certificates; compromise does not by itself create a valid Travel grant, but can impersonate roles where later SPKI/grant checks do not narrow the certificate |
 | Business CA | Issuer-side encrypted private key; CA certificate is public | Exact CA certificate is root-bound in deployment trust and carried in enrollment responses | Issues business certificates; Travel/Home still apply root-bound Home SPKI or signed Travel-grant checks |
 | Server control-signing key | Server runtime as an unencrypted PKCS#8 file protected by host/file permissions | Public key, Server ID, and epoch are root-bound | Signs Travel-specific Relay/Catalog snapshots; compromise controls discovery integrity and availability until its epoch is removed |
@@ -283,7 +284,7 @@ Import performs these checks in order:
 
 1. the response and approval versions/IDs are valid;
 2. the response carries the exact original request;
-3. the embedded deployment trust verifies against the public root compiled into Travel;
+3. the response deployment trust verifies against the root selected by the explicit bootstrap configuration and does not roll back or conflict with the configured baseline trust;
 4. the selected authority is present in that trust and permits the scope;
 5. the authority signature and every atomic credential field match the approval, CAs, certificates,
    and request;
@@ -552,8 +553,9 @@ Travel build, and reissuance under the replacement deployment.
 - Signed state protects integrity and rollback only within the persisted history available to that
   component. Deleting or maliciously replacing local high-water files defeats that local history.
 - Release binaries are not yet Developer ID notarized, reproducibly attested, or delivered by an
-  authenticated anti-rollback updater. An embedded root cannot prove that the executable containing
-  it was not replaced.
+  authenticated anti-rollback updater. Separate configuration prevents deployment coupling but does
+  not by itself authenticate the adjacent root file; package provenance or an independently verified
+  root fingerprint remains required.
 - The project has not undergone a professional third-party security audit and is not a certified
   security product.
 
