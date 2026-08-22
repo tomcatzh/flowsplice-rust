@@ -19,10 +19,11 @@ rm -rf \
   "${generated_dir}/dynamic-home-issuer" \
   "${generated_dir}/dynamic-home-global" \
   "${generated_dir}/dynamic-home-third" \
-  "${generated_dir}/dynamic-travel"
+  "${generated_dir}/dynamic-travel" \
+  "${generated_dir}/travel"
 
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
-  "${repo_root}/tests/e2e/generate-certs.sh" prepare
+  "${repo_root}/tests/e2e/generate-certs.sh"
 else
   find "${generated_dir}/state" -maxdepth 1 -type f ! -name relay-pins.json -delete
   rm -rf "${generated_dir}/state/travel-enrollment"
@@ -139,7 +140,6 @@ if docker run --rm \
   exit 1
 fi
 printf '%s\n' '{"checkpoint": "runtime-bootstrap-config-boundary"}'
-"${repo_root}/tests/e2e/generate-certs.sh" enroll-only
 
 teardown() {
   docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
@@ -498,68 +498,79 @@ python3 "${repo_root}/tests/e2e/tcp-probe.py" \
   --expect-unavailable
 docker compose -f "${compose_file}" stop firsttravel
 
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" issue \
+mkdir -p "${generated_dir}/travel"
+cp "${generated_dir}/offline/test-password.txt" \
+  "${generated_dir}/travel/test-password.txt"
+chmod 600 "${generated_dir}/travel/test-password.txt"
+if [[ -e "${generated_dir}/travel/travelagent.toml" || \
+      -e "${generated_dir}/travel/cert" ]]; then
+  echo 'main Travel was not clean before remote enrollment' >&2
+  exit 1
+fi
+docker compose -f "${compose_file}" run --no-deps --rm travelagent \
+  /usr/local/bin/flowsplice-travelagent enroll-remote \
+  --travel-id travel-1 \
+  --home-id home-1 \
+  --install-dir /travel \
+  --bootstrap-config /config/travel-bootstrap.toml \
+  --test-password-file /travel/test-password.txt \
+  --wait-timeout-secs 180 \
+  >"${generated_dir}/travel/enroll.log" 2>&1 &
+first_enroll_pid=$!
+main_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
   --port 19081 \
-  --request "${generated_dir}/travel/enrollment-request.json" \
+  --travel-id travel-1 \
+  --wait-secs 120)"
+main_travel_request_id="$(python3 -c \
+  'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+  "${main_travel_pending}")"
+main_travel_verification_code="$(python3 -c \
+  'import json,sys; value=json.loads(sys.argv[1]); assert value["bootstrap"] is True; print(value["verification_code"])' \
+  "${main_travel_pending}")"
+if ! grep -Fq "Home verification code: ${main_travel_verification_code}" \
+  "${generated_dir}/travel/enroll.log"; then
+  echo 'Home and main Travel verification codes did not match' >&2
+  exit 1
+fi
+python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+  --port 19081 \
+  --request-id "${main_travel_request_id}" \
   --password-file "${generated_dir}/offline/wrong-password.txt" \
   --scope global \
-  --output "${generated_dir}/authorization/invalid-response.json" \
+  --valid-days 365 \
   --expect-failure
-
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" issue \
+python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
   --port 19081 \
-  --request "${generated_dir}/travel/enrollment-request.json" \
+  --request-id "${main_travel_request_id}" \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --scope global \
-  --output "${generated_dir}/authorization/enrollment-response.json"
-
-python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
-  --input "${generated_dir}/authorization/enrollment-response.json" \
-  --output "${generated_dir}/authorization/tampered-enrollment-response.json" \
-  --mode root-signature
-python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
-  --input "${generated_dir}/authorization/enrollment-response.json" \
-  --output "${generated_dir}/authorization/spliced-certificate-response.json" \
-  --mode certificate
-python3 "${repo_root}/tests/e2e/tamper-enrollment-response.py" \
-  --input "${generated_dir}/authorization/enrollment-response.json" \
-  --output "${generated_dir}/authorization/spliced-request-response.json" \
-  --mode request
-for invalid_response in \
-  tampered-enrollment-response.json \
-  spliced-certificate-response.json \
-  spliced-request-response.json; do
-  if docker run --rm \
-    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
-    -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
-    -v "${generated_dir}/travel:/travel" \
-    -v "${generated_dir}/authorization:/authorization:ro" \
-    -v "${generated_dir}/config:/config:ro" \
-    -v "${generated_dir}/certs:/certs:ro" \
-    flowsplice-e2e:local \
-    /usr/local/bin/flowsplice-travelagent enroll-import \
-    --enrollment-dir /travel \
-    --response "/authorization/${invalid_response}" \
-    --bootstrap-config /config/travel-bootstrap.toml \
-    --test-password-file /travel/test-password.txt; then
-    echo "Travel accepted tampered Enrollment Response ${invalid_response}" >&2
+  --valid-days 365 >/dev/null
+wait "${first_enroll_pid}"
+first_enroll_pid=""
+for required in \
+  travelagent.toml \
+  cert/enrollment-request.json \
+  cert/travel-management.crt \
+  cert/travel-management.key \
+  cert/travel-business.crt \
+  cert/travel-business.key \
+  cert/deployment-root.pub \
+  cert/deployment-trust.json \
+  state/travel-state.redb; do
+  if [[ ! -s "${generated_dir}/travel/${required}" ]]; then
+    echo "main remote Travel did not create ${required}" >&2
     exit 1
   fi
 done
-
-docker run --rm \
-  --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
-  -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
-  -v "${generated_dir}/travel:/travel" \
-  -v "${generated_dir}/authorization:/authorization:ro" \
-  -v "${generated_dir}/config:/config:ro" \
-  -v "${generated_dir}/certs:/certs:ro" \
-  flowsplice-e2e:local \
-  /usr/local/bin/flowsplice-travelagent enroll-import \
-  --enrollment-dir /travel \
-  --response /authorization/enrollment-response.json \
-  --bootstrap-config /config/travel-bootstrap.toml \
-  --test-password-file /travel/test-password.txt
+if [[ -e "${generated_dir}/travel/bootstrap-enrollment.json" ]]; then
+  echo 'completed main Travel enrollment retained its retrieval token' >&2
+  exit 1
+fi
+if grep -Eq '^(mappings =|\[\[mappings\]\])' \
+  "${generated_dir}/travel/travelagent.toml"; then
+  echo 'main remote enrollment generated an unsolicited business mapping' >&2
+  exit 1
+fi
 
 docker compose -f "${compose_file}" up -d travelagent
 python3 -u "${repo_root}/tests/e2e/assert_e2e.py"

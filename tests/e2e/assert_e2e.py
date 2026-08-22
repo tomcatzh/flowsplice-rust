@@ -728,7 +728,7 @@ def issue_scope(
     validity = {"valid_days": 365}
     if valid_minutes is not None:
         validity = {"valid_minutes": valid_minutes}
-    request = json.loads((generated / "travel/enrollment-request.json").read_text())
+    request = json.loads((generated / "travel/cert/enrollment-request.json").read_text())
     request["request_id"] = str(uuid.uuid4())
     request["created_at_unix_secs"] = int(time.time())
     result = issuer_request(
@@ -810,7 +810,7 @@ def container_pid(service: str) -> int:
 def check_home_issued_enrollment() -> str:
     generated = Path(__file__).resolve().parent / "generated"
     response = json.loads(
-        (generated / "authorization/enrollment-response.json").read_text()
+        (generated / "travel/cert/enrollment-response.json").read_text()
     )
     assert "authority_public_key" not in response
     assert "management_ca_certificate_pem" not in response
@@ -839,10 +839,10 @@ def check_home_issued_enrollment() -> str:
     assert trust["business_ca_certificate_pem"].startswith(
         "-----BEGIN CERTIFICATE-----"
     )
-    assert (generated / "travel/management-ca.crt").read_text() == trust[
+    assert (generated / "travel/cert/management-ca.crt").read_text() == trust[
         "management_ca_certificate_pem"
     ]
-    assert (generated / "travel/business-ca.crt").read_text() == trust[
+    assert (generated / "travel/cert/business-ca.crt").read_text() == trust[
         "business_ca_certificate_pem"
     ]
     credentials = [
@@ -868,7 +868,7 @@ def check_duplicate_enrollment_issue_is_idempotent(
         "/api/test/issue",
         {
             "request": json.loads(
-                (generated / "travel/enrollment-request.json").read_text()
+                (generated / "travel/cert/enrollment-request.json").read_text()
             ),
             "valid_days": 365,
             "scope": {"kind": "global"},
@@ -888,7 +888,7 @@ def check_duplicate_enrollment_issue_is_idempotent(
         "/api/test/issue",
         {
             "request": json.loads(
-                (generated / "travel/enrollment-request.json").read_text()
+                (generated / "travel/cert/enrollment-request.json").read_text()
             ),
             "valid_days": 365,
             "scope": {"kind": "home", "home_id": "home-1"},
@@ -1562,7 +1562,7 @@ def check_scoped_authorization_and_home_revocation(
         "/api/test/issue",
         {
             "request": json.loads(
-                (generated / "travel/enrollment-request.json").read_text()
+                (generated / "travel/cert/enrollment-request.json").read_text()
             ),
             "valid_days": 365,
             "scope": {"kind": "global"},
@@ -1740,9 +1740,8 @@ checks = [
     "tls13-only",
     "slow-frame-deadline",
     "duplicate-travel-login-rejected-across-relays",
-    "encrypted-local-travel-enrollment",
+    "encrypted-remote-travel-enrollment",
     "tampered-enrollment-trust-rejected",
-    "cross-request-and-certificate-splicing-rejected",
     "independent-enrollment-nonce-bound",
     "single-file-enrollment-response-includes-ca-roots",
     "home-embedded-issuer-ui",

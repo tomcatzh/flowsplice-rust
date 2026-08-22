@@ -99,35 +99,11 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::enum_variant_names)]
 enum Command {
-    EnrollInit(EnrollInitArgs),
-    EnrollImport(EnrollImportArgs),
     EnrollRemote(EnrollRemoteArgs),
     CheckBootstrapConfig {
         #[arg(long, default_value = "travel-bootstrap.toml")]
         config: PathBuf,
     },
-}
-
-#[derive(clap::Args)]
-struct EnrollInitArgs {
-    #[arg(long)]
-    travel_id: String,
-    #[arg(long)]
-    enrollment_dir: PathBuf,
-    #[arg(long, hide = true)]
-    test_password_file: Option<PathBuf>,
-}
-
-#[derive(clap::Args)]
-struct EnrollImportArgs {
-    #[arg(long)]
-    enrollment_dir: PathBuf,
-    #[arg(long)]
-    response: PathBuf,
-    #[arg(long, default_value = "travel-bootstrap.toml")]
-    bootstrap_config: PathBuf,
-    #[arg(long, hide = true)]
-    test_password_file: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -700,29 +676,6 @@ async fn monitor_trust_expiry(state: AppState) -> Result<()> {
 
 async fn run_command(command: Command) -> Result<()> {
     match command {
-        Command::EnrollInit(args) => {
-            let password = if let Some(path) = args.test_password_file.as_deref() {
-                test_password(path)?
-            } else {
-                prompt_new_private_key_password()?
-            };
-            if password.len() < 12 {
-                bail!("private-key password must contain at least 12 characters");
-            }
-            let request = create_enrollment_request(
-                &args.travel_id,
-                password.as_bytes(),
-                &args.enrollment_dir,
-                unix_time_secs()?,
-            )?;
-            println!(
-                "created Travel enrollment request {} ({})",
-                request.request_id,
-                args.enrollment_dir.display()
-            );
-            Ok(())
-        }
-        Command::EnrollImport(args) => run_enroll_import(&args),
         Command::EnrollRemote(args) => run_remote_enrollment(args).await,
         Command::CheckBootstrapConfig { config } => {
             let bootstrap = load_travel_bootstrap(&config)?;
@@ -735,76 +688,6 @@ async fn run_command(command: Command) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn run_enroll_import(args: &EnrollImportArgs) -> Result<()> {
-    let bootstrap = load_travel_bootstrap(&args.bootstrap_config)?;
-    let deployment_root_public_key = bootstrap.deployment_root_public_key.as_str();
-    let password = if let Some(path) = args.test_password_file.as_deref() {
-        test_password(path)?
-    } else {
-        Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?)
-    };
-    if password.is_empty() {
-        bail!("private-key password must not be empty");
-    }
-    let response: TravelEnrollmentResponse = load_json(&args.response)?;
-    let trust = response
-        .deployment_trust
-        .verify(deployment_root_public_key, unix_time_secs()?)?;
-    validate_bootstrap_trust_continuity(
-        &bootstrap.signed_trust,
-        &bootstrap.trust,
-        &response.deployment_trust,
-        &trust,
-    )?;
-    let control_trust_state_path = args.enrollment_dir.join(CONTROL_TRUST_STATE_FILE);
-    let mut control_trust_state = if control_trust_state_path.exists() {
-        flowsplice_core::authorization::load_json(&control_trust_state_path)?
-    } else {
-        ControlTrustState::new()
-    };
-    control_trust_state.validate_shape()?;
-    if control_trust_state
-        .deployment_id
-        .as_deref()
-        .is_some_and(|deployment_id| deployment_id != trust.deployment_id)
-    {
-        bail!("Enrollment Response belongs to a different deployment");
-    }
-    if trust.generation < control_trust_state.trust_generation {
-        bail!("Enrollment Response would roll back deployment trust");
-    }
-    let trust_digest_sha256 = response.deployment_trust.payload_digest_sha256()?;
-    if trust.generation == control_trust_state.trust_generation
-        && control_trust_state.trust_digest_sha256.is_some()
-        && control_trust_state.trust_digest_sha256.as_deref() != Some(&trust_digest_sha256)
-    {
-        bail!("Enrollment Response conflicts with installed deployment trust");
-    }
-    let credential = install_enrollment_response(
-        &args.enrollment_dir,
-        &response,
-        deployment_root_public_key,
-        password.as_bytes(),
-        unix_time_secs()?,
-    )?;
-    write_or_verify_private(
-        &args.enrollment_dir.join("deployment-root.pub"),
-        format!("{}\n", deployment_root_public_key.trim()).as_bytes(),
-    )?;
-    control_trust_state.deployment_id = Some(trust.deployment_id);
-    control_trust_state.trust_generation = trust.generation;
-    control_trust_state.trust_digest_sha256 = Some(trust_digest_sha256);
-    flowsplice_core::authorization::store_json_atomic(
-        &control_trust_state_path,
-        &control_trust_state,
-    )?;
-    println!(
-        "installed Travel credential {} for {}",
-        credential.credential_id, credential.travel_id
-    );
-    Ok(())
 }
 
 fn load_travel_bootstrap(path: &Path) -> Result<VerifiedTravelBootstrap> {
@@ -3221,6 +3104,7 @@ impl Drop for FlowGuard {
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, extract::Request, http::Method};
+    use clap::CommandFactory;
     use flowsplice_core::{
         authorization::TrustedTravelAuthority,
         deployment::{
@@ -3231,12 +3115,24 @@ mod tests {
     use flowsplice_storage::{StateStore, Table, WriteBatch};
 
     use super::{
-        ConfiguredHome, ControlTrustState, RELAY_HISTORY_VERSION, RelayHistoryRecord, SeedRelay,
-        bootstrap_candidate_pool, configured_home_ids, configured_homes_are_trusted,
+        Cli, ConfiguredHome, ControlTrustState, RELAY_HISTORY_VERSION, RelayHistoryRecord,
+        SeedRelay, bootstrap_candidate_pool, configured_home_ids, configured_homes_are_trusted,
         load_relay_history, local_ui_request_allowed, remote_enrollment_capacity_available,
         remote_enrollment_outbox_expired, require_authenticated_relay_in_snapshot,
         require_control_snapshot_subject, signed_directory_candidates, trusted_home_business_pins,
     };
+
+    #[test]
+    fn travel_cli_exposes_remote_enrollment_only() {
+        let command = Cli::command();
+        let subcommands = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect::<Vec<_>>();
+        assert!(subcommands.contains(&"enroll-remote"));
+        assert!(!subcommands.contains(&"enroll-init"));
+        assert!(!subcommands.contains(&"enroll-import"));
+    }
 
     #[test]
     fn remote_enrollment_outbox_has_bounded_capacity_and_retention() {

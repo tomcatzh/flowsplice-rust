@@ -32,6 +32,8 @@ codesign --verify --strict --verbose=2 ./bin/flowsplice-travelagent
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
 
+Travel 只提供 `enroll-remote` 这一条身份注册路径，不提供申请文件导出或签发结果文件导入命令。
+
 选择一个全新的 Travel ID 和一个空安装目录。首次注册只需要 Travel ID、要申请的 Home ID 和安装目录：
 
 ```bash

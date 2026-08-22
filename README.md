@@ -38,7 +38,7 @@ not interchangeable failover replicas.
 | `flowsplice-travelagent` | Creates local mappings, verifies signed discovery state, races Relays, and originates end-to-end business TLS. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
 | `flowsplice-core` | Implements shared framing, authorization, deployment trust, TLS identity, and route admission. |
-| `flowsplice-enrollment` | Implements Travel enrollment/import, Home-side issuance, encrypted-key handling, and the offline `flowsplice-trust` utility. |
+| `flowsplice-enrollment` | Implements remote Travel enrollment installation, Home-side issuance, encrypted-key handling, and the offline deployment-root `flowsplice-trust` utility. |
 | `flowsplice-storage` | Provides redb-backed local state, five-minute statistics buckets/outboxes, Relay history, and remote-enrollment inbox/outbox storage. |
 
 The repository is one Rust workspace. The Home and Travel frontends are TypeScript/Vite SPAs
@@ -183,6 +183,9 @@ mkdir -m 700 ./my-travel
   --home-id home-1 \
   --install-dir ./my-travel
 ```
+
+`enroll-remote` is the only Travel identity-enrollment command. There is no request-file export or
+response-file import path.
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
 two encrypted private keys locally, validates the configured signed deployment trust, contacts the

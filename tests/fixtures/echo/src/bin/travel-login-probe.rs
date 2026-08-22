@@ -29,12 +29,12 @@ async fn main() -> Result<()> {
     let password = fs::read_to_string("/travel/test-password.txt")
         .context("failed to read test-only Travel password")?;
     let key = load_private_key(
-        Path::new("/travel/travel-management.key"),
+        Path::new("/travel/cert/travel-management.key"),
         Some(password.trim_end().as_bytes()),
         false,
     )?;
     let connector = identity_client_connector_with_private_key(
-        Path::new("/travel/travel-management.crt"),
+        Path::new("/travel/cert/travel-management.crt"),
         key,
         Path::new("/certs/management-ca.crt"),
     )?;

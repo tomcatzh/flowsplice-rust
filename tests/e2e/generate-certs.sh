@@ -2,7 +2,6 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-mode="${1:-all}"
 cert_dir="${script_dir}/generated/certs"
 config_dir="${script_dir}/generated/config"
 authorization_dir="${script_dir}/generated/authorization"
@@ -12,22 +11,6 @@ offline_home2_dir="${script_dir}/generated/offline-home2"
 root_dir="${script_dir}/generated/deployment-root-offline"
 travel_dir="${script_dir}/generated/travel"
 first_travel_dir="${script_dir}/generated/first-travel"
-if [[ "${mode}" == "enroll-only" ]]; then
-  rm -rf "${travel_dir}"
-  docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE=1 \
-    -v "${script_dir}/generated:/generated" \
-    flowsplice-e2e:local \
-    /usr/local/bin/flowsplice-travelagent enroll-init \
-    --travel-id travel-1 \
-    --enrollment-dir /generated/travel \
-    --test-password-file /generated/offline/test-password.txt
-  cp "${offline_dir}/test-password.txt" "${travel_dir}/test-password.txt"
-  cp "${travel_dir}/enrollment-request.json" "${authorization_dir}/enrollment-request.json"
-  chmod 600 "${travel_dir}/test-password.txt"
-  exit 0
-fi
 mkdir -p "${cert_dir}"
 mkdir -p "${config_dir}"
 mkdir -p "${authorization_dir}"
