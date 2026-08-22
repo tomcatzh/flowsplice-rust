@@ -444,7 +444,7 @@ mkdir -m 700 ./my-travel
 
 Travel 本机输入并确认自己的私钥密码，终端随后保持等待。在首个 Global Home 本机打开 `http://127.0.0.1:9081`，核对校验码、选择最小授权范围与有效期、点击批准并输入 Home 签发密码。无需 SSH、远程打开 Home 页面或人工传 enrollment 文件。
 
-批准后 Travel 自动产生 cert、TOML 和 `travel-state.redb`。再按实际业务显式增加 `[[mappings]]`，启动并输入 Travel 私钥密码。完整流程见 [Travel Quick Start](QUICK_START.zh-CN.md)。
+批准后 Travel 自动产生 cert、TOML 和 `travel-state.redb`。启动并输入 Travel 私钥密码，再在 Travel 本地 Web 页面创建所需业务监听；监听立即生效并保存在 redb，不修改 TOML、不重启。完整流程见 [Travel Quick Start](QUICK_START.zh-CN.md)。
 
 ## 13. Home 2、Home 3 及后续 Home
 

@@ -182,6 +182,40 @@ teardown
 trap finish EXIT
 docker compose -f "${compose_file}" up -d echo echo2 relay1 relay2 server homeagent homeagent2
 
+configure_travel_mapping() {
+  local service="$1"
+  local token="$2"
+  local home_id="$3"
+  local service_id="$4"
+  local protocol="$5"
+  local bind="$6"
+  local payload
+  payload="$(printf '{\"home_id\":\"%s\",\"service_id\":\"%s\",\"protocol\":\"%s\",\"bind\":\"%s\"}' \
+    "${home_id}" "${service_id}" "${protocol}" "${bind}")"
+  local ready=0
+  for _ in $(seq 1 90); do
+    if docker compose -f "${compose_file}" exec -T "${service}" \
+      wget -qO- \
+      --header="Authorization: Bearer ${token}" \
+      http://127.0.0.1:9080/api/status >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( ready == 0 )); then
+    echo "${service} Travel API did not become ready" >&2
+    exit 1
+  fi
+  docker compose -f "${compose_file}" exec -T "${service}" \
+    wget -qO- \
+    --header="Authorization: Bearer ${token}" \
+    --header='Origin: http://127.0.0.1:9080' \
+    --header='Content-Type: application/json' \
+    --post-data="${payload}" \
+    http://127.0.0.1:9080/api/mappings >/dev/null
+}
+
 if docker compose -f "${compose_file}" exec -T homeagent \
   test -e /issuer/deployment-root.key; then
   echo 'deployment root private key was exposed to Home Agent' >&2
@@ -378,9 +412,12 @@ python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
   --valid-days 180 >/dev/null
 wait "${first_enroll_pid}"
 first_enroll_pid=""
-printf '\n[[homes]]\nid = "home-1"\n\n[[mappings]]\nhome_id = "home-1"\nservice_id = "tcp-echo"\nprotocol = "tcp"\nbind = "0.0.0.0:10080"\n' \
+printf '\n[[homes]]\nid = "home-1"\n' \
   >>"${generated_dir}/dynamic-travel/travelagent.toml"
 docker compose -f "${compose_file}" up -d dynamictravel
+configure_travel_mapping dynamictravel \
+  flowsplice-e2e-dynamic-home-travel-administrator-token \
+  home-1 tcp-echo tcp 0.0.0.0:10080
 python3 "${repo_root}/tests/e2e/tcp-probe.py" \
   --port 13080 \
   --payload dynamic-home-global-issuer-business \
@@ -464,12 +501,13 @@ if grep -Eq '^(mappings =|\[\[mappings\]\])' \
   echo 'first remote enrollment generated an unsolicited business mapping' >&2
   exit 1
 fi
-printf '\n[[mappings]]\nhome_id = "home-1"\nservice_id = "tcp-echo"\nprotocol = "tcp"\nbind = "0.0.0.0:10080"\n' \
-  >>"${generated_dir}/first-travel/travelagent.toml"
 bootstrap_credential_id="$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["enrollment"]["approval"]["credential_id"])' \
   "${generated_dir}/first-travel/approval.json")"
 docker compose -f "${compose_file}" up -d firsttravel
+configure_travel_mapping firsttravel \
+  flowsplice-e2e-first-remote-administrator-token \
+  home-1 tcp-echo tcp 0.0.0.0:10080
 python3 "${repo_root}/tests/e2e/tcp-probe.py" \
   --port 12080 \
   --payload first-remote-enrollment-business \
@@ -584,6 +622,18 @@ if grep -Eq '^(mappings =|\[\[mappings\]\])' \
 fi
 
 docker compose -f "${compose_file}" up -d travelagent
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-1 tcp-echo tcp 0.0.0.0:10080
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-1 udp-echo udp 0.0.0.0:10081
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-2 tcp-echo tcp 0.0.0.0:10082
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-2 home-1-only tcp 0.0.0.0:10083
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-1 target-failure tcp 0.0.0.0:10084
+configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+  home-2 target-failure tcp 0.0.0.0:10085
 python3 -u "${repo_root}/tests/e2e/assert_e2e.py"
 docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 for event in \

@@ -181,6 +181,7 @@ services:
       - "127.0.0.1:11083:10083"
       - "127.0.0.1:11084:10084"
       - "127.0.0.1:11085:10085"
+      - "127.0.0.1:11086:10086"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro

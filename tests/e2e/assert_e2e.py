@@ -243,6 +243,97 @@ def exchange_line(
     return int(connection)
 
 
+def wait_business_port(port: int, payload: bytes, timeout_secs: int = 45) -> None:
+    deadline = time.monotonic() + timeout_secs
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as stream:
+                stream.settimeout(12)
+                exchange_line(stream, payload)
+                return
+        except (AssertionError, ConnectionError, OSError, socket.timeout) as error:
+            last_error = error
+            time.sleep(0.25)
+    raise AssertionError(f"business port {port} did not become ready: {last_error}")
+
+
+def wait_port_closed(port: int, timeout_secs: int = 15) -> None:
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1) as stream:
+                stream.settimeout(1)
+                stream.sendall(b"listener-must-be-closed\n")
+                if stream.recv(1) == b"":
+                    return
+        except socket.timeout:
+            pass
+        except (ConnectionError, OSError):
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"old mapping port {port} remained open")
+
+
+def check_travel_runtime_mapping_rebind_and_persistence() -> None:
+    identity = {
+        "home_id": "home-1",
+        "service_id": "tcp-echo",
+        "protocol": "tcp",
+    }
+    container_before = subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "ps", "-q", "travelagent"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    updated = travel_request(
+        "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:10086"}
+    )
+    assert updated["bind"] == "0.0.0.0:10086", updated
+    container_after = subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "ps", "-q", "travelagent"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert container_after == container_before
+    wait_business_port(11086, b"runtime-port-without-restart")
+    wait_port_closed(11080)
+
+    failure = travel_request(
+        "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:9080"}, False
+    )
+    assert "failed to bind TCP mapping" in failure["error"], failure
+    status = travel_request("GET", "/api/status")
+    current = next(
+        mapping
+        for mapping in status["mappings"]
+        if all(mapping[key] == value for key, value in identity.items())
+    )
+    assert current["bind"] == "0.0.0.0:10086", current
+    wait_business_port(11086, b"failed-rebind-kept-old-listener")
+
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "travelagent"],
+        check=True,
+    )
+    status = wait_ready()
+    restarted = next(
+        mapping
+        for mapping in status["mappings"]
+        if all(mapping[key] == value for key, value in identity.items())
+    )
+    assert restarted["bind"] == "0.0.0.0:10086", restarted
+    wait_business_port(11086, b"runtime-port-survived-restart")
+
+    travel_request(
+        "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:10080"}
+    )
+    wait_business_port(11080, b"runtime-port-restored")
+    wait_port_closed(11086)
+
+
 def wait_catalog_homes(expected: set[str]) -> dict:
     deadline = time.monotonic() + 30
     last = None
@@ -1657,6 +1748,8 @@ def checkpoint(name: str) -> None:
 
 checkpoint("initial-ready")
 state = wait_ready()
+checkpoint("travel-runtime-mapping")
+check_travel_runtime_mapping_rebind_and_persistence()
 checkpoint("expired-snapshot-learned-relay")
 check_expired_snapshot_bootstraps_through_learned_relay()
 checkpoint("home-issued-enrollment")
@@ -1717,6 +1810,7 @@ checkpoint("home2-remote-enrollment")
 home2_remote_credential_id = check_home2_remote_enrollment(remote_identity_password)
 assert home2_remote_credential_id not in {credential_id, remote_credential_id}
 checks = [
+    "travel-runtime-mapping-hot-rebind-and-restart-persistence",
     "server-downlinked-two-relay-spki-directory",
     "two-home-catalog",
     "same-service-id-isolated-by-home",

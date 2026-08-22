@@ -32,14 +32,6 @@ id = "home-2"
 [[seed_relays]]
 management_addr = "relay-1.example.net:8443"
 
-[[mappings]]
-home_id = "home-1"
-service_id = "ssh"
-protocol = "tcp"
-bind = "127.0.0.1:10022"
-
-[[mappings]]
-home_id = "home-2"
-service_id = "ssh"
-protocol = "tcp"
-bind = "127.0.0.1:20022"
+# Create and change business listeners in the local Travel Web page. They are saved in state_store
+# and take effect without a process restart. Legacy [[mappings]] entries are imported once when an
+# older 0.2 development installation first starts with this version.

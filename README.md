@@ -216,10 +216,11 @@ flowsplice-travelagent --config ./my-travel/travelagent.toml
 ```
 
 Enter the same Travel password. Enrollment does not require a business mapping. The generated TOML
-already contains the identity, trust, Home, Relay bootstrap, local UI, and state paths; add
-`[[mappings]]` afterward for the businesses this Travel should expose, or edit it to add another
-Home, change local loopback ports, or tune limits. Do not add Home SPKIs or a full Relay authorization
-list. TOML Relay entries are bootstrap addresses only. Travel durably remembers every Relay learned
+already contains the identity, trust, Home, Relay bootstrap, local UI, and state paths. Create,
+change, or remove local business listeners in the Travel Web page; changes take effect immediately
+and are persisted in `travel-state.redb`. Edit TOML only to add another Home or tune process-level
+limits. Do not add Home SPKIs or a full Relay authorization list. TOML Relay entries are bootstrap
+addresses only. Travel durably remembers every Relay learned
 from a verified signed directory, but after restart it still requires a fresh signed directory
 before using any Relay for business.
 

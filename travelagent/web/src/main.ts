@@ -107,6 +107,7 @@ if (!root) {
 }
 const app: HTMLElement = root;
 let passwordDialogOpen = false;
+let mappingEditorActive = false;
 let noticeMessage = "";
 let statisticsPeriod: Statistics["period"] = "day";
 let currentPage: Page = "overview";
@@ -137,6 +138,31 @@ function number(value: number): string {
 
 function businessKey(homeId: string, serviceId: string, protocol: Protocol): string {
   return `${homeId}\u0000${serviceId}\u0000${protocol}`;
+}
+
+async function saveMapping(mapping: Mapping): Promise<void> {
+  await requestJson<Mapping>("/api/mappings", {
+    method: "POST",
+    body: JSON.stringify(mapping),
+  });
+  noticeMessage = `${mapping.service_id} now listens on ${mapping.bind}. No restart was needed.`;
+  mappingEditorActive = false;
+  await render();
+}
+
+async function deleteMapping(mapping: Mapping): Promise<void> {
+  if (!window.confirm(`Stop the local listener for ${mapping.service_id}?`)) return;
+  await requestJson<Mapping>("/api/mappings/delete", {
+    method: "POST",
+    body: JSON.stringify({
+      home_id: mapping.home_id,
+      service_id: mapping.service_id,
+      protocol: mapping.protocol,
+    }),
+  });
+  noticeMessage = `${mapping.service_id} local listener stopped.`;
+  mappingEditorActive = false;
+  await render();
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -280,15 +306,20 @@ async function render(): Promise<void> {
         const service = serviceByBusiness.get(
           businessKey(mapping.home_id, mapping.service_id, mapping.protocol),
         );
-        return `<tr>
+        return `<tr data-home="${escapeHtml(mapping.home_id)}" data-service="${escapeHtml(mapping.service_id)}" data-protocol="${mapping.protocol}">
           <td><span class="protocol ${mapping.protocol}">${mapping.protocol.toUpperCase()}</span></td>
           <td><strong>${escapeHtml(home?.home_alias ?? mapping.home_id)}</strong><small>${escapeHtml(mapping.home_id)}</small></td>
           <td><strong>${escapeHtml(service?.alias ?? mapping.service_id)}</strong><small>${escapeHtml(mapping.service_id)}</small></td>
-          <td><code>${escapeHtml(mapping.bind)}</code></td>
+          <td><div class="mapping-address"><input class="mapping-bind" aria-label="Local address for ${escapeHtml(mapping.service_id)}" value="${escapeHtml(mapping.bind)}"><button type="button" class="save-mapping">Apply</button></div></td>
           <td><span class="state ${service ? "ready" : "waiting"}">${service ? "Ready" : "Waiting for catalog"}</span></td>
+          <td><button type="button" class="secondary delete-mapping">Remove</button></td>
         </tr>`;
       })
       .join("");
+    const mappingOptions = catalog.homes.flatMap((home) => home.services.map((service) => {
+      const value = encodeURIComponent(JSON.stringify({ home_id: home.home_id, service_id: service.id, protocol: service.protocol }));
+      return `<option value="${value}">${escapeHtml(home.home_alias)} · ${escapeHtml(service.alias)} · ${service.protocol.toUpperCase()}</option>`;
+    })).join("");
     const enrollmentRows = enrollments.map((item) => `<tr><td><code>${escapeHtml(item.request_id)}</code></td><td>${escapeHtml(item.home_id)}</td><td>${item.restart_required ? "Restart required" : item.response_received ? "Ready to install" : "Awaiting Home approval"}</td><td>${item.response_received && !item.restart_required ? `<button class="install-enrollment" data-id="${escapeHtml(item.request_id)}">Install</button>` : ""}</td></tr>`).join("");
     app.innerHTML = `<header>
       <div><p class="eyebrow">Private service access</p><h1>FlowSplice</h1></div>
@@ -307,7 +338,8 @@ async function render(): Promise<void> {
     </section>
     <section class="panel">
       <div class="panel-heading"><div><p class="eyebrow">Local listeners</p><h2>Service mappings</h2></div><span>${status.mappings.length} configured</span></div>
-      <div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Home</th><th>Service</th><th>Local address</th><th>Status</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">No mappings configured</td></tr>'}</tbody></table></div>
+      <form id="new-mapping-form" class="mapping-create"><label>Business<select id="new-mapping-business" ${mappingOptions ? "" : "disabled"}>${mappingOptions || '<option>Waiting for catalog</option>'}</select></label><label>Local address<input id="new-mapping-bind" value="127.0.0.1:10080" inputmode="text"></label><button type="submit" ${mappingOptions ? "" : "disabled"}>Add listener</button></form>
+      <div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Home</th><th>Service</th><th>Local address</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="empty">No local listeners yet. Add one above; it will be saved in Travel state.</td></tr>'}</tbody></table></div>
     </section>
     ${status.private_key_password_rotation_available ? `<section class="panel key-panel"><div class="panel-heading"><div><p class="eyebrow">Local key maintenance</p><h2>Travel private-key password</h2></div><button id="open-password-dialog" class="secondary">Change password</button></div>
       <div class="maintenance-copy"><p>Re-encrypts both local Travel private keys. Active flows and the running process continue without interruption.</p><p>FlowSplice does not store either password and does not write to the system keychain.</p></div>
@@ -342,6 +374,35 @@ async function render(): Promise<void> {
     });
     document.querySelectorAll<HTMLButtonElement>(".create-enrollment").forEach((button) => button.addEventListener("click", () => void createEnrollment(button.dataset.home ?? "").catch((error) => { noticeMessage = friendlyError(error); void render(); })));
     document.querySelectorAll<HTMLButtonElement>(".install-enrollment").forEach((button) => button.addEventListener("click", () => void installEnrollment(button.dataset.id ?? "").catch((error) => { noticeMessage = friendlyError(error); void render(); })));
+    const mappingPanel = document.querySelector<HTMLElement>("#new-mapping-form")?.closest(".panel");
+    mappingPanel?.addEventListener("focusin", () => { mappingEditorActive = true; });
+    mappingPanel?.addEventListener("focusout", () => window.setTimeout(() => {
+      mappingEditorActive = mappingPanel.contains(document.activeElement);
+    }, 0));
+    document.querySelector<HTMLFormElement>("#new-mapping-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const encoded = document.querySelector<HTMLSelectElement>("#new-mapping-business")?.value ?? "";
+      const bind = document.querySelector<HTMLInputElement>("#new-mapping-bind")?.value.trim() ?? "";
+      try {
+        const identity = JSON.parse(decodeURIComponent(encoded)) as Omit<Mapping, "bind">;
+        void saveMapping({ ...identity, bind }).catch((error) => { noticeMessage = friendlyError(error); void render(); });
+      } catch (error) {
+        noticeMessage = friendlyError(error);
+        void render();
+      }
+    });
+    document.querySelectorAll<HTMLButtonElement>(".save-mapping").forEach((button) => button.addEventListener("click", () => {
+      const row = button.closest<HTMLTableRowElement>("tr");
+      const bind = row?.querySelector<HTMLInputElement>(".mapping-bind")?.value.trim() ?? "";
+      if (!row) return;
+      void saveMapping({ home_id: row.dataset.home ?? "", service_id: row.dataset.service ?? "", protocol: row.dataset.protocol as Protocol, bind }).catch((error) => { noticeMessage = friendlyError(error); void render(); });
+    }));
+    document.querySelectorAll<HTMLButtonElement>(".delete-mapping").forEach((button) => button.addEventListener("click", () => {
+      const row = button.closest<HTMLTableRowElement>("tr");
+      const bind = row?.querySelector<HTMLInputElement>(".mapping-bind")?.value.trim() ?? "";
+      if (!row) return;
+      void deleteMapping({ home_id: row.dataset.home ?? "", service_id: row.dataset.service ?? "", protocol: row.dataset.protocol as Protocol, bind }).catch((error) => { noticeMessage = friendlyError(error); void render(); });
+    }));
   } catch (error) {
     app.innerHTML = `<section class="error"><p class="eyebrow">Local agent unavailable</p><h1>Unable to load status</h1><p>${escapeHtml(String(error))}</p><button type="button">Retry</button></section>`;
     app.querySelector("button")?.addEventListener("click", () => void render());
@@ -350,5 +411,5 @@ async function render(): Promise<void> {
 
 void render();
 window.setInterval(() => {
-  if (!passwordDialogOpen && currentPage === "overview") void render();
+  if (!passwordDialogOpen && !mappingEditorActive && currentPage === "overview") void render();
 }, 5000);

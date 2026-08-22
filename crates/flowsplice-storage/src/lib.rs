@@ -33,6 +33,7 @@ pub const LATENCY_HISTOGRAM_BOUNDS_MS: [u64; 12] =
 const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
 const TRAVEL_CONTROL_STATE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("travel_control_state");
+const TRAVEL_MAPPINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("travel_mappings");
 const RELAY_HISTORY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay_history");
 const METRIC_5M: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metric_5m");
 const METRIC_DAILY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metric_daily");
@@ -49,6 +50,7 @@ const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 pub enum Table {
     Metadata,
     TravelControlState,
+    TravelMappings,
     RelayHistory,
     Metric5m,
     MetricDaily,
@@ -64,6 +66,7 @@ impl Table {
         match self {
             Self::Metadata => METADATA,
             Self::TravelControlState => TRAVEL_CONTROL_STATE,
+            Self::TravelMappings => TRAVEL_MAPPINGS,
             Self::RelayHistory => RELAY_HISTORY,
             Self::Metric5m => METRIC_5M,
             Self::MetricDaily => METRIC_DAILY,
@@ -179,6 +182,7 @@ impl StateStore {
         for table in [
             Table::Metadata,
             Table::TravelControlState,
+            Table::TravelMappings,
             Table::RelayHistory,
             Table::Metric5m,
             Table::MetricDaily,

@@ -68,8 +68,8 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, RwLock, Semaphore, mpsc},
-    task::JoinSet,
+    sync::{Mutex, RwLock, Semaphore, mpsc, watch},
+    task::{JoinHandle, JoinSet},
     time::{interval, sleep, timeout},
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -273,8 +273,6 @@ struct InstalledTravelConfig {
     test_admin_token: Option<String>,
     homes: Vec<InstalledHome>,
     seed_relays: Vec<SeedRelayOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    mappings: Vec<Mapping>,
 }
 
 #[derive(Serialize)]
@@ -299,7 +297,7 @@ struct ConfiguredHome {
     id: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Mapping {
     home_id: String,
     service_id: String,
@@ -357,6 +355,7 @@ const fn default_max_unacked_bytes() -> usize {
 
 const CONTROL_TRUST_STATE_FILE: &str = "control-trust-state.json";
 const CONTROL_STATE_KEY: &[u8] = b"control";
+const TRAVEL_MAPPINGS_KEY: &[u8] = b"active";
 const LEGACY_CONTROL_STATE_DIGEST_KEY: &[u8] = b"legacy_control_state_sha256";
 const ACTIVE_IDENTITY_DIR_KEY: &[u8] = b"active_identity_dir";
 const REMOTE_ENROLLMENT_VERSION: u32 = 1;
@@ -473,6 +472,19 @@ struct AppState {
     statistics_certificate_pem: Arc<String>,
     relay_history: Arc<RwLock<Vec<RelayHistoryRecord>>>,
     control_trust_state: Arc<Mutex<ControlTrustState>>,
+    mappings: Arc<RwLock<Vec<Mapping>>>,
+    mapping_tasks: Arc<Mutex<HashMap<String, MappingTask>>>,
+    mapping_operation: Arc<Mutex<()>>,
+}
+
+struct MappingTask {
+    shutdown: watch::Sender<bool>,
+    join: JoinHandle<()>,
+}
+
+enum PreparedMappingListener {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
 }
 
 #[derive(Clone)]
@@ -531,6 +543,14 @@ struct InstallRemoteEnrollmentResponse {
     restart_required: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MappingIdentityRequest {
+    home_id: String,
+    service_id: String,
+    protocol: ServiceProtocol,
+}
+
 #[derive(Serialize)]
 struct RotatePrivateKeyPasswordResponse {
     rotated_keys: usize,
@@ -567,6 +587,7 @@ async fn main() -> Result<()> {
     let mut config: Config = load_toml(&cli.config)?;
     validate_config(&config)?;
     let state_store = StateStore::open(&config.state_store)?;
+    let mappings = load_runtime_mappings(&config, &state_store)?;
     apply_active_identity_directory(&mut config, &state_store)?;
     let deployment_root_public_key = fs::read_to_string(&config.deployment_root_public_key)
         .with_context(|| {
@@ -646,19 +667,17 @@ async fn main() -> Result<()> {
         statistics_certificate_pem: Arc::new(statistics_certificate_pem),
         relay_history: Arc::new(RwLock::new(relay_history)),
         control_trust_state: Arc::new(Mutex::new(control_trust_state)),
+        mappings: Arc::new(RwLock::new(mappings)),
+        mapping_tasks: Arc::new(Mutex::new(HashMap::new())),
+        mapping_operation: Arc::new(Mutex::new(())),
     };
+
+    start_initial_mapping_listeners(&state).await?;
 
     let mut tasks = JoinSet::new();
     tasks.spawn(run_catalog_subscription(state.clone()));
     tasks.spawn(run_ui(state.clone()));
     tasks.spawn(monitor_trust_expiry(state.clone()));
-    for mapping in state.config.mappings.clone() {
-        let state = state.clone();
-        match mapping.protocol {
-            ServiceProtocol::Tcp => tasks.spawn(run_tcp_listener(state, mapping)),
-            ServiceProtocol::Udp => tasks.spawn(run_udp_listener(state, mapping)),
-        };
-    }
     while let Some(result) = tasks.join_next().await {
         result??;
     }
@@ -941,7 +960,6 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             .into_iter()
             .map(|management_addr| SeedRelayOutput { management_addr })
             .collect(),
-        mappings: Vec::new(),
     };
     let encoded = toml::to_string_pretty(&generated).context("failed to encode Travel config")?;
     let mut config_file = fs::OpenOptions::new()
@@ -1473,7 +1491,7 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    let home_ids = configured_home_ids(&config.homes)?;
+    configured_home_ids(&config.homes)?;
     if config.state_store.as_os_str().is_empty() {
         bail!("state_store must be non-empty");
     }
@@ -1510,9 +1528,15 @@ fn validate_config(config: &Config) -> Result<()> {
     {
         bail!("Travel UI must listen directly on 127.0.0.1");
     }
+    validate_mapping_set(config, &config.mappings)?;
+    Ok(())
+}
+
+fn validate_mapping_set(config: &Config, mappings: &[Mapping]) -> Result<()> {
+    let home_ids = configured_home_ids(&config.homes)?;
     let mut services = HashSet::new();
     let mut binds = HashSet::new();
-    for mapping in &config.mappings {
+    for mapping in mappings {
         if mapping.service_id.is_empty() || !home_ids.contains(mapping.home_id.as_str()) {
             bail!("every mapping must name a configured Home and a non-empty service");
         }
@@ -1528,6 +1552,34 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn load_runtime_mappings(config: &Config, store: &StateStore) -> Result<Vec<Mapping>> {
+    if let Some(mappings) =
+        store.get_json::<Vec<Mapping>>(Table::TravelMappings, TRAVEL_MAPPINGS_KEY)?
+    {
+        validate_mapping_set(config, &mappings)?;
+        return Ok(mappings);
+    }
+    let mappings = config.mappings.clone();
+    persist_runtime_mappings(store, &mappings)?;
+    Ok(mappings)
+}
+
+fn persist_runtime_mappings(store: &StateStore, mappings: &[Mapping]) -> Result<()> {
+    store.apply_immediate(WriteBatch::new().put_json(
+        Table::TravelMappings,
+        TRAVEL_MAPPINGS_KEY.to_vec(),
+        &mappings,
+    )?)
+}
+
+fn mapping_key(mapping: &Mapping) -> String {
+    let protocol = match mapping.protocol {
+        ServiceProtocol::Tcp => "tcp",
+        ServiceProtocol::Udp => "udp",
+    };
+    format!("{}\0{}\0{protocol}", mapping.home_id, mapping.service_id)
 }
 
 #[cfg(feature = "e2e-remote-ui")]
@@ -2428,11 +2480,85 @@ fn require_authenticated_relay_in_snapshot(
     Ok(())
 }
 
-async fn run_tcp_listener(state: AppState, mapping: Mapping) -> Result<()> {
-    let listener = TcpListener::bind(&mapping.bind).await?;
+async fn prepare_mapping_listener(mapping: &Mapping) -> Result<PreparedMappingListener> {
+    match mapping.protocol {
+        ServiceProtocol::Tcp => Ok(PreparedMappingListener::Tcp(
+            TcpListener::bind(&mapping.bind)
+                .await
+                .with_context(|| format!("failed to bind TCP mapping {}", mapping.bind))?,
+        )),
+        ServiceProtocol::Udp => Ok(PreparedMappingListener::Udp(
+            UdpSocket::bind(&mapping.bind)
+                .await
+                .with_context(|| format!("failed to bind UDP mapping {}", mapping.bind))?,
+        )),
+    }
+}
+
+fn spawn_mapping_listener(
+    state: AppState,
+    mapping: Mapping,
+    prepared: PreparedMappingListener,
+) -> MappingTask {
+    let (shutdown, receiver) = watch::channel(false);
+    let join = tokio::spawn(async move {
+        let result = match prepared {
+            PreparedMappingListener::Tcp(listener) => {
+                run_tcp_listener(state, mapping.clone(), listener, receiver).await
+            }
+            PreparedMappingListener::Udp(socket) => {
+                run_udp_listener(state, mapping.clone(), socket, receiver).await
+            }
+        };
+        if let Err(error) = result {
+            warn!(
+                home_id = %mapping.home_id,
+                service_id = %mapping.service_id,
+                address = %mapping.bind,
+                %error,
+                "local mapping listener stopped"
+            );
+        }
+    });
+    MappingTask { shutdown, join }
+}
+
+async fn stop_mapping_task(mut task: MappingTask) {
+    let _ = task.shutdown.send(true);
+    if timeout(Duration::from_secs(2), &mut task.join)
+        .await
+        .is_err()
+    {
+        task.join.abort();
+        let _ = task.join.await;
+    }
+}
+
+async fn start_initial_mapping_listeners(state: &AppState) -> Result<()> {
+    for mapping in state.mappings.read().await.clone() {
+        let prepared = prepare_mapping_listener(&mapping).await?;
+        let key = mapping_key(&mapping);
+        let task = spawn_mapping_listener(state.clone(), mapping, prepared);
+        state.mapping_tasks.lock().await.insert(key, task);
+    }
+    Ok(())
+}
+
+async fn run_tcp_listener(
+    state: AppState,
+    mapping: Mapping,
+    listener: TcpListener,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     info!(home_id = %mapping.home_id, service_id = %mapping.service_id, address = %mapping.bind, "local TCP mapping ready");
     loop {
-        let (local, peer) = listener.accept().await?;
+        let (local, peer) = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
             warn!(%peer, "travel active-flow limit reached");
             continue;
@@ -2453,14 +2579,25 @@ async fn run_tcp_flow(state: &AppState, mapping: &Mapping, local: TcpStream) -> 
     tcp_flow::run(state.clone(), mapping.clone(), local).await
 }
 
-async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind(&mapping.bind).await?);
+async fn run_udp_listener(
+    state: AppState,
+    mapping: Mapping,
+    socket: UdpSocket,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let socket = Arc::new(socket);
     info!(home_id = %mapping.home_id, service_id = %mapping.service_id, address = %mapping.bind, "local UDP mapping ready");
     let associations: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut buffer = vec![0_u8; 65_507];
     loop {
-        let (count, peer) = socket.recv_from(&mut buffer).await?;
+        let (count, peer) = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            received = socket.recv_from(&mut buffer) => received?,
+        };
         let mut bytes = buffer[..count].to_vec();
         let existing = associations.lock().await.get(&peer).cloned();
         if let Some(tx) = existing {
@@ -2494,10 +2631,13 @@ async fn run_udp_listener(state: AppState, mapping: Mapping) -> Result<()> {
         let associations = Arc::clone(&associations);
         let state = state.clone();
         let mapping = mapping.clone();
+        let association_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
-            if let Err(error) = run_udp_association(&state, &mapping, socket, peer, rx).await {
+            if let Err(error) =
+                run_udp_association(&state, &mapping, socket, peer, rx, association_shutdown).await
+            {
                 warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "UDP association closed");
             }
             let mut current = associations.lock().await;
@@ -2517,6 +2657,7 @@ async fn run_udp_association(
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     mut outgoing: mpsc::Receiver<Vec<u8>>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let config = &state.config;
     let flow_id = Uuid::new_v4();
@@ -2550,6 +2691,10 @@ async fn run_udp_association(
     let mut receive_sequence = 0_u64;
     loop {
         tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
             datagram = timeout(Duration::from_secs(config.udp_idle_secs), outgoing.recv()) => {
                 let Some(bytes) = datagram.context("UDP association idle timeout")? else { return Ok(()); };
                 record_travel_udp_metric(state, mapping, &relay_id, "travel_flow_upload_observed_bytes", bytes.len() as u64);
@@ -2596,6 +2741,8 @@ fn record_travel_udp_metric(
 async fn run_ui(state: AppState) -> Result<()> {
     let api = Router::new()
         .route("/status", get(api_status))
+        .route("/mappings", post(api_upsert_mapping))
+        .route("/mappings/delete", post(api_delete_mapping))
         .route("/catalog", get(api_catalog))
         .route("/relays", get(api_relays))
         .route("/statistics", get(api_statistics))
@@ -2635,9 +2782,92 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
         catalog_generation: generation,
         relay_directory_generation: directory_generation,
         active_relays,
-        mappings: state.config.mappings.clone(),
+        mappings: state.mappings.read().await.clone(),
         private_key_password_rotation_available: travel_password_rotation_is_local(&state.config),
     })
+}
+
+async fn api_upsert_mapping(
+    State(state): State<AppState>,
+    Json(mapping): Json<Mapping>,
+) -> ApiResult<Mapping> {
+    let _operation = state.mapping_operation.lock().await;
+    let current = state.mappings.read().await.clone();
+    let key = mapping_key(&mapping);
+    if current
+        .iter()
+        .find(|candidate| mapping_key(candidate) == key)
+        .is_some_and(|candidate| candidate == &mapping)
+    {
+        return Ok(Json(mapping));
+    }
+
+    let mut next = current;
+    if let Some(existing) = next
+        .iter_mut()
+        .find(|candidate| mapping_key(candidate) == key)
+    {
+        *existing = mapping.clone();
+    } else {
+        next.push(mapping.clone());
+    }
+    validate_mapping_set(&state.config, &next).map_err(api_error)?;
+
+    // Bind before committing so an occupied or invalid new port leaves both durable state and the
+    // currently running listener untouched.
+    let prepared = prepare_mapping_listener(&mapping)
+        .await
+        .map_err(api_error)?;
+    let store = Arc::clone(&state.state_store);
+    let durable = next.clone();
+    tokio::task::spawn_blocking(move || persist_runtime_mappings(&store, &durable))
+        .await
+        .map_err(api_error)?
+        .map_err(api_error)?;
+
+    let task = spawn_mapping_listener(state.clone(), mapping.clone(), prepared);
+    let old = state.mapping_tasks.lock().await.insert(key, task);
+    *state.mappings.write().await = next;
+    if let Some(old) = old {
+        stop_mapping_task(old).await;
+    }
+    Ok(Json(mapping))
+}
+
+async fn api_delete_mapping(
+    State(state): State<AppState>,
+    Json(identity): Json<MappingIdentityRequest>,
+) -> ApiResult<Mapping> {
+    let _operation = state.mapping_operation.lock().await;
+    let requested = Mapping {
+        home_id: identity.home_id,
+        service_id: identity.service_id,
+        protocol: identity.protocol,
+        bind: String::new(),
+    };
+    let key = mapping_key(&requested);
+    let current = state.mappings.read().await.clone();
+    let removed = current
+        .iter()
+        .find(|candidate| mapping_key(candidate) == key)
+        .cloned()
+        .ok_or_else(|| api_error(anyhow!("mapping does not exist")))?;
+    let next = current
+        .into_iter()
+        .filter(|candidate| mapping_key(candidate) != key)
+        .collect::<Vec<_>>();
+    let store = Arc::clone(&state.state_store);
+    let durable = next.clone();
+    tokio::task::spawn_blocking(move || persist_runtime_mappings(&store, &durable))
+        .await
+        .map_err(api_error)?
+        .map_err(api_error)?;
+    let old = state.mapping_tasks.lock().await.remove(&key);
+    *state.mappings.write().await = next;
+    if let Some(old) = old {
+        stop_mapping_task(old).await;
+    }
+    Ok(Json(removed))
 }
 
 async fn api_catalog(State(state): State<AppState>) -> Json<Catalog> {
@@ -3110,14 +3340,15 @@ mod tests {
         deployment::{
             ControlSnapshotPayload, DeploymentTrust, HomeEndpointTrust, VerifiedControlSnapshot,
         },
-        protocol::{Catalog, RelayDirectory, RelayEndpoint},
+        protocol::{Catalog, RelayDirectory, RelayEndpoint, ServiceProtocol},
     };
     use flowsplice_storage::{StateStore, Table, WriteBatch};
 
     use super::{
-        Cli, ConfiguredHome, ControlTrustState, RELAY_HISTORY_VERSION, RelayHistoryRecord,
-        SeedRelay, bootstrap_candidate_pool, configured_home_ids, configured_homes_are_trusted,
-        load_relay_history, local_ui_request_allowed, remote_enrollment_capacity_available,
+        Cli, ConfiguredHome, ControlTrustState, Mapping, RELAY_HISTORY_VERSION, RelayHistoryRecord,
+        SeedRelay, TRAVEL_MAPPINGS_KEY, bootstrap_candidate_pool, configured_home_ids,
+        configured_homes_are_trusted, load_relay_history, local_ui_request_allowed,
+        persist_runtime_mappings, remote_enrollment_capacity_available,
         remote_enrollment_outbox_expired, require_authenticated_relay_in_snapshot,
         require_control_snapshot_subject, signed_directory_candidates, trusted_home_business_pins,
     };
@@ -3154,6 +3385,24 @@ mod tests {
             Some(200),
             200 + 24 * 60 * 60
         ));
+    }
+
+    #[test]
+    fn runtime_mappings_are_immediately_durable_in_redb() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = StateStore::open(directory.path().join("travel.redb"))?;
+        let mappings = vec![Mapping {
+            home_id: "home-1".to_owned(),
+            service_id: "tcp-echo".to_owned(),
+            protocol: ServiceProtocol::Tcp,
+            bind: "127.0.0.1:10080".to_owned(),
+        }];
+        persist_runtime_mappings(&store, &mappings)?;
+        let loaded = store
+            .get_json::<Vec<Mapping>>(Table::TravelMappings, TRAVEL_MAPPINGS_KEY)?
+            .unwrap_or_default();
+        assert_eq!(loaded, mappings);
+        Ok(())
     }
 
     #[test]

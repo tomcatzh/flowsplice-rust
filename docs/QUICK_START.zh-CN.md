@@ -117,12 +117,11 @@ my-travel/
 
 ## TOML 什么时候需要修改
 
-第一次远程注册已经生成身份、根公钥路径、信任、Home、Relay seed 和本地状态所需的完整 TOML。首次注册不要求业务映射；获得凭据后，再按实际需要增加 `[[mappings]]`。
+第一次远程注册已经生成身份、根公钥路径、信任、Home、Relay seed 和本地状态所需的完整 TOML。首次注册不要求业务映射；获得凭据并启动 Travel 后，在本地 Web 页面按实际需要创建业务监听。
 
 通常只修改以下内容：
 
-- 增加 `[[homes]]`；
-- 增加或调整 `[[mappings]]` 的 `home_id`、`service_id`、`protocol` 和本地 `bind`；
+- 增加 `[[homes]]` 后使 Travel 重新读取可访问的 Home；
 - 调整本地 `ui_listen` 或容量/超时参数；
 - 在确有 bootstrap 可用性需要时增加 `[[seed_relays]]`。
 
@@ -130,18 +129,9 @@ my-travel/
 
 首次 enrollment 具体连接哪个 Relay，完全由 `travel-bootstrap.toml` 的 `bootstrap_relays` 决定。程序会规范化、排序、去重后逐一轮询；一个 Relay 失败会继续尝试下一个。Relay 地址变化只修改并重新分发配置文件，不重新编译二进制。
 
-例如，注册完成后再增加一个 Foobar TCP 映射：
+业务映射不再写入 TOML。在 `http://127.0.0.1:9080` 的“Service mappings”区域选择 Home 与业务，填写本地监听地址（例如 `127.0.0.1:10080`）并创建。修改已有监听的地址或端口后点击 Apply，会先确认新端口能够绑定，再原子写入 `travel-state.redb` 并切换监听；无需重启。若新端口无效或已占用，旧监听和持久状态保持不变。Remove 会停止该本地监听并删除其持久记录。
 
-```toml
-[[homes]]
-id = "home-1"
-
-[[mappings]]
-home_id = "home-1"
-service_id = "foobar"
-protocol = "tcp"
-bind = "127.0.0.1:10080"
-```
+从较早的 0.2 开发版本升级时，程序会在第一次启动时把旧 TOML 中的 `[[mappings]]` 一次性导入 redb。此后 redb 优先，继续修改旧 TOML 不会改变运行映射；确认 Web 中记录无误后可删除旧条目。
 
 ## 换发和撤销
 

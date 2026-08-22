@@ -31,39 +31,3 @@ id = "home-2"
 
 [[seed_relays]]
 management_addr = "relay1:8443"
-
-[[mappings]]
-home_id = "home-1"
-service_id = "tcp-echo"
-protocol = "tcp"
-bind = "0.0.0.0:10080"
-
-[[mappings]]
-home_id = "home-1"
-service_id = "udp-echo"
-protocol = "udp"
-bind = "0.0.0.0:10081"
-
-[[mappings]]
-home_id = "home-2"
-service_id = "tcp-echo"
-protocol = "tcp"
-bind = "0.0.0.0:10082"
-
-[[mappings]]
-home_id = "home-2"
-service_id = "home-1-only"
-protocol = "tcp"
-bind = "0.0.0.0:10083"
-
-[[mappings]]
-home_id = "home-1"
-service_id = "target-failure"
-protocol = "tcp"
-bind = "0.0.0.0:10084"
-
-[[mappings]]
-home_id = "home-2"
-service_id = "target-failure"
-protocol = "tcp"
-bind = "0.0.0.0:10085"
