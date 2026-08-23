@@ -4,8 +4,8 @@
 
 ## 运行前条件
 
-- 包内的二进制不绑定根公钥、CA、Server ID、证书名、端口或 IP；这些值全部位于独立的 `home-bootstrap.toml`、`deployment-root.pub` 和根签名 `deployment-trust.json`。
-- 新 Mac 仍然只输入 Server IP。程序自动读取同目录配置，先验证 deployment trust，再从已验证 trust 中取得 Management CA。
+- 公开包的二进制不绑定根公钥、CA、Server ID、证书名、端口、IP 或子域名；包内也不包含这些部署材料。
+- `home-bootstrap.example.toml` 只是使用 IANA 保留示例域名的结构样例。通过私密渠道取得真实配置、`deployment-root.pub` 和根签名 `deployment-trust.json`，在公开仓库之外生成 `home-bootstrap.toml` 后才能初始化。
 - Server 的 Home control 端口（默认 `7443`）可从新 Mac 主动访问。
 - 至少一台已有的 Global issuer Home 在线，操作员可以打开它的本地 Home 页面并输入签发密码。
 - 新 Home 不需要公网入站端口；批准页面也不需要在新 Mac 上远程打开。
@@ -23,21 +23,19 @@ codesign -dvvv ./bin/flowsplice-homeagent 2>&1 \
 
 包内二进制使用免费的 ad-hoc codesign。它不是 Developer ID 签名，也没有 notarization；`SHA256SUMS` 用于校验发布文件，ad-hoc 签名用于校验 Mach-O 没有在签名后被修改。
 
-这两种校验都不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256，或至少核对 `deployment-root.pub` 的 SHA-256 指纹；不要只依赖同一个下载包内的 `SHA256SUMS`。
+这两种校验都不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256；私下取得部署根公钥后，还应通过独立可信渠道核对其 SHA-256 指纹。
 
 解包后的包结构必须是：
 
 ```text
 flowsplice-home2-0.2.0-macos-arm64/
 ├── bin/flowsplice-homeagent
-├── home-bootstrap.toml
-├── deployment-root.pub
-├── deployment-trust.json
+├── home-bootstrap.example.toml
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS
 ```
 
-不要把这三个配置/信任文件移出包目录。改变 Server 身份、端口或 trust 时只替换经过验证的新配置文件，不重新编译 HomeAgent。
+公开包只允许上述四个文件。真实 IP 和任何子域名均按密钥级信息处理；主域公开不代表其子域可公开。使用前，在解包目录私下放置填写后的 `home-bootstrap.toml`、`deployment-root.pub` 和 `deployment-trust.json`，绝不能把它们上传回仓库或公开 Release。改变 Server 身份、端口或 trust 时只替换私下验证的新配置文件，不重新编译 HomeAgent。
 
 ## 2. 新 Mac 只运行这一条命令
 

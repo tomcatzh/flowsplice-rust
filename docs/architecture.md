@@ -61,8 +61,9 @@ Server authenticates the publishing Home, requires it to own the root-certified 
 
 Revocation also originates from the owning Home. Server validates ownership, persists the credential ID and reason, then broadcasts a new monotonic generation. Relay and Home verify every signature and persist the highest generation plus all observed revoked IDs. A lower generation or missing prior revocation is rejected even after restart. Applying an update does not restart a component. A revoked or expired credential cannot open new management sessions, routes, or Carriers; matching Relay, Server, Home, and target state is terminated. A revoked credential can never be restored; replacement uses a new key pair, certificate pair, and credential ID.
 
-A fresh Travel uses a deployment-neutral binary plus separate `travel-bootstrap.toml`,
-`deployment-root.pub`, and root-signed `deployment-trust.json` files. It validates the signed trust,
+A fresh Travel uses a deployment-neutral binary. Operators privately provision separate
+`travel-bootstrap.toml`, `deployment-root.pub`, and root-signed `deployment-trust.json` files; public
+packages contain only an `*.example.toml` sample and no deployment material. Travel validates the signed trust,
 uses its Management CA and configured Relay addresses, generates encrypted keys, a
 bound enrollment request, and a random 256-bit retrieval token locally, then opens a
 server-authenticated TLS bootstrap connection without presenting a client certificate. Relay

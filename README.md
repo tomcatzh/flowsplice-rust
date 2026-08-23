@@ -172,9 +172,11 @@ private keys, bearer tokens, or route/work secrets.
 
 ## Travel Quick Start
 
-Use the deployment-neutral Travel binary together with the package's separate
-`travel-bootstrap.toml`, `deployment-root.pub`, and root-signed `deployment-trust.json`. A fresh
-device does not need a generated runtime TOML or certificate directory before this command:
+The public Travel package contains a deployment-neutral binary and
+`travel-bootstrap.example.toml` only. Before enrollment, privately provision
+`travel-bootstrap.toml`, `deployment-root.pub`, and root-signed `deployment-trust.json` beside the
+binary; never commit or publicly upload those deployment files. A fresh device does not need a
+generated runtime TOML or certificate directory before this command:
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -329,8 +331,10 @@ device ABI and preserve a rollback snapshot before installation.
 ## Release artifacts
 
 `scripts/build-release.sh` builds deployment-neutral executables. It accepts no deployment root,
-CA, Relay, Server identity, address, domain, or port input. Those values belong only in separate
-runtime or package configuration files.
+CA, Relay, Server identity, address, hostname, domain, or port input. Real IP addresses and every
+non-example hostname or subdomain are secret-equivalent deployment metadata, even when their parent
+domain is public. They belong only in private runtime configuration outside this repository and its
+public releases.
 
 The script uses the lockfile and produces:
 
@@ -338,16 +342,15 @@ The script uses the lockfile and produces:
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
-`make home2-macos-package` and `make travel-macos-package` build and verify the dedicated
-`dist/macos-arm64/flowsplice-home2-0.2.0-macos-arm64.tar.gz` bundle. It contains the same HomeAgent
-binary used by every Home, a separate bootstrap TOML, root public key, signed deployment trust, the
-Chinese Quick Start, and internal SHA-256 checksums. The matching Travel package has the same
-configuration boundary. Set `FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE` or
-`FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE` to a prepared package configuration whose directory also
-contains `deployment-root.pub` and `deployment-trust.json`. Neither binary contains deployment
-configuration; neither archive may contain a private key, password, generated endpoint certificate,
-credential, or token. Distributable Travel packages require DNS names in `bootstrap_relays`; the
-package privacy check rejects IPv4 and IPv6 literals before packaging.
+`make home2-macos-package` and `make travel-macos-package` build and verify public, deployment-neutral
+macOS bundles. Each bundle contains one generic binary, a Chinese Quick Start, an
+`*.example.toml` file using only IANA-reserved example names, and internal SHA-256 checksums. The
+public builders accept no operator-supplied configuration input. Their package tests use a strict
+member allowlist and reject actual bootstrap filenames, deployment roots, signed deployment trust,
+certificates, keys, credentials, tokens, real IP addresses, and non-example hostnames or subdomains.
+Operators must provision actual bootstrap configuration and trust through a private ignored workflow;
+those materials must never be uploaded to this repository, Actions logs, issues, pull requests, or
+GitHub Releases.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc

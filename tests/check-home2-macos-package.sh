@@ -15,7 +15,11 @@ grep -q 'Home issuer' "${quick_start}"
 grep -q 'Global issuer' "${quick_start}"
 grep -q 'Library/Application Support/FlowSplice/Home' "${quick_start}"
 grep -q 'io.zxf.flowsplice.homeagent' "${package_script}"
-grep -q 'FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE' "${package_script}"
+grep -q 'homeagent/bootstrap.example.toml' "${package_script}"
+if grep -q 'FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE' "${package_script}"; then
+  printf 'Public Home packaging must not accept a deployment configuration input.\n' >&2
+  exit 1
+fi
 if grep -Eq 'FLOWSPLICE_(DEPLOYMENT_ROOT_PUBLIC_KEY|MANAGEMENT_CA_CERTIFICATE_PEM|SERVER_ID|SERVER_NAME|SERVER_CONTROL_PORT|HOME_UI_PORT)=' "${package_script}"; then
   printf 'Home package script must not compile deployment configuration into the binary.\n' >&2
   exit 1
@@ -48,15 +52,28 @@ package_root="$(find "${tmp_dir}" -mindepth 1 -maxdepth 1 -type d -name 'flowspl
 for relative in \
   bin/flowsplice-homeagent \
   QUICK_START.zh-CN.md \
-  home-bootstrap.toml \
-  deployment-root.pub \
-  deployment-trust.json \
+  home-bootstrap.example.toml \
   SHA256SUMS; do
   [[ -f "${package_root}/${relative}" ]] || {
     printf 'Package member is missing: %s\n' "${relative}" >&2
     exit 1
   }
 done
+
+if [[ "$(find "${package_root}" -type f | wc -l | tr -d ' ')" -ne 4 ]]; then
+  printf 'Home 2 public package contains files outside the allowlist.\n' >&2
+  exit 1
+fi
+for forbidden in home-bootstrap.toml deployment-root.pub deployment-trust.json; do
+  if find "${package_root}" -type f -name "${forbidden}" -print -quit | grep -q .; then
+    printf 'Home 2 public package contains deployment material.\n' >&2
+    exit 1
+  fi
+done
+if find "${package_root}" -type l -print -quit | grep -q .; then
+  printf 'Home 2 public package must not contain symbolic links.\n' >&2
+  exit 1
+fi
 
 if [[ -e "${package_root}/launchd" ]]; then
   printf 'One-command Home package must not ship a manual launchd template.\n' >&2
@@ -68,28 +85,10 @@ if find "${package_root}" -type f \( -name '*.key' -o -name '*.crt' -o -name '*.
   exit 1
 fi
 file "${package_root}/bin/flowsplice-homeagent" | grep -q 'Mach-O 64-bit executable arm64'
-grep -Fxq 'deployment_root_public_key = "deployment-root.pub"' \
-  "${package_root}/home-bootstrap.toml"
-grep -Fxq 'deployment_trust = "deployment-trust.json"' \
-  "${package_root}/home-bootstrap.toml"
-root_public_key="$(tr -d '\r\n' <"${package_root}/deployment-root.pub")"
-if strings "${package_root}/bin/flowsplice-homeagent" | grep -Fq "${root_public_key}"; then
-  printf 'Home binary contains the configured deployment root.\n' >&2
-  exit 1
-fi
-trust_payload="${tmp_dir}/deployment-trust-payload.json"
-jq -r '.payload_hex' "${package_root}/deployment-trust.json" | xxd -r -p >"${trust_payload}"
-management_ca_body_line="$(jq -r '.management_ca_certificate_pem' "${trust_payload}" | sed -n '2p')"
-for configured in \
-  "$(jq -r '.deployment_id' "${trust_payload}")" \
-  "${management_ca_body_line}"; do
-  if strings "${package_root}/bin/flowsplice-homeagent" | grep -Fq "${configured}"; then
-    printf 'Home binary contains deployment trust material.\n' >&2
-    exit 1
-  fi
-done
+python3 "${repo_root}/scripts/check-package-privacy.py" \
+  "${package_root}/home-bootstrap.example.toml"
 for value in server_id server_name; do
-  configured="$(awk -F'"' -v field="${value}" '$1 ~ "^" field " = " { print $2; exit }' "${package_root}/home-bootstrap.toml")"
+  configured="$(awk -F'"' -v field="${value}" '$1 ~ "^" field " = " { print $2; exit }' "${package_root}/home-bootstrap.example.toml")"
   if [[ -n "${configured}" ]] \
     && strings "${package_root}/bin/flowsplice-homeagent" | grep -Fq "${configured}"; then
     printf 'Home binary contains configured %s.\n' "${value}" >&2

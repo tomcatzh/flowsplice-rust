@@ -379,9 +379,9 @@ curl --fail http://127.0.0.1:9081/
 
 macOS 用 `lsof -nP -iTCP -sTCP:LISTEN` 代替 `ss`。确认 Server 只有控制端口和 loopback UI；Relay 有 management/data 与 loopback UI；Home 只有 loopback UI 和主动出站连接。
 
-## 11. 构建与部署无关的正式程序和独立配置包
+## 11. 构建公开样例包与私有部署材料
 
-正式 Home/Travel/Server/Relay 可执行文件不得包含 deployment root、CA、节点 ID、IP、域名、端口或 Relay 列表。所有部署值都必须位于独立配置文件；修改配置不得重新编译程序。
+正式 Home/Travel/Server/Relay 可执行文件不得包含 deployment root、CA、节点 ID、IP、子域名、端口或 Relay 列表。所有真实部署值都按密钥级信息管理，必须位于公开仓库之外的私有配置中；主域公开绝不意味着任何子域可公开，也不得从一个公开名称推断同级或下级名称。
 
 先构建一次通用程序：
 
@@ -390,21 +390,23 @@ export FLOWSPLICE_DOCKER_PULL=false
 ./scripts/build-release.sh
 ```
 
-再分别准备 Home 和 Travel 的发布配置目录。两个目录都包含 `deployment-root.pub` 和同一份根签名 `deployment-trust.json`，但 bootstrap TOML 各自保存角色需要的拓扑：
+公开 Home 和 Travel 包由仓库内的 `*.example.toml` 构建，只使用 IANA 保留示例域名：
 
 ```text
-package-config/home/
-├── home-bootstrap.toml
-├── deployment-root.pub
-└── deployment-trust.json
+flowsplice-home2-0.2.0-macos-arm64/
+├── bin/flowsplice-homeagent
+├── home-bootstrap.example.toml
+├── QUICK_START.zh-CN.md
+└── SHA256SUMS
 
-package-config/travel/
-├── travel-bootstrap.toml
-├── deployment-root.pub
-└── deployment-trust.json
+flowsplice-travel-0.2.0-macos-arm64/
+├── bin/flowsplice-travelagent
+├── travel-bootstrap.example.toml
+├── QUICK_START.zh-CN.md
+└── SHA256SUMS
 ```
 
-`home-bootstrap.toml`：
+`home-bootstrap.example.toml`：
 
 ```toml
 deployment_root_public_key = "deployment-root.pub"
@@ -415,7 +417,7 @@ server_control_port = 7443
 ui_listen = "127.0.0.1:9082"
 ```
 
-`travel-bootstrap.toml`：
+`travel-bootstrap.example.toml`：
 
 ```toml
 deployment_root_public_key = "deployment-root.pub"
@@ -424,22 +426,22 @@ bootstrap_relays = ["relay-1.example.net:8443"]
 ui_listen = "127.0.0.1:9080"
 ```
 
-可分发的 Travel 包在 `bootstrap_relays` 中只允许 DNS 名称，不允许 IPv4 或 IPv6 字面量；打包前的隐私检查会直接拒绝含 IP 的配置。
-
-构建配置化 macOS 包：
+构建公开、部署中立的 macOS 样例包：
 
 ```bash
-export FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/home/home-bootstrap.toml"
-export FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/travel/travel-bootstrap.toml"
 ./scripts/build-home2-macos-package.sh
 ./scripts/build-travel-macos-package.sh
 ```
+
+公开构建脚本不接受任何操作员配置输入。它们只打包受控样例，并以成员白名单拒绝实际 bootstrap 文件、deployment root、signed trust、证书、密钥和凭据；样例检查只允许 IANA 保留示例域名，拒绝所有 IP 和非示例主机名，而且错误信息不回显被拒绝的值。
+
+真实部署时，在被版本控制忽略的私有目录中复制样例为 `home-bootstrap.toml` 或 `travel-bootstrap.toml`，并通过私密渠道放入 `deployment-root.pub` 和 `deployment-trust.json`。这些私有材料只能在目标机器或受控私有分发流程中组合，不得进入 Git、构建日志、CI 日志、Issue、PR、公开 Release、截图、公共 Wiki 或聊天输出。
 
 仓库的 Dockerfile 还必须把 frontend 和所有基础镜像锁到不可变 digest。`FLOWSPLICE_DOCKER_PULL=false` 禁止主动更新；如果本机缺少该 digest，应停止并安排一次明确的缓存准备，不能在普通发布或部署时临时下载新层。
 
 macOS 文件使用免费的 ad-hoc codesign 与稳定的 `io.zxf.flowsplice.*` identifier。它能校验签名后未被修改，但没有 Apple Developer ID 身份，也未 notarize；公开分发时必须如实说明 Gatekeeper 限制。
 
-记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。客户端包应包含公开 bootstrap TOML、root 公钥和签名 trust，但不得包含 `*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。用 `strings` 检查二进制不得出现配置中的 root、公网 Relay、Server ID/域名或 CA PEM。
+记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。公开客户端包只能包含通用二进制、Quick Start、`*.example.toml` 和内部校验文件；不得包含真实配置、root 公钥、签名 trust、`*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。私有发布前用不回显原值的检查验证二进制不得出现配置中的 root、Relay 地址、Server ID/主机名或 CA PEM。
 
 ## 12. 首个 Travel 从空目录注册
 

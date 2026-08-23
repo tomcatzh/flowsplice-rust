@@ -2,25 +2,23 @@
 
 ## 准备
 
-使用 0.2 Travel 正式包。`flowsplice-travelagent` 是与具体部署无关的通用二进制；部署根公钥、签名 deployment trust、Management CA 和 Relay bootstrap 地址都不在二进制里，而是由包内独立配置提供。
+使用 0.2 Travel 公开包。`flowsplice-travelagent` 是与具体部署无关的通用二进制；公开包不含任何真实部署配置、根公钥、签名 deployment trust、Management CA、IP 或子域名。
 
-包内必须包含：
+公开包只允许包含：
 
 ```text
 flowsplice-travel-0.2.0-macos-arm64/
 ├── bin/flowsplice-travelagent
-├── travel-bootstrap.toml
-├── deployment-root.pub
-├── deployment-trust.json
+├── travel-bootstrap.example.toml
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS
 ```
 
-`travel-bootstrap.toml` 明确配置根公钥文件、签名 trust 文件、首次联系的 Relay 列表和本地 UI 地址。程序先用根公钥验证 `deployment-trust.json`，再从已验证 trust 中读取 Management CA 建立首次 TLS；不会信任 TOML 中裸放的 CA 内容。
+`travel-bootstrap.example.toml` 只是使用 IANA 保留示例域名的结构样例，不能直接用于部署。通过私密渠道取得本部署的根公钥、签名 trust 和真实 Relay 地址后，在公开仓库之外复制并填写为 `travel-bootstrap.toml`。真实 IP 和任何子域名都按密钥级信息处理；主域公开不代表其子域可公开。
 
 macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。免费签名是 ad-hoc codesign：它能校验文件未被签名后修改，但不提供 Apple Developer ID 身份，也没有 notarization。若文件经浏览器下载而被 Gatekeeper 隔离，仍可能需要在 macOS 的“隐私与安全性”页面由用户明确允许。
 
-ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256，或至少核对 `deployment-root.pub` 的 SHA-256 指纹；不要只依赖同一个下载包内自带的校验值。
+ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256；私下取得部署根公钥后，还应通过独立可信渠道核对其 SHA-256 指纹。
 
 解包后进入包目录，验证全部文件和 ad-hoc 签名：
 
@@ -29,6 +27,9 @@ shasum -a 256 -c SHA256SUMS
 chmod 755 ./bin/flowsplice-travelagent
 codesign --verify --strict --verbose=2 ./bin/flowsplice-travelagent
 ```
+
+随后在该目录私下放置 `travel-bootstrap.toml`、`deployment-root.pub` 和
+`deployment-trust.json`。绝不能把填写后的文件复制回仓库、公共构建目录或公开 Release。
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
 

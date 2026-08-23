@@ -14,20 +14,25 @@ finding-by-finding record of the current security review, see
 
 ### The design is public; only secrets are secret
 
-FlowSplice assumes that an attacker can read the source, protocol, certificate profiles, topology,
-logs, and failure behavior. Security must come from protected private keys, fresh random secrets,
+FlowSplice assumes that an attacker can read the source, protocol, certificate profiles, and failure
+behavior. Security must come from protected private keys, fresh random secrets,
 authenticated state, and explicit authorization—not from an undocumented protocol or hidden Relay
 address.
 
-This principle also defines what may be distributed safely. Certificates, CA certificates, public
-keys, signed trust documents, signed credentials, and a deployment-root public key are public
-material. Private keys, passwords, bearer tokens, and short-lived route/work secrets are not.
+This principle does not authorize publishing a real deployment's topology or public-key material.
+Every real IP address and every non-example hostname or subdomain is secret-equivalent infrastructure
+metadata; public knowledge of a parent domain never authorizes disclosure of any child name. Public
+source and release artifacts contain only deployment-neutral binaries and `*.example.toml` samples.
+Actual certificates, CA certificates, public keys, signed trust documents, signed credentials,
+deployment-root public keys, private keys, passwords, bearer tokens, and route/work secrets remain in
+private deployment channels according to their integrity and confidentiality requirements.
 
 ### One configured bootstrap trust point, not executable deployment data
 
-A Travel package contains separate `travel-bootstrap.toml`, `deployment-root.pub`, and
-`deployment-trust.json` files. The binary contains none of those deployment values. The
-root public-key file verifies a signed
+A public Travel package contains only a deployment-neutral binary and a reserved-name
+`travel-bootstrap.example.toml`; it contains no real bootstrap configuration or deployment trust.
+Operators privately supply `travel-bootstrap.toml`, `deployment-root.pub`, and
+`deployment-trust.json`. The binary contains none of those deployment values. The root public-key file verifies a signed
 deployment-trust document, which in turn binds the management and business CAs, Server control keys,
 Home endpoint keys, and scoped Travel authorities. Relay identities and Home SPKIs are learned from
 authenticated state instead of being copied into each Travel configuration.
