@@ -25,6 +25,9 @@ mkdir -p "${dist_dir}/macos-arm64"
   -p flowsplice-foobar)
 (cd "${repo_root}" && cargo build --locked --release \
   -p flowsplice-enrollment --bin flowsplice-trust)
+bash "${repo_root}/tests/check-release-feature-gates.sh" \
+  --home "${repo_root}/target/release/flowsplice-homeagent" \
+  --travel "${repo_root}/target/release/flowsplice-travelagent"
 for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar flowsplice-trust; do
   cp "${repo_root}/target/release/${binary}" "${dist_dir}/macos-arm64/${binary}"
 done

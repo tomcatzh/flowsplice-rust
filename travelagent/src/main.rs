@@ -2169,9 +2169,6 @@ async fn open_business_on(
 
 async fn relay_candidates(state: &AppState) -> Vec<RelayCandidate> {
     let directory = state.directory.read().await.clone();
-    if directory.relays.is_empty() {
-        return bootstrap_candidates(state).await;
-    }
     signed_directory_candidates(directory)
 }
 
@@ -3682,5 +3679,6 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.expected_id.as_deref() != Some("relay-removed"))
         );
+        assert!(signed_directory_candidates(RelayDirectory::default()).is_empty());
     }
 }

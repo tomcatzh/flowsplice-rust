@@ -351,6 +351,15 @@ flowsplice-server --config /etc/flowsplice/server.toml --check-config
 flowsplice-relay --config /etc/flowsplice/relay.toml --check-config
 ```
 
+配置和公共信任确认无误后，对手工配置的首个 Home 与每个 Relay 各执行一次显式授权状态初始化：
+
+```bash
+flowsplice-homeagent initialize-authorization-state --config /etc/flowsplice/homeagent.toml
+flowsplice-relay --config /etc/flowsplice/relay.toml --initialize-authorization-state
+```
+
+命令幂等，但只会创建缺失的空状态，绝不覆盖已有状态。正常启动遇到授权状态丢失或损坏时必须 fail-closed；不要用初始化命令代替恢复备份。通过 `init --server <IP>` 加入的后续 Home 会在首次安装事务中自动完成初始化，无需增加第二条命令。
+
 Home 没有单独的 `--check-config`；首次以前台启动观察一次，确认配置、证书、trust、SPKI 和 issuer key 绑定均通过，再交给服务管理器。
 
 ## 10. 启动顺序与服务管理
@@ -462,7 +471,7 @@ Travel 本机输入并确认自己的私钥密码，终端随后保持等待。�
 
 只有下列证据全部通过，才算环境建立完成：
 
-1. Server、每个 Relay、首个 Home 的配置和证书身份检查通过。
+1. Server、每个 Relay、首个 Home 的配置和证书身份检查通过；手工配置的 Home/Relay 已显式初始化授权状态，删除该状态后的启动负向测试必须失败。
 2. Server 无业务 listener；业务路径为 `Travel ↔ Relay ↔ Home`。
 3. Travel 从真正空目录远程注册，Home 错误签发密码被拒绝，正确密码后自动生成证书/TOML/redb。
 4. Home 2 从真正空环境只执行一次 `init --server <IP>`，批准后三种权限与文件权限符合预期；重跑同一命令可幂等恢复安装。
@@ -471,10 +480,10 @@ Travel 本机输入并确认自己的私钥密码，终端随后保持等待。�
 7. 至少两个 Relay 时，停止当前 Relay 后同一 TCP Flow 切换并继续；不是新建连接掩盖失败。
 8. 停止 Server 后，已经建立的业务 Flow 继续；新路由可以失败，但不得存在隐藏的 Server data fallback。
 9. 恢复 Server/Relay 后控制目录、Catalog 与授权 generation 单调恢复。
-9. Travel 重启从 redb 得到历史 Relay 启动候选，但在新鲜签名目录到达前不能用于业务授权。
-10. Travel、Relay、Home 的统计只在各自第二页点击后加载；Server 只接收签名五分钟汇总并幂等去重，日/周/月/年窗口可查询。
-11. 撤销 Travel 凭据必须再次输入签发密码；在线与重启后均拒绝已撤销凭据。
-12. 所有日志与发布归档通过秘密扫描，未出现密码、私钥、route/work secret、真实恢复 token 或业务 payload。
+10. Travel 重启从 redb 得到历史 Relay 启动候选；Server 离线且没有新鲜签名目录时，本地业务连接必须失败，目录恢复后才可承运。
+11. Travel、Relay、Home 的统计只在各自第二页点击后加载；Server 只接收签名五分钟汇总并幂等去重，日/周/月/年窗口可查询。
+12. 撤销 Travel 凭据必须再次输入签发密码；在线与重启后均拒绝已撤销凭据。
+13. 所有日志与发布归档通过秘密扫描，未出现密码、私钥、route/work secret、真实恢复 token 或业务 payload。
 
 Docker 验收使用同一功能边界，但只能使用 `tests/e2e/generated/` 的一次性测试 PKI；测试凭据绝不能进入真实环境。
 

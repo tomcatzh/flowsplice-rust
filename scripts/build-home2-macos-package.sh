@@ -46,6 +46,8 @@ fi
 
 (cd "${repo_root}/homeagent/web" && npm run build)
 (cd "${repo_root}" && cargo build --locked --release -p flowsplice-homeagent)
+bash "${repo_root}/tests/check-release-feature-gates.sh" \
+  --home "${repo_root}/target/release/flowsplice-homeagent"
 
 mkdir -p \
   "${package_root}/bin" \

@@ -2,6 +2,7 @@
 import gzip
 import http.client
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 import socket
@@ -191,6 +192,37 @@ def wait_ready() -> dict:
     raise AssertionError(f"Travel Agent did not become ready: {last_error}")
 
 
+def wait_fresh_directory(expected_relay_ids: set[str]) -> dict:
+    deadline = time.monotonic() + 90
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            relay_status, _, relay_body = http_get(
+                "/api/relays", {"Accept": "application/json"}
+            )
+            catalog_status, _, catalog_body = http_get(
+                "/api/catalog", {"Accept": "application/json"}
+            )
+            if relay_status == 200 and catalog_status == 200:
+                directory = json.loads(relay_body)
+                catalog = json.loads(catalog_body)
+                relay_ids = {relay["id"] for relay in directory["relays"]}
+                home_ids = {home["home_id"] for home in catalog["homes"]}
+                if (
+                    directory["generation"] >= 1
+                    and relay_ids == expected_relay_ids
+                    and {"home-1", "home-2"}.issubset(home_ids)
+                ):
+                    return directory
+                last_error = (directory, home_ids)
+        except Exception as error:  # recovery polling records transport failures
+            last_error = error
+        time.sleep(1)
+    raise AssertionError(
+        f"Travel did not receive the expected fresh Relay directory: {last_error}"
+    )
+
+
 def read_control_high_water() -> dict:
     generated = Path(__file__).resolve().parent / "generated"
     state_store = generated / "state/travel-state.redb"
@@ -332,6 +364,37 @@ def check_travel_runtime_mapping_rebind_and_persistence() -> None:
     )
     wait_business_port(11080, b"runtime-port-restored")
     wait_port_closed(11086)
+
+    concurrent_binds = ["0.0.0.0:10086", "0.0.0.0:10087", "0.0.0.0:10088"]
+    with ThreadPoolExecutor(max_workers=len(concurrent_binds)) as executor:
+        responses = list(
+            executor.map(
+                lambda bind: travel_request(
+                    "POST", "/api/mappings", {**identity, "bind": bind}
+                ),
+                concurrent_binds,
+            )
+        )
+    assert {response["bind"] for response in responses} == set(concurrent_binds), responses
+    status = travel_request("GET", "/api/status")
+    current = next(
+        mapping
+        for mapping in status["mappings"]
+        if all(mapping[key] == value for key, value in identity.items())
+    )
+    assert current["bind"] in concurrent_binds, current
+    current_port = int(current["bind"].rsplit(":", 1)[1]) + 1000
+    wait_business_port(current_port, b"concurrent-mapping-update-serialized")
+    for bind in concurrent_binds:
+        host_port = int(bind.rsplit(":", 1)[1]) + 1000
+        if host_port != current_port:
+            wait_port_closed(host_port)
+
+    travel_request(
+        "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:10080"}
+    )
+    wait_business_port(11080, b"concurrent-mapping-update-restored")
+    wait_port_closed(current_port)
 
 
 def wait_catalog_homes(expected: set[str]) -> dict:
@@ -508,6 +571,7 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
             "stop",
             "travelagent",
             "relay1",
+            "server",
         ],
         check=True,
     )
@@ -549,7 +613,36 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
         stdout=subprocess.PIPE,
     ).stdout.strip()
     assert relay1_running == "false", relay1_running
-    wait_ready()
+    deadline = time.monotonic() + 45
+    empty_directory = None
+    while time.monotonic() < deadline:
+        try:
+            status, _, body = http_get("/api/relays", {"Accept": "application/json"})
+            if status == 200:
+                empty_directory = json.loads(body)
+                if empty_directory["generation"] == 0 and not empty_directory["relays"]:
+                    break
+        except (ConnectionError, OSError, http.client.HTTPException):
+            pass
+        time.sleep(0.25)
+    assert empty_directory is not None, "Travel UI did not start without Server"
+    assert empty_directory["generation"] == 0 and not empty_directory["relays"], empty_directory
+    expect_mapping_unavailable_without_cross_home_fallback(11080)
+
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            "server",
+        ],
+        check=True,
+    )
+    wait_fresh_directory({"relay-2"})
     refreshed = travel_request("GET", "/api/statistics?period=day")
     refreshed_relays = {
         row["relay_id"]: row for row in refreshed["relay_discovery"]
@@ -1812,6 +1905,8 @@ assert home2_remote_credential_id not in {credential_id, remote_credential_id}
 checks = [
     "ipv4-ipv6-loopback-ui-policy",
     "travel-runtime-mapping-hot-rebind-and-restart-persistence",
+    "concurrent-mapping-updates-serialized",
+    "authorization-state-missing-fails-closed",
     "server-downlinked-two-relay-spki-directory",
     "two-home-catalog",
     "same-service-id-isolated-by-home",

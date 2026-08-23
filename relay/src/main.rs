@@ -24,7 +24,8 @@ use clap::Parser;
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
     authorization::{
-        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization, load_json,
+        AuthorizationCache, TravelAuthorizationSnapshot, VerifiedAuthorization,
+        initialize_authorization_cache, load_initialized_authorization_cache, load_json,
         store_json_atomic, unix_time_secs,
     },
     config::load_toml,
@@ -59,8 +60,11 @@ use uuid::Uuid;
 struct Args {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "relay.toml")]
     config: PathBuf,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "initialize_authorization_state")]
     check_config: bool,
+    /// Explicitly create the rollback and revocation cache for a first-time Relay install.
+    #[arg(long, conflicts_with = "check_config")]
+    initialize_authorization_state: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -240,11 +244,22 @@ async fn main() -> Result<()> {
         info!(event = "config_validated", path = %args.config.display(), "relay configuration is valid");
         return Ok(());
     }
-    let authorization_cache = if config.travel_authorization_cache.exists() {
-        load_json(&config.travel_authorization_cache)?
-    } else {
-        AuthorizationCache::default()
-    };
+    if args.initialize_authorization_state {
+        if initialize_authorization_cache(&config.travel_authorization_cache)? {
+            println!(
+                "initialized Relay authorization state: {}",
+                config.travel_authorization_cache.display()
+            );
+        } else {
+            println!(
+                "Relay authorization state is already initialized: {}",
+                config.travel_authorization_cache.display()
+            );
+        }
+        return Ok(());
+    }
+    let authorization_cache =
+        load_initialized_authorization_cache(&config.travel_authorization_cache)?;
     let state_store = StateStore::open(&config.state_store)?;
     let statistics = LocalStatistics::new(state_store);
     let statistics_certificate_pem = fs::read_to_string(&config.cert)

@@ -490,7 +490,7 @@ authenticated encryption. A future format change may choose an authenticated pri
 | Local business statistics | Travel/Relay/Home redb stores five-minute buckets and a durable signed-report outbox; only locally observed business metrics are recorded |
 | Server collected statistics | redb; verifies certificate/role/session-bound signatures and idempotently deduplicates node summaries by revision/digest |
 | Remote enrollment | A temporary Travel bootstrap record makes first enrollment resumable; after installation, Travel redb outbox and Home redb inbox preserve request/response/install-ack lifecycle across reconnect and restart |
-| Relay/Home authorization cache | Atomic JSON; rejects lower authorization generations, same-generation content changes, and loss of any observed revocation |
+| Relay/Home authorization cache | Explicit one-time initialization plus atomic JSON updates; missing/invalid state fails closed, and accepted state rejects lower generations, same-generation content changes, and loss of any observed revocation |
 | Server authorization state | One atomic JSON object containing generation, add-only credentials, irreversible revocations, and permanently spent enrollment-request hashes |
 | Server control generation | Atomic JSON high-water mark reserved before each signed snapshot; gaps are allowed but reuse after restart is not |
 | Home issuance ledger | Mode-`0600` atomic file; makes enrollment requests permanently single-use and retry-idempotent |

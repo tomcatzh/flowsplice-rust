@@ -34,6 +34,7 @@ policy-check:
 	bash ./tests/check-docker-pull-policy.sh
 	bash ./tests/check-home2-macos-package.sh
 	bash ./tests/check-travel-macos-package.sh
+	bash ./tests/check-release-feature-gates.sh
 	bash ./tests/check-runtime-configuration-boundary.sh
 
 openwrt-ipk:

@@ -180,6 +180,59 @@ if docker run --rm \
 fi
 printf '%s\n' '{"checkpoint": "runtime-bootstrap-config-boundary"}'
 
+authorization_negative_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-authorization-state-negative.XXXXXX")"
+if docker run --rm \
+  --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+  -v "${generated_dir}/config:/config:ro" \
+  -v "${generated_dir}/certs:/certs:ro" \
+  -v "${generated_dir}/offline:/issuer:ro" \
+  -v "${authorization_negative_dir}:/state" \
+  flowsplice-e2e:local \
+  /usr/local/bin/flowsplice-homeagent --config /config/homeagent.toml \
+  >"${authorization_negative_dir}/home.log" 2>&1; then
+  echo 'Home started without explicitly initialized authorization state' >&2
+  exit 1
+fi
+grep -Fq 'is not initialized; refusing to forget rollback and revocation history' \
+  "${authorization_negative_dir}/home.log"
+rm -f "${authorization_negative_dir}/home-state.redb"
+if docker run --rm \
+  --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+  -v "${generated_dir}/config:/config:ro" \
+  -v "${generated_dir}/certs:/certs:ro" \
+  -v "${authorization_negative_dir}:/state" \
+  flowsplice-e2e:local \
+  /usr/local/bin/flowsplice-relay --config /config/relay.toml \
+  >"${authorization_negative_dir}/relay.log" 2>&1; then
+  echo 'Relay started without explicitly initialized authorization state' >&2
+  exit 1
+fi
+grep -Fq 'is not initialized; refusing to forget rollback and revocation history' \
+  "${authorization_negative_dir}/relay.log"
+rm -rf -- "${authorization_negative_dir}"
+
+for home_config in homeagent.toml homeagent2.toml; do
+  docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+    -v "${generated_dir}/config:/config:ro" \
+    -v "${generated_dir}/certs:/certs:ro" \
+    -v "${generated_dir}/state:/state" \
+    flowsplice-e2e:local \
+    /usr/local/bin/flowsplice-homeagent initialize-authorization-state \
+    --config "/config/${home_config}"
+done
+for relay_config in relay.toml relay2.toml; do
+  docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+    -v "${generated_dir}/config:/config:ro" \
+    -v "${generated_dir}/certs:/certs:ro" \
+    -v "${generated_dir}/state:/state" \
+    flowsplice-e2e:local \
+    /usr/local/bin/flowsplice-relay --config "/config/${relay_config}" \
+    --initialize-authorization-state
+done
+printf '%s\n' '{"checkpoint": "authorization-state-explicit-initialization"}'
+
 teardown() {
   docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
@@ -334,6 +387,7 @@ enroll_dynamic_home() {
     cert/home-business.crt \
     cert/home-business.key \
     cert/home-endpoint-credential.json \
+    state/travel-authorization-cache.json \
     state/home-state.redb; do
     if [[ ! -s "${directory}/${required}" ]]; then
       echo "${service} init did not create ${required}" >&2

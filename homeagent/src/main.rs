@@ -31,7 +31,8 @@ use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::{
         AuthorizationCache, SignedTravelCredential, TravelAuthorizationSnapshot,
-        TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization, load_json,
+        TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization,
+        initialize_authorization_cache, load_initialized_authorization_cache, load_json,
         store_json_atomic, unix_time_secs,
     },
     config::{load_toml, resolve_path},
@@ -126,6 +127,11 @@ enum Command {
     /// Validate bootstrap configuration without connecting or writing local state.
     CheckBootstrapConfig {
         #[arg(long, default_value = "home-bootstrap.toml")]
+        config: PathBuf,
+    },
+    /// Explicitly create the rollback and revocation cache for a manually provisioned Home.
+    InitializeAuthorizationState {
+        #[arg(long, default_value = "homeagent.toml")]
         config: PathBuf,
     },
 }
@@ -380,6 +386,7 @@ struct HomeStatistics {
     reporter_id: Arc<String>,
 }
 
+#[cfg(feature = "e2e-remote-ui")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssueRequest {
@@ -572,8 +579,31 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::InitializeAuthorizationState { config }) => {
+            initialize_home_authorization_state(&config)
+        }
         None => run_home_agent(args.config).await,
     }
+}
+
+fn initialize_home_authorization_state(config_path: &Path) -> Result<()> {
+    let config: Config = load_toml(config_path)?;
+    validate_home_ui_config(&config)?;
+    validate_services(&config.services)?;
+    validate_spki_pins(&config.server_spki_pins, "server")?;
+    let _ = load_home_trust(&config)?;
+    if initialize_authorization_cache(&config.travel_authorization_cache)? {
+        println!(
+            "initialized Home authorization state: {}",
+            config.travel_authorization_cache.display()
+        );
+    } else {
+        println!(
+            "Home authorization state is already initialized: {}",
+            config.travel_authorization_cache.display()
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -644,11 +674,8 @@ async fn run_home_agent(config_path: PathBuf) -> Result<()> {
         )?,
     });
     let config = Arc::new(config);
-    let authorization_cache = if config.travel_authorization_cache.exists() {
-        load_json(&config.travel_authorization_cache)?
-    } else {
-        AuthorizationCache::default()
-    };
+    let authorization_cache =
+        load_initialized_authorization_cache(&config.travel_authorization_cache)?;
     let authorization =
         TravelAuthorizationState::new(authorization_cache, deployment_trust.clone());
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
@@ -965,8 +992,9 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         services: Vec::new(),
     };
     let encoded = toml::to_string_pretty(&generated).context("failed to encode Home TOML")?;
-    write_new_private(&config_path, encoded.as_bytes())?;
+    initialize_authorization_cache(&generated.travel_authorization_cache)?;
     let _ = StateStore::open(&generated.state_store)?;
+    write_new_private(&config_path, encoded.as_bytes())?;
     #[cfg(target_os = "macos")]
     install_and_start_macos_home(&install_root, &config_path, &request.home_id)?;
     fs::remove_file(&bootstrap_state_path)?;
@@ -2656,6 +2684,13 @@ async fn approve_home_enrollment(
     state: &IssuerAppState,
     request: ApproveHomeEnrollmentRequest,
 ) -> Result<ApproveHomeEnrollmentResponse> {
+    let ApproveHomeEnrollmentRequest {
+        request_id,
+        profile,
+        valid_days,
+        password,
+    } = request;
+    let password = Zeroizing::new(password);
     if state.issuer.global_authority.is_none() {
         bail!("only a global Home issuer may approve new Homes");
     }
@@ -2665,7 +2700,6 @@ async fn approve_home_enrollment(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Home enrollment authority is not configured"))?;
     let store = Arc::clone(&state.statistics.store);
-    let request_id = request.request_id;
     let mut record = tokio::task::spawn_blocking(move || {
         store
             .get_json::<HomeEnrollmentInboxRecord>(
@@ -2677,22 +2711,19 @@ async fn approve_home_enrollment(
     .await
     .context("Home enrollment inbox read task failed")??;
     if let Some(existing) = &record.response {
-        if existing.approval.profile != request.profile {
+        if existing.approval.profile != profile {
             bail!("Home enrollment was already approved with a different profile");
         }
         return Ok(ApproveHomeEnrollmentResponse {
             request_id,
             home_id: record.home_id,
-            profile: request.profile,
+            profile,
         });
     }
-    let valid_days = request
-        .valid_days
-        .unwrap_or(state.issuer.default_valid_days);
+    let valid_days = valid_days.unwrap_or(state.issuer.default_valid_days);
     if valid_days == 0 || valid_days > MAX_VALID_DAYS {
         bail!("Home validity must be between 1 and {MAX_VALID_DAYS} days");
     }
-    let password = Zeroizing::new(request.password);
     if password.is_empty() && !state.issuer.allow_unencrypted_test_keys {
         bail!("issuer password must not be empty");
     }
@@ -2700,7 +2731,7 @@ async fn approve_home_enrollment(
         record.request.clone(),
         u64::from(valid_days) * 86_400,
         enrollment_authority.id.clone(),
-        request.profile,
+        profile,
         unix_time_secs()?,
     )?;
     let protected = |path| ProtectedKey {
@@ -2742,7 +2773,7 @@ async fn approve_home_enrollment(
     Ok(ApproveHomeEnrollmentResponse {
         request_id,
         home_id,
-        profile: request.profile,
+        profile,
     })
 }
 
@@ -2750,8 +2781,15 @@ async fn approve_remote_enrollment(
     state: &IssuerAppState,
     request: ApproveRemoteEnrollmentRequest,
 ) -> Result<IssueResponse> {
+    let ApproveRemoteEnrollmentRequest {
+        request_id,
+        valid_days,
+        valid_minutes,
+        scope,
+        password,
+    } = request;
+    let password = Zeroizing::new(password);
     let store = Arc::clone(&state.statistics.store);
-    let request_id = request.request_id;
     let record = tokio::task::spawn_blocking(move || {
         store
             .get_json::<RemoteEnrollmentInboxRecord>(Table::EnrollmentInbox, request_id.as_bytes())?
@@ -2762,15 +2800,13 @@ async fn approve_remote_enrollment(
     if record.travel_id != record.request.travel_id || record.home_id != state.config.id {
         bail!("remote enrollment inbox record has an invalid identity binding");
     }
-    let issued = issue_from_home(
+    let issued = issue_from_home_with_password(
         state,
-        IssueRequest {
-            request: record.request.clone(),
-            valid_days: request.valid_days,
-            valid_minutes: request.valid_minutes,
-            scope: request.scope,
-            password: request.password,
-        },
+        record.request.clone(),
+        valid_days,
+        valid_minutes,
+        scope,
+        password,
     )
     .await?;
     let mut updated = record;
@@ -2893,6 +2929,7 @@ fn record_issuer_operation(state: &IssuerAppState, family: &str, accepted: bool)
     }
 }
 
+#[cfg(feature = "e2e-remote-ui")]
 async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Result<IssueResponse> {
     let IssueRequest {
         request,
@@ -2901,6 +2938,25 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
         scope,
         password,
     } = request;
+    issue_from_home_with_password(
+        state,
+        request,
+        valid_days,
+        valid_minutes,
+        scope,
+        Zeroizing::new(password),
+    )
+    .await
+}
+
+async fn issue_from_home_with_password(
+    state: &IssuerAppState,
+    request: TravelEnrollmentRequest,
+    valid_days: Option<u32>,
+    valid_minutes: Option<u32>,
+    scope: TravelCredentialScope,
+    password: Zeroizing<String>,
+) -> Result<IssueResponse> {
     let valid_for_secs =
         requested_validity_secs(valid_days, valid_minutes, state.issuer.default_valid_days)?;
     validate_requested_scope(&state.config, &state.issuer, &scope)?;
@@ -2939,7 +2995,6 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
     let _sensitive_permit = Arc::clone(&state.sensitive_operation)
         .try_acquire_owned()
         .map_err(|_| anyhow::anyhow!("another sensitive issuer operation is already running"))?;
-    let password = Zeroizing::new(password);
     if password.is_empty() && !state.issuer.allow_unencrypted_test_keys {
         bail!("private-key password must not be empty");
     }

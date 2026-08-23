@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Write,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -678,14 +679,99 @@ pub fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Creates an empty authorization cache exactly once without replacing existing state.
+///
+/// The caller must use this only during an explicit first-run initialization. A missing cache at
+/// normal startup is security-significant because recreating it would forget rollback and
+/// revocation history.
+///
+/// # Errors
+///
+/// Returns an error when an existing cache is invalid or durable creation fails.
+pub fn initialize_authorization_cache(path: &Path) -> Result<bool> {
+    if path.exists() {
+        let _: AuthorizationCache = load_json(path).with_context(|| {
+            format!(
+                "existing authorization state {} is invalid; refusing to replace it",
+                path.display()
+            )
+        })?;
+        return Ok(false);
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("authorization state path has no file name"))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.init", Uuid::new_v4()));
+    let result = (|| -> Result<bool> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        let bytes = serde_json::to_vec_pretty(&AuthorizationCache::default())
+            .context("failed to encode initial authorization state")?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        match fs::hard_link(&temporary, path) {
+            Ok(()) => {
+                fs::File::open(parent)?.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _: AuthorizationCache = load_json(path).with_context(|| {
+                    format!(
+                        "concurrently created authorization state {} is invalid",
+                        path.display()
+                    )
+                })?;
+                Ok(false)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to install initial authorization state {}",
+                    path.display()
+                )
+            }),
+        }
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+/// Loads an authorization cache that must already have been explicitly initialized.
+///
+/// # Errors
+///
+/// Returns an error when the cache is missing or invalid. It never silently recreates state.
+pub fn load_initialized_authorization_cache(path: &Path) -> Result<AuthorizationCache> {
+    if !path.exists() {
+        bail!(
+            "authorization state {} is not initialized; refusing to forget rollback and revocation history",
+            path.display()
+        );
+    }
+    load_json(path).with_context(|| {
+        format!(
+            "authorization state {} is invalid; refusing to forget rollback and revocation history",
+            path.display()
+        )
+    })
+}
+
 /// Atomically replaces a small JSON state file and fsyncs both file and directory.
 ///
 /// # Errors
 ///
 /// Returns an error when serialization or durable replacement fails.
 pub fn store_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    use std::io::Write;
-
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -944,6 +1030,34 @@ mod tests {
             migrated.revoked_credentials,
             authorization.revoked_credentials
         );
+        Ok(())
+    }
+
+    #[test]
+    fn authorization_cache_requires_explicit_non_destructive_initialization() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("nested/authorization-cache.json");
+        assert!(load_initialized_authorization_cache(&path).is_err());
+
+        assert!(initialize_authorization_cache(&path)?);
+        assert_eq!(
+            load_initialized_authorization_cache(&path)?,
+            AuthorizationCache::default()
+        );
+
+        let preserved = AuthorizationCache {
+            generation: 7,
+            snapshot_sha256: "ab".repeat(32),
+            revoked_credentials: HashSet::from([Uuid::new_v4()]),
+        };
+        store_json_atomic(&path, &preserved)?;
+        assert!(!initialize_authorization_cache(&path)?);
+        assert_eq!(load_initialized_authorization_cache(&path)?, preserved);
+
+        fs::write(&path, b"not-json")?;
+        assert!(initialize_authorization_cache(&path).is_err());
+        assert!(load_initialized_authorization_cache(&path).is_err());
+        assert_eq!(fs::read(&path)?, b"not-json");
         Ok(())
     }
 }

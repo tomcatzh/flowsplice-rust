@@ -145,7 +145,7 @@ launchctl print "gui/$(id -u)/io.zxf.flowsplice.homeagent.$home_id"
 
 如果批准前网络中断，保留原安装目录和原发布包，在包目录重新执行同一条 `init --server <SERVER_IP>`；程序会使用本地 retrieval token 继续等待，不会生成另一个 Home。若证书已经安装但 launchd 启动被中断，重跑同一命令会验证现有文件并补完启动，不会覆盖冲突内容。
 
-Home 的授权与统计状态保存在 redb。Travel 另外把历史上验证过的 Relay 保存在自己的 redb 中，并只把它们作为下次启动候选；业务仍必须先拿到当前有效的 Server 签名目录，过期快照不会变成永久授权。
+Home 的授权防回滚/撤销高水位保存在独立原子状态文件，统计状态保存在 redb；`init --server <IP>` 会在首次安装时自动创建两者。后续正常启动若授权状态丢失或损坏会拒绝运行，不会重建空状态。Travel 另外把历史上验证过的 Relay 保存在自己的 redb 中，并只把它们作为下次启动候选；业务仍必须先拿到当前有效的 Server 签名目录，过期快照不会变成永久授权。
 
 ## 验收
 

@@ -46,6 +46,8 @@ fi
 
 (cd "${repo_root}/travelagent/web" && npm run build)
 (cd "${repo_root}" && cargo build --locked --release -p flowsplice-travelagent)
+bash "${repo_root}/tests/check-release-feature-gates.sh" \
+  --travel "${repo_root}/target/release/flowsplice-travelagent"
 
 mkdir -p "${package_root}/bin" "${dist_dir}"
 cp "${repo_root}/target/release/flowsplice-travelagent" \

@@ -34,4 +34,12 @@ The Server keeps one atomic authorization state containing the generation, add-o
 /etc/init.d/flowsplice validate
 ```
 
+After validating a newly configured Relay and before its first start, explicitly initialize its anti-rollback state using that instance's rendered TOML, for example:
+
+```sh
+su -s /bin/sh -c '/usr/bin/flowsplice-relay --config /var/run/flowsplice/relay_lan.toml --initialize-authorization-state' flowsplice
+```
+
+Repeat once for every enabled Relay section. The command is idempotent but never replaces existing state. If a running installation later reports missing or invalid authorization state, restore the matching backup instead of initializing an empty cache.
+
 WAN firewall exposure is intentionally a separate operation.
