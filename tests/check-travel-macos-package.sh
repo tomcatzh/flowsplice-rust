@@ -12,6 +12,7 @@ done
 grep -q 'travel-bootstrap.toml' "${quick_start}"
 grep -q 'io.zxf.flowsplice.travelagent' "${package_script}"
 grep -q 'FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE' "${package_script}"
+grep -q 'check-package-privacy.py' "${package_script}"
 if grep -Eq 'FLOWSPLICE_(DEPLOYMENT_ROOT_PUBLIC_KEY|MANAGEMENT_CA_CERTIFICATE_PEM|BOOTSTRAP_RELAYS)=' "${package_script}"; then
   printf 'Travel package script must not compile deployment configuration into the binary.\n' >&2
   exit 1
@@ -60,6 +61,8 @@ fi
 grep -Fxq 'deployment_root_public_key = "deployment-root.pub"' \
   "${package_root}/travel-bootstrap.toml"
 grep -Fxq 'deployment_trust = "deployment-trust.json"' \
+  "${package_root}/travel-bootstrap.toml"
+python3 "${repo_root}/scripts/check-package-privacy.py" \
   "${package_root}/travel-bootstrap.toml"
 root_public_key="$(tr -d '\r\n' <"${package_root}/deployment-root.pub")"
 if strings "${package_root}/bin/flowsplice-travelagent" | grep -Fq "${root_public_key}"; then

@@ -36,6 +36,7 @@ policy-check:
 	bash ./tests/check-travel-macos-package.sh
 	bash ./tests/check-release-feature-gates.sh
 	bash ./tests/check-runtime-configuration-boundary.sh
+	python3 ./tests/test_package_privacy.py
 
 openwrt-ipk:
 	python3 scripts/build-openwrt-ipk.py \

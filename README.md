@@ -346,7 +346,8 @@ configuration boundary. Set `FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE` or
 `FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE` to a prepared package configuration whose directory also
 contains `deployment-root.pub` and `deployment-trust.json`. Neither binary contains deployment
 configuration; neither archive may contain a private key, password, generated endpoint certificate,
-credential, or token.
+credential, or token. Distributable Travel packages require DNS names in `bootstrap_relays`; the
+package privacy check rejects IPv4 and IPv6 literals before packaging.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc

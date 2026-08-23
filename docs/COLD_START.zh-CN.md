@@ -424,6 +424,8 @@ bootstrap_relays = ["relay-1.example.net:8443"]
 ui_listen = "127.0.0.1:9080"
 ```
 
+可分发的 Travel 包在 `bootstrap_relays` 中只允许 DNS 名称，不允许 IPv4 或 IPv6 字面量；打包前的隐私检查会直接拒绝含 IP 的配置。
+
 构建配置化 macOS 包：
 
 ```bash

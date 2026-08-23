@@ -23,6 +23,11 @@ if [[ -z "${bootstrap_config_file}" || ! -f "${bootstrap_config_file}" ]]; then
   printf 'FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE must name travel-bootstrap.toml.\n' >&2
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'python3 is required to validate distributable package privacy.\n' >&2
+  exit 1
+fi
+python3 "${repo_root}/scripts/check-package-privacy.py" "${bootstrap_config_file}"
 bootstrap_dir="$(cd -- "$(dirname -- "${bootstrap_config_file}")" && pwd)"
 deployment_root_public_key_file="${bootstrap_dir}/deployment-root.pub"
 deployment_trust_file="${bootstrap_dir}/deployment-trust.json"
