@@ -129,6 +129,7 @@ for spec in \
   'flowsplice-travelagent travel-bootstrap.toml'; do
   set -- ${spec}
   docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
     -v "${ipv6_bootstrap_dir}:/bootstrap:ro" \
     flowsplice-e2e:local \
     "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"
@@ -153,6 +154,7 @@ for spec in \
   'flowsplice-travelagent travel-bootstrap.toml'; do
   set -- ${spec}
   if docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
     -v "${invalid_bootstrap_dir}:/bootstrap:ro" \
     flowsplice-e2e:local \
     "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"; then
