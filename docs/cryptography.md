@@ -20,9 +20,10 @@ authenticated state, and explicit authorization—not from an undocumented proto
 address.
 
 This principle does not authorize publishing a real deployment's topology or public-key material.
-Every real IP address and every non-example hostname or subdomain is secret-equivalent infrastructure
-metadata; public knowledge of a parent domain never authorizes disclosure of any child name. Public
-source and release artifacts contain only deployment-neutral binaries and `*.example.toml` samples.
+Every real IP address and every infrastructure hostname or subdomain not explicitly declassified by
+its exact name is secret-equivalent metadata; public knowledge of a parent domain never authorizes
+disclosure of any child name. Public source and release artifacts contain only deployment-neutral
+binaries and `*.example.toml` samples.
 Actual certificates, CA certificates, public keys, signed trust documents, signed credentials,
 deployment-root public keys, private keys, passwords, bearer tokens, and route/work secrets remain in
 private deployment channels according to their integrity and confidentiality requirements.

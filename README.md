@@ -332,9 +332,10 @@ device ABI and preserve a rollback snapshot before installation.
 
 `scripts/build-release.sh` builds deployment-neutral executables. It accepts no deployment root,
 CA, Relay, Server identity, address, hostname, domain, or port input. Real IP addresses and every
-non-example hostname or subdomain are secret-equivalent deployment metadata, even when their parent
-domain is public. They belong only in private runtime configuration outside this repository and its
-public releases.
+infrastructure hostname or subdomain not explicitly declassified by its exact name are
+secret-equivalent deployment metadata. Publishing a parent domain declassifies only that exact name,
+never a child or sibling. Deployment names belong only in private runtime configuration outside this
+repository and its public releases.
 
 The script uses the lockfile and produces:
 
