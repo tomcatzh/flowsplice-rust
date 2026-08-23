@@ -723,8 +723,8 @@ fn load_travel_bootstrap(path: &Path) -> Result<VerifiedTravelBootstrap> {
         .ui_listen
         .parse()
         .context("invalid Travel bootstrap UI listener")?;
-    if ui_listen != SocketAddr::from(([127, 0, 0, 1], ui_listen.port())) {
-        bail!("Travel bootstrap UI must listen directly on 127.0.0.1");
+    if !ui_listen.ip().is_loopback() {
+        bail!("Travel bootstrap UI must listen directly on a loopback address");
     }
     let mut bootstrap_relays = configured.bootstrap_relays;
     bootstrap_relays.sort();
@@ -1523,10 +1523,8 @@ fn validate_config(config: &Config) -> Result<()> {
         bail!("carrier timeout, reevaluation, or unacknowledged-data limits are invalid");
     }
     let ui_addr: SocketAddr = config.ui_listen.parse().context("invalid ui_listen")?;
-    if ui_addr != SocketAddr::from(([127, 0, 0, 1], ui_addr.port()))
-        && !test_remote_ui_enabled(config)
-    {
-        bail!("Travel UI must listen directly on 127.0.0.1");
+    if !ui_addr.ip().is_loopback() && !test_remote_ui_enabled(config) {
+        bail!("Travel UI must listen directly on a loopback address");
     }
     validate_mapping_set(config, &config.mappings)?;
     Ok(())
@@ -3235,7 +3233,7 @@ fn travel_password_rotation_is_local(config: &Config) -> bool {
     config
         .ui_listen
         .parse::<SocketAddr>()
-        .is_ok_and(|address| address.ip() == std::net::Ipv4Addr::LOCALHOST)
+        .is_ok_and(|address| address.ip().is_loopback())
         || test_remote_ui_enabled(config)
 }
 
@@ -3280,7 +3278,7 @@ fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
     let Ok(address) = listen.parse::<SocketAddr>() else {
         return false;
     };
-    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
+    if !address.ip().is_loopback() {
         return false;
     }
     let authority = address.to_string();
@@ -3413,6 +3411,12 @@ mod tests {
             .body(Body::empty())?;
         assert!(local_ui_request_allowed(&get, "127.0.0.1:9080"));
 
+        let ipv6_get = Request::builder()
+            .uri("http://[::1]:9080/")
+            .header("host", "[::1]:9080")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&ipv6_get, "[::1]:9080"));
+
         let bad_site = Request::builder()
             .uri("http://127.0.0.1:9080/")
             .header("host", "127.0.0.1:9080")
@@ -3427,6 +3431,20 @@ mod tests {
             .header("origin", "http://127.0.0.1:9080")
             .body(Body::empty())?;
         assert!(local_ui_request_allowed(&post, "127.0.0.1:9080"));
+
+        let ipv6_post = Request::builder()
+            .method(Method::POST)
+            .uri("http://[::1]:9080/api/keys/password")
+            .header("host", "[::1]:9080")
+            .header("origin", "http://[::1]:9080")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&ipv6_post, "[::1]:9080"));
+
+        let non_loopback = Request::builder()
+            .uri("http://192.0.2.1:9080/")
+            .header("host", "192.0.2.1:9080")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&non_loopback, "192.0.2.1:9080"));
 
         let missing_origin = Request::builder()
             .method(Method::POST)

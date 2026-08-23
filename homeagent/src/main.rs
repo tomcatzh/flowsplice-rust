@@ -1216,10 +1216,8 @@ fn validate_issuer_config(
         .ui_listen
         .parse::<SocketAddr>()
         .context("invalid Home UI listen address")?;
-    if listen != SocketAddr::from(([127, 0, 0, 1], listen.port()))
-        && !test_remote_issuer_enabled(issuer)
-    {
-        bail!("Home issuer UI must listen directly on 127.0.0.1");
+    if !listen.ip().is_loopback() && !test_remote_issuer_enabled(issuer) {
+        bail!("Home issuer UI must listen directly on a loopback address");
     }
     if issuer.default_valid_days == 0 || issuer.default_valid_days > MAX_VALID_DAYS {
         bail!("Travel validity must be between 1 and {MAX_VALID_DAYS} days");
@@ -3255,7 +3253,7 @@ fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
     let Ok(address) = listen.parse::<SocketAddr>() else {
         return false;
     };
-    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
+    if !address.ip().is_loopback() {
         return false;
     }
     let authority = address.to_string();
@@ -3361,6 +3359,12 @@ mod tests {
             .body(Body::empty())?;
         assert!(local_ui_request_allowed(&get, "127.0.0.1:9081"));
 
+        let ipv6_get = Request::builder()
+            .uri("http://[::1]:9081/")
+            .header("host", "[::1]:9081")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&ipv6_get, "[::1]:9081"));
+
         let bad_host = Request::builder()
             .uri("http://attacker.invalid/")
             .header("host", "attacker.invalid")
@@ -3374,6 +3378,20 @@ mod tests {
             .header("origin", "http://127.0.0.1:9081")
             .body(Body::empty())?;
         assert!(local_ui_request_allowed(&post, "127.0.0.1:9081"));
+
+        let ipv6_post = Request::builder()
+            .method(Method::POST)
+            .uri("http://[::1]:9081/api/revoke")
+            .header("host", "[::1]:9081")
+            .header("origin", "http://[::1]:9081")
+            .body(Body::empty())?;
+        assert!(local_ui_request_allowed(&ipv6_post, "[::1]:9081"));
+
+        let non_loopback = Request::builder()
+            .uri("http://192.0.2.1:9081/")
+            .header("host", "192.0.2.1:9081")
+            .body(Body::empty())?;
+        assert!(!local_ui_request_allowed(&non_loopback, "192.0.2.1:9081"));
 
         let missing_origin = Request::builder()
             .method(Method::POST)

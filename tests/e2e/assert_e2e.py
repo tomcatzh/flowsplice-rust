@@ -1810,6 +1810,7 @@ checkpoint("home2-remote-enrollment")
 home2_remote_credential_id = check_home2_remote_enrollment(remote_identity_password)
 assert home2_remote_credential_id not in {credential_id, remote_credential_id}
 checks = [
+    "ipv4-ipv6-loopback-ui-policy",
     "travel-runtime-mapping-hot-rebind-and-restart-persistence",
     "server-downlinked-two-relay-spki-directory",
     "two-home-catalog",

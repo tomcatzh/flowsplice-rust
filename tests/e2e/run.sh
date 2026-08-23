@@ -107,6 +107,34 @@ if docker run --rm flowsplice-e2e:local \
   echo 'Home accepted a missing bootstrap configuration' >&2
   exit 1
 fi
+ipv6_bootstrap_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-ipv6-bootstrap.XXXXXX")"
+cp "${generated_dir}/config/home-bootstrap.toml" "${ipv6_bootstrap_dir}/home-bootstrap.toml"
+cp "${generated_dir}/config/travel-bootstrap.toml" "${ipv6_bootstrap_dir}/travel-bootstrap.toml"
+cp "${generated_dir}/certs/deployment-root.pub" "${ipv6_bootstrap_dir}/deployment-root.pub"
+cp "${generated_dir}/certs/deployment-trust.json" "${ipv6_bootstrap_dir}/deployment-trust.json"
+sed -i.bak \
+  -e 's#/certs/deployment-root.pub#deployment-root.pub#' \
+  -e 's#/certs/deployment-trust.json#deployment-trust.json#' \
+  -e 's/^ui_listen = .*/ui_listen = "[::1]:9081"/' \
+  "${ipv6_bootstrap_dir}/home-bootstrap.toml"
+sed -i.bak \
+  -e 's#/certs/deployment-root.pub#deployment-root.pub#' \
+  -e 's#/certs/deployment-trust.json#deployment-trust.json#' \
+  -e 's/^ui_listen = .*/ui_listen = "[::1]:9080"/' \
+  "${ipv6_bootstrap_dir}/travel-bootstrap.toml"
+rm -f "${ipv6_bootstrap_dir}/home-bootstrap.toml.bak" \
+  "${ipv6_bootstrap_dir}/travel-bootstrap.toml.bak"
+for spec in \
+  'flowsplice-homeagent home-bootstrap.toml' \
+  'flowsplice-travelagent travel-bootstrap.toml'; do
+  set -- ${spec}
+  docker run --rm \
+    -v "${ipv6_bootstrap_dir}:/bootstrap:ro" \
+    flowsplice-e2e:local \
+    "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"
+done
+rm -rf -- "${ipv6_bootstrap_dir}"
+printf '%s\n' '{"checkpoint": "ipv4-ipv6-loopback-ui-policy"}'
 invalid_bootstrap_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-invalid-bootstrap.XXXXXX")"
 cp "${generated_dir}/config/home-bootstrap.toml" "${invalid_bootstrap_dir}/home-bootstrap.toml"
 cp "${generated_dir}/config/travel-bootstrap.toml" "${invalid_bootstrap_dir}/travel-bootstrap.toml"
