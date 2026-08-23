@@ -2,6 +2,7 @@
 import gzip
 import http.client
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
@@ -888,6 +889,8 @@ def check_duplicate_travel_login_is_rejected() -> None:
                 "docker",
                 "run",
                 "--rm",
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
                 "--network",
                 network,
                 "-v",
@@ -1621,6 +1624,8 @@ def assert_revoked_management_certificate_rejected(relay: str) -> None:
             "docker",
             "run",
             "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--network",
             "e2e_flowsplice",
             "-v",
@@ -1819,6 +1824,8 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
             "docker",
             "run",
             "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--network",
             "e2e_flowsplice",
             "-v",
