@@ -200,7 +200,7 @@
       <path d="M1150 614h24v18h-24zM1155 619h14M1155 625h9" fill="none" stroke="#00A88F" stroke-width="2.2" stroke-linecap="round"/>
       <text class="label" x="1202" y="612">Home service</text>
       <text class="small" x="1202" y="638">NAS / SSH / Web / UDP</text>
-      <text class="tiny" x="1202" y="658">Example: 192.168.1.20:443</text>
+      <text class="tiny" x="1202" y="658">Example: 192.0.2.10:443</text>
     </g>
 
     <rect x="1116" y="687" width="404" height="25" rx="12.5" fill="#DDF4EE"/>
