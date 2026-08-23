@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            homeagent/web/package-lock.json
+            travelagent/web/package-lock.json
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends clang cmake make perl pkg-config python3 ripgrep
+
+      - name: Select the pinned Rust toolchain
+        run: |
+          rustup show
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust build data
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.97.1-
+
+      - name: Run policy, format, build, and lint checks
+        run: make check
+
+      - name: Run the complete Rust test suite
+        run: cargo test --workspace --all-targets
+
+  docker-e2e:
+    name: Docker E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install E2E host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends jq openssl xxd
+
+      - name: Show Docker environment
+        run: |
+          docker version
+          docker buildx version
+
+      - name: Run the complete Docker E2E suite
+        env:
+          RUST_MIRROR_URL: off
+          FLOWSPLICE_DOCKER_PULL: "false"
+        run: make e2e
+
+      - name: Upload E2E logs after a failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flowsplice-e2e-logs-${{ github.run_id }}
+          path: tests/e2e/generated/*.log
+          if-no-files-found: ignore
+          retention-days: 14
