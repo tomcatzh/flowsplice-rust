@@ -145,6 +145,69 @@ struct CertificateChainVerifier {
     signature_algorithms: WebPkiSupportedAlgorithms,
 }
 
+#[derive(Debug)]
+struct BootstrapDiscoveryCertificateVerifier {
+    signature_algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for BootstrapDiscoveryCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        let (_, certificate) = parse_x509_certificate(end_entity.as_ref()).map_err(|error| {
+            RustlsError::General(format!("invalid discovery certificate: {error}"))
+        })?;
+        let now = i64::try_from(now.as_secs()).map_err(|_| {
+            RustlsError::General("discovery time is outside the certificate range".to_owned())
+        })?;
+        let now = x509_parser::time::ASN1Time::from_timestamp(now)
+            .map_err(|error| RustlsError::General(format!("invalid discovery time: {error}")))?;
+        if !certificate.validity().is_valid_at(now) {
+            return Err(RustlsError::General(
+                "discovery certificate is outside its validity period".to_owned(),
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_algorithms.supported_schemes()
+    }
+}
+
 impl ServerCertVerifier for CertificateChainVerifier {
     fn verify_server_cert(
         &self,
@@ -312,6 +375,25 @@ pub fn identity_server_auth_connector_from_ca_pem(ca_pem: &str) -> Result<TlsCon
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Builds the narrowly scoped connector used to retrieve public first-contact material.
+///
+/// The server certificate is not yet anchored during this one request. The caller must parse a
+/// Relay identity, verify the returned signed deployment document, reconnect with the discovered
+/// management CA, and require human verification at Home before accepting an identity.
+#[must_use]
+pub fn bootstrap_discovery_connector() -> TlsConnector {
+    let signature_algorithms =
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let verifier = BootstrapDiscoveryCertificateVerifier {
+        signature_algorithms,
+    };
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
 }
 
 /// Builds an mTLS client connector that validates the certificate chain while `FlowSplice` checks

@@ -14,10 +14,18 @@ class TravelUnitTest {
     }
 
     @Test
-    fun profileConfigurationReplacementIsExact() {
-        val source = "id = \"travel-1\"\nstate_store = \"/old/state.redb\"\n"
-        val updated = TravelProfile.replaceTomlValue(source, "state_store", "/new/state.redb")
-        assertEquals("id = \"travel-1\"\nstate_store = \"/new/state.redb\"\n", updated)
-        assertFalse(updated.contains("/old/"))
+    fun deviceNamesBecomeValidTravelIds() {
+        assertEquals("HONOR-Magic-V5", DeviceIdentity.normalizeTravelId("HONOR Magic V5"))
+        assertEquals("android-travel", DeviceIdentity.normalizeTravelId("android-travel"))
+    }
+
+    @Test
+    fun relayAddressesRequireAHostAndValidPort() {
+        assertEquals(true, RelayPreference.isValid("relay.example:8443"))
+        assertEquals(true, RelayPreference.isValid("192.0.2.1:443"))
+        assertEquals(true, RelayPreference.isValid("[2001:db8::1]:8443"))
+        assertFalse(RelayPreference.isValid("relay.example"))
+        assertFalse(RelayPreference.isValid("relay.example:0"))
+        assertFalse(RelayPreference.isValid("2001:db8::1:8443"))
     }
 }

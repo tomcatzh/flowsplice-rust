@@ -4,19 +4,21 @@
 //! and transport behavior remains in the safe `flowsplice-travel-core` crate.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use flowsplice_core::protocol::ServiceProtocol;
-use flowsplice_travel_core::{Mapping, TravelCore};
+use flowsplice_travel_core::{
+    Mapping, RemoteEnrollmentOptions, RemoteEnrollmentProgress, TravelCore, enroll_remote,
+};
 use jni::{
     Env, EnvUnowned,
     objects::{JClass, JString},
 };
 use serde::Serialize;
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, task::JoinHandle};
 
 static RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -26,6 +28,40 @@ static RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
         .map_err(|error| error.to_string())
 });
 static ENGINE: Mutex<Option<Arc<TravelCore>>> = Mutex::new(None);
+static ENROLLMENT: Mutex<Option<EnrollmentSession>> = Mutex::new(None);
+
+struct EnrollmentSession {
+    status: Arc<Mutex<NativeEnrollmentStatus>>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone, Serialize)]
+struct NativeEnrollmentStatus {
+    phase: String,
+    travel_id: String,
+    request_id: Option<String>,
+    verification_code: Option<String>,
+    config_path: Option<PathBuf>,
+    credential_id: Option<String>,
+    error: Option<String>,
+}
+
+impl From<RemoteEnrollmentProgress> for NativeEnrollmentStatus {
+    fn from(progress: RemoteEnrollmentProgress) -> Self {
+        Self {
+            phase: serde_json::to_value(progress.phase)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            travel_id: progress.travel_id,
+            request_id: progress.request_id.map(|id| id.to_string()),
+            verification_code: progress.verification_code,
+            config_path: progress.config_path,
+            credential_id: progress.credential_id.map(|id| id.to_string()),
+            error: None,
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct NativeResponse<T> {
@@ -85,6 +121,116 @@ fn catalog() -> Result<serde_json::Value> {
     Ok(serde_json::to_value(runtime()?.block_on(engine.catalog()))?)
 }
 
+fn enrollment_status() -> Result<serde_json::Value> {
+    let slot = ENROLLMENT
+        .lock()
+        .map_err(|_| anyhow!("Travel enrollment lock is poisoned"))?;
+    let Some(session) = slot.as_ref() else {
+        return Ok(serde_json::json!({
+            "phase": "idle",
+            "travel_id": "",
+            "request_id": null,
+            "verification_code": null,
+            "config_path": null,
+            "credential_id": null,
+            "error": null
+        }));
+    };
+    let status = session
+        .status
+        .lock()
+        .map_err(|_| anyhow!("Travel enrollment status lock is poisoned"))?
+        .clone();
+    Ok(serde_json::to_value(status)?)
+}
+
+fn begin_enrollment(
+    install_dir: &str,
+    travel_id: &str,
+    home_id: &str,
+    selected_relay: &str,
+    password: &str,
+) -> Result<serde_json::Value> {
+    let mut slot = ENROLLMENT
+        .lock()
+        .map_err(|_| anyhow!("Travel enrollment lock is poisoned"))?;
+    if let Some(session) = slot.as_ref()
+        && !session.task.is_finished()
+    {
+        let current = session
+            .status
+            .lock()
+            .map_err(|_| anyhow!("Travel enrollment status lock is poisoned"))?
+            .clone();
+        return Ok(serde_json::to_value(current)?);
+    }
+
+    let initial = NativeEnrollmentStatus {
+        phase: "preparing".to_owned(),
+        travel_id: travel_id.to_owned(),
+        request_id: None,
+        verification_code: None,
+        config_path: None,
+        credential_id: None,
+        error: None,
+    };
+    let status = Arc::new(Mutex::new(initial.clone()));
+    let task_status = Arc::clone(&status);
+    let options = RemoteEnrollmentOptions {
+        travel_id: travel_id.to_owned(),
+        home_id: home_id.to_owned(),
+        install_dir: PathBuf::from(install_dir),
+        bootstrap_config: None,
+        selected_relay: (!selected_relay.is_empty()).then(|| selected_relay.to_owned()),
+        private_key_password: password.to_owned(),
+        wait_timeout_secs: 900,
+    };
+    let task = runtime()?.spawn(async move {
+        let progress_status = Arc::clone(&task_status);
+        let result = enroll_remote(options, move |progress| {
+            if let Ok(mut current) = progress_status.lock() {
+                *current = progress.into();
+            }
+        })
+        .await;
+        if let Err(error) = result
+            && let Ok(mut current) = task_status.lock()
+        {
+            "error".clone_into(&mut current.phase);
+            current.error = Some(format!("{error:#}"));
+        }
+    });
+    *slot = Some(EnrollmentSession { status, task });
+    Ok(serde_json::to_value(initial)?)
+}
+
+fn cancel_enrollment() -> Result<serde_json::Value> {
+    let mut slot = ENROLLMENT
+        .lock()
+        .map_err(|_| anyhow!("Travel enrollment lock is poisoned"))?;
+    let Some(session) = slot.take() else {
+        return Ok(serde_json::json!({
+            "phase": "idle",
+            "travel_id": "",
+            "request_id": null,
+            "verification_code": null,
+            "config_path": null,
+            "credential_id": null,
+            "error": null
+        }));
+    };
+    session.task.abort();
+    drop(slot);
+    let _ = runtime()?.block_on(session.task);
+    let mut status = session
+        .status
+        .lock()
+        .map_err(|_| anyhow!("Travel enrollment status lock is poisoned"))?;
+    "cancelled".clone_into(&mut status.phase);
+    status.error = None;
+    Ok(serde_json::to_value(status.clone())?)
+}
+
 fn upsert_mapping(mapping_json: &str) -> Result<serde_json::Value> {
     let engine = with_engine()?;
     let mapping: Mapping = serde_json::from_str(mapping_json).context("invalid mapping request")?;
@@ -135,8 +281,45 @@ fn jni_string<'caller>(
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-// These six symbols are the entire unsafe ABI surface. `EnvUnowned::with_env` catches panics and
+// These symbols are the entire unsafe ABI surface. `EnvUnowned::with_env` catches panics and
 // prevents unwinding across the foreign boundary before any JNI operation is attempted.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_beginEnrollment<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    install_dir: JString<'caller>,
+    travel_id: JString<'caller>,
+    home_id: JString<'caller>,
+    selected_relay: JString<'caller>,
+    password: JString<'caller>,
+) -> JString<'caller> {
+    jni_string(&mut unowned_env, |_env| {
+        response_json(begin_enrollment(
+            &install_dir.to_string(),
+            &travel_id.to_string(),
+            &home_id.to_string(),
+            &selected_relay.to_string(),
+            &password.to_string(),
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_enrollmentStatus<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    jni_string(&mut unowned_env, |_env| response_json(enrollment_status()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_cancelEnrollment<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    jni_string(&mut unowned_env, |_env| response_json(cancel_enrollment()))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_start<'caller>(
     mut unowned_env: EnvUnowned<'caller>,

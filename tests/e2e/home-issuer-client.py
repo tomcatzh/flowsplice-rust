@@ -73,7 +73,13 @@ def main() -> int:
     if args.action == "pending":
         deadline = time.monotonic() + args.wait_secs
         while True:
-            records = request(args.port, "GET", "/api/enrollment/pending")["items"]
+            try:
+                records = request(args.port, "GET", "/api/enrollment/pending")["items"]
+            except (OSError, http.client.HTTPException):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+                continue
             if args.travel_id:
                 record = next(
                     (item for item in records if item["travel_id"] == args.travel_id),
@@ -94,7 +100,13 @@ def main() -> int:
     if args.action == "home-pending":
         deadline = time.monotonic() + args.wait_secs
         while True:
-            records = request(args.port, "GET", "/api/home-enrollment/pending")["items"]
+            try:
+                records = request(args.port, "GET", "/api/home-enrollment/pending")["items"]
+            except (OSError, http.client.HTTPException):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+                continue
             if args.home_id:
                 record = next(
                     (item for item in records if item["home_id"] == args.home_id),

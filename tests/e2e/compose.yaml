@@ -1,12 +1,12 @@
 services:
   echo:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-echo"]
     networks: [flowsplice]
 
   echo2:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-echo"]
     environment:
@@ -14,7 +14,7 @@ services:
     networks: [flowsplice]
 
   relay1:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay.toml"]
     environment:
@@ -24,12 +24,12 @@ services:
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
     ports:
-      - "127.0.0.1:18443:8443"
-      - "127.0.0.1:18444:8444"
+      - "127.0.0.1:18446:8443"
+      - "127.0.0.1:18447:8444"
     networks: [flowsplice]
 
   relay2:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay2.toml"]
     environment:
@@ -39,12 +39,12 @@ services:
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
     ports:
-      - "127.0.0.1:28443:8443"
-      - "127.0.0.1:28444:8444"
+      - "127.0.0.1:28446:8443"
+      - "127.0.0.1:28447:8444"
     networks: [flowsplice]
 
   server:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-server", "--config", "/config/server.toml"]
     environment:
@@ -58,7 +58,7 @@ services:
     networks: [flowsplice]
 
   homeagent:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent.toml"]
     environment:
@@ -71,11 +71,11 @@ services:
       - ./generated/state:/state
       - ./generated/offline:/issuer
     ports:
-      - "127.0.0.1:19081:9081"
+      - "127.0.0.1:19084:9081"
     networks: [flowsplice]
 
   homeagent2:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent2.toml"]
     environment:
@@ -88,11 +88,11 @@ services:
       - ./generated/state:/state
       - ./generated/offline-home2:/issuer
     ports:
-      - "127.0.0.1:29081:9081"
+      - "127.0.0.1:29084:9081"
     networks: [flowsplice]
 
   homeagent2serving:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/config/homeagent2-serving.toml"]
     environment:
@@ -105,7 +105,7 @@ services:
     networks: [flowsplice]
 
   dynamichome-serving:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
     environment:
@@ -119,7 +119,7 @@ services:
     networks: [flowsplice]
 
   dynamichome-issuer:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
     environment:
@@ -127,7 +127,7 @@ services:
       FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
     depends_on: [server]
     ports:
-      - "127.0.0.1:39083:9082"
+      - "127.0.0.1:39086:9082"
     volumes:
       - ./generated/dynamic-home-issuer:/dynamic-home
       - ./generated:/generated:ro
@@ -136,7 +136,7 @@ services:
     networks: [flowsplice]
 
   dynamichome-global:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-homeagent", "--config", "/dynamic-home/homeagent.toml"]
     environment:
@@ -144,7 +144,7 @@ services:
       FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
     depends_on: [server]
     ports:
-      - "127.0.0.1:39084:9082"
+      - "127.0.0.1:39087:9082"
     volumes:
       - ./generated/dynamic-home-global:/dynamic-home
       - ./generated:/generated:ro
@@ -153,7 +153,7 @@ services:
     networks: [flowsplice]
 
   dynamichome-third:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     environment:
       RUST_LOG: flowsplice_homeagent=debug,info
@@ -166,7 +166,7 @@ services:
     networks: [flowsplice]
 
   travelagent:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/config/travelagent.toml"]
     environment:
@@ -176,16 +176,16 @@ services:
       FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
     depends_on: [relay1, relay2, homeagent, homeagent2]
     ports:
-      - "127.0.0.1:19080:9080"
-      - "127.0.0.1:11080:10080"
-      - "127.0.0.1:11081:10081/udp"
-      - "127.0.0.1:11082:10082"
-      - "127.0.0.1:11083:10083"
-      - "127.0.0.1:11084:10084"
-      - "127.0.0.1:11085:10085"
-      - "127.0.0.1:11086:10086"
-      - "127.0.0.1:11087:10087"
-      - "127.0.0.1:11088:10088"
+      - "127.0.0.1:19083:9080"
+      - "127.0.0.1:11083:10080"
+      - "127.0.0.1:11084:10081/udp"
+      - "127.0.0.1:11085:10082"
+      - "127.0.0.1:11086:10083"
+      - "127.0.0.1:11087:10084"
+      - "127.0.0.1:11088:10085"
+      - "127.0.0.1:11089:10086"
+      - "127.0.0.1:11090:10087"
+      - "127.0.0.1:11091:10088"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
@@ -193,21 +193,8 @@ services:
       - ./generated/state:/state
     networks: [flowsplice]
 
-  androidtravel:
-    image: flowsplice-e2e:local
-    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
-    command: ["/bin/true"]
-    environment:
-      FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
-    volumes:
-      - ./generated/android-travel:/android-travel
-      - ./generated/config:/config:ro
-      - ./generated/certs:/certs:ro
-      - ./generated/offline:/offline:ro
-    networks: [flowsplice]
-
   firsttravel:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/first-travel/travelagent.toml"]
     environment:
@@ -216,7 +203,7 @@ services:
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /first-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent]
     ports:
-      - "127.0.0.1:12080:10080"
+      - "127.0.0.1:12083:10080"
     volumes:
       - ./generated/first-travel:/first-travel
       - ./generated/config:/config:ro
@@ -224,7 +211,7 @@ services:
     networks: [flowsplice]
 
   dynamictravel:
-    image: flowsplice-e2e:local
+    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/dynamic-travel/travelagent.toml"]
     environment:
@@ -233,7 +220,7 @@ services:
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /dynamic-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent, dynamichome-global]
     ports:
-      - "127.0.0.1:13080:10080"
+      - "127.0.0.1:13083:10080"
     volumes:
       - ./generated/dynamic-travel:/dynamic-travel
       - ./generated/config:/config:ro

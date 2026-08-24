@@ -51,57 +51,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.lifecycleScope
 import io.zxf.flowsplice.travel.ui.theme.FlowSpliceTravelAgentTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
-    private var pendingProfilePassword: String? = null
-
-    private val profileLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        val password = pendingProfilePassword
-        pendingProfilePassword = null
-        if (uri == null || password.isNullOrEmpty()) return@registerForActivityResult
-        lifecycleScope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    TravelProfile.install(this@MainActivity, uri, password)
-                }
-            }
-            result.onSuccess {
-                TravelRepository.profileChanged(this@MainActivity)
-            }.onFailure { error ->
-                TravelRepository.publish(
-                    TravelRepository.state.value.copy(
-                        phase = TravelPhase.ERROR,
-                        profileInstalled = TravelProfile.isInstalled(this@MainActivity),
-                        error = error.message ?: "Could not import the profile",
-                    ),
-                )
-            }
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         TravelRepository.initialize(this)
         enableEdgeToEdge()
         setContent {
             FlowSpliceTravelAgentTheme {
-                TravelApp(
-                    onImportProfile = { password ->
-                        pendingProfilePassword = password
-                        profileLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
-                    },
-                )
+                TravelApp()
             }
         }
     }
@@ -109,9 +75,10 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TravelApp(onImportProfile: (String) -> Unit) {
+private fun TravelApp() {
     val context = LocalContext.current
     val snapshot by TravelRepository.state.collectAsStateWithLifecycle()
+    val enrollment by TravelRepository.enrollment.collectAsStateWithLifecycle()
     var showMappingDialog by rememberSaveable { mutableStateOf(false) }
     var notificationAllowed by remember {
         mutableStateOf(
@@ -139,40 +106,85 @@ private fun TravelApp(onImportProfile: (String) -> Unit) {
             )
         },
     ) { padding ->
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-        ) {
-            val expanded = maxWidth >= 720.dp
-            if (expanded) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 24.dp),
-                    horizontalArrangement = Arrangement.spacedBy(24.dp),
-                ) {
+        if (!snapshot.enrolled) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = PaddingValues(16.dp, 12.dp, 16.dp, 32.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                item {
+                    EnrollmentPane(
+                        enrollment = enrollment,
+                        notificationAllowed = notificationAllowed,
+                        onPermission = { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
+                        onEnroll = { travelId, homeId, relay, password ->
+                            TravelRepository.enroll(context, travelId, homeId, relay, password)
+                        },
+                        onCancel = { TravelRepository.cancelEnrollment(context) },
+                    )
+                }
+            }
+        } else {
+            BoxWithConstraints(
+                modifier = Modifier.fillMaxSize().padding(padding),
+            ) {
+                val expanded = maxWidth >= 720.dp
+                if (expanded) {
+                    Row(
+                        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
+                        horizontalArrangement = Arrangement.spacedBy(24.dp),
+                    ) {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 20.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                        ) {
+                            item {
+                                OverviewPane(
+                                    snapshot = snapshot,
+                                    notificationAllowed = notificationAllowed,
+                                    onPermission = {
+                                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    },
+                                    onStart = { TravelRepository.start(context) },
+                                    onStop = { TravelRepository.stop(context) },
+                                )
+                            }
+                        }
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 20.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            item {
+                                MappingHeader(
+                                    enabled = snapshot.phase == TravelPhase.RUNNING,
+                                    onAdd = { showMappingDialog = true },
+                                )
+                            }
+                            items(snapshot.mappings, key = { "${it.homeId}/${it.serviceId}/${it.protocol}" }) { mapping ->
+                                MappingCard(mapping = mapping, onDelete = { TravelRepository.delete(context, mapping) })
+                            }
+                            if (snapshot.mappings.isEmpty()) item { EmptyMappings() }
+                        }
+                    }
+                } else {
                     LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(vertical = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(16.dp, 12.dp, 16.dp, 32.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
                         item {
                             OverviewPane(
                                 snapshot = snapshot,
                                 notificationAllowed = notificationAllowed,
-                                onPermission = { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
+                                onPermission = {
+                                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                },
                                 onStart = { TravelRepository.start(context) },
                                 onStop = { TravelRepository.stop(context) },
-                                onImportProfile = onImportProfile,
                             )
                         }
-                    }
-                    LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(vertical = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
                         item {
                             MappingHeader(
                                 enabled = snapshot.phase == TravelPhase.RUNNING,
@@ -184,33 +196,6 @@ private fun TravelApp(onImportProfile: (String) -> Unit) {
                         }
                         if (snapshot.mappings.isEmpty()) item { EmptyMappings() }
                     }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(16.dp, 12.dp, 16.dp, 32.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    item {
-                        OverviewPane(
-                            snapshot = snapshot,
-                            notificationAllowed = notificationAllowed,
-                            onPermission = { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
-                            onStart = { TravelRepository.start(context) },
-                            onStop = { TravelRepository.stop(context) },
-                            onImportProfile = onImportProfile,
-                        )
-                    }
-                    item {
-                        MappingHeader(
-                            enabled = snapshot.phase == TravelPhase.RUNNING,
-                            onAdd = { showMappingDialog = true },
-                        )
-                    }
-                    items(snapshot.mappings, key = { "${it.homeId}/${it.serviceId}/${it.protocol}" }) { mapping ->
-                        MappingCard(mapping = mapping, onDelete = { TravelRepository.delete(context, mapping) })
-                    }
-                    if (snapshot.mappings.isEmpty()) item { EmptyMappings() }
                 }
             }
         }
@@ -228,20 +213,173 @@ private fun TravelApp(onImportProfile: (String) -> Unit) {
 }
 
 @Composable
+private fun EnrollmentPane(
+    enrollment: EnrollmentSnapshot,
+    notificationAllowed: Boolean,
+    onPermission: () -> Unit,
+    onEnroll: (String, String, String, String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    val context = LocalContext.current
+    var travelId by rememberSaveable { mutableStateOf(DeviceIdentity.defaultTravelId(context)) }
+    var homeId by rememberSaveable { mutableStateOf("home-1") }
+    var relay by rememberSaveable { mutableStateOf(RelayPreference.load(context)) }
+    var password by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+            shape = RoundedCornerShape(24.dp),
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("Enroll this device", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                Text("Keys are generated on this Android device. Home approval completes enrollment automatically.")
+            }
+        }
+
+        if (!notificationAllowed) PermissionCard(onPermission)
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Device identity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = travelId,
+                    onValueChange = { travelId = DeviceIdentity.normalizeTravelId(it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Travel ID") },
+                    supportingText = { Text("Defaults to this Android device name and can be changed.") },
+                    enabled = !enrollment.active,
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = homeId,
+                    onValueChange = { homeId = DeviceIdentity.normalizeTravelId(it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Home ID") },
+                    supportingText = { Text("Enter the Home that will approve this device.") },
+                    enabled = !enrollment.active,
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = relay,
+                    onValueChange = {
+                        relay = it
+                        RelayPreference.save(context, it)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Relay address") },
+                    supportingText = { Text("Enter host:port or IP:port. The APK does not contain this address.") },
+                    enabled = !enrollment.active,
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Private-key password") },
+                    supportingText = { Text("Use at least 12 characters.") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !enrollment.active,
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Confirm password") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !enrollment.active,
+                    singleLine = true,
+                )
+                Button(
+                    onClick = { onEnroll(travelId, homeId, relay, password) },
+                    enabled = notificationAllowed &&
+                        !enrollment.active &&
+                        travelId.isNotBlank() &&
+                        homeId.isNotBlank() &&
+                        RelayPreference.isValid(relay) &&
+                        password.length >= 12 &&
+                        password == confirmPassword,
+                ) {
+                    Text(if (enrollment.phase == EnrollmentPhase.ERROR) "Retry enrollment" else "Enroll")
+                }
+            }
+        }
+
+        if (enrollment.active || enrollment.phase == EnrollmentPhase.ERROR) {
+            EnrollmentStatusCard(enrollment, onCancel)
+        }
+    }
+}
+
+@Composable
+private fun EnrollmentStatusCard(snapshot: EnrollmentSnapshot, onCancel: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (snapshot.phase == EnrollmentPhase.ERROR) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.secondaryContainer
+            },
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                when (snapshot.phase) {
+                    EnrollmentPhase.PREPARING -> "Generating device keys"
+                    EnrollmentPhase.WAITING_FOR_APPROVAL -> "Waiting for Home approval"
+                    EnrollmentPhase.ERROR -> "Enrollment needs attention"
+                    else -> "Remote enrollment"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            snapshot.verificationCode?.let { code ->
+                Text("Compare this code on Home:", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    code,
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            snapshot.error?.let { Text(it) }
+            Text(
+                if (snapshot.active) "You may leave the app while approval is pending."
+                else "Start over to change the Travel ID, Home, Relay, or password.",
+            )
+            OutlinedButton(onClick = onCancel) {
+                Text(if (snapshot.active) "Cancel enrollment" else "Start over")
+            }
+        }
+    }
+}
+
+@Composable
 private fun OverviewPane(
     snapshot: TravelSnapshot,
     notificationAllowed: Boolean,
     onPermission: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
-    onImportProfile: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         StatusCard(snapshot, onStart, onStop)
         if (snapshot.error != null) ErrorCard(snapshot.error)
         MetricRow(snapshot)
         if (!notificationAllowed) PermissionCard(onPermission)
-        ProfileCard(snapshot, onImportProfile)
     }
 }
 
@@ -271,7 +409,7 @@ private fun StatusCard(snapshot: TravelSnapshot, onStart: () -> Unit, onStop: ()
                 when (snapshot.phase) {
                     TravelPhase.RUNNING, TravelPhase.STARTING -> OutlinedButton(onClick = onStop) { Text("Stop") }
                     TravelPhase.STOPPING -> Button(onClick = {}, enabled = false) { Text("Stopping") }
-                    else -> Button(onClick = onStart, enabled = snapshot.profileInstalled) { Text("Start") }
+                    else -> Button(onClick = onStart, enabled = snapshot.enrolled) { Text("Start") }
                 }
             }
             if (snapshot.phase == TravelPhase.RUNNING) {
@@ -318,45 +456,9 @@ private fun PermissionCard(onPermission: () -> Unit) {
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Keep status visible", fontWeight = FontWeight.SemiBold)
-                Text("Allow notifications to see connection and traffic while Travel runs.")
+                Text("Allow notifications for enrollment, connection state, and traffic.")
             }
             FilledTonalButton(onClick = onPermission) { Text("Allow") }
-        }
-    }
-}
-
-@Composable
-private fun ProfileCard(snapshot: TravelSnapshot, onImportProfile: (String) -> Unit) {
-    var password by rememberSaveable { mutableStateOf("") }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text("Travel profile", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text(
-                if (snapshot.profileInstalled) "An enrolled profile is installed. Importing another package replaces it."
-                else "Import the enrolled profile package produced by your FlowSplice Home.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            OutlinedTextField(
-                value = password,
-                onValueChange = { password = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Private-key password") },
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-            )
-            OutlinedButton(
-                onClick = {
-                    onImportProfile(password)
-                    password = ""
-                },
-                enabled = password.isNotBlank() && snapshot.phase != TravelPhase.RUNNING,
-            ) {
-                Text(if (snapshot.profileInstalled) "Replace profile" else "Import profile")
-            }
         }
     }
 }
@@ -482,7 +584,7 @@ private fun statusLabel(snapshot: TravelSnapshot): String = when (snapshot.phase
     TravelPhase.RUNNING -> if (snapshot.online) "Online · ${snapshot.relayCount} Relay" else "Waiting for Relay"
     TravelPhase.STOPPING -> "Stopping…"
     TravelPhase.ERROR -> "Stopped"
-    TravelPhase.STOPPED -> if (snapshot.profileInstalled) "Ready" else "Profile required"
+    TravelPhase.STOPPED -> if (snapshot.enrolled) "Ready" else "Enrollment required"
 }
 
 private fun formatDuration(seconds: Long): String {

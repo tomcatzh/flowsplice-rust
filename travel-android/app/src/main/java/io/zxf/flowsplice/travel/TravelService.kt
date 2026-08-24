@@ -28,13 +28,19 @@ import java.util.Locale
 
 object TravelRepository {
     private val mutableState = MutableStateFlow(TravelSnapshot())
+    private val mutableEnrollment = MutableStateFlow(EnrollmentSnapshot())
     val state: StateFlow<TravelSnapshot> = mutableState.asStateFlow()
+    val enrollment: StateFlow<EnrollmentSnapshot> = mutableEnrollment.asStateFlow()
 
     fun initialize(context: Context) {
+        val enrolled = TravelInstallation.isInstalled(context)
         if (mutableState.value.phase == TravelPhase.STOPPED) {
-            mutableState.value = mutableState.value.copy(
-                profileInstalled = TravelProfile.isInstalled(context),
-            )
+            mutableState.value = mutableState.value.copy(enrolled = enrolled)
+        }
+        if (!enrolled) {
+            mutableEnrollment.value = runCatching {
+                EnrollmentSnapshot.fromNative(NativeTravel.enrollmentStatus())
+            }.getOrDefault(EnrollmentSnapshot())
         }
     }
 
@@ -42,10 +48,33 @@ object TravelRepository {
         mutableState.value = snapshot
     }
 
+    fun publishEnrollment(snapshot: EnrollmentSnapshot) {
+        mutableEnrollment.value = snapshot
+    }
+
+    fun enroll(context: Context, travelId: String, homeId: String, relay: String, password: String) {
+        CredentialStore.save(context, password)
+        EnrollmentStore.save(context, travelId, homeId, relay)
+        mutableEnrollment.value = EnrollmentSnapshot(
+            phase = EnrollmentPhase.PREPARING,
+            travelId = travelId,
+        )
+        ContextCompat.startForegroundService(
+            context,
+            Intent(context, TravelService::class.java).setAction(TravelService.ACTION_ENROLL),
+        )
+    }
+
+    fun cancelEnrollment(context: Context) {
+        context.startService(
+            Intent(context, TravelService::class.java).setAction(TravelService.ACTION_CANCEL_ENROLLMENT),
+        )
+    }
+
     fun start(context: Context) {
         mutableState.value = mutableState.value.copy(
             phase = TravelPhase.STARTING,
-            profileInstalled = TravelProfile.isInstalled(context),
+            enrolled = TravelInstallation.isInstalled(context),
             error = null,
         )
         ContextCompat.startForegroundService(
@@ -78,9 +107,37 @@ object TravelRepository {
                 .putExtra(TravelService.EXTRA_PROTOCOL, mapping.protocol),
         )
     }
+}
 
-    fun profileChanged(context: Context) {
-        mutableState.value = TravelSnapshot(profileInstalled = TravelProfile.isInstalled(context))
+private object EnrollmentStore {
+    private const val PREFERENCES = "travel-enrollment"
+    private const val PENDING = "pending"
+    private const val TRAVEL_ID = "travel-id"
+    private const val HOME_ID = "home-id"
+    private const val RELAY = "relay"
+
+    data class Inputs(val travelId: String, val homeId: String, val relay: String)
+
+    fun save(context: Context, travelId: String, homeId: String, relay: String) {
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit {
+            putBoolean(PENDING, true)
+            putString(TRAVEL_ID, travelId)
+            putString(HOME_ID, homeId)
+            putString(RELAY, relay)
+        }
+    }
+
+    fun load(context: Context): Inputs? {
+        val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+        if (!preferences.getBoolean(PENDING, false)) return null
+        val travelId = preferences.getString(TRAVEL_ID, null) ?: return null
+        val homeId = preferences.getString(HOME_ID, null) ?: return null
+        val relay = preferences.getString(RELAY, null) ?: return null
+        return Inputs(travelId, homeId, relay)
+    }
+
+    fun clear(context: Context) {
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit { clear() }
     }
 }
 
@@ -95,10 +152,17 @@ class TravelService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_ENROLL -> startEnrollment()
+            ACTION_CANCEL_ENROLLMENT -> cancelEnrollment()
             ACTION_STOP -> stopTravel()
             ACTION_UPSERT -> intent.getStringExtra(EXTRA_MAPPING)?.let(::upsertMapping)
             ACTION_DELETE -> deleteMapping(intent)
-            ACTION_START, null -> startTravel()
+            ACTION_START -> startTravel()
+            null -> when {
+                TravelInstallation.isInstalled(this) -> startTravel()
+                EnrollmentStore.load(this) != null -> startEnrollment()
+                else -> stopSelf()
+            }
         }
         return START_STICKY
     }
@@ -112,32 +176,115 @@ class TravelService : Service() {
         super.onDestroy()
     }
 
-    private fun startTravel() {
-        startForegroundNow(TravelSnapshot(phase = TravelPhase.STARTING, profileInstalled = true))
+    private fun startEnrollment() {
+        val inputs = EnrollmentStore.load(this)
+        if (inputs == null) {
+            failEnrollment("Enrollment inputs are unavailable")
+            return
+        }
+        val initial = EnrollmentSnapshot(
+            phase = EnrollmentPhase.PREPARING,
+            travelId = inputs.travelId,
+        )
+        startForegroundNow(enrollmentNotification(initial))
         serviceScope.launch {
-            if (!TravelProfile.isInstalled(this@TravelService)) {
-                failAndStop("Import an enrolled Travel profile before starting")
+            val password = CredentialStore.load(this@TravelService)
+            if (password.isNullOrEmpty()) {
+                failEnrollment("The private-key password is unavailable")
+                return@launch
+            }
+            val first = runCatching {
+                EnrollmentSnapshot.fromNative(
+                    NativeTravel.beginEnrollment(
+                        TravelInstallation.directory(this@TravelService).absolutePath,
+                        inputs.travelId,
+                        inputs.homeId,
+                        inputs.relay,
+                        password,
+                    ),
+                )
+            }.getOrElse { error ->
+                failEnrollment(error.message ?: "Could not start remote enrollment")
+                return@launch
+            }
+            TravelRepository.publishEnrollment(first)
+            updateNotification(enrollmentNotification(first))
+            pollingJob?.cancel()
+            pollingJob = launch {
+                while (isActive) {
+                    delay(1_000)
+                    val next = runCatching {
+                        EnrollmentSnapshot.fromNative(NativeTravel.enrollmentStatus())
+                    }.getOrElse { error ->
+                        EnrollmentSnapshot(
+                            phase = EnrollmentPhase.ERROR,
+                            travelId = inputs.travelId,
+                            error = error.message ?: "Remote enrollment failed",
+                        )
+                    }
+                    TravelRepository.publishEnrollment(next)
+                    updateNotification(enrollmentNotification(next))
+                    when (next.phase) {
+                        EnrollmentPhase.INSTALLED -> {
+                            EnrollmentStore.clear(this@TravelService)
+                            TravelRepository.publish(TravelSnapshot(enrolled = true, travelId = inputs.travelId))
+                            pollingJob = null
+                            startTravel()
+                            return@launch
+                        }
+                        EnrollmentPhase.ERROR, EnrollmentPhase.CANCELLED -> {
+                            failEnrollment(next.error ?: "Remote enrollment stopped")
+                            return@launch
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cancelEnrollment() {
+        pollingJob?.cancel()
+        serviceScope.launch {
+            runCatching { NativeTravel.cancelEnrollment() }
+            EnrollmentStore.clear(this@TravelService)
+            TravelInstallation.discardPending(this@TravelService)
+            CredentialStore.clear(this@TravelService)
+            TravelRepository.publishEnrollment(EnrollmentSnapshot())
+            TravelRepository.publish(TravelSnapshot())
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun startTravel() {
+        startForegroundNow(
+            travelNotification(TravelSnapshot(phase = TravelPhase.STARTING, enrolled = true)),
+        )
+        serviceScope.launch {
+            if (!TravelInstallation.isInstalled(this@TravelService)) {
+                failAndStop("Complete remote enrollment before starting")
                 return@launch
             }
             val password = CredentialStore.load(this@TravelService)
             if (password.isNullOrEmpty()) {
-                failAndStop("The private-key password is unavailable; import the profile again")
+                failAndStop("The private-key password is unavailable")
                 return@launch
             }
             val snapshot = runCatching {
                 TravelSnapshot.fromNative(
-                    NativeTravel.start(TravelProfile.config(this@TravelService).absolutePath, password),
-                    profileInstalled = true,
+                    NativeTravel.start(TravelInstallation.config(this@TravelService).absolutePath, password),
+                    enrolled = true,
                 )
             }.getOrElse { error ->
                 TravelSnapshot(
                     phase = TravelPhase.ERROR,
-                    profileInstalled = true,
+                    enrolled = true,
                     error = error.message ?: "Travel Core failed to start",
                 )
             }
             TravelRepository.publish(snapshot)
-            updateNotification(snapshot)
+            updateNotification(travelNotification(snapshot))
             if (snapshot.phase == TravelPhase.ERROR) {
                 failAndStop(snapshot.error ?: "Travel Core failed to start")
                 return@launch
@@ -148,7 +295,7 @@ class TravelService : Service() {
                 while (isActive) {
                     delay(1_000)
                     val next = runCatching {
-                        TravelSnapshot.fromNative(NativeTravel.status(), profileInstalled = true)
+                        TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
                     }.getOrElse { error ->
                         TravelRepository.state.value.copy(
                             phase = TravelPhase.ERROR,
@@ -157,7 +304,7 @@ class TravelService : Service() {
                         )
                     }
                     TravelRepository.publish(next)
-                    updateNotification(next)
+                    updateNotification(travelNotification(next))
                 }
             }
         }
@@ -169,7 +316,7 @@ class TravelService : Service() {
             runCatching { NativeTravel.stop() }
             getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, false) }
             TravelRepository.publish(
-                TravelSnapshot(profileInstalled = TravelProfile.isInstalled(this@TravelService)),
+                TravelSnapshot(enrolled = TravelInstallation.isInstalled(this@TravelService)),
             )
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -203,16 +350,25 @@ class TravelService : Service() {
             )
             return
         }
-        val next = TravelSnapshot.fromNative(NativeTravel.status(), profileInstalled = true)
+        val next = TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
         TravelRepository.publish(next)
-        updateNotification(next)
+        updateNotification(travelNotification(next))
+    }
+
+    private fun failEnrollment(message: String) {
+        val current = TravelRepository.enrollment.value
+        TravelRepository.publishEnrollment(
+            current.copy(phase = EnrollmentPhase.ERROR, error = message),
+        )
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun failAndStop(message: String) {
         TravelRepository.publish(
             TravelSnapshot(
                 phase = TravelPhase.ERROR,
-                profileInstalled = TravelProfile.isInstalled(this),
+                enrolled = TravelInstallation.isInstalled(this),
                 error = message,
             ),
         )
@@ -220,8 +376,7 @@ class TravelService : Service() {
         stopSelf()
     }
 
-    private fun startForegroundNow(snapshot: TravelSnapshot) {
-        val notification = notification(snapshot)
+    private fun startForegroundNow(notification: Notification) {
         startForeground(
             NOTIFICATION_ID,
             notification,
@@ -229,26 +384,34 @@ class TravelService : Service() {
         )
     }
 
-    private fun updateNotification(snapshot: TravelSnapshot) {
-        getSystemService(NotificationManager::class.java).notify(
-            NOTIFICATION_ID,
-            notification(snapshot),
-        )
+    private fun updateNotification(notification: Notification) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
     }
 
-    private fun notification(snapshot: TravelSnapshot): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, TravelService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+    private fun enrollmentNotification(snapshot: EnrollmentSnapshot): Notification {
+        val status = when (snapshot.phase) {
+            EnrollmentPhase.PREPARING -> "Preparing device keys"
+            EnrollmentPhase.WAITING_FOR_APPROVAL -> "Waiting for Home approval"
+            EnrollmentPhase.INSTALLED -> "Enrollment complete"
+            EnrollmentPhase.ERROR -> "Enrollment needs attention"
+            EnrollmentPhase.CANCELLED -> "Enrollment cancelled"
+            EnrollmentPhase.IDLE -> "Ready to enroll"
+        }
+        val details = snapshot.verificationCode?.let { "Verification code: $it" } ?: status
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_travel_notification)
+            .setContentTitle("${snapshot.travelId.ifEmpty { "FlowSplice Travel" }} · $status")
+            .setContentText(details)
+            .setStyle(Notification.BigTextStyle().bigText(details))
+            .setContentIntent(openPendingIntent())
+            .setOngoing(snapshot.active)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .addAction(Notification.Action.Builder(null, "Cancel", cancelEnrollmentPendingIntent()).build())
+            .build()
+    }
+
+    private fun travelNotification(snapshot: TravelSnapshot): Notification {
         val status = when (snapshot.phase) {
             TravelPhase.STARTING -> "Connecting"
             TravelPhase.RUNNING -> if (snapshot.online) "Online" else "Waiting for Relay"
@@ -262,11 +425,11 @@ class TravelService : Service() {
             .setContentTitle("${snapshot.travelId} · $status")
             .setContentText(details)
             .setStyle(Notification.BigTextStyle().bigText(details))
-            .setContentIntent(openIntent)
+            .setContentIntent(openPendingIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
-            .addAction(Notification.Action.Builder(null, "Stop", stopIntent).build())
+            .addAction(Notification.Action.Builder(null, "Stop", stopPendingIntent()).build())
         if (Build.VERSION.SDK_INT >= 37) {
             builder.setRequestPromotedOngoing(true)
             builder.setShortCriticalText(status)
@@ -274,19 +437,42 @@ class TravelService : Service() {
         return builder.build()
     }
 
+    private fun openPendingIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun stopPendingIntent(): PendingIntent = PendingIntent.getService(
+        this,
+        1,
+        Intent(this, TravelService::class.java).setAction(ACTION_STOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun cancelEnrollmentPendingIntent(): PendingIntent = PendingIntent.getService(
+        this,
+        2,
+        Intent(this, TravelService::class.java).setAction(ACTION_CANCEL_ENROLLMENT),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Travel status",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Persistent connection, traffic, and active-flow status"
+            description = "Enrollment, connection, traffic, and active-flow status"
             setShowBadge(false)
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     companion object {
+        const val ACTION_ENROLL = "io.zxf.flowsplice.travel.ENROLL"
+        const val ACTION_CANCEL_ENROLLMENT = "io.zxf.flowsplice.travel.CANCEL_ENROLLMENT"
         const val ACTION_START = "io.zxf.flowsplice.travel.START"
         const val ACTION_STOP = "io.zxf.flowsplice.travel.STOP"
         const val ACTION_UPSERT = "io.zxf.flowsplice.travel.UPSERT"

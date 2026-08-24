@@ -74,6 +74,8 @@ struct Config {
     management_listen: String,
     data_listen: String,
     data_public_addr: String,
+    #[serde(default)]
+    discovery_data_public_addr: Option<String>,
     server_id: String,
     cert: PathBuf,
     key: PathBuf,
@@ -295,7 +297,14 @@ async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
 }
 
 fn validate_config(config: &Config) -> Result<DeploymentTrust> {
-    if config.id.is_empty() || config.server_id.is_empty() || config.data_public_addr.is_empty() {
+    if config.id.is_empty()
+        || config.server_id.is_empty()
+        || config.data_public_addr.is_empty()
+        || config
+            .discovery_data_public_addr
+            .as_deref()
+            .is_some_and(str::is_empty)
+    {
         bail!("Relay ids and advertised addresses must be non-empty");
     }
     if config.state_store.as_os_str().is_empty() {
@@ -403,6 +412,30 @@ async fn handle_bootstrap_travel(
     let message = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT)
         .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
         .await?;
+    if let ControlMessage::BootstrapDiscoveryRequest { protocol_version } = message {
+        if protocol_version != CONTROL_PROTOCOL_VERSION {
+            bail!("unsupported bootstrap protocol version");
+        }
+        let deployment_root_public_key = fs::read_to_string(&config.deployment_root_public_key)
+            .context("failed to read deployment root public key for discovery")?;
+        let deployment_trust_json = fs::read(&config.deployment_trust)
+            .context("failed to read deployment trust for discovery")?;
+        write_json(
+            &mut stream,
+            &ControlMessage::BootstrapDiscoveryResult {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                deployment_root_public_key: deployment_root_public_key.trim().to_owned(),
+                deployment_trust_json,
+                relay_data_addr: config
+                    .discovery_data_public_addr
+                    .clone()
+                    .unwrap_or_else(|| config.data_public_addr.clone()),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    }
     let ControlMessage::BootstrapEnrollmentSubmit {
         protocol_version,
         request_id,
@@ -412,7 +445,7 @@ async fn handle_bootstrap_travel(
         request_json,
     } = message
     else {
-        bail!("anonymous Relay peer may submit only first enrollment");
+        bail!("anonymous Relay peer may only discover deployment trust or submit first enrollment");
     };
     let response = if protocol_version == CONTROL_PROTOCOL_VERSION {
         match forward_bootstrap_enrollment(

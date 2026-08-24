@@ -19,10 +19,16 @@ class TravelAppE2ETest {
             .onNodeWithText("FlowSplice Travel")
             .assertIsDisplayed()
         composeTestRule
-            .onNodeWithText("Profile required")
+            .onNodeWithText("Enroll this device")
             .assertIsDisplayed()
         composeTestRule
-            .onNodeWithText("Local mappings")
+            .onNodeWithText("Travel ID")
+            .assertIsDisplayed()
+        composeTestRule
+            .onNodeWithText("Home ID")
+            .assertIsDisplayed()
+        composeTestRule
+            .onNodeWithText("Relay address")
             .assertIsDisplayed()
     }
 }

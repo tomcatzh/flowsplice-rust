@@ -7,9 +7,16 @@ generated_dir="${repo_root}/tests/e2e/generated"
 log_file="${generated_dir}/e2e.log"
 export FLOWSPLICE_E2E_UID="$(id -u)"
 export FLOWSPLICE_E2E_GID="$(id -g)"
+export COMPOSE_PROJECT_NAME="${FLOWSPLICE_E2E_PROJECT_NAME:-flowsplice-e2e-$$}"
+export FLOWSPLICE_E2E_IMAGE="${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e-0-3-$$:local}"
 docker_pull="${FLOWSPLICE_DOCKER_PULL:-false}"
 if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2
+  exit 1
+fi
+skip_build="${FLOWSPLICE_E2E_SKIP_BUILD:-0}"
+if [[ "${skip_build}" != "0" && "${skip_build}" != "1" ]]; then
+  printf 'FLOWSPLICE_E2E_SKIP_BUILD must be 0 or 1.\n' >&2
   exit 1
 fi
 rust_mirror_url="${RUST_MIRROR_URL-http://host.docker.internal:18787}"
@@ -28,9 +35,6 @@ rm -rf \
   "${generated_dir}/dynamic-home-global" \
   "${generated_dir}/dynamic-home-third" \
   "${generated_dir}/dynamic-travel" \
-  "${generated_dir}/android-travel" \
-  "${generated_dir}/android-travel-profile.zip" \
-  "${generated_dir}/android-profile-password.txt" \
   "${generated_dir}/travel"
 
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
@@ -58,17 +62,21 @@ for template in "${repo_root}"/tests/e2e/config/*.toml; do
   output="${generated_dir}/config/$(basename -- "${template}")"
   sed -e "s/__SERVER_PIN__/${server_pin}/g" "${template}" >"${output}"
 done
-docker build \
-  --pull="${docker_pull}" \
-  --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
-  --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
-  --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
-  -f "${repo_root}/docker/e2e.Dockerfile" \
-  -t flowsplice-e2e:local \
-  "${repo_root}"
+if [[ "${skip_build}" == "1" ]]; then
+  docker image inspect "${FLOWSPLICE_E2E_IMAGE}" >/dev/null
+else
+  docker build \
+    --pull="${docker_pull}" \
+    --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
+    --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
+    --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
+    -f "${repo_root}/docker/e2e.Dockerfile" \
+    -t "${FLOWSPLICE_E2E_IMAGE}" \
+    "${repo_root}"
+fi
 
 binary_audit_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-e2e-binary-audit.XXXXXX")"
-binary_audit_container="$(docker create flowsplice-e2e:local /bin/true)"
+binary_audit_container="$(docker create "${FLOWSPLICE_E2E_IMAGE}" /bin/true)"
 docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-homeagent" \
   "${binary_audit_dir}/flowsplice-homeagent"
 docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-travelagent" \
@@ -103,7 +111,7 @@ done
 rm -rf -- "${binary_audit_dir}"
 rm -f -- "${deployment_payload_file}"
 
-if docker run --rm flowsplice-e2e:local \
+if docker run --rm "${FLOWSPLICE_E2E_IMAGE}" \
   /usr/local/bin/flowsplice-homeagent init \
   --server 192.0.2.1 \
   --bootstrap-config /missing-home-bootstrap.toml; then
@@ -134,7 +142,7 @@ for spec in \
   docker run --rm \
     --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
     -v "${ipv6_bootstrap_dir}:/bootstrap:ro" \
-    flowsplice-e2e:local \
+    "${FLOWSPLICE_E2E_IMAGE}" \
     "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"
 done
 rm -rf -- "${ipv6_bootstrap_dir}"
@@ -159,7 +167,7 @@ for spec in \
   if docker run --rm \
     --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
     -v "${invalid_bootstrap_dir}:/bootstrap:ro" \
-    flowsplice-e2e:local \
+    "${FLOWSPLICE_E2E_IMAGE}" \
     "/usr/local/bin/$1" check-bootstrap-config --config "/bootstrap/$2"; then
     echo "$1 accepted deployment trust with an invalid root signature" >&2
     exit 1
@@ -173,7 +181,7 @@ if docker run --rm \
   -v "${generated_dir}/certs:/certs:ro" \
   -v "${generated_dir}/offline:/offline:ro" \
   -v "${generated_dir}/state:/invalid-travel" \
-  flowsplice-e2e:local \
+  "${FLOWSPLICE_E2E_IMAGE}" \
   /usr/local/bin/flowsplice-travelagent enroll-remote \
   --travel-id invalid-config-travel \
   --home-id home-1 \
@@ -192,7 +200,7 @@ if docker run --rm \
   -v "${generated_dir}/certs:/certs:ro" \
   -v "${generated_dir}/offline:/issuer:ro" \
   -v "${authorization_negative_dir}:/state" \
-  flowsplice-e2e:local \
+  "${FLOWSPLICE_E2E_IMAGE}" \
   /usr/local/bin/flowsplice-homeagent --config /config/homeagent.toml \
   >"${authorization_negative_dir}/home.log" 2>&1; then
   echo 'Home started without explicitly initialized authorization state' >&2
@@ -206,7 +214,7 @@ if docker run --rm \
   -v "${generated_dir}/config:/config:ro" \
   -v "${generated_dir}/certs:/certs:ro" \
   -v "${authorization_negative_dir}:/state" \
-  flowsplice-e2e:local \
+  "${FLOWSPLICE_E2E_IMAGE}" \
   /usr/local/bin/flowsplice-relay --config /config/relay.toml \
   >"${authorization_negative_dir}/relay.log" 2>&1; then
   echo 'Relay started without explicitly initialized authorization state' >&2
@@ -222,7 +230,7 @@ for home_config in homeagent.toml homeagent2.toml; do
     -v "${generated_dir}/config:/config:ro" \
     -v "${generated_dir}/certs:/certs:ro" \
     -v "${generated_dir}/state:/state" \
-    flowsplice-e2e:local \
+    "${FLOWSPLICE_E2E_IMAGE}" \
     /usr/local/bin/flowsplice-homeagent initialize-authorization-state \
     --config "/config/${home_config}"
 done
@@ -232,14 +240,28 @@ for relay_config in relay.toml relay2.toml; do
     -v "${generated_dir}/config:/config:ro" \
     -v "${generated_dir}/certs:/certs:ro" \
     -v "${generated_dir}/state:/state" \
-    flowsplice-e2e:local \
+    "${FLOWSPLICE_E2E_IMAGE}" \
     /usr/local/bin/flowsplice-relay --config "/config/${relay_config}" \
     --initialize-authorization-state
 done
 printf '%s\n' '{"checkpoint": "authorization-state-explicit-initialization"}'
 
 teardown() {
-  docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  local remaining
+  for _ in $(seq 1 3); do
+    docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+      if remaining="$(
+        docker ps -aq \
+          --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" 2>/dev/null
+      )" && [[ -z "${remaining}" ]]; then
+        return 0
+      fi
+      sleep 1
+    done
+  done
+  echo 'FlowSplice E2E containers were not removed before the cleanup deadline' >&2
+  return 1
 }
 
 first_enroll_pid=""
@@ -311,7 +333,7 @@ fi
 home_issuer_ready=0
 for _ in $(seq 1 60); do
   if python3 "${repo_root}/tests/e2e/home-issuer-client.py" status \
-    --port 19081 >/dev/null 2>&1; then
+    --port 19084 >/dev/null 2>&1; then
     home_issuer_ready=1
     break
   fi
@@ -335,7 +357,7 @@ enroll_dynamic_home() {
   local service="$1"
   local profile="$2"
   local directory="$3"
-  local approving_port="${4:-19081}"
+  local approving_port="${4:-19084}"
   local log_path="${directory}/init.log"
   mkdir -p "${directory}"
   docker compose -f "${compose_file}" run --no-deps --rm "${service}" \
@@ -439,7 +461,7 @@ for directory in dynamic-home-issuer dynamic-home-global; do
 done
 docker compose -f "${compose_file}" up -d \
   dynamichome-serving dynamichome-issuer dynamichome-global
-for port in 39083 39084; do
+for port in 39086 39087; do
   dynamic_home_ready=0
   for _ in $(seq 1 60); do
     if python3 "${repo_root}/tests/e2e/home-issuer-client.py" status \
@@ -454,13 +476,13 @@ for port in 39083 39084; do
     exit 1
   fi
 done
-python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is (p == "39084"); assert s["home_enrollment_available"] is (p == "39084")' \
-  39083 "${repo_root}/tests/e2e/home-issuer-client.py"
+python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is (p == "39087"); assert s["home_enrollment_available"] is (p == "39087")' \
+  39086 "${repo_root}/tests/e2e/home-issuer-client.py"
 python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is True; assert s["home_enrollment_available"] is True' \
-  39084 "${repo_root}/tests/e2e/home-issuer-client.py"
+  39087 "${repo_root}/tests/e2e/home-issuer-client.py"
 
 dynamic_third_home_id="$(enroll_dynamic_home \
-  dynamichome-third serving_only "${generated_dir}/dynamic-home-third" 39084)"
+  dynamichome-third serving_only "${generated_dir}/dynamic-home-third" 39087)"
 if [[ -z "${dynamic_third_home_id}" ]]; then
   echo 'Dynamic Global Home did not approve the third Home' >&2
   exit 1
@@ -485,14 +507,14 @@ docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
   >"${generated_dir}/dynamic-travel/enroll.log" 2>&1 &
 first_enroll_pid=$!
 dynamic_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 39084 \
+  --port 39087 \
   --travel-id dynamic-home-issued-travel \
   --wait-secs 120)"
 dynamic_travel_request_id="$(python3 -c \
   'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
   "${dynamic_travel_pending}")"
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 39084 \
+  --port 39087 \
   --request-id "${dynamic_travel_request_id}" \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --scope global \
@@ -506,7 +528,7 @@ configure_travel_mapping dynamictravel \
   flowsplice-e2e-dynamic-home-travel-administrator-token \
   home-1 tcp-echo tcp 0.0.0.0:10080
 python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 13080 \
+  --port 13083 \
   --payload dynamic-home-global-issuer-business \
   --wait-secs 90
 
@@ -532,7 +554,7 @@ docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
   >"${generated_dir}/first-travel/enroll.log" 2>&1 &
 first_enroll_pid=$!
 bootstrap_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 19081 \
+  --port 19084 \
   --travel-id first-remote-e2e \
   --wait-secs 120)"
 bootstrap_request_id="$(python3 -c \
@@ -547,14 +569,14 @@ if ! grep -Fq "Home verification code: ${bootstrap_verification_code}" \
   exit 1
 fi
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19081 \
+  --port 19084 \
   --request-id "${bootstrap_request_id}" \
   --password-file "${generated_dir}/offline/wrong-password.txt" \
   --scope global \
   --valid-days 365 \
   --expect-failure
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19081 \
+  --port 19084 \
   --request-id "${bootstrap_request_id}" \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --scope global \
@@ -596,13 +618,13 @@ configure_travel_mapping firsttravel \
   flowsplice-e2e-first-remote-administrator-token \
   home-1 tcp-echo tcp 0.0.0.0:10080
 python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 12080 \
+  --port 12083 \
   --payload first-remote-enrollment-business \
   --wait-secs 90
 bootstrap_acknowledged=0
 for _ in $(seq 1 45); do
   current_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-    --port 19081)"
+    --port 19084)"
   if python3 -c \
     'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
     "${current_pending}" "${bootstrap_request_id}"; then
@@ -623,12 +645,12 @@ python3 -c \
   'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
   "${first_travel_outbox}" "${bootstrap_request_id}"
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" revoke \
-  --port 19081 \
+  --port 19084 \
   --credential-id "${bootstrap_credential_id}" \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --reason 'first remote enrollment E2E completed'
 python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 12080 \
+  --port 12083 \
   --payload revoked-first-remote-enrollment \
   --wait-secs 90 \
   --expect-unavailable
@@ -654,7 +676,7 @@ docker compose -f "${compose_file}" run --no-deps --rm travelagent \
   >"${generated_dir}/travel/enroll.log" 2>&1 &
 first_enroll_pid=$!
 main_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 19081 \
+  --port 19084 \
   --travel-id travel-1 \
   --wait-secs 120)"
 main_travel_request_id="$(python3 -c \
@@ -669,14 +691,14 @@ if ! grep -Fq "Home verification code: ${main_travel_verification_code}" \
   exit 1
 fi
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19081 \
+  --port 19084 \
   --request-id "${main_travel_request_id}" \
   --password-file "${generated_dir}/offline/wrong-password.txt" \
   --scope global \
   --valid-days 365 \
   --expect-failure
 python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19081 \
+  --port 19084 \
   --request-id "${main_travel_request_id}" \
   --password-file "${generated_dir}/offline/test-password.txt" \
   --scope global \
@@ -706,58 +728,6 @@ if grep -Eq '^(mappings =|\[\[mappings\]\])' \
   "${generated_dir}/travel/travelagent.toml"; then
   echo 'main remote enrollment generated an unsolicited business mapping' >&2
   exit 1
-fi
-
-if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
-  mkdir -p "${generated_dir}/android-travel"
-  docker compose -f "${compose_file}" run --no-deps --rm androidtravel \
-    /usr/local/bin/flowsplice-travelagent enroll-remote \
-    --travel-id android-e2e-travel \
-    --home-id home-1 \
-    --install-dir /android-travel \
-    --bootstrap-config /config/travel-bootstrap.toml \
-    --test-password-file /offline/test-password.txt \
-    --wait-timeout-secs 180 \
-    >"${generated_dir}/android-travel/enroll.log" 2>&1 &
-  first_enroll_pid=$!
-  android_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-    --port 19081 \
-    --travel-id android-e2e-travel \
-    --wait-secs 120)"
-  android_travel_request_id="$(python3 -c \
-    'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
-    "${android_travel_pending}")"
-  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-    --port 19081 \
-    --request-id "${android_travel_request_id}" \
-    --password-file "${generated_dir}/offline/test-password.txt" \
-    --scope global \
-    --valid-days 1 >/dev/null
-  wait "${first_enroll_pid}"
-  first_enroll_pid=""
-  cp "${generated_dir}/offline/test-password.txt" \
-    "${generated_dir}/android-profile-password.txt"
-  chmod 600 "${generated_dir}/android-profile-password.txt"
-  sed -i.bak \
-    -e 's/relay1:8443/10.0.2.2:18443/g' \
-    -e 's/relay2:8443/10.0.2.2:28443/g' \
-    "${generated_dir}/android-travel/travelagent.toml"
-  sed -i.bak '/^\[\[homes\]\]$/i\
-[[relay_address_overrides]]\
-id = "relay-1"\
-management_addr = "10.0.2.2:18443"\
-data_addr = "10.0.2.2:18444"\
-\
-[[relay_address_overrides]]\
-id = "relay-2"\
-management_addr = "10.0.2.2:28443"\
-data_addr = "10.0.2.2:28444"\
-' "${generated_dir}/android-travel/travelagent.toml"
-  rm -f "${generated_dir}/android-travel/travelagent.toml.bak"
-  (
-    cd "${generated_dir}/android-travel"
-    zip -q -r "${generated_dir}/android-travel-profile.zip" travelagent.toml cert state
-  )
 fi
 
 docker compose -f "${compose_file}" up -d travelagent
@@ -805,10 +775,10 @@ if ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=fal
   exit 1
 fi
 if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
-  docker compose -f "${compose_file}" up -d relay1 relay2 homeagent
+  docker compose -f "${compose_file}" up -d --no-deps relay1 relay2 homeagent
   "${repo_root}/tests/e2e/android/run.sh" \
-    "${generated_dir}/android-travel-profile.zip" \
-    "${generated_dir}/android-profile-password.txt"
+    "${generated_dir}/offline/test-password.txt" \
+    "10.0.2.2:18446"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
 docker compose -f "${compose_file}" ps

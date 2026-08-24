@@ -5,6 +5,15 @@ object NativeTravel {
         System.loadLibrary("flowsplice_travel_android")
     }
 
+    external fun beginEnrollment(
+        installDirectory: String,
+        travelId: String,
+        homeId: String,
+        selectedRelay: String,
+        privateKeyPassword: String,
+    ): String
+    external fun enrollmentStatus(): String
+    external fun cancelEnrollment(): String
     external fun start(configPath: String, privateKeyPassword: String): String
     external fun stop(): String
     external fun status(): String

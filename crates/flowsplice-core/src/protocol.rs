@@ -6,7 +6,7 @@ use crate::authorization::{SignedTravelCredential, TravelAuthorizationSnapshot};
 use crate::deployment::{SignedControlSnapshot, SignedHomeEndpointCredential};
 use crate::statistics::SignedStatisticsReport;
 
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Returns the short human comparison code for one first-enrollment request and its private
 /// retrieval token. This code is not an authentication secret; it lets the Home operator confirm
@@ -243,6 +243,15 @@ pub enum ControlMessage {
         response_json: Option<Vec<u8>>,
         error: Option<String>,
     },
+    BootstrapDiscoveryRequest {
+        protocol_version: u32,
+    },
+    BootstrapDiscoveryResult {
+        protocol_version: u32,
+        deployment_root_public_key: String,
+        deployment_trust_json: Vec<u8>,
+        relay_data_addr: String,
+    },
     BootstrapEnrollmentSubmit {
         protocol_version: u32,
         request_id: Uuid,
@@ -459,6 +468,33 @@ mod tests {
                 assert_eq!(id, "travel-1");
                 assert_eq!(decoded_session, session_id);
                 assert_eq!(purpose, TravelConnectionPurpose::Catalog);
+            }
+            _ => panic!("wrong control message variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_discovery_preserves_public_material() -> Result<(), serde_json::Error> {
+        let message = ControlMessage::BootstrapDiscoveryResult {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            deployment_root_public_key: "root-public-key".to_owned(),
+            deployment_trust_json: br#"{"payload_hex":"01","signature_hex":"02"}"#.to_vec(),
+            relay_data_addr: "relay.example:8444".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&message)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        match decoded {
+            ControlMessage::BootstrapDiscoveryResult {
+                protocol_version,
+                deployment_root_public_key,
+                deployment_trust_json,
+                relay_data_addr,
+            } => {
+                assert_eq!(protocol_version, CONTROL_PROTOCOL_VERSION);
+                assert_eq!(deployment_root_public_key, "root-public-key");
+                assert!(!deployment_trust_json.is_empty());
+                assert_eq!(relay_data_addr, "relay.example:8444");
             }
             _ => panic!("wrong control message variant"),
         }

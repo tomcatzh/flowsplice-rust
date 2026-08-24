@@ -43,9 +43,9 @@ use flowsplice_core::{
     route::{RouteSide, write_preface},
     statistics::statistics_signing_key,
     tls::{
-        identity_client_connector_with_private_key, identity_from_certificate_pem,
-        identity_server_auth_connector_from_ca_pem, identity_server_name, peer_identity,
-        require_peer,
+        bootstrap_discovery_connector, identity_client_connector_with_private_key,
+        identity_from_certificate_pem, identity_server_auth_connector_from_ca_pem,
+        identity_server_name, peer_identity, require_peer,
     },
 };
 use flowsplice_enrollment::{
@@ -186,7 +186,10 @@ struct Config {
 struct TravelBootstrapConfig {
     deployment_root_public_key: PathBuf,
     deployment_trust: PathBuf,
+    #[serde(default)]
     bootstrap_relays: Vec<String>,
+    #[serde(default)]
+    relay_address_overrides: Vec<RelayAddressOverride>,
     ui_listen: String,
 }
 
@@ -195,7 +198,43 @@ struct VerifiedTravelBootstrap {
     signed_trust: SignedDeploymentTrust,
     trust: DeploymentTrust,
     bootstrap_relays: Vec<String>,
+    relay_address_overrides: Vec<RelayAddressOverride>,
     ui_listen: String,
+}
+
+/// Inputs for a complete first-device remote enrollment.
+pub struct RemoteEnrollmentOptions {
+    pub travel_id: String,
+    pub home_id: String,
+    pub install_dir: PathBuf,
+    pub bootstrap_config: Option<PathBuf>,
+    pub selected_relay: Option<String>,
+    pub private_key_password: String,
+    pub wait_timeout_secs: u64,
+    #[cfg(feature = "e2e-remote-ui")]
+    pub test_allow_remote_listen: bool,
+    #[cfg(feature = "e2e-remote-ui")]
+    pub test_admin_token: Option<String>,
+}
+
+/// Observable stages of first-device remote enrollment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEnrollmentPhase {
+    Preparing,
+    WaitingForApproval,
+    Installed,
+}
+
+/// Progress snapshot emitted by the reusable enrollment operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemoteEnrollmentProgress {
+    pub phase: RemoteEnrollmentPhase,
+    pub travel_id: String,
+    pub request_id: Option<Uuid>,
+    pub verification_code: Option<String>,
+    pub config_path: Option<PathBuf>,
+    pub credential_id: Option<Uuid>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -204,7 +243,7 @@ struct SeedRelay {
     management_addr: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RelayAddressOverride {
     id: String,
@@ -283,6 +322,8 @@ struct InstalledTravelConfig {
     test_admin_token: Option<String>,
     homes: Vec<InstalledHome>,
     seed_relays: Vec<SeedRelayOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    relay_address_overrides: Vec<RelayAddressOverride>,
 }
 
 #[derive(Serialize)]
@@ -825,9 +866,12 @@ async fn monitor_trust_expiry(state: AppState) -> Result<()> {
 
 async fn run_command(command: Command) -> Result<()> {
     match command {
-        Command::EnrollRemote(args) => run_remote_enrollment(args).await,
+        Command::EnrollRemote(args) => run_remote_enrollment_cli(args).await,
         Command::CheckBootstrapConfig { config } => {
             let bootstrap = load_travel_bootstrap(&config)?;
+            if bootstrap.bootstrap_relays.is_empty() {
+                bail!("Travel bootstrap configuration has no Relay address");
+            }
             println!(
                 "Travel bootstrap configuration is valid for deployment {} generation {} with {} Relay(s)",
                 bootstrap.trust.deployment_id,
@@ -859,12 +903,19 @@ fn load_travel_bootstrap(path: &Path) -> Result<VerifiedTravelBootstrap> {
     let mut bootstrap_relays = configured.bootstrap_relays;
     bootstrap_relays.sort();
     bootstrap_relays.dedup();
-    if bootstrap_relays.is_empty() {
-        bail!("Travel bootstrap configuration has no Relay address");
-    }
     for relay in &bootstrap_relays {
         if !valid_connect_address(relay) {
             bail!("invalid bootstrap Relay address {relay}");
+        }
+    }
+    let mut override_ids = HashSet::new();
+    for relay in &configured.relay_address_overrides {
+        if relay.id.is_empty()
+            || !override_ids.insert(relay.id.clone())
+            || !valid_connect_address(&relay.management_addr)
+            || !valid_connect_address(&relay.data_addr)
+        {
+            bail!("invalid or duplicate bootstrap Relay address override");
         }
     }
     Ok(VerifiedTravelBootstrap {
@@ -872,6 +923,7 @@ fn load_travel_bootstrap(path: &Path) -> Result<VerifiedTravelBootstrap> {
         signed_trust,
         trust,
         bootstrap_relays,
+        relay_address_overrides: configured.relay_address_overrides,
         ui_listen: configured.ui_listen,
     })
 }
@@ -896,34 +948,137 @@ fn validate_bootstrap_trust_continuity(
     Ok(())
 }
 
+async fn run_remote_enrollment_cli(args: EnrollRemoteArgs) -> Result<()> {
+    let password = if let Some(path) = args.test_password_file.as_deref() {
+        test_password(path)?
+    } else {
+        prompt_new_private_key_password()?
+    };
+    let options = RemoteEnrollmentOptions {
+        travel_id: args.travel_id,
+        home_id: args.home_id,
+        install_dir: args.install_dir,
+        bootstrap_config: Some(args.bootstrap_config),
+        selected_relay: None,
+        private_key_password: password.to_string(),
+        wait_timeout_secs: args.wait_timeout_secs,
+        #[cfg(feature = "e2e-remote-ui")]
+        test_allow_remote_listen: args.test_allow_remote_listen,
+        #[cfg(feature = "e2e-remote-ui")]
+        test_admin_token: args.test_admin_token,
+    };
+    enroll_remote(options, |progress| match progress.phase {
+        RemoteEnrollmentPhase::Preparing => {}
+        RemoteEnrollmentPhase::WaitingForApproval => {
+            if let (Some(request_id), Some(code)) =
+                (progress.request_id, progress.verification_code)
+            {
+                println!("first enrollment request: {request_id}");
+                println!("Home verification code: {code}");
+                println!(
+                    "Open the local Home page, compare this code, select scope/validity, and approve with the Home issuance password."
+                );
+            }
+        }
+        RemoteEnrollmentPhase::Installed => {
+            if let Some(credential_id) = progress.credential_id {
+                println!("installed Travel credential {credential_id}");
+            }
+            if let Some(config_path) = progress.config_path {
+                println!("configuration: {}", config_path.display());
+                println!(
+                    "start: flowsplice-travelagent --config {}",
+                    config_path.display()
+                );
+            }
+        }
+    })
+    .await
+}
+
+/// Completes first-device remote enrollment and atomically installs a runnable Travel identity.
+///
+/// The callback receives resumable progress snapshots and can safely update a native UI. Private
+/// keys are generated inside `install_dir` and never included in the public enrollment request.
+///
+/// # Errors
+///
+/// Returns an error for invalid inputs or bootstrap trust, conflicting resumable state, network or
+/// approval timeout, rejected enrollment, failed response verification, or failed durable install.
 #[allow(clippy::too_many_lines)]
-async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
-    if args.wait_timeout_secs == 0 {
+pub async fn enroll_remote<F>(options: RemoteEnrollmentOptions, on_progress: F) -> Result<()>
+where
+    F: Fn(RemoteEnrollmentProgress) + Send + Sync,
+{
+    init_crypto();
+    if options.wait_timeout_secs == 0 {
         bail!("wait-timeout-secs must be positive");
     }
-    let bootstrap = load_travel_bootstrap(&args.bootstrap_config)?;
+    if options.home_id.is_empty() || options.home_id.len() > 128 {
+        bail!("Home id must be non-empty and no longer than 128 bytes");
+    }
+    let password = Zeroizing::new(options.private_key_password);
+    if password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
+        bail!(
+            "private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
+        );
+    }
+    on_progress(RemoteEnrollmentProgress {
+        phase: RemoteEnrollmentPhase::Preparing,
+        travel_id: options.travel_id.clone(),
+        request_id: None,
+        verification_code: None,
+        config_path: None,
+        credential_id: None,
+    });
+    let selected_relay = options
+        .selected_relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|relay| !relay.is_empty())
+        .map(str::to_owned);
+    if let Some(relay) = selected_relay.as_deref()
+        && !valid_connect_address(relay)
+    {
+        bail!("invalid selected Relay address {relay}");
+    }
+    let bootstrap = if let Some(config) = options.bootstrap_config.as_deref() {
+        load_travel_bootstrap(config)?
+    } else {
+        let relay = selected_relay
+            .as_deref()
+            .ok_or_else(|| anyhow!("remote enrollment requires a Relay address"))?;
+        discover_bootstrap_relay(relay).await?
+    };
     let root_public_key = bootstrap.deployment_root_public_key.as_str();
     let management_ca = &bootstrap.trust.management_ca_certificate_pem;
     let bootstrap_relays = bootstrap.bootstrap_relays.clone();
-
-    if args.install_dir.exists() && !args.install_dir.is_dir() {
+    let polling_relays = if let Some(selected) = selected_relay {
+        vec![selected]
+    } else {
+        bootstrap_relays.clone()
+    };
+    if polling_relays.is_empty() {
+        bail!("remote enrollment requires a Relay address");
+    }
+    if options.install_dir.exists() && !options.install_dir.is_dir() {
         bail!(
             "Travel install path is not a directory: {}",
-            args.install_dir.display()
+            options.install_dir.display()
         );
     }
-    fs::create_dir_all(&args.install_dir).with_context(|| {
+    fs::create_dir_all(&options.install_dir).with_context(|| {
         format!(
             "failed to create Travel install directory {}",
-            args.install_dir.display()
+            options.install_dir.display()
         )
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&args.install_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&options.install_dir, fs::Permissions::from_mode(0o700))?;
     }
-    let install_root = args
+    let install_root = options
         .install_dir
         .canonicalize()
         .context("failed to resolve Travel install directory")?;
@@ -936,24 +1091,13 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             config_path.display()
         );
     }
-    let password = if let Some(path) = args.test_password_file.as_deref() {
-        test_password(path)?
-    } else {
-        prompt_new_private_key_password()?
-    };
-    if password.chars().count() < MIN_PRIVATE_KEY_PASSWORD_CHARACTERS {
-        bail!(
-            "private-key password must contain at least {MIN_PRIVATE_KEY_PASSWORD_CHARACTERS} characters"
-        );
-    }
-
     let (request, retrieval_token) = if bootstrap_state_path.exists() {
         let state: BootstrapEnrollmentState = load_json(&bootstrap_state_path)?;
-        if state.version != REMOTE_ENROLLMENT_VERSION || state.home_id != args.home_id {
+        if state.version != REMOTE_ENROLLMENT_VERSION || state.home_id != options.home_id {
             bail!("existing first-enrollment state conflicts with the requested Home");
         }
         let request: TravelEnrollmentRequest = load_json(&enrollment_dir.join(REQUEST_FILE))?;
-        if request.request_id != state.request_id || request.travel_id != args.travel_id {
+        if request.request_id != state.request_id || request.travel_id != options.travel_id {
             bail!("existing first-enrollment state conflicts with the requested Travel id");
         }
         let token = hex::decode(&state.retrieval_token_hex)
@@ -970,7 +1114,7 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             );
         }
         let request = create_enrollment_request(
-            &args.travel_id,
+            &options.travel_id,
             password.as_bytes(),
             &enrollment_dir,
             unix_time_secs()?,
@@ -983,31 +1127,41 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             &bootstrap_state_path,
             &BootstrapEnrollmentState {
                 version: REMOTE_ENROLLMENT_VERSION,
-                home_id: args.home_id.clone(),
+                home_id: options.home_id.clone(),
                 request_id: request.request_id,
                 retrieval_token_hex: hex::encode(&token),
             },
         )?;
         (request, token)
     };
+    let request_id = request.request_id;
     let request_json = serde_json::to_vec(&request)?;
     let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
-    println!("first enrollment request: {}", request.request_id);
-    println!("Home verification code: {verification_code}");
-    println!(
-        "Open the local Home page, compare this code, select scope/validity, and approve with the Home issuance password."
-    );
+    on_progress(RemoteEnrollmentProgress {
+        phase: RemoteEnrollmentPhase::WaitingForApproval,
+        travel_id: options.travel_id.clone(),
+        request_id: Some(request_id),
+        verification_code: Some(verification_code),
+        config_path: None,
+        credential_id: None,
+    });
 
     let connector = identity_server_auth_connector_from_ca_pem(management_ca)?;
-    let deadline = Instant::now() + Duration::from_secs(args.wait_timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(options.wait_timeout_secs);
     let mut last_error = None;
     let (response, mut seed_relays) = 'outer: loop {
-        for relay in &bootstrap_relays {
+        for relay in &polling_relays {
+            let expected_relay_id = bootstrap
+                .relay_address_overrides
+                .iter()
+                .find(|candidate| candidate.management_addr.as_str() == relay.as_str())
+                .map(|candidate| candidate.id.as_str());
             match poll_bootstrap_relay(
                 relay,
+                expected_relay_id,
                 &connector,
                 &request,
-                &args.home_id,
+                &options.home_id,
                 &retrieval_token,
                 &request_json,
             )
@@ -1059,15 +1213,13 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
         format!("{}\n", root_public_key.trim()).as_bytes(),
     )?;
     seed_relays.retain(|relay| valid_connect_address(relay));
-    if seed_relays.is_empty() {
-        seed_relays = bootstrap_relays;
-    }
+    seed_relays.extend(polling_relays);
     seed_relays.sort();
     seed_relays.dedup();
 
     let state_store_path = install_root.join("state/travel-state.redb");
     let generated = InstalledTravelConfig {
-        id: args.travel_id.clone(),
+        id: options.travel_id.clone(),
         deployment_root_public_key: enrollment_dir.join("deployment-root.pub"),
         deployment_trust: enrollment_dir.join(DEPLOYMENT_TRUST_FILE),
         management_cert: enrollment_dir.join(MANAGEMENT_CERT_FILE),
@@ -1080,16 +1232,17 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
         enrollment_work_dir: install_root.join("state/enrollment"),
         ui_listen: bootstrap.ui_listen,
         #[cfg(feature = "e2e-remote-ui")]
-        test_allow_remote_listen: args.test_allow_remote_listen,
+        test_allow_remote_listen: options.test_allow_remote_listen,
         #[cfg(feature = "e2e-remote-ui")]
-        test_admin_token: args.test_admin_token,
+        test_admin_token: options.test_admin_token,
         homes: vec![InstalledHome {
-            id: args.home_id.clone(),
+            id: options.home_id.clone(),
         }],
         seed_relays: seed_relays
             .into_iter()
             .map(|management_addr| SeedRelayOutput { management_addr })
             .collect(),
+        relay_address_overrides: bootstrap.relay_address_overrides,
     };
     let encoded = toml::to_string_pretty(&generated).context("failed to encode Travel config")?;
     let mut config_file = fs::OpenOptions::new()
@@ -1107,10 +1260,10 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
     let store = StateStore::open(&state_store_path)?;
     store.apply_immediate(WriteBatch::new().put_json(
         Table::EnrollmentOutbox,
-        request.request_id.as_bytes().to_vec(),
+        request_id.as_bytes().to_vec(),
         &RemoteEnrollmentOutboxRecord {
             version: REMOTE_ENROLLMENT_VERSION,
-            home_id: args.home_id,
+            home_id: options.home_id,
             enrollment_dir,
             request,
             response: Some(response),
@@ -1127,12 +1280,14 @@ async fn run_remote_enrollment(args: EnrollRemoteArgs) -> Result<()> {
             bootstrap_state_path.display()
         )
     })?;
-    println!("installed Travel credential {}", credential.credential_id);
-    println!("configuration: {}", config_path.display());
-    println!(
-        "start: flowsplice-travelagent --config {}",
-        config_path.display()
-    );
+    on_progress(RemoteEnrollmentProgress {
+        phase: RemoteEnrollmentPhase::Installed,
+        travel_id: options.travel_id,
+        request_id: Some(request_id),
+        verification_code: None,
+        config_path: Some(config_path),
+        credential_id: Some(credential.credential_id),
+    });
     Ok(())
 }
 
@@ -1171,8 +1326,70 @@ fn write_or_verify_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap> {
+    let socket = timeout(Duration::from_secs(10), TcpStream::connect(relay))
+        .await
+        .context("Relay discovery TCP connection timed out")??;
+    socket.set_nodelay(true)?;
+    let connector = bootstrap_discovery_connector();
+    let mut stream = timeout(
+        Duration::from_secs(10),
+        connector.connect(identity_server_name()?, socket),
+    )
+    .await
+    .context("Relay discovery TLS handshake timed out")??;
+    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    require_peer(&identity, Role::Relay, None, &[])?;
+    write_json(
+        &mut stream,
+        &ControlMessage::BootstrapDiscoveryRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+        },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
+    let result = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT)
+        .read_with_timeout::<ControlMessage>(Duration::from_secs(20))
+        .await?;
+    let ControlMessage::BootstrapDiscoveryResult {
+        protocol_version,
+        deployment_root_public_key,
+        deployment_trust_json,
+        relay_data_addr,
+    } = result
+    else {
+        bail!("Relay returned an unexpected discovery response");
+    };
+    if protocol_version != CONTROL_PROTOCOL_VERSION {
+        bail!("Relay returned an unsupported discovery protocol version");
+    }
+    let deployment_root_public_key = deployment_root_public_key.trim().to_owned();
+    let signed_trust: SignedDeploymentTrust = serde_json::from_slice(&deployment_trust_json)
+        .context("Relay discovery returned invalid deployment trust")?;
+    let trust = signed_trust.verify(&deployment_root_public_key, unix_time_secs()?)?;
+    if trust.home_endpoints.is_empty() {
+        bail!("discovered deployment trust has no Home");
+    }
+    if !valid_connect_address(&relay_data_addr) {
+        bail!("Relay discovery returned an invalid data address");
+    }
+    Ok(VerifiedTravelBootstrap {
+        deployment_root_public_key,
+        signed_trust,
+        trust,
+        bootstrap_relays: vec![relay.to_owned()],
+        relay_address_overrides: vec![RelayAddressOverride {
+            id: identity.id,
+            management_addr: relay.to_owned(),
+            data_addr: relay_data_addr,
+        }],
+        ui_listen: "127.0.0.1:0".to_owned(),
+    })
+}
+
 async fn poll_bootstrap_relay(
     relay: &str,
+    expected_relay_id: Option<&str>,
     connector: &TlsConnector,
     request: &TravelEnrollmentRequest,
     home_id: &str,
@@ -1190,7 +1407,7 @@ async fn poll_bootstrap_relay(
     .await
     .context("bootstrap Relay TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Relay, None, &[])?;
+    require_peer(&identity, Role::Relay, expected_relay_id, &[])?;
     write_json(
         &mut stream,
         &ControlMessage::BootstrapEnrollmentSubmit {

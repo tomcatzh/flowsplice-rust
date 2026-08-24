@@ -14,12 +14,14 @@ import uuid
 AUTHORIZATION = "Bearer flowsplice-e2e-administrator-token"
 ISSUER_AUTHORIZATION = "Bearer flowsplice-e2e-home-issuer-administrator-token"
 COMPOSE_FILE = Path(__file__).resolve().parent / "compose.yaml"
+COMPOSE_NETWORK = f"{os.environ.get('COMPOSE_PROJECT_NAME', 'e2e')}_flowsplice"
+E2E_IMAGE = os.environ.get("FLOWSPLICE_E2E_IMAGE", "flowsplice-e2e:local")
 
 
 def http_get(path: str, headers: dict[str, str] | None = None):
     request_headers = {"Authorization": AUTHORIZATION}
     request_headers.update(headers or {})
-    conn = http.client.HTTPConnection("127.0.0.1", 19080, timeout=3)
+    conn = http.client.HTTPConnection("127.0.0.1", 19083, timeout=3)
     conn.request("GET", path, headers=request_headers)
     response = conn.getresponse()
     body = response.read()
@@ -31,7 +33,7 @@ def http_get(path: str, headers: dict[str, str] | None = None):
 def issuer_get(path: str, headers: dict[str, str] | None = None):
     request_headers = {"Authorization": ISSUER_AUTHORIZATION}
     request_headers.update(headers or {})
-    connection = http.client.HTTPConnection("127.0.0.1", 19081, timeout=3)
+    connection = http.client.HTTPConnection("127.0.0.1", 19084, timeout=3)
     connection.request("GET", path, headers=request_headers)
     response = connection.getresponse()
     body = response.read()
@@ -88,7 +90,7 @@ def issuer_raw_status(port: int, method: str, path: str, body=None) -> int:
 
 
 def travel_request(method: str, path: str, body=None, expect_ok=True):
-    connection = http.client.HTTPConnection("127.0.0.1", 19080, timeout=180)
+    connection = http.client.HTTPConnection("127.0.0.1", 19083, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
     connection.request(
         method,
@@ -331,8 +333,8 @@ def check_travel_runtime_mapping_rebind_and_persistence() -> None:
         stdout=subprocess.PIPE,
     ).stdout.strip()
     assert container_after == container_before
-    wait_business_port(11086, b"runtime-port-without-restart")
-    wait_port_closed(11080)
+    wait_business_port(11089, b"runtime-port-without-restart")
+    wait_port_closed(11083)
 
     failure = travel_request(
         "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:9080"}, False
@@ -345,7 +347,7 @@ def check_travel_runtime_mapping_rebind_and_persistence() -> None:
         if all(mapping[key] == value for key, value in identity.items())
     )
     assert current["bind"] == "0.0.0.0:10086", current
-    wait_business_port(11086, b"failed-rebind-kept-old-listener")
+    wait_business_port(11089, b"failed-rebind-kept-old-listener")
 
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "travelagent"],
@@ -358,13 +360,13 @@ def check_travel_runtime_mapping_rebind_and_persistence() -> None:
         if all(mapping[key] == value for key, value in identity.items())
     )
     assert restarted["bind"] == "0.0.0.0:10086", restarted
-    wait_business_port(11086, b"runtime-port-survived-restart")
+    wait_business_port(11089, b"runtime-port-survived-restart")
 
     travel_request(
         "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:10080"}
     )
-    wait_business_port(11080, b"runtime-port-restored")
-    wait_port_closed(11086)
+    wait_business_port(11083, b"runtime-port-restored")
+    wait_port_closed(11089)
 
     concurrent_binds = ["0.0.0.0:10086", "0.0.0.0:10087", "0.0.0.0:10088"]
     with ThreadPoolExecutor(max_workers=len(concurrent_binds)) as executor:
@@ -384,17 +386,17 @@ def check_travel_runtime_mapping_rebind_and_persistence() -> None:
         if all(mapping[key] == value for key, value in identity.items())
     )
     assert current["bind"] in concurrent_binds, current
-    current_port = int(current["bind"].rsplit(":", 1)[1]) + 1000
+    current_port = int(current["bind"].rsplit(":", 1)[1]) + 1003
     wait_business_port(current_port, b"concurrent-mapping-update-serialized")
     for bind in concurrent_binds:
-        host_port = int(bind.rsplit(":", 1)[1]) + 1000
+        host_port = int(bind.rsplit(":", 1)[1]) + 1003
         if host_port != current_port:
             wait_port_closed(host_port)
 
     travel_request(
         "POST", "/api/mappings", {**identity, "bind": "0.0.0.0:10080"}
     )
-    wait_business_port(11080, b"concurrent-mapping-update-restored")
+    wait_business_port(11083, b"concurrent-mapping-update-restored")
     wait_port_closed(current_port)
 
 
@@ -430,26 +432,26 @@ def expect_mapping_unavailable_without_cross_home_fallback(port: int) -> None:
 
 
 def check_multi_home_business_routing() -> None:
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one:
         home_one.settimeout(15)
         exchange_line(home_one, b"same-service-on-home-one")
-    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"same-service-on-home-two", b"home-2")
     # This service exists on home-1 only, while the mapping explicitly selects
     # home-2. It must fail instead of falling back across the Home boundary.
-    expect_mapping_unavailable_without_cross_home_fallback(11083)
+    expect_mapping_unavailable_without_cross_home_fallback(11086)
 
 
 def check_target_failures_are_home_isolated() -> None:
-    expect_mapping_unavailable_without_cross_home_fallback(11084)
-    expect_mapping_unavailable_without_cross_home_fallback(11085)
+    expect_mapping_unavailable_without_cross_home_fallback(11087)
+    expect_mapping_unavailable_without_cross_home_fallback(11088)
 
 
 def check_home_lifecycle_is_isolated() -> None:
     with (
-        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
     ):
         home_one.settimeout(15)
         home_two.settimeout(15)
@@ -465,13 +467,22 @@ def check_home_lifecycle_is_isolated() -> None:
             == home_one_connection
         )
         wait_local_flow_closed(home_two)
-    expect_mapping_unavailable_without_cross_home_fallback(11082)
+    expect_mapping_unavailable_without_cross_home_fallback(11085)
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "homeagent2"],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            "homeagent2",
+        ],
         check=True,
     )
     wait_catalog_homes({"home-1", "home-2"})
-    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-returned", b"home-2")
 
@@ -489,12 +500,13 @@ def check_serving_only_home2_profile() -> None:
             str(COMPOSE_FILE),
             "up",
             "-d",
+            "--no-deps",
             "homeagent2serving",
         ],
         check=True,
     )
     wait_catalog_homes({"home-1", "home-2"})
-    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-serving-only", b"home-2")
     time.sleep(7)
@@ -549,7 +561,16 @@ def check_serving_only_home2_profile() -> None:
         check=True,
     )
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "homeagent2"],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            "homeagent2",
+        ],
         check=True,
     )
     wait_catalog_homes({"home-1", "home-2"})
@@ -628,7 +649,7 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
         time.sleep(0.25)
     assert empty_directory is not None, "Travel UI did not start without Server"
     assert empty_directory["generation"] == 0 and not empty_directory["relays"], empty_directory
-    expect_mapping_unavailable_without_cross_home_fallback(11080)
+    expect_mapping_unavailable_without_cross_home_fallback(11083)
 
     subprocess.run(
         [
@@ -651,7 +672,7 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
     relay2_success_after = refreshed_relays["relay-2"]["last_success_unix_secs"]
     assert relay2_success_after is not None
     assert relay2_success_before is None or relay2_success_after > relay2_success_before
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
+    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as stream:
         stream.settimeout(15)
         exchange_line(stream, b"fresh-directory-via-learned-relay")
 
@@ -663,6 +684,7 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
             str(COMPOSE_FILE),
             "up",
             "-d",
+            "--no-deps",
             "relay1",
         ],
         check=True,
@@ -683,7 +705,7 @@ def wait_active_relay(excluded: str | None = None) -> str:
 
 
 def check_tcp_relay_failover(
-    port: int = 11080, expected_home: bytes | None = None
+    port: int = 11083, expected_home: bytes | None = None
 ) -> tuple[str, str]:
     with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
         stream.settimeout(30)
@@ -720,7 +742,7 @@ def check_udp() -> None:
     expected = b"flowsplice-udp-e2e"
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
         datagram.settimeout(8)
-        datagram.sendto(expected, ("127.0.0.1", 11081))
+        datagram.sendto(expected, ("127.0.0.1", 11084))
         received, _ = datagram.recvfrom(65535)
     assert received == expected
 
@@ -829,13 +851,13 @@ def check_embedded_spa() -> None:
     )
     assert issuer_api_status == 404
     assert issuer_missing_asset_status == 404
-    assert issuer_raw_status(19081, "POST", "/api/issue", {}) == 404
+    assert issuer_raw_status(19084, "POST", "/api/issue", {}) == 404
 
     pending_travel = issuer_request(
-        19081, "GET", "/api/enrollment/pending?page=1&page_size=20"
+        19084, "GET", "/api/enrollment/pending?page=1&page_size=20"
     )
     pending_home = issuer_request(
-        19081, "GET", "/api/home-enrollment/pending?page=1&page_size=20"
+        19084, "GET", "/api/home-enrollment/pending?page=1&page_size=20"
     )
     for pending in (pending_travel, pending_home):
         assert pending["page"] == 1 and pending["page_size"] == 20, pending
@@ -844,17 +866,17 @@ def check_embedded_spa() -> None:
         assert all(record["approved"] is False for record in pending["items"]), pending
 
     credentials = issuer_request(
-        19081, "GET", "/api/credentials?status=all&page=1&page_size=1"
+        19084, "GET", "/api/credentials?status=all&page=1&page_size=1"
     )
     assert credentials["page"] == 1 and credentials["page_size"] == 1, credentials
     assert credentials["total"] >= 1 and len(credentials["items"]) == 1, credentials
     last_credentials_page = issuer_request(
-        19081, "GET", "/api/credentials?status=all&page=999&page_size=1"
+        19084, "GET", "/api/credentials?status=all&page=999&page_size=1"
     )
     assert last_credentials_page["page"] == last_credentials_page["total_pages"]
     known_travel_id = credentials["items"][0]["travel_id"]
     matching_credentials = issuer_request(
-        19081,
+        19084,
         "GET",
         f"/api/credentials?status=all&page=1&page_size=20&search={known_travel_id}",
     )
@@ -864,13 +886,13 @@ def check_embedded_spa() -> None:
         for credential in matching_credentials["items"]
     ), matching_credentials
     issuer_request(
-        19081,
+        19084,
         "GET",
         "/api/credentials?status=unknown&page=1&page_size=20",
         expect_ok=False,
     )
     issuer_request(
-        19081,
+        19084,
         "GET",
         "/api/credentials?status=all&page=1&page_size=101",
         expect_ok=False,
@@ -879,7 +901,7 @@ def check_embedded_spa() -> None:
 
 def check_duplicate_travel_login_is_rejected() -> None:
     generated_dir = Path(__file__).resolve().parent / "generated"
-    network = "e2e_flowsplice"
+    network = COMPOSE_NETWORK
     for relay_addr, relay_id in [
         ("relay1:8443", "relay-1"),
         ("relay2:8443", "relay-2"),
@@ -897,7 +919,7 @@ def check_duplicate_travel_login_is_rejected() -> None:
                 f"{generated_dir / 'travel'}:/travel:ro",
                 "-v",
                 f"{generated_dir / 'certs'}:/certs:ro",
-                "flowsplice-e2e:local",
+                E2E_IMAGE,
                 "/usr/local/bin/flowsplice-travel-login-probe",
                 "duplicate",
                 relay_addr,
@@ -911,7 +933,7 @@ def issue_scope(
     port: int, scope: dict, *, valid_minutes: int | None = None
 ) -> tuple[str, int]:
     generated = Path(__file__).resolve().parent / "generated"
-    issuer_directory = "offline-home2" if port == 29081 else "offline"
+    issuer_directory = "offline-home2" if port == 29084 else "offline"
     validity = {"valid_days": 365}
     if valid_minutes is not None:
         validity = {"valid_minutes": valid_minutes}
@@ -937,7 +959,7 @@ def issue_scope(
 
 def revoke_from_home(port: int, credential_id: str, expect_ok=True) -> dict:
     generated = Path(__file__).resolve().parent / "generated"
-    issuer_directory = "offline-home2" if port == 29081 else "offline"
+    issuer_directory = "offline-home2" if port == 29084 else "offline"
     return issuer_request(
         port,
         "POST",
@@ -1033,7 +1055,7 @@ def check_home_issued_enrollment() -> str:
         "business_ca_certificate_pem"
     ]
     credentials = [
-        credential for credential in issued_credentials(19081)
+        credential for credential in issued_credentials(19084)
         if credential["travel_id"] == "travel-1" and credential["scope"]["kind"] == "global"
     ]
     assert len(credentials) == 1, credentials
@@ -1048,9 +1070,9 @@ def check_duplicate_enrollment_issue_is_idempotent(
     credential_id: str, expected_generation: int | None = None
 ) -> int:
     generated = Path(__file__).resolve().parent / "generated"
-    before = issued_credentials(19081)
+    before = issued_credentials(19084)
     result = issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/test/issue",
         {
@@ -1066,11 +1088,11 @@ def check_duplicate_enrollment_issue_is_idempotent(
     assert result["enrollment"]["approval"]["credential_id"] == credential_id, result
     if expected_generation is not None:
         assert result["generation"] == expected_generation, result
-    after = issued_credentials(19081)
+    after = issued_credentials(19084)
     assert after == before, (before, after)
 
     changed_scope = issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/test/issue",
         {
@@ -1084,7 +1106,7 @@ def check_duplicate_enrollment_issue_is_idempotent(
         expect_ok=False,
     )
     assert "already used for a different authorization" in changed_scope["error"], changed_scope
-    assert issued_credentials(19081) == before
+    assert issued_credentials(19084) == before
     return result["generation"]
 
 
@@ -1099,7 +1121,7 @@ def check_private_key_password_rotation(
     wrong_password = "flowsplice-e2e-wrong-private-key-password"
 
     issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/private-key-password",
         {"current_password": wrong_password, "new_password": new_password},
@@ -1112,7 +1134,7 @@ def check_private_key_password_rotation(
         expect_ok=False,
     )
     home_result = issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/private-key-password",
         {"current_password": old_password, "new_password": new_password},
@@ -1135,7 +1157,7 @@ def check_private_key_password_rotation(
     assert travel_result["rotated_keys"] == 2, travel_result
 
     issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/private-key-password",
         {"current_password": old_password, "new_password": wrong_password},
@@ -1153,7 +1175,7 @@ def check_private_key_password_rotation(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent", "travelagent"],
         check=True,
     )
-    wait_issuer_ready(19081)
+    wait_issuer_ready(19084)
     check_duplicate_enrollment_issue_is_idempotent(
         credential_id, issuance_generation
     )
@@ -1194,7 +1216,7 @@ def prepare_remote_enrollment() -> tuple[str, str]:
     deadline = time.monotonic() + 90
     pending = None
     while time.monotonic() < deadline:
-        records = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
+        records = issuer_request(19084, "GET", "/api/enrollment/pending")["items"]
         pending = next(
             (record for record in records if record["request_id"] == request_id), None
         )
@@ -1204,7 +1226,7 @@ def prepare_remote_enrollment() -> tuple[str, str]:
     assert pending is not None and pending["approved"] is False, pending
 
     issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/enrollment/approve",
         {
@@ -1217,13 +1239,13 @@ def prepare_remote_enrollment() -> tuple[str, str]:
     )
     pending_after_wrong_password = next(
         record
-        for record in issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
+        for record in issuer_request(19084, "GET", "/api/enrollment/pending")["items"]
         if record["request_id"] == request_id
     )
     assert pending_after_wrong_password["approved"] is False
 
     approved = issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/enrollment/approve",
         {
@@ -1258,13 +1280,13 @@ def activate_remote_enrollment(request_id: str, password: str) -> tuple[dict, st
         check=True,
     )
     ready = wait_ready()
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as stream:
+    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as stream:
         stream.settimeout(15)
         exchange_line(stream, b"remote-enrollment-identity-active")
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         travel_pending = travel_request("GET", "/api/enrollment")
-        home_pending = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
+        home_pending = issuer_request(19084, "GET", "/api/enrollment/pending")["items"]
         if (
             all(record["request_id"] != request_id for record in travel_pending)
             and all(record["request_id"] != request_id for record in home_pending)
@@ -1285,8 +1307,8 @@ def check_home2_remote_enrollment(password: str) -> str:
     deadline = time.monotonic() + 90
     pending = None
     while time.monotonic() < deadline:
-        home_one_records = issuer_request(19081, "GET", "/api/enrollment/pending")["items"]
-        home_two_records = issuer_request(29081, "GET", "/api/enrollment/pending")["items"]
+        home_one_records = issuer_request(19084, "GET", "/api/enrollment/pending")["items"]
+        home_two_records = issuer_request(29084, "GET", "/api/enrollment/pending")["items"]
         assert all(record["request_id"] != request_id for record in home_one_records)
         pending = next(
             (record for record in home_two_records if record["request_id"] == request_id),
@@ -1297,7 +1319,7 @@ def check_home2_remote_enrollment(password: str) -> str:
         time.sleep(1)
     assert pending is not None and pending["home_id"] == "home-2", pending
     issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/enrollment/approve",
         {
@@ -1309,7 +1331,7 @@ def check_home2_remote_enrollment(password: str) -> str:
         expect_ok=False,
     )
     issuer_request(
-        29081,
+        29084,
         "POST",
         "/api/enrollment/approve",
         {
@@ -1321,7 +1343,7 @@ def check_home2_remote_enrollment(password: str) -> str:
         expect_ok=False,
     )
     approved = issuer_request(
-        29081,
+        29084,
         "POST",
         "/api/enrollment/approve",
         {
@@ -1345,10 +1367,10 @@ def check_home2_remote_enrollment(password: str) -> str:
         check=True,
     )
     wait_scoped_catalog({"home-2": {"tcp-echo", "target-failure"}})
-    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"remote-home-two-scope", b"home-2")
-    expect_mapping_unavailable_without_cross_home_fallback(11080)
+    expect_mapping_unavailable_without_cross_home_fallback(11083)
 
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
@@ -1359,7 +1381,7 @@ def check_home2_remote_enrollment(password: str) -> str:
             )
             and all(
                 record["request_id"] != request_id
-                for record in issuer_request(29081, "GET", "/api/enrollment/pending")["items"]
+                for record in issuer_request(29084, "GET", "/api/enrollment/pending")["items"]
             )
         ):
             break
@@ -1367,14 +1389,14 @@ def check_home2_remote_enrollment(password: str) -> str:
     else:
         raise AssertionError("Home-2 remote enrollment was not acknowledged and retired")
 
-    revoke_with_wrong_password(29081, credential_id)
+    revoke_with_wrong_password(29084, credential_id)
     active = next(
         credential
-        for credential in issued_credentials(29081)
+        for credential in issued_credentials(29084)
         if credential["credential_id"] == credential_id
     )
     assert active["active"] and not active["revoked"], active
-    revoke_from_home(29081, credential_id)
+    revoke_from_home(29084, credential_id)
     wait_scoped_catalog({})
     return credential_id
 
@@ -1402,8 +1424,8 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
     )
     assert listener_probe.returncode != 0, listener_probe.stdout
     with (
-        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
     ):
         home_one.settimeout(20)
         home_two.settimeout(20)
@@ -1424,7 +1446,16 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
             == home_two_connection
         )
         subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "server"],
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "up",
+                "-d",
+                "--no-deps",
+                "server",
+            ],
             check=True,
         )
         wait_ready()
@@ -1440,7 +1471,7 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
     last_error = None
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", 11080), timeout=3) as fresh:
+            with socket.create_connection(("127.0.0.1", 11083), timeout=3) as fresh:
                 fresh.settimeout(6)
                 exchange_line(fresh, b"new-route-after-server-recovery")
                 return
@@ -1455,7 +1486,7 @@ def check_statistics_pipeline() -> None:
     last = None
     while time.monotonic() < deadline:
         travel = travel_request("GET", "/api/statistics?period=day")
-        home = issuer_request(19081, "GET", "/api/statistics?period=week")
+        home = issuer_request(19084, "GET", "/api/statistics?period=week")
         relay_one = container_json_request(
             "relay1", 9084, "/api/statistics?period=month"
         )
@@ -1560,8 +1591,8 @@ def home_delivered_upload_sum(port: int) -> int:
 
 def check_home_statistics_write_failures_are_isolated() -> None:
     for service, issuer_port, business_port, expected_home in (
-        ("homeagent", 19081, 11080, None),
-        ("homeagent2", 29081, 11082, b"home-2"),
+        ("homeagent", 19084, 11083, None),
+        ("homeagent2", 29084, 11085, b"home-2"),
     ):
         before = home_delivered_upload_sum(issuer_port)
         armed = issuer_request(
@@ -1627,12 +1658,12 @@ def assert_revoked_management_certificate_rejected(relay: str) -> None:
             "--user",
             f"{os.getuid()}:{os.getgid()}",
             "--network",
-            "e2e_flowsplice",
+            COMPOSE_NETWORK,
             "-v",
             f"{generated_dir / 'travel'}:/travel:ro",
             "-v",
             f"{generated_dir / 'certs'}:/certs:ro",
-            "flowsplice-e2e:local",
+            E2E_IMAGE,
             "/usr/local/bin/flowsplice-travel-login-probe",
             "duplicate",
             f"{relay}:8443",
@@ -1692,7 +1723,16 @@ def check_scoped_authorization_and_home_revocation(
 ) -> None:
     service = {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay]
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", service],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            service,
+        ],
         check=True,
     )
     pids = {
@@ -1701,8 +1741,8 @@ def check_scoped_authorization_and_home_revocation(
     }
 
     with (
-        socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two,
+        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
+        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
     ):
         home_one.settimeout(10)
         home_two.settimeout(10)
@@ -1713,7 +1753,7 @@ def check_scoped_authorization_and_home_revocation(
         # replacement grants only after they exist, then prove revoking the original grant
         # closes its flows while the replacement grants remain usable for new flows.
         home_one_credential, _ = issue_scope(
-            19081,
+            19084,
             {
                 "kind": "service",
                 "home_id": "home-1",
@@ -1723,14 +1763,14 @@ def check_scoped_authorization_and_home_revocation(
             valid_minutes=30,
         )
         home_two_credential, _ = issue_scope(
-            29081, {"kind": "home", "home_id": "home-2"}
+            29084, {"kind": "home", "home_id": "home-2"}
         )
-        revoke_from_home(29081, global_credential_id, expect_ok=False)
-        wrong_password = revoke_with_wrong_password(19081, global_credential_id)
+        revoke_from_home(29084, global_credential_id, expect_ok=False)
+        wrong_password = revoke_with_wrong_password(19084, global_credential_id)
         assert wrong_password["error"], wrong_password
         still_active = next(
             credential
-            for credential in issued_credentials(19081)
+            for credential in issued_credentials(19084)
             if credential["credential_id"] == global_credential_id
         )
         assert still_active["active"] and not still_active["revoked"], still_active
@@ -1740,13 +1780,13 @@ def check_scoped_authorization_and_home_revocation(
             b"wrong-revoke-password-kept-home-two-open",
             b"home-2",
         )
-        revoke_from_home(19081, global_credential_id)
+        revoke_from_home(19084, global_credential_id)
         wait_local_flow_closed(home_one)
         wait_local_flow_closed(home_two)
 
     generated = Path(__file__).resolve().parent / "generated"
     revoked_retry = issuer_request(
-        19081,
+        19084,
         "POST",
         "/api/test/issue",
         {
@@ -1764,15 +1804,15 @@ def check_scoped_authorization_and_home_revocation(
     wait_scoped_catalog(
         {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo", "target-failure"}}
     )
-    with socket.create_connection(("127.0.0.1", 11080), timeout=5) as home_one:
+    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one:
         home_one.settimeout(15)
         exchange_line(home_one, b"home-one-service-scope")
-    with socket.create_connection(("127.0.0.1", 11082), timeout=5) as home_two:
+    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-home-scope", b"home-2")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
         datagram.settimeout(4)
-        datagram.sendto(b"must-not-pass-service-scope", ("127.0.0.1", 11081))
+        datagram.sendto(b"must-not-pass-service-scope", ("127.0.0.1", 11084))
         try:
             received, _ = datagram.recvfrom(65535)
         except socket.timeout:
@@ -1780,13 +1820,13 @@ def check_scoped_authorization_and_home_revocation(
         else:
             raise AssertionError(f"service-scoped credential exposed UDP: {received!r}")
 
-    revoke_from_home(29081, home_one_credential, expect_ok=False)
-    revoke_from_home(19081, home_one_credential)
-    revoke_from_home(19081, home_one_credential)
+    revoke_from_home(29084, home_one_credential, expect_ok=False)
+    revoke_from_home(19084, home_one_credential)
+    revoke_from_home(19084, home_one_credential)
     wait_scoped_catalog({"home-2": {"tcp-echo", "target-failure"}})
-    expect_mapping_unavailable_without_cross_home_fallback(11080)
+    expect_mapping_unavailable_without_cross_home_fallback(11083)
 
-    revoke_from_home(29081, home_two_credential)
+    revoke_from_home(29084, home_two_credential)
     wait_scoped_catalog({})
     assert_revoked_management_certificate_rejected("relay1")
     assert_revoked_management_certificate_rejected("relay2")
@@ -1810,7 +1850,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
     tls12.minimum_version = ssl.TLSVersion.TLSv1_2
     tls12.maximum_version = ssl.TLSVersion.TLSv1_2
     try:
-        with socket.create_connection(("127.0.0.1", 18443), timeout=3) as raw:
+        with socket.create_connection(("127.0.0.1", 18446), timeout=3) as raw:
             with tls12.wrap_socket(raw, server_hostname="relay-1.flowsplice"):
                 pass
     except (OSError, ssl.SSLError):
@@ -1827,12 +1867,12 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
             "--user",
             f"{os.getuid()}:{os.getgid()}",
             "--network",
-            "e2e_flowsplice",
+            COMPOSE_NETWORK,
             "-v",
             f"{generated_dir / 'travel'}:/travel:ro",
             "-v",
             f"{generated_dir / 'certs'}:/certs:ro",
-            "flowsplice-e2e:local",
+            E2E_IMAGE,
             "/usr/local/bin/flowsplice-travel-login-probe",
             "slow-frame",
             "relay1:8443",
@@ -1892,13 +1932,14 @@ subprocess.run(
         str(COMPOSE_FILE),
         "up",
         "-d",
+        "--no-deps",
         {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay],
     ],
     check=True,
 )
 wait_ready()
 checkpoint("home2-tcp-relay-failover")
-home2_failed_relay, _ = check_tcp_relay_failover(11082, b"home-2")
+home2_failed_relay, _ = check_tcp_relay_failover(11085, b"home-2")
 checkpoint("scoped-authorization-and-revocation")
 check_scoped_authorization_and_home_revocation(home2_failed_relay, credential_id)
 checkpoint("activate-remote-enrollment")

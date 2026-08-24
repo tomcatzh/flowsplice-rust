@@ -24,16 +24,29 @@ class TravelCoreDockerE2ETest {
     fun nativeCoreCompletesRoundTripsWhileAppIsInBackground() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val arguments = InstrumentationRegistry.getArguments()
-        val profilePath = arguments.getString("profile_path")
-        val profilePassword = arguments.getString("profile_password")
-        assumeTrue("Docker profile arguments are required", profilePath != null && profilePassword != null)
-        File(requireNotNull(profilePath)).inputStream().use { input ->
-            TravelProfile.install(context, input, requireNotNull(profilePassword))
-        }
-        TravelRepository.profileChanged(context)
+        val relayAddress = arguments.getString("relay_address")
+        val privateKeyPassword = arguments.getString("private_key_password")
+        assumeTrue(
+            "Docker enrollment arguments are required",
+            relayAddress != null && privateKeyPassword != null,
+        )
+        TravelRepository.initialize(context)
 
         try {
-            TravelRepository.start(context)
+            TravelRepository.enroll(
+                context,
+                travelId = "android-e2e-travel",
+                homeId = "home-1",
+                relay = requireNotNull(relayAddress),
+                password = requireNotNull(privateKeyPassword),
+            )
+            val enrollment = awaitEnrollment("Android did not submit its enrollment request") {
+                it.phase == EnrollmentPhase.WAITING_FOR_APPROVAL &&
+                    !it.verificationCode.isNullOrEmpty()
+            }
+            println("FLOWSPLICE_ANDROID_VERIFICATION_CODE=${enrollment.verificationCode}")
+            File(context.filesDir, "e2e-verification-code")
+                .writeText(requireNotNull(enrollment.verificationCode))
             awaitSnapshot("Travel Core did not come online") { it.phase == TravelPhase.RUNNING && it.online }
             val mapping = TravelMapping(
                 homeId = "home-1",
@@ -79,11 +92,26 @@ class TravelCoreDockerE2ETest {
         }
     }
 
+    private suspend fun awaitEnrollment(
+        message: String,
+        predicate: (EnrollmentSnapshot) -> Boolean,
+    ): EnrollmentSnapshot {
+        repeat(120) {
+            val snapshot = TravelRepository.enrollment.value
+            if (snapshot.phase == EnrollmentPhase.ERROR) {
+                error(snapshot.error ?: message)
+            }
+            if (predicate(snapshot)) return snapshot
+            delay(1_000)
+        }
+        error("$message: ${TravelRepository.enrollment.value}")
+    }
+
     private suspend fun awaitSnapshot(
         message: String,
         predicate: (TravelSnapshot) -> Boolean,
     ): TravelSnapshot {
-        repeat(90) {
+        repeat(180) {
             val snapshot = TravelRepository.state.value
             if (snapshot.phase == TravelPhase.ERROR) {
                 error(snapshot.error ?: message)

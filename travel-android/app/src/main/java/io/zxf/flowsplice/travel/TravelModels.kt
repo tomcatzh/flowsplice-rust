@@ -10,6 +10,55 @@ enum class TravelPhase {
     ERROR,
 }
 
+enum class EnrollmentPhase {
+    IDLE,
+    PREPARING,
+    WAITING_FOR_APPROVAL,
+    INSTALLED,
+    CANCELLED,
+    ERROR,
+}
+
+data class EnrollmentSnapshot(
+    val phase: EnrollmentPhase = EnrollmentPhase.IDLE,
+    val travelId: String = "",
+    val requestId: String? = null,
+    val verificationCode: String? = null,
+    val error: String? = null,
+) {
+    val active: Boolean
+        get() = phase == EnrollmentPhase.PREPARING || phase == EnrollmentPhase.WAITING_FOR_APPROVAL
+
+    companion object {
+        fun fromNative(json: String): EnrollmentSnapshot {
+            val envelope = JSONObject(json)
+            if (!envelope.optBoolean("ok")) {
+                return EnrollmentSnapshot(
+                    phase = EnrollmentPhase.ERROR,
+                    error = envelope.optString("error", "Remote enrollment failed"),
+                )
+            }
+            val data = envelope.getJSONObject("data")
+            fun optionalString(key: String): String? =
+                if (data.isNull(key)) null else data.optString(key).takeIf(String::isNotEmpty)
+            return EnrollmentSnapshot(
+                phase = when (data.optString("phase")) {
+                    "preparing" -> EnrollmentPhase.PREPARING
+                    "waiting_for_approval" -> EnrollmentPhase.WAITING_FOR_APPROVAL
+                    "installed" -> EnrollmentPhase.INSTALLED
+                    "cancelled" -> EnrollmentPhase.CANCELLED
+                    "error" -> EnrollmentPhase.ERROR
+                    else -> EnrollmentPhase.IDLE
+                },
+                travelId = data.optString("travel_id"),
+                requestId = optionalString("request_id"),
+                verificationCode = optionalString("verification_code"),
+                error = optionalString("error"),
+            )
+        }
+    }
+}
+
 data class TravelMapping(
     val homeId: String,
     val serviceId: String,
@@ -20,7 +69,7 @@ data class TravelMapping(
 data class TravelSnapshot(
     val phase: TravelPhase = TravelPhase.STOPPED,
     val online: Boolean = false,
-    val profileInstalled: Boolean = false,
+    val enrolled: Boolean = false,
     val travelId: String = "Travel",
     val uptimeSeconds: Long = 0,
     val activeFlows: Int = 0,
@@ -31,12 +80,12 @@ data class TravelSnapshot(
     val error: String? = null,
 ) {
     companion object {
-        fun fromNative(json: String, profileInstalled: Boolean): TravelSnapshot {
+        fun fromNative(json: String, enrolled: Boolean): TravelSnapshot {
             val envelope = JSONObject(json)
             if (!envelope.optBoolean("ok")) {
                 return TravelSnapshot(
                     phase = TravelPhase.ERROR,
-                    profileInstalled = profileInstalled,
+                    enrolled = enrolled,
                     error = envelope.optString("error", "Travel Core failed"),
                 )
             }
@@ -60,7 +109,7 @@ data class TravelSnapshot(
             return TravelSnapshot(
                 phase = TravelPhase.RUNNING,
                 online = data.optBoolean("online"),
-                profileInstalled = profileInstalled,
+                enrolled = enrolled,
                 travelId = data.optString("travel_id", "Travel"),
                 uptimeSeconds = data.optLong("uptime_secs"),
                 activeFlows = data.optInt("active_flows"),
