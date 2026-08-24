@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowSplice Icon Direction A — Continuous S</title>
+  <!--
+    Assumption: the calmest interpretation should stay closest to the existing dark-jade UI.
+    Reasoning: one uninterrupted route is the simplest expression of a stable local service.
+    Draft only: geometry and palette remain subject to user direction approval.
+  -->
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; min-height: 100%; background: #e8ece8; }
+    body { font-family: "Avenir Next", "Helvetica Neue", sans-serif; color: #07110f; }
+    .board {
+      width: 1440px; height: 1000px; margin: 0 auto; overflow: hidden;
+      display: grid; grid-template-columns: 390px 1fr; background: #f4f7f5;
+    }
+    .folio {
+      position: relative; padding: 58px 48px; border-right: 1px solid #bcc9c3;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .folio::after {
+      content: ""; position: absolute; left: 48px; right: 48px; top: 148px;
+      height: 1px; background: #07110f;
+    }
+    .kicker { font-size: 12px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    .number { margin-top: 104px; font-size: 188px; line-height: .78; letter-spacing: -.085em; font-weight: 650; }
+    h1 { margin: 28px 0 12px; font-size: 42px; line-height: .96; letter-spacing: -.045em; font-weight: 620; }
+    .summary { width: 270px; margin: 0; color: #40514b; font-size: 15px; line-height: 1.55; }
+    .logic { font-family: ui-monospace, "SFMono-Regular", monospace; color: #52635d; font-size: 11px; line-height: 1.5; }
+    .canvas { position: relative; padding: 58px 64px 54px; display: grid; grid-template-rows: 1fr 254px; gap: 28px; }
+    .hero {
+      position: relative; overflow: hidden; background: #07110f; border-radius: 4px;
+      display: grid; grid-template-columns: 1fr 330px; align-items: center; padding: 64px 68px;
+    }
+    .hero::before {
+      content: ""; position: absolute; inset: 0; opacity: .22;
+      background-image: linear-gradient(#70d8b61a 1px, transparent 1px), linear-gradient(90deg, #70d8b61a 1px, transparent 1px);
+      background-size: 54px 54px;
+    }
+    .hero-copy { position: relative; z-index: 1; align-self: end; padding-bottom: 8px; }
+    .hero-copy small { color: #70d8b6; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; font-weight: 800; }
+    .hero-copy strong { display: block; width: 390px; margin-top: 16px; color: #f4f7f5; font-size: 34px; line-height: 1.08; letter-spacing: -.035em; font-weight: 560; }
+    .hero-copy p { width: 390px; margin: 18px 0 0; color: #93aaa2; font-size: 14px; line-height: 1.55; }
+    .master {
+      position: relative; z-index: 1; width: 290px; height: 290px; justify-self: end;
+      display: grid; place-items: center; background: #0a1915; border: 1px solid #25463d;
+    }
+    .master svg { width: 242px; height: 242px; }
+    .samples { display: grid; grid-template-columns: 1.4fr 1fr 1.15fr; gap: 18px; }
+    .sample { min-width: 0; padding: 22px; border: 1px solid #c4cec9; background: #ffffff; }
+    .sample-label { margin-bottom: 16px; color: #5c6c66; font-size: 10px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .masks { display: flex; align-items: center; gap: 16px; }
+    .app-icon { width: 92px; height: 92px; display: grid; place-items: center; background: #07110f; box-shadow: 0 10px 24px #07110f24; }
+    .app-icon.circle { border-radius: 50%; }
+    .app-icon.squircle { border-radius: 25%; }
+    .app-icon svg { width: 80px; height: 80px; }
+    .tab { height: 58px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; border: 1px solid #d0d8d4; border-radius: 9px 9px 0 0; background: #f8faf9; }
+    .tab-icon { width: 18px; height: 18px; display: grid; place-items: center; background: #07110f; border-radius: 3px; }
+    .tab-icon svg { width: 16px; height: 16px; }
+    .tab span { color: #22312c; font-size: 13px; font-weight: 650; }
+    .size-row { height: 86px; display: flex; align-items: end; gap: 24px; color: #07110f; }
+    .size-item { display: grid; justify-items: center; gap: 7px; }
+    .size-item svg { display: block; background: #07110f; border-radius: 22%; }
+    .size-item em { color: #6b7974; font-size: 9px; font-style: normal; }
+    .palette { position: absolute; z-index: 2; left: 88px; top: 78px; display: flex; gap: 6px; }
+    .swatch { width: 38px; height: 6px; }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true">
+    <symbol id="mark-a" viewBox="0 0 108 108">
+      <path d="M81 30H51C36 30 27 36 27 46C27 55 35 59 48 59H60C73 59 81 63 81 72C81 81 72 82 57 82H27"
+            fill="none" stroke="currentColor" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </svg>
+  <main class="board">
+    <section class="folio">
+      <div>
+        <div class="kicker">FlowSplice identity study</div>
+        <div class="number">01</div>
+        <h1>Continuous<br>S</h1>
+        <p class="summary">A single route stays unbroken as it bends from one endpoint to another. The silhouette is quiet, immediate, and unusually stable at favicon scale.</p>
+      </div>
+      <div class="logic">ROULETTE 18 / BOOKCRAFT DATA<br>FORM: ONE CONTINUOUS LOCAL-TO-HOME ROUTE</div>
+    </section>
+    <section class="canvas">
+      <div class="hero">
+        <div class="hero-copy">
+          <small>One route · no visual noise</small>
+          <strong>Continuity is the promise.</strong>
+          <p>The route itself becomes the “S”. Rounded terminals keep the icon approachable while the deep-jade field links it directly to today's product UI.</p>
+        </div>
+        <div class="master">
+          <svg style="color:#70d8b6"><use href="#mark-a"/></svg>
+        </div>
+      </div>
+      <div class="samples">
+        <div class="sample">
+          <div class="sample-label">Adaptive masks</div>
+          <div class="masks">
+            <div class="app-icon circle"><svg style="color:#70d8b6"><use href="#mark-a"/></svg></div>
+            <div class="app-icon squircle"><svg style="color:#70d8b6"><use href="#mark-a"/></svg></div>
+          </div>
+        </div>
+        <div class="sample">
+          <div class="sample-label">Browser tab · 16 px</div>
+          <div class="tab">
+            <div class="tab-icon"><svg style="color:#70d8b6"><use href="#mark-a"/></svg></div>
+            <span>FlowSplice · Home</span>
+          </div>
+        </div>
+        <div class="sample">
+          <div class="sample-label">Monochrome size test</div>
+          <div class="size-row">
+            <div class="size-item"><svg width="64" height="64"><use href="#mark-a" style="color:#f4f7f5"/></svg><em>64</em></div>
+            <div class="size-item"><svg width="32" height="32"><use href="#mark-a" style="color:#f4f7f5"/></svg><em>32</em></div>
+            <div class="size-item"><svg width="16" height="16"><use href="#mark-a" style="color:#f4f7f5"/></svg><em>16</em></div>
+          </div>
+        </div>
+      </div>
+      <div class="palette">
+        <span class="swatch" style="background:#07110f"></span>
+        <span class="swatch" style="background:#70d8b6"></span>
+        <span class="swatch" style="background:#f4f7f5"></span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

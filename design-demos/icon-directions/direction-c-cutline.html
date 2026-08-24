@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowSplice Icon Direction C — Cutline</title>
+  <!--
+    Assumption: the most systematic option should feel like a durable tool family.
+    Reasoning: modular lanes and one diagonal seam can scale into future role variants.
+    Draft only: geometry and palette remain subject to user direction approval.
+  -->
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; min-height: 100%; background: #07110f; }
+    body { font-family: "Avenir Next", "Helvetica Neue", sans-serif; color: #f4f7f5; }
+    .board {
+      width: 1440px; height: 1000px; margin: 0 auto; padding: 54px 58px;
+      display: grid; grid-template-columns: 1fr 392px; grid-template-rows: 1fr 218px;
+      gap: 22px; background: #07110f;
+    }
+    .hero {
+      position: relative; overflow: hidden; border: 1px solid #315249;
+      display: grid; grid-template-columns: 1fr 1.12fr; align-items: center;
+      background: #0a1915;
+    }
+    .hero::before {
+      content: ""; position: absolute; inset: 0; opacity: .35;
+      background-image: linear-gradient(#315249 1px, transparent 1px), linear-gradient(90deg,#315249 1px,transparent 1px);
+      background-size: 72px 72px;
+    }
+    .hero-copy { position: relative; z-index: 1; align-self: stretch; padding: 52px; display: flex; flex-direction: column; justify-content: space-between; border-right: 1px solid #315249; }
+    .index { color: #70d8b6; font-size: 12px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 0 0 18px; font-size: 86px; line-height: .84; letter-spacing: -.065em; font-weight: 680; }
+    .intro { width: 360px; margin: 0; color: #91a69f; font-size: 15px; line-height: 1.55; }
+    .philosophy { color: #70d8b6; font: 11px ui-monospace, "SFMono-Regular", monospace; line-height: 1.5; }
+    .master { position: relative; z-index: 1; width: 420px; height: 420px; justify-self: center; display: grid; place-items: center; background: #07110f; border: 1px solid #315249; border-radius: 22%; }
+    .master svg { width: 360px; height: 360px; }
+    .annotation { padding: 34px 30px; border: 1px solid #315249; background: #0a1915; }
+    .annotation h2 { margin: 0 0 20px; color: #70d8b6; font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+    .annotation ol { margin: 0; padding-left: 20px; color: #b6c8c2; font-size: 14px; line-height: 1.7; }
+    .bottom { grid-column: 1 / 2; display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 22px; }
+    .sample { min-width: 0; padding: 20px 22px; border: 1px solid #315249; background: #0a1915; }
+    .label { margin-bottom: 14px; color: #6f887f; font-size: 10px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .masks { display: flex; align-items: center; gap: 15px; }
+    .app-icon { width: 88px; height: 88px; display: grid; place-items: center; background: #07110f; border: 1px solid #315249; }
+    .app-icon.circle { border-radius: 50%; }
+    .app-icon.squircle { border-radius: 25%; }
+    .app-icon svg { width: 76px; height: 76px; }
+    .light-icon { background: #f4f7f5; }
+    .tab { height: 56px; display: flex; align-items: center; gap: 10px; padding: 10px 14px; color: #25352f; background: #f4f7f5; border-radius: 9px 9px 0 0; }
+    .tab svg { width: 18px; height: 18px; padding: 1px; border-radius: 3px; background: #07110f; }
+    .tab span { font-size: 13px; font-weight: 650; }
+    .sizes { height: 86px; display: flex; align-items: end; gap: 22px; }
+    .size { display: grid; justify-items: center; gap: 7px; }
+    .size svg { display: block; background: #07110f; border-radius: 22%; }
+    .size em { color: #6f887f; font-size: 9px; font-style: normal; }
+    .palette { grid-column: 2; grid-row: 2; padding: 22px; border: 1px solid #315249; display: grid; grid-template-rows: auto 1fr; gap: 14px; background: #0a1915; }
+    .palette-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 7px; }
+    .swatch { display: flex; align-items: end; padding: 7px; font: 8px ui-monospace,monospace; color: white; }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true">
+    <symbol id="mark-c-color" viewBox="0 0 108 108">
+      <path d="M24 29H59M71 29H84M24 54H47M59 54H84M24 79H35M47 79H84" fill="none" stroke="#F4F7F5" stroke-width="11" stroke-linecap="round"/>
+      <path d="M65 29L53 54L41 79" fill="none" stroke="#70D8B6" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="mark-c-mono" viewBox="0 0 108 108">
+      <path d="M24 29H59M71 29H84M24 54H47M59 54H84M24 79H35M47 79H84M65 29L53 54L41 79" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </svg>
+  <main class="board">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="index">03 · system-first identity</div>
+        <div>
+          <h1>Cut<br>line</h1>
+          <p class="intro">Three stable lanes are cut by one deliberate seam, then rejoined. The mark feels engineered and can become a coherent family across Server, Relay, Home, and Travel.</p>
+        </div>
+        <div class="philosophy">GRID DISCIPLINE / 0·45·90°<br>FORM: A SPLICE JOINT MADE VISIBLE</div>
+      </div>
+      <div class="master"><svg><use href="#mark-c-color"/></svg></div>
+    </section>
+    <aside class="annotation">
+      <h2>Why this system scales</h2>
+      <ol>
+        <li>Strong outer rhythm at 16 pixels.</li>
+        <li>One-color geometry is native, not a fallback.</li>
+        <li>Lane color can distinguish future roles without changing the mark.</li>
+        <li>The diagonal seam is the 120% signature detail.</li>
+      </ol>
+    </aside>
+    <section class="bottom">
+      <div class="sample">
+        <div class="label">Adaptive masks · dark / light</div>
+        <div class="masks">
+          <div class="app-icon circle"><svg><use href="#mark-c-color"/></svg></div>
+          <div class="app-icon squircle"><svg><use href="#mark-c-color"/></svg></div>
+          <div class="app-icon squircle light-icon"><svg><use href="#mark-c-mono" style="color:#07110f"/></svg></div>
+        </div>
+      </div>
+      <div class="sample">
+        <div class="label">Browser tab · 16 px</div>
+        <div class="tab"><svg><use href="#mark-c-color"/></svg><span>FlowSplice</span></div>
+      </div>
+      <div class="sample">
+        <div class="label">Monochrome size test</div>
+        <div class="sizes">
+          <div class="size"><svg width="64" height="64"><use href="#mark-c-mono" style="color:#f4f7f5"/></svg><em>64</em></div>
+          <div class="size"><svg width="32" height="32"><use href="#mark-c-mono" style="color:#f4f7f5"/></svg><em>32</em></div>
+          <div class="size"><svg width="16" height="16"><use href="#mark-c-mono" style="color:#f4f7f5"/></svg><em>16</em></div>
+        </div>
+      </div>
+    </section>
+    <section class="palette">
+      <div class="label">Repository-grounded palette</div>
+      <div class="palette-row">
+        <div class="swatch" style="background:#07110f">07110F</div>
+        <div class="swatch" style="background:#0a1915">0A1915</div>
+        <div class="swatch" style="background:#70d8b6;color:#07110f">70D8B6</div>
+        <div class="swatch" style="background:#f4f7f5;color:#07110f">F4F7F5</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

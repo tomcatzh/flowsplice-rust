@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowSplice Icon Direction B — Exchange</title>
+  <!--
+    Assumption: two visible paths better explain selection and Relay redundancy.
+    Reasoning: the mark is built from only two strokes and must still work in one color.
+    Draft only: geometry and palette remain subject to user direction approval.
+  -->
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; min-height: 100%; background: #dfe7e4; }
+    body { font-family: "Helvetica Neue", "Avenir Next", sans-serif; color: #07110f; }
+    .board { width: 1440px; height: 1000px; margin: 0 auto; padding: 42px; background: #f4f7f5; }
+    .frame { height: 100%; border: 1px solid #849791; display: grid; grid-template-rows: 116px 1fr 252px; }
+    header { display: grid; grid-template-columns: 210px 1fr 330px; align-items: center; border-bottom: 1px solid #849791; }
+    .code { height: 100%; display: grid; place-items: center; border-right: 1px solid #849791; color: #3177f6; font-size: 46px; font-weight: 750; letter-spacing: -.05em; }
+    h1 { margin: 0; padding-left: 34px; font-size: 42px; letter-spacing: -.04em; font-weight: 650; }
+    .reference { padding-right: 30px; color: #50625c; font-size: 11px; line-height: 1.45; letter-spacing: .08em; text-transform: uppercase; text-align: right; }
+    .hero { position: relative; display: grid; grid-template-columns: 1fr 530px 1fr; align-items: center; overflow: hidden; }
+    .hero::before {
+      content: ""; position: absolute; inset: 0;
+      background-image: linear-gradient(#71837d24 1px, transparent 1px), linear-gradient(90deg,#71837d24 1px,transparent 1px);
+      background-size: 42px 42px;
+    }
+    .note { position: relative; z-index: 1; padding: 36px; font-size: 14px; line-height: 1.58; color: #34453f; }
+    .note strong { display: block; margin-bottom: 11px; color: #07110f; font-size: 13px; letter-spacing: .11em; text-transform: uppercase; }
+    .note.left { align-self: start; margin-top: 50px; border-top: 4px solid #3177f6; }
+    .note.right { align-self: end; margin-bottom: 50px; border-bottom: 4px solid #00a88f; }
+    .master-wrap { position: relative; z-index: 1; width: 470px; height: 470px; justify-self: center; display: grid; place-items: center; background: #fff; border: 1px solid #9aaba5; border-radius: 30%; box-shadow: 0 30px 80px #19372c1a; }
+    .master-wrap::after { content: "66 dp safe zone"; position: absolute; inset: 88px; border: 1px dashed #7e918b; border-radius: 50%; color: #738680; font: 10px ui-monospace, monospace; padding: 8px; }
+    .master-wrap svg { width: 390px; height: 390px; }
+    .strip { display: grid; grid-template-columns: 1.15fr 1fr 1fr 1fr; border-top: 1px solid #849791; }
+    .cell { padding: 22px 24px; border-right: 1px solid #849791; overflow: hidden; }
+    .cell:last-child { border-right: 0; }
+    .label { margin-bottom: 18px; color: #5e716a; font-size: 10px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .masks { display: flex; gap: 16px; }
+    .app-icon { width: 92px; height: 92px; display: grid; place-items: center; background: white; border: 1px solid #bac7c2; box-shadow: 0 8px 20px #19372c17; }
+    .app-icon.circle { border-radius: 50%; }
+    .app-icon.squircle { border-radius: 25%; }
+    .app-icon svg { width: 78px; height: 78px; }
+    .tab { height: 56px; padding: 11px 14px; display: flex; align-items: center; gap: 9px; background: #07110f; border-radius: 9px 9px 0 0; color: #d8e4df; }
+    .tab svg { width: 18px; height: 18px; flex: 0 0 auto; }
+    .tab span { font-size: 13px; font-weight: 650; }
+    .mono { display: flex; align-items: center; gap: 14px; }
+    .mono-icon { display: grid; place-items: center; background: #1d342d; color: #f4f7f5; border-radius: 50%; }
+    .mono-icon svg { width: 88%; height: 88%; }
+    .palette { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .swatch { height: 46px; display: flex; align-items: end; padding: 8px; color: white; font: 9px ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true">
+    <symbol id="mark-b-color" viewBox="0 0 108 108">
+      <path d="M28 28C28 44 41 51 54 54C67 57 80 64 80 80" fill="none" stroke="#3177F6" stroke-width="11" stroke-linecap="round"/>
+      <path d="M80 28C80 44 67 51 54 54C41 57 28 64 28 80" fill="none" stroke="#00A88F" stroke-width="11" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="mark-b-mono" viewBox="0 0 108 108">
+      <path d="M28 28C28 44 41 51 54 54C67 57 80 64 80 80M80 28C80 44 67 51 54 54C41 57 28 64 28 80" fill="none" stroke="currentColor" stroke-width="11" stroke-linecap="round"/>
+    </symbol>
+  </svg>
+  <main class="board">
+    <section class="frame">
+      <header>
+        <div class="code">02</div>
+        <h1>Exchange</h1>
+        <div class="reference">Benchmark logic<br>Pentagram / Slack<br>multiscale consistency</div>
+      </header>
+      <div class="hero">
+        <div class="note left">
+          <strong>Two independent paths</strong>
+          Blue begins on Travel. Teal begins at Home. Their shared center is the splice, not a decorative knot.
+        </div>
+        <div class="master-wrap"><svg><use href="#mark-b-color"/></svg></div>
+        <div class="note right">
+          <strong>One controlled exchange</strong>
+          In color, direction is visible. In monochrome, the same silhouette becomes a precise crossing that survives system tinting.
+        </div>
+      </div>
+      <div class="strip">
+        <div class="cell">
+          <div class="label">Adaptive masks</div>
+          <div class="masks">
+            <div class="app-icon circle"><svg><use href="#mark-b-color"/></svg></div>
+            <div class="app-icon squircle"><svg><use href="#mark-b-color"/></svg></div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="label">Browser tab · dark</div>
+          <div class="tab"><svg><use href="#mark-b-color"/></svg><span>FlowSplice Travel</span></div>
+        </div>
+        <div class="cell">
+          <div class="label">Themed monochrome</div>
+          <div class="mono">
+            <div class="mono-icon" style="width:72px;height:72px"><svg><use href="#mark-b-mono"/></svg></div>
+            <div class="mono-icon" style="width:32px;height:32px"><svg><use href="#mark-b-mono"/></svg></div>
+            <div class="mono-icon" style="width:16px;height:16px"><svg><use href="#mark-b-mono"/></svg></div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="label">Palette</div>
+          <div class="palette">
+            <div class="swatch" style="background:#3177f6">3177F6</div>
+            <div class="swatch" style="background:#00a88f">00A88F</div>
+            <div class="swatch" style="background:#07110f">07110F</div>
+            <div class="swatch" style="background:#f4f7f5;color:#40514b">F4F7F5</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

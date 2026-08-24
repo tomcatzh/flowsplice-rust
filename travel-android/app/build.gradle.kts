@@ -20,7 +20,7 @@ android {
         applicationId = "io.zxf.flowsplice.travel"
         minSdk = 34
         targetSdk = 37
-        versionCode = 5
+        versionCode = 6
         versionName = "0.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
