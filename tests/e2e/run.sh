@@ -75,6 +75,17 @@ else
     "${repo_root}"
 fi
 
+expected_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${repo_root}/Cargo.toml" | head -n 1)"
+for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent; do
+  actual_version="$(docker run --rm "${FLOWSPLICE_E2E_IMAGE}" "/usr/local/bin/${binary}" --version)"
+  if [[ "${actual_version}" != "${binary} ${expected_version}" ]]; then
+    printf 'E2E image contains stale %s: expected %s, got %s\n' \
+      "${binary}" "${expected_version}" "${actual_version}" >&2
+    exit 1
+  fi
+done
+printf '{"checkpoint": "e2e-image-version", "version": "%s"}\n' "${expected_version}"
+
 binary_audit_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-e2e-binary-audit.XXXXXX")"
 binary_audit_container="$(docker create "${FLOWSPLICE_E2E_IMAGE}" /bin/true)"
 docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-homeagent" \
@@ -290,6 +301,44 @@ teardown
 trap finish EXIT
 docker compose -f "${compose_file}" up -d echo echo2 relay1 relay2 server homeagent homeagent2
 
+wait_for_relay_control_mode() {
+  local relay_id="$1"
+  local connection_mode="$2"
+  for _ in $(seq 1 60); do
+    if docker compose -f "${compose_file}" logs --no-color server 2>/dev/null \
+      | grep -F "relay_id=${relay_id}" \
+      | grep -F "connection_mode=${connection_mode}" \
+      | grep -Fq 'relay control connected'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Server did not establish ${connection_mode} control for ${relay_id}" >&2
+  exit 1
+}
+
+wait_for_relay_control_mode relay-1 passive
+wait_for_relay_control_mode relay-2 active
+printf '%s\n' '{"checkpoint": "passive-and-active-relay-control"}'
+
+wait_for_complete_relay_directory() {
+  local service="$1"
+  for _ in $(seq 1 60); do
+    if docker compose -f "${compose_file}" logs --no-color "${service}" 2>/dev/null \
+      | grep -F 'event="relay_directory_applied"' \
+      | grep -Fq 'relay_count=2'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${service} did not receive the complete in-memory Relay directory" >&2
+  exit 1
+}
+
+wait_for_complete_relay_directory relay1
+wait_for_complete_relay_directory relay2
+printf '%s\n' '{"checkpoint": "complete-relay-directory-broadcast"}'
+
 configure_travel_mapping() {
   local service="$1"
   local token="$2"
@@ -499,7 +548,7 @@ docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
   --travel-id dynamic-home-issued-travel \
   --home-id "${dynamic_global_home_id}" \
   --install-dir /dynamic-travel \
-  --bootstrap-config /config/travel-bootstrap.toml \
+  --relay relay2:8443 \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
   --test-password-file /dynamic-travel/test-password.txt \
@@ -546,7 +595,7 @@ docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
   --travel-id first-remote-e2e \
   --home-id home-1 \
   --install-dir /first-travel \
-  --bootstrap-config /config/travel-bootstrap.toml \
+  --relay relay2:8443 \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-first-remote-administrator-token \
   --test-password-file /first-travel/test-password.txt \
@@ -670,7 +719,7 @@ docker compose -f "${compose_file}" run --no-deps --rm travelagent \
   --travel-id travel-1 \
   --home-id home-1 \
   --install-dir /travel \
-  --bootstrap-config /config/travel-bootstrap.toml \
+  --relay relay2:8443 \
   --test-password-file /travel/test-password.txt \
   --wait-timeout-secs 180 \
   >"${generated_dir}/travel/enroll.log" 2>&1 &

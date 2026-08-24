@@ -9,6 +9,7 @@ sh -n "${repo_root}/openwrt/control/postinst"
 sh -n "${repo_root}/openwrt/control/prerm"
 python3 -m json.tool "${repo_root}/openwrt/root/usr/share/luci/menu.d/luci-app-flowsplice.json" >/dev/null
 python3 -m json.tool "${repo_root}/openwrt/root/usr/share/rpcd/acl.d/luci-app-flowsplice.json" >/dev/null
+python3 -m json.tool "${repo_root}/openwrt/root/usr/share/acl.d/flowsplice.json" >/dev/null
 node -e 'new Function(require("fs").readFileSync(process.argv[1], "utf8"))' \
   "${repo_root}/openwrt/root/www/luci-static/resources/view/flowsplice.js"
 python3 "${repo_root}/tests/openwrt/test_ipk.py"

@@ -1,26 +1,21 @@
-# FlowSplice 0.2 Travel 快速开始
+# FlowSplice 0.3 Travel 快速开始
 
 ## 准备
 
-使用 0.2 Travel 正式包。`flowsplice-travelagent` 是与具体部署无关的通用二进制；部署根公钥、签名 deployment trust、Management CA 和 Relay bootstrap 地址都不在二进制里，而是由包内独立配置提供。
+使用 0.3 Travel 公开包。`flowsplice-travelagent` 是与具体部署无关的通用二进制；公开包不含任何真实部署配置、根公钥、签名 deployment trust、Management CA、IP 或子域名。
 
-包内必须包含：
+公开包只允许包含：
 
 ```text
-flowsplice-travel-0.2.0-macos-arm64/
+flowsplice-travel-0.3.0-macos-arm64/
 ├── bin/flowsplice-travelagent
-├── travel-bootstrap.toml
-├── deployment-root.pub
-├── deployment-trust.json
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS
 ```
 
-`travel-bootstrap.toml` 明确配置根公钥文件、签名 trust 文件、首次联系的 Relay 列表和本地 UI 地址。程序先用根公钥验证 `deployment-trust.json`，再从已验证 trust 中读取 Management CA 建立首次 TLS；不会信任 TOML 中裸放的 CA 内容。
-
 macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。免费签名是 ad-hoc codesign：它能校验文件未被签名后修改，但不提供 Apple Developer ID 身份，也没有 notarization。若文件经浏览器下载而被 Gatekeeper 隔离，仍可能需要在 macOS 的“隐私与安全性”页面由用户明确允许。
 
-ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256，或至少核对 `deployment-root.pub` 的 SHA-256 指纹；不要只依赖同一个下载包内自带的校验值。
+ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，应通过另一个可信渠道核对整个包的 SHA-256。
 
 解包后进入包目录，验证全部文件和 ad-hoc 签名：
 
@@ -32,22 +27,23 @@ codesign --verify --strict --verbose=2 ./bin/flowsplice-travelagent
 
 ## 第一次远程注册：开始时不需要 TOML 和 cert 目录
 
-Travel 只提供 `enroll-remote` 这一条身份注册路径，不提供申请文件导出或签发结果文件导入命令。
+Travel 使用 `enroll-remote` 完成身份注册。
 
-选择一个全新的 Travel ID 和一个空安装目录。首次注册只需要 Travel ID、要申请的 Home ID 和安装目录：
+选择一个全新的 Travel ID、要申请的 Home ID、一个空安装目录，以及任意可达 Relay 的 Management 地址：
 
 ```bash
 mkdir -m 700 ./my-travel
 ./bin/flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
-  --install-dir ./my-travel
+  --install-dir ./my-travel \
+  --relay relay.example:8443
 ```
 
 命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
 
 1. 在 Travel 本机生成两把独立、加密保存的 Management/Business 私钥；
-2. 读取 `travel-bootstrap.toml`，验证根签名 trust，并依次尝试配置中的 Relay 建立首次注册 TLS 通道；
+2. 从指定 Relay 取得公开的首次联系材料，验证根签名 trust，再使用已验证的 Management CA 重新连接；
 3. 把只有公钥和 proof-of-possession 的 enrollment 请求送到指定 Home；
 4. 在终端显示 `Home verification code`；
 5. 保持运行并重试，等待 Home 上的人工批准。
@@ -127,7 +123,7 @@ my-travel/
 
 不要把 Home SPKI、完整 Relay 授权名单或密码手工写进 TOML。`[[seed_relays]]` 只是首次取得签名目录的联系地址。Travel 会把历史上从有效签名目录中验证过的 Relay 长期保存在 `travel-state.redb`，以后重启时把它们也当成 bootstrap 候选；旧记录永远不能代替新的 Server 签名目录授权。
 
-首次 enrollment 具体连接哪个 Relay，完全由 `travel-bootstrap.toml` 的 `bootstrap_relays` 决定。程序会规范化、排序、去重后逐一轮询；一个 Relay 失败会继续尝试下一个。Relay 地址变化只修改并重新分发配置文件，不重新编译二进制。
+首次 enrollment 只连接命令行 `--relay` 指定的 Relay。正常运行后，Relay 会在已认证的双向控制会话上报告当前监听端点：被动 Relay 由 Server 通过固定种子连接，主动 Relay 自行连接 Server。IPv4/IPv6 地址变化只更新签名目录，不需要 DDNS，也不需要修改 Travel 配置；如首次联系地址失效，重新运行 enrollment 并指定另一个 Relay 即可。
 
 业务映射不再写入 TOML。在 `http://127.0.0.1:9080` 的“Service mappings”区域选择 Home 与业务，填写本地监听地址（例如 `127.0.0.1:10080`）并创建。修改已有监听的地址或端口后点击 Apply，会先确认新端口能够绑定，再原子写入 `travel-state.redb` 并切换监听；无需重启。若新端口无效或已占用，旧监听和持久状态保持不变。Remove 会停止该本地监听并删除其持久记录。
 
@@ -139,4 +135,4 @@ my-travel/
 
 删除/撤销凭据必须在签发它的 Home 页面执行，并再次输入 Home 签发密码。错误密码不改变状态。成功操作产生不可回滚的签名撤销记录；界面隐藏活动凭据不代表删除审计与防回滚历史。
 
-Home 后台只提供远程审批，不再提供上传申请文件、下载签发结果的手工入口。首次注册和换发都通过现有控制连接自动传输公开申请与签名响应。
+Home 后台只提供远程审批。首次注册和换发都通过现有控制连接自动传输公开申请与签名响应。

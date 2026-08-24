@@ -1,0 +1,8 @@
+{
+	"user": "flowsplice",
+	"access": {
+		"network.interface.*": {
+			"methods": [ "status" ]
+		}
+	}
+}

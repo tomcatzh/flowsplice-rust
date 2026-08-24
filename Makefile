@@ -36,11 +36,12 @@ policy-check:
 	bash ./tests/check-travel-macos-package.sh
 	bash ./tests/check-release-feature-gates.sh
 	bash ./tests/check-runtime-configuration-boundary.sh
+	python3 ./tests/test_package_privacy.py
 
 openwrt-ipk:
 	python3 scripts/build-openwrt-ipk.py \
 		--server dist/linux-arm64/flowsplice-server \
 		--relay dist/linux-arm64/flowsplice-relay \
 		--architecture aarch64_generic \
-		--version 0.2.0 \
+		--version 0.3.0 \
 		--output-dir dist/openwrt

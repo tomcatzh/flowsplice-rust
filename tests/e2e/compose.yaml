@@ -19,6 +19,7 @@ services:
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay.toml"]
     environment:
       RUST_LOG: flowsplice_relay=debug,info
+      FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR: 10.0.2.2:18447
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro

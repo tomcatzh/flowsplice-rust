@@ -182,6 +182,7 @@ fn begin_enrollment(
         install_dir: PathBuf::from(install_dir),
         bootstrap_config: None,
         selected_relay: (!selected_relay.is_empty()).then(|| selected_relay.to_owned()),
+        ui_listen: None,
         private_key_password: password.to_owned(),
         wait_timeout_secs: 900,
     };

@@ -2,7 +2,7 @@
 
 本文用于从零建立一套新的 FlowSplice 0.2 部署：离线部署根、两套 CA、Server、至少一个 Relay、首个 Global Home、首个 Travel，以及后续 Home 的单命令加入。它是公开文档，所有名称、域名、地址和目录均为占位示例；不要把生产密码、私钥、真实节点清单或临时工作目录提交到仓库。
 
-这不是 0.1.1 的滚动升级指南。0.2 使用协议 v2，Server 不再有业务数据端口，也不允许 0.1.1/0.2.0 数据面混跑。
+这不是旧版本的滚动升级指南。0.3 使用协议 v2，Server 不再有业务数据端口，也不允许旧数据面与 0.3 混跑。
 
 ## 1. 最终拓扑与开放端口
 
@@ -198,7 +198,7 @@ issue_leaf home-1-business home home-1 home-1.example.net \
   serverAuth business-ca
 ```
 
-删除 CSR、扩展临时文件和 CA serial 临时文件前，先验证每张证书。Travel 和后续 Home 不在这里预签叶证书：它们在自己的机器生成私钥和 CSR，经人工批准后取得证书。
+主动 Relay 连接 Server 时复用自身已有的 `serverAuth` 端点身份；Server 只对配置为 `active` 的相同 Relay 角色和 ID 接受这种连接。被动模式仍由 Server 连接 Relay，并按 TLS 服务端身份验证同一张证书。两种方向在握手后使用同一套双向控制协议，因此 Relay 证书不需要 `clientAuth`，升级也不需要重签。删除 CSR、扩展临时文件和 CA serial 临时文件前，先验证每张证书。Travel 和后续 Home 不在这里预签叶证书：它们在自己的机器生成私钥和 CSR，经人工批准后取得证书。
 
 ## 7. 生成并签署 deployment trust
 
@@ -322,13 +322,18 @@ chmod 600 state/server-authorization.json state/server-control-generation.json
 - `control_signing_key` 与 trust 中 `server_control_keys` 的公钥一致。
 - `travel_authorization_state`、`control_generation_state` 和 `state_store` 使用持久目录。
 - `[[homes]]` 至少列出根信任中的 `home-1`。
-- 每个 `[[relays]]` 的 `id`、`management_addr`、`data_public_addr` 与对应 Relay 完全一致。
+- 每个 `[[relays]]` 明确填写 `connection_mode`。`passive` 还需要一个固定 `connect_addr` 供 Server 主动连接；`active` 只填写 Relay `id`，Server 不保存 Relay IP 地址。
 - `ui_listen` 保持 loopback。
 
 ### Relay 必填关系
 
 - `management_listen = "0.0.0.0:8443"`，`data_listen = "0.0.0.0:8444"`。
-- `data_public_addr` 是 Travel 与 Home 真正可达的公网地址。
+- 不配置 `management_public_addr` 或 `data_public_addr`。精确监听地址直接用于注册；通配监听会从连向 Server 的已认证连接自动取得匹配的本机地址。
+- OpenWrt Relay 额外设置 `openwrt_network`：固定 LAN 监听可直接注册该精确地址，WAN IPv4/IPv6 通配监听从 netifd/ubus 读取当前地址并绑定其 `l3_device`。
+- `connection_mode = "passive"` 时由 Server 连接 Relay，不配置 `server_control_addr`；适合固定公网 IP 的 VPS。
+- `connection_mode = "active"` 时 Relay 使用 `server_control_addr` 主动连接 Server，并把同一条认证连接作为完整控制会话；适合 OpenWrt LAN/WAN6 Relay。
+- 无论连接方向如何，发布地址都来自 Relay 在已认证控制会话上的上报；被动模式的 `connect_addr` 只是种子，不会作为发布地址。
+- Relay 上线、地址变化、撤销或掉线时，Server 都重新生成有代次、按 ID 排序的完整内存 Relay 目录，并把全量替换快照通知所有在线 Relay；Relay 原子替换本地内存目录，不拼接局部增量。目录变化与签名 Travel 快照共用持久的 `control_generation_state` 高水位，Server 重启后代次只能前进，不能回退。
 - Relay 叶证书 URI 必须是 `flowsplice://identity/relay/<relay-id>`。
 - `server_spki_pins` 是 Server 叶证书的 SHA-256 SPKI pin。
 - `travel_authorization_cache` 和 `state_store` 各 Relay 独立，不共享文件。
@@ -379,9 +384,9 @@ curl --fail http://127.0.0.1:9081/
 
 macOS 用 `lsof -nP -iTCP -sTCP:LISTEN` 代替 `ss`。确认 Server 只有控制端口和 loopback UI；Relay 有 management/data 与 loopback UI；Home 只有 loopback UI 和主动出站连接。
 
-## 11. 构建与部署无关的正式程序和独立配置包
+## 11. 构建公开样例包与私有部署材料
 
-正式 Home/Travel/Server/Relay 可执行文件不得包含 deployment root、CA、节点 ID、IP、域名、端口或 Relay 列表。所有部署值都必须位于独立配置文件；修改配置不得重新编译程序。
+正式 Home/Travel/Server/Relay 可执行文件不得包含 deployment root、CA、节点 ID、IP、子域名、端口或 Relay 列表。所有真实部署值都按密钥级信息管理，必须位于公开仓库之外的私有配置中；主域公开绝不意味着任何子域可公开，也不得从一个公开名称推断同级或下级名称。
 
 先构建一次通用程序：
 
@@ -390,21 +395,22 @@ export FLOWSPLICE_DOCKER_PULL=false
 ./scripts/build-release.sh
 ```
 
-再分别准备 Home 和 Travel 的发布配置目录。两个目录都包含 `deployment-root.pub` 和同一份根签名 `deployment-trust.json`，但 bootstrap TOML 各自保存角色需要的拓扑：
+公开 Home 和 Travel 包由仓库内的 `*.example.toml` 构建，只使用 IANA 保留示例域名：
 
 ```text
-package-config/home/
-├── home-bootstrap.toml
-├── deployment-root.pub
-└── deployment-trust.json
+flowsplice-home2-0.3.0-macos-arm64/
+├── bin/flowsplice-homeagent
+├── home-bootstrap.example.toml
+├── QUICK_START.zh-CN.md
+└── SHA256SUMS
 
-package-config/travel/
-├── travel-bootstrap.toml
-├── deployment-root.pub
-└── deployment-trust.json
+flowsplice-travel-0.3.0-macos-arm64/
+├── bin/flowsplice-travelagent
+├── QUICK_START.zh-CN.md
+└── SHA256SUMS
 ```
 
-`home-bootstrap.toml`：
+`home-bootstrap.example.toml`：
 
 ```toml
 deployment_root_public_key = "deployment-root.pub"
@@ -415,40 +421,34 @@ server_control_port = 7443
 ui_listen = "127.0.0.1:9082"
 ```
 
-`travel-bootstrap.toml`：
-
-```toml
-deployment_root_public_key = "deployment-root.pub"
-deployment_trust = "deployment-trust.json"
-bootstrap_relays = ["relay-1.example.net:8443"]
-ui_listen = "127.0.0.1:9080"
-```
-
-构建配置化 macOS 包：
+构建公开、部署中立的 macOS 样例包：
 
 ```bash
-export FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/home/home-bootstrap.toml"
-export FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE="$PWD/package-config/travel/travel-bootstrap.toml"
 ./scripts/build-home2-macos-package.sh
 ./scripts/build-travel-macos-package.sh
 ```
+
+公开构建脚本不接受任何操作员配置输入。它们只打包受控样例，并以成员白名单拒绝实际 bootstrap 文件、deployment root、signed trust、证书、密钥和凭据；样例检查只允许 IANA 保留示例域名，拒绝所有 IP 和非示例主机名，而且错误信息不回显被拒绝的值。
+
+Home 的真实部署仍需在被版本控制忽略的私有目录中复制样例为 `home-bootstrap.toml`，并通过私密渠道放入 `deployment-root.pub` 和 `deployment-trust.json`。这些私有材料只能在目标机器或受控私有分发流程中组合，不得进入 Git、构建日志、CI 日志、Issue、PR、公开 Release、截图、公共 Wiki 或聊天输出。Travel 首次注册不需要这些文件，只需人工输入一个可达 Relay 地址。
 
 仓库的 Dockerfile 还必须把 frontend 和所有基础镜像锁到不可变 digest。`FLOWSPLICE_DOCKER_PULL=false` 禁止主动更新；如果本机缺少该 digest，应停止并安排一次明确的缓存准备，不能在普通发布或部署时临时下载新层。
 
 macOS 文件使用免费的 ad-hoc codesign 与稳定的 `io.zxf.flowsplice.*` identifier。它能校验签名后未被修改，但没有 Apple Developer ID 身份，也未 notarize；公开分发时必须如实说明 Gatekeeper 限制。
 
-记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。客户端包应包含公开 bootstrap TOML、root 公钥和签名 trust，但不得包含 `*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。用 `strings` 检查二进制不得出现配置中的 root、公网 Relay、Server ID/域名或 CA PEM。
+记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。公开客户端包只能包含通用二进制、Quick Start、`*.example.toml` 和内部校验文件；不得包含真实配置、root 公钥、签名 trust、`*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。私有发布前用不回显原值的检查验证二进制不得出现配置中的 root、Relay 地址、Server ID/主机名或 CA PEM。
 
 ## 12. 首个 Travel 从空目录注册
 
-Travel 机器不预先创建运行期 TOML 或 cert；从包含 `travel-bootstrap.toml` 的包目录执行：
+Travel 机器不预先创建运行期 TOML 或 cert；从公开包目录执行：
 
 ```bash
 mkdir -m 700 ./my-travel
 ./flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
-  --install-dir ./my-travel
+  --install-dir ./my-travel \
+  --relay relay.example:8443
 ```
 
 Travel 本机输入并确认自己的私钥密码，终端随后保持等待。在首个 Global Home 本机打开 `http://127.0.0.1:9081`，核对校验码、选择最小授权范围与有效期、点击批准并输入 Home 签发密码。无需 SSH、远程打开 Home 页面或人工传 enrollment 文件。

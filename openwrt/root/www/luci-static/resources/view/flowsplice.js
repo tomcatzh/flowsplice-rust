@@ -199,7 +199,7 @@ return view.extend({
 		required(s.option(form.Value, 'id', _('Home ID')));
 
 		s = m.section(form.GridSection, 'relay', _('Local Relay instances'),
-			_('Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle.'));
+			_('Create separate named instances for each entry path. Every instance binds its OpenWrt network device, discovers the matching IPv4 or IPv6 address, and reports both listener endpoints to Server automatically.'));
 		s.addremove = true;
 		s.nodescriptions = true;
 		s.addbtntitle = _('Add Relay instance');
@@ -207,13 +207,22 @@ return view.extend({
 		o.default = o.disabled;
 		o.rmempty = false;
 		required(s.option(form.Value, 'id', _('Relay ID')));
+		o = required(s.option(form.ListValue, 'connection_mode', _('Connection mode')));
+		o.value('active', _('Active (Relay connects to Server)'));
+		o.value('passive', _('Passive (Server connects to Relay)'));
+		o.default = 'active';
 		required(s.option(form.Value, 'management_listen', _('Management listen'))).placeholder = '192.0.2.1:8443';
 		o = required(s.option(form.Value, 'data_listen', _('Data listen')));
 		o.modalonly = true;
-		o = required(s.option(form.Value, 'data_public_addr', _('Advertised data address')));
+		o = required(s.option(form.Value, 'openwrt_network', _('OpenWrt network')));
+		o.placeholder = 'wan6';
 		o.modalonly = true;
 		o = required(s.option(form.Value, 'server_id', _('Server ID')));
 		o.modalonly = true;
+		o = s.option(form.Value, 'server_control_addr', _('Server control address'));
+		o.placeholder = '127.0.0.1:7443';
+		o.modalonly = true;
+		o.depends('connection_mode', 'active');
 		[ [ 'cert', _('Management certificate') ], [ 'key', _('Management private key') ], [ 'management_ca', _('Management CA') ], [ 'deployment_root_public_key', _('Deployment root public key') ], [ 'deployment_trust', _('Signed deployment trust') ] ].forEach(function(item) {
 			var pathOption = required(s.option(form.Value, item[0], item[1]));
 			pathOption.modalonly = true;
@@ -236,7 +245,7 @@ return view.extend({
 		});
 
 		s = m.section(form.GridSection, 'relay_endpoint', _('Server Relay directory'),
-			_('These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID.'));
+			_('Choose who initiates each authenticated control session. Passive Relays require one stable management seed; active Relays connect to Server and require no stored Relay address. Published management and data endpoints always come from the authenticated Relay.'));
 		s.addremove = true;
 		s.nodescriptions = true;
 		s.addbtntitle = _('Add directory entry');
@@ -244,8 +253,13 @@ return view.extend({
 		o.default = o.enabled;
 		o.rmempty = false;
 		required(s.option(form.Value, 'id', _('Relay ID')));
-		required(s.option(form.Value, 'management_addr', _('Management address')));
-		required(s.option(form.Value, 'data_public_addr', _('Advertised data address')));
+		o = required(s.option(form.ListValue, 'connection_mode', _('Connection mode')));
+		o.value('active', _('Active (Relay connects to Server)'));
+		o.value('passive', _('Passive (Server connects to Relay)'));
+		o.default = 'active';
+		o = s.option(form.Value, 'connect_addr', _('Passive management seed'));
+		o.placeholder = '192.0.2.10:8443';
+		o.depends('connection_mode', 'passive');
 
 		return m.render();
 	}

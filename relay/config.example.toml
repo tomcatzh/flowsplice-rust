@@ -1,8 +1,11 @@
 id = "relay-1"
+connection_mode = "active"
 management_listen = "0.0.0.0:8443"
 data_listen = "0.0.0.0:8444"
-data_public_addr = "relay.example.net:8444"
 server_id = "server-1"
+server_control_addr = "server.example.net:7443"
+# Active mode reuses the Relay serverAuth endpoint identity when dialing Server. Passive mode omits
+# server_control_addr and waits for Server. Existing Relay leaves need no clientAuth or reissuance.
 cert = "/etc/flowsplice/relay.crt"
 key = "/etc/flowsplice/relay.key"
 management_ca = "/etc/flowsplice/management-ca.crt"

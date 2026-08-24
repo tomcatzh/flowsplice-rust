@@ -39,16 +39,17 @@ config_get() {
 		home_1.id) resolved='home-1' ;;
 		home_2.id) resolved='home-2' ;;
 		relay_1.id) resolved='relay-1' ;;
-		relay_1.management_addr) resolved='relay-1.example:8443' ;;
-		relay_1.data_public_addr) resolved='relay-1.example:8444' ;;
+		relay_1.connection_mode) resolved='passive' ;;
+		relay_1.connect_addr) resolved='192.0.2.10:8443' ;;
 		relay_2.id) resolved='relay-2' ;;
-		relay_2.management_addr) resolved='relay-2.example:8443' ;;
-		relay_2.data_public_addr) resolved='relay-2.example:8444' ;;
+		relay_2.connection_mode) resolved='active' ;;
 		relay_test.id) resolved='relay-test' ;;
-		relay_test.management_listen) resolved='0.0.0.0:8443' ;;
-		relay_test.data_listen) resolved='0.0.0.0:8444' ;;
-		relay_test.data_public_addr) resolved='relay-test.example:8444' ;;
+		relay_test.connection_mode) resolved='active' ;;
+		relay_test.management_listen) resolved='192.0.2.1:8443' ;;
+		relay_test.data_listen) resolved='192.0.2.1:8444' ;;
+		relay_test.openwrt_network) resolved='lan' ;;
 		relay_test.server_id) resolved='server-1' ;;
+		relay_test.server_control_addr) resolved='server.example:7443' ;;
 		relay_test.cert) resolved='/etc/flowsplice/relay.crt' ;;
 		relay_test.key) resolved='/etc/flowsplice/relay.key' ;;
 		relay_test.management_ca) resolved='/etc/flowsplice/management-ca.crt' ;;
@@ -62,6 +63,26 @@ config_get() {
 		relay_test.max_pending_routes) resolved='256' ;;
 		relay_test.max_management_connections) resolved='1024' ;;
 		relay_test.max_data_connections) resolved='2048' ;;
+		relay_dynamic.id) resolved='relay-dynamic' ;;
+		relay_dynamic.connection_mode) resolved='active' ;;
+		relay_dynamic.management_listen) resolved='[::]:8443' ;;
+		relay_dynamic.data_listen) resolved='[::]:8444' ;;
+		relay_dynamic.openwrt_network) resolved='wan6' ;;
+		relay_dynamic.server_id) resolved='server-1' ;;
+		relay_dynamic.server_control_addr) resolved='server.example:7443' ;;
+		relay_dynamic.cert) resolved='/etc/flowsplice/relay.crt' ;;
+		relay_dynamic.key) resolved='/etc/flowsplice/relay.key' ;;
+		relay_dynamic.management_ca) resolved='/etc/flowsplice/management-ca.crt' ;;
+		relay_dynamic.deployment_root_public_key) resolved='/etc/flowsplice/deployment-root.pub' ;;
+		relay_dynamic.deployment_trust) resolved='/etc/flowsplice/deployment-trust.json' ;;
+		relay_dynamic.travel_authorization_cache) resolved='/etc/flowsplice/relay-auth.json' ;;
+		relay_dynamic.state_store) resolved='/etc/flowsplice/relay-state.redb' ;;
+		relay_dynamic.ui_listen) resolved='127.0.0.1:9084' ;;
+		relay_dynamic.handshake_timeout_secs) resolved='10' ;;
+		relay_dynamic.route_ttl_secs) resolved='15' ;;
+		relay_dynamic.max_pending_routes) resolved='256' ;;
+		relay_dynamic.max_management_connections) resolved='1024' ;;
+		relay_dynamic.max_data_connections) resolved='2048' ;;
 	esac
 	eval "$variable=\$resolved"
 }
@@ -75,6 +96,7 @@ config_list_foreach() {
 	local section="$1" option="$2" callback="$3" value
 	case "$section.$option" in
 		relay_test.server_spki_pin) set -- '0123456789abcdef' 'fedcba9876543210' ;;
+		relay_dynamic.server_spki_pin) set -- '0123456789abcdef' 'fedcba9876543210' ;;
 		*) set -- ;;
 	esac
 	for value in "$@"; do "$callback" "$value"; done
@@ -133,32 +155,58 @@ class RendererTest(unittest.TestCase):
         self.assertEqual([home["id"] for home in config["homes"]], ["home-1", "home-2"])
         self.assertTrue(all(set(home) == {"id"} for home in config["homes"]))
         self.assertEqual([relay["id"] for relay in config["relays"]], ["relay-1", "relay-2"])
+        self.assertEqual(
+            config["relays"],
+            [
+                {
+                    "id": "relay-1",
+                    "connection_mode": "passive",
+                    "connect_addr": "192.0.2.10:8443",
+                },
+                {"id": "relay-2", "connection_mode": "active"},
+            ],
+        )
         self.assertNotIn("travel_authorities", config)
         self.assertEqual(config["control_snapshot_ttl_secs"], 120)
         self.assertEqual(config["deployment_root_public_key"], "/etc/flowsplice/deployment-root.pub")
         self.assertEqual(config["state_store"], "/etc/flowsplice/server-state.redb")
         self.assertEqual(config["ui_listen"], "127.0.0.1:9083")
         self.assertNotIn("data_listens", config)
-        self.assertEqual(
-            [relay["data_public_addr"] for relay in config["relays"]],
-            ["relay-1.example:8444", "relay-2.example:8444"],
-        )
 
     def test_server_render_fails_without_a_home(self) -> None:
         result = self.run_renderer("server", no_homes=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("at least one home section", result.stderr)
 
-    def test_relay_renders_direct_data_plane_and_redb_state(self) -> None:
+    def test_relay_renders_exact_ipv4_listener_without_duplicate_advertised_address(self) -> None:
         result = self.run_renderer("relay", "relay_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         output = result.output_path  # type: ignore[attr-defined]
         config = tomllib.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(config["data_public_addr"], "relay-test.example:8444")
+        self.assertEqual(config["management_listen"], "192.0.2.1:8443")
+        self.assertEqual(config["connection_mode"], "active")
+        self.assertEqual(config["data_listen"], "192.0.2.1:8444")
+        self.assertEqual(config["openwrt_network"], "lan")
+        self.assertNotIn("management_public_addr", config)
+        self.assertNotIn("data_public_addr", config)
+        self.assertEqual(config["server_control_addr"], "server.example:7443")
         self.assertEqual(config["state_store"], "/etc/flowsplice/relay-state.redb")
         self.assertEqual(config["ui_listen"], "127.0.0.1:9084")
         self.assertEqual(config["server_spki_pins"], ["0123456789abcdef", "fedcba9876543210"])
         self.assertNotIn("server_data_addr", config)
+
+    def test_relay_renders_dynamic_openwrt_network_without_public_addresses(self) -> None:
+        result = self.run_renderer("relay", "relay_dynamic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.output_path  # type: ignore[attr-defined]
+        config = tomllib.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(config["management_listen"], "[::]:8443")
+        self.assertEqual(config["connection_mode"], "active")
+        self.assertEqual(config["data_listen"], "[::]:8444")
+        self.assertEqual(config["openwrt_network"], "wan6")
+        self.assertEqual(config["server_control_addr"], "server.example:7443")
+        self.assertNotIn("management_public_addr", config)
+        self.assertNotIn("data_public_addr", config)
 
 
 if __name__ == "__main__":

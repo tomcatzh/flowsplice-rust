@@ -89,6 +89,7 @@ static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
 });
 
 #[derive(Parser)]
+#[command(name = "flowsplice-travelagent", version)]
 struct Cli {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "travelagent.toml")]
     config: PathBuf,
@@ -114,8 +115,16 @@ struct EnrollRemoteArgs {
     home_id: String,
     #[arg(long)]
     install_dir: PathBuf,
-    #[arg(long, default_value = "travel-bootstrap.toml")]
-    bootstrap_config: PathBuf,
+    /// Relay management address used for first contact, for example relay.example:8443.
+    #[arg(
+        long,
+        required_unless_present = "bootstrap_config",
+        conflicts_with = "bootstrap_config"
+    )]
+    relay: Option<String>,
+    /// Legacy private bootstrap file accepted for compatibility with existing automation.
+    #[arg(long, conflicts_with = "relay")]
+    bootstrap_config: Option<PathBuf>,
     #[arg(long, default_value_t = 900)]
     wait_timeout_secs: u64,
     #[cfg(feature = "e2e-remote-ui")]
@@ -209,6 +218,8 @@ pub struct RemoteEnrollmentOptions {
     pub install_dir: PathBuf,
     pub bootstrap_config: Option<PathBuf>,
     pub selected_relay: Option<String>,
+    /// Listener written to a generated CLI config. Native clients may leave this unset.
+    pub ui_listen: Option<String>,
     pub private_key_password: String,
     pub wait_timeout_secs: u64,
     #[cfg(feature = "e2e-remote-ui")]
@@ -954,12 +965,25 @@ async fn run_remote_enrollment_cli(args: EnrollRemoteArgs) -> Result<()> {
     } else {
         prompt_new_private_key_password()?
     };
+    let ui_listen = if args.bootstrap_config.is_none() {
+        #[cfg(feature = "e2e-remote-ui")]
+        if args.test_allow_remote_listen {
+            Some("0.0.0.0:9080".to_owned())
+        } else {
+            Some("127.0.0.1:9080".to_owned())
+        }
+        #[cfg(not(feature = "e2e-remote-ui"))]
+        Some("127.0.0.1:9080".to_owned())
+    } else {
+        None
+    };
     let options = RemoteEnrollmentOptions {
         travel_id: args.travel_id,
         home_id: args.home_id,
         install_dir: args.install_dir,
-        bootstrap_config: Some(args.bootstrap_config),
-        selected_relay: None,
+        bootstrap_config: args.bootstrap_config,
+        selected_relay: args.relay,
+        ui_listen,
         private_key_password: password.to_string(),
         wait_timeout_secs: args.wait_timeout_secs,
         #[cfg(feature = "e2e-remote-ui")]
@@ -1230,7 +1254,7 @@ where
         business_ca: enrollment_dir.join(BUSINESS_CA_FILE),
         state_store: state_store_path.clone(),
         enrollment_work_dir: install_root.join("state/enrollment"),
-        ui_listen: bootstrap.ui_listen,
+        ui_listen: options.ui_listen.unwrap_or(bootstrap.ui_listen),
         #[cfg(feature = "e2e-remote-ui")]
         test_allow_remote_listen: options.test_allow_remote_listen,
         #[cfg(feature = "e2e-remote-ui")]
@@ -3192,12 +3216,12 @@ async fn travel_status(state: &AppState) -> StatusResponse {
     let generation = state.catalog.read().await.generation;
     let directory_generation = state.directory.read().await.generation;
     let mut active_relays: Vec<_> = state.flow_relays.lock().await.values().cloned().collect();
-    active_relays.extend(state.connected_relays.read().await.iter().cloned());
     active_relays.sort();
     active_relays.dedup();
+    let online = !active_relays.is_empty() || !state.connected_relays.read().await.is_empty();
     StatusResponse {
         ok: true,
-        online: !active_relays.is_empty(),
+        online,
         travel_id: state.config.id.clone(),
         uptime_secs: state.started.elapsed().as_secs(),
         active_flows: state.active_flows.load(Ordering::Relaxed),
@@ -3778,7 +3802,7 @@ impl Drop for FlowGuard {
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, extract::Request, http::Method};
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use flowsplice_core::{
         authorization::TrustedTravelAuthority,
         deployment::{
@@ -3808,6 +3832,38 @@ mod tests {
         assert!(subcommands.contains(&"enroll-remote"));
         assert!(!subcommands.contains(&"enroll-init"));
         assert!(!subcommands.contains(&"enroll-import"));
+    }
+
+    #[test]
+    fn remote_enrollment_cli_accepts_a_relay_without_bootstrap_files() {
+        let parsed = Cli::try_parse_from([
+            "flowsplice-travelagent",
+            "enroll-remote",
+            "--travel-id",
+            "travel-1",
+            "--home-id",
+            "home-1",
+            "--install-dir",
+            "/tmp/travel-1",
+            "--relay",
+            "relay.example:8443",
+        ]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn remote_enrollment_cli_requires_one_first_contact_source() {
+        let parsed = Cli::try_parse_from([
+            "flowsplice-travelagent",
+            "enroll-remote",
+            "--travel-id",
+            "travel-1",
+            "--home-id",
+            "home-1",
+            "--install-dir",
+            "/tmp/travel-1",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[test]

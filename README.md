@@ -59,7 +59,7 @@ order, persistent anti-rollback state, compromise boundaries, and implementation
 
 | Layer | Endpoints | Purpose |
 | --- | --- | --- |
-| Management TLS | Home→Server, Server→Relay, Travel→Relay | Mutual authentication for catalogs, heartbeats, route requests, and short-lived secrets. |
+| Management TLS | Home→Server, Relay↔Server, Travel→Relay | Mutual authentication for endpoint registration, catalogs, heartbeats, route requests, and short-lived secrets. |
 | Route admission | Travel→Relay and Home→Relay data sockets | HMAC-SHA256 proves possession of a single-use route/work secret before Relay pairs the sockets. |
 | Business TLS | Travel↔Home through one Relay | End-to-end mutual TLS protects the selected service ID, Flow frames, and business plaintext. |
 
@@ -172,25 +172,27 @@ private keys, bearer tokens, or route/work secrets.
 
 ## Travel Quick Start
 
-Use the deployment-neutral Travel binary together with the package's separate
-`travel-bootstrap.toml`, `deployment-root.pub`, and root-signed `deployment-trust.json`. A fresh
-device does not need a generated runtime TOML or certificate directory before this command:
+The public Travel package contains a deployment-neutral binary and no deployment address or trust
+material. A fresh device needs only a reachable Relay management address; it does not need a
+generated runtime TOML, certificate directory, root public key, or signed trust file before this
+command:
 
 ```bash
 mkdir -m 700 ./my-travel
 ./bin/flowsplice-travelagent enroll-remote \
   --travel-id travel-laptop \
   --home-id home-1 \
-  --install-dir ./my-travel
+  --install-dir ./my-travel \
+  --relay relay.example:8443
 ```
 
-`enroll-remote` is the only Travel identity-enrollment command. There is no request-file export or
-response-file import path.
+`enroll-remote` is the Travel identity-enrollment command.
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
-two encrypted private keys locally, validates the configured signed deployment trust, contacts the
-Relays listed in `travel-bootstrap.toml` using the verified Management CA, and prints a short Home
-verification code. The command remains running while it retries and waits for attended Home approval.
+two encrypted private keys locally, retrieves public first-contact material from the selected Relay,
+verifies the root-signed deployment trust, reconnects with the verified Management CA, and prints a
+short Home verification code. The command remains running while it retries and waits for attended
+Home approval.
 
 Leave `enroll-remote` running on the Travel machine. On the separate machine that runs Home, open the
 issuer page locally at its loopback `ui_listen` address (normally `http://127.0.0.1:9081`). Open the
@@ -209,7 +211,7 @@ my-travel/state/travel-state.redb
 ```
 
 No request or response file is transferred manually. The private keys never leave Travel, and the
-generated TOML contains paths and public Relay addresses but no private-key password. Start it:
+generated TOML contains paths and Relay bootstrap addresses but no private-key password. Start it:
 
 ```bash
 flowsplice-travelagent --config ./my-travel/travelagent.toml
@@ -260,14 +262,13 @@ immediately and prevents a revoked Carrier from reattaching; a local TCP socket 
 recovery can remain until Travel's shorter recovery deadline expires.
 
 An already enrolled and authenticated Travel can request replacement enrollment through its local
-UI without manually transferring request/response files. The request is relayed over the existing
-authenticated control path to the selected Home. A Home operator must still click approval and enter
+UI. The request is relayed over the existing authenticated control path to the selected Home. A Home operator must still click approval and enter
 the issuer password; after the signed response returns, the Travel operator enters the local key
 password to install it. Restart activates the replacement identity; the new process confirms
 installation to Home, after which both durable lifecycle records are retired.
 
-The Home UI exposes only remote approval. It has no request-file upload/download signer; enrollment
-and replacement responses travel through the authenticated control path.
+The Home UI exposes only remote approval; enrollment and replacement responses travel through the
+authenticated control path.
 
 Travel, Relay, and Home keep only locally observed business metrics in five-minute redb buckets and
 serve loopback statistics pages with rolling day/week/month/year report windows. Nodes sign summaries with their
@@ -315,6 +316,15 @@ and a Chinese/English LuCI page. It contains no deployment addresses, credential
 or private regression tooling. Installation is inert by default and does not create WAN firewall
 rules.
 
+Relay listener addresses are never duplicated as manually maintained advertised addresses. An exact
+IPv4 or IPv6 listener registers itself directly; an OpenWrt wildcard listener reads the selected
+logical network through netifd/ubus, binds its current L3 device, and registers the matching current
+address over its authenticated control session. A passive Relay is reached by Server through one
+stable management seed; an active Relay connects to Server and requires no Relay address in Server
+configuration. The reported listener endpoints, never the passive seed, are published. Server keeps
+one sorted, generation-numbered in-memory directory and broadcasts the complete replacement snapshot
+to every connected Relay whenever any Relay is added, updated, withdrawn, or disconnected.
+
 Build release binaries first, then the target-matched IPK:
 
 ```bash
@@ -329,8 +339,11 @@ device ABI and preserve a rollback snapshot before installation.
 ## Release artifacts
 
 `scripts/build-release.sh` builds deployment-neutral executables. It accepts no deployment root,
-CA, Relay, Server identity, address, domain, or port input. Those values belong only in separate
-runtime or package configuration files.
+CA, Relay, Server identity, address, hostname, domain, or port input. Real IP addresses and every
+infrastructure hostname or subdomain not explicitly declassified by its exact name are
+secret-equivalent deployment metadata. Publishing a parent domain declassifies only that exact name,
+never a child or sibling. Deployment names belong only in private runtime configuration outside this
+repository and its public releases.
 
 The script uses the lockfile and produces:
 
@@ -338,15 +351,14 @@ The script uses the lockfile and produces:
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
-`make home2-macos-package` and `make travel-macos-package` build and verify the dedicated
-`dist/macos-arm64/flowsplice-home2-0.2.0-macos-arm64.tar.gz` bundle. It contains the same HomeAgent
-binary used by every Home, a separate bootstrap TOML, root public key, signed deployment trust, the
-Chinese Quick Start, and internal SHA-256 checksums. The matching Travel package has the same
-configuration boundary. Set `FLOWSPLICE_HOME_BOOTSTRAP_CONFIG_FILE` or
-`FLOWSPLICE_TRAVEL_BOOTSTRAP_CONFIG_FILE` to a prepared package configuration whose directory also
-contains `deployment-root.pub` and `deployment-trust.json`. Neither binary contains deployment
-configuration; neither archive may contain a private key, password, generated endpoint certificate,
-credential, or token.
+`make home2-macos-package` and `make travel-macos-package` build and verify public, deployment-neutral
+macOS bundles. Each bundle contains one generic binary, a Chinese Quick Start, an
+deployment-neutral Quick Start, and internal SHA-256 checksums. The
+public builders accept no operator-supplied configuration input. Their package tests use a strict
+member allowlist and reject bootstrap files, deployment roots, signed deployment trust,
+certificates, keys, credentials, tokens, real IP addresses, and non-example hostnames or subdomains.
+Operators enter the Relay address at enrollment time; no deployment material is placed in the
+public bundle.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The release builder explicitly applies and verifies free ad-hoc

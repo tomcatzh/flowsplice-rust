@@ -60,16 +60,20 @@ require_option() {
 }
 
 write_relay_endpoint() {
-	local section="$1" enabled id management_addr data_public_addr
+	local section="$1" enabled id connection_mode connect_addr
 	config_get_bool enabled "$section" enabled 1
 	[ "$enabled" -eq 1 ] || return 0
 	id="$(require_option "$section" id)"
-	management_addr="$(require_option "$section" management_addr)"
-	data_public_addr="$(require_option "$section" data_public_addr)"
+	connection_mode="$(require_option "$section" connection_mode)"
+	case "$connection_mode" in
+		passive) connect_addr="$(require_option "$section" connect_addr)" ;;
+		active) connect_addr= ;;
+		*) die "$section.connection_mode must be passive or active" ;;
+	esac
 	printf '\n[[relays]]\n' >>"$RENDER_OUTPUT"
 	write_string id "$id" "$RENDER_OUTPUT"
-	write_string management_addr "$management_addr" "$RENDER_OUTPUT"
-	write_string data_public_addr "$data_public_addr" "$RENDER_OUTPUT"
+	write_string connection_mode "$connection_mode" "$RENDER_OUTPUT"
+	[ -z "$connect_addr" ] || write_string connect_addr "$connect_addr" "$RENDER_OUTPUT"
 	RELAY_ENDPOINT_COUNT=$((RELAY_ENDPOINT_COUNT + 1))
 }
 
@@ -136,17 +140,24 @@ render_server() {
 
 render_relay() {
 	local section="$1" output="$2" tmp
-	local id management_listen data_listen data_public_addr state_store ui_listen
+	local id connection_mode management_listen data_listen openwrt_network
+	local server_control_addr state_store ui_listen
 	local server_id cert key management_ca deployment_root deployment_trust
 	local authorization_cache handshake route_ttl max_pending max_management_connections max_data_connections
 	tmp="${output}.tmp.$$"
 	trap 'rm -f "$tmp"' EXIT INT TERM
 	: >"$tmp"
 	id="$(require_option "$section" id)"
+	connection_mode="$(require_option "$section" connection_mode)"
 	management_listen="$(require_option "$section" management_listen)"
 	data_listen="$(require_option "$section" data_listen)"
-	data_public_addr="$(require_option "$section" data_public_addr)"
+	openwrt_network="$(require_option "$section" openwrt_network)"
 	server_id="$(require_option "$section" server_id)"
+	case "$connection_mode" in
+		active) server_control_addr="$(require_option "$section" server_control_addr)" ;;
+		passive) server_control_addr= ;;
+		*) die "$section.connection_mode must be passive or active" ;;
+	esac
 	cert="$(require_option "$section" cert)"
 	key="$(require_option "$section" key)"
 	management_ca="$(require_option "$section" management_ca)"
@@ -161,10 +172,12 @@ render_relay() {
 	config_get max_management_connections "$section" max_management_connections 1024
 	config_get max_data_connections "$section" max_data_connections 2048
 	write_string id "$id" "$tmp"
+	write_string connection_mode "$connection_mode" "$tmp"
 	write_string management_listen "$management_listen" "$tmp"
 	write_string data_listen "$data_listen" "$tmp"
-	write_string data_public_addr "$data_public_addr" "$tmp"
+	write_string openwrt_network "$openwrt_network" "$tmp"
 	write_string server_id "$server_id" "$tmp"
+	[ -z "$server_control_addr" ] || write_string server_control_addr "$server_control_addr" "$tmp"
 	write_string cert "$cert" "$tmp"
 	write_string key "$key" "$tmp"
 	write_string management_ca "$management_ca" "$tmp"

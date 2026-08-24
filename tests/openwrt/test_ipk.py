@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -106,6 +107,9 @@ class IpkBuilderTest(unittest.TestCase):
                     init_script,
                 )
                 packaged_config = open_member(data, "./etc/config/flowsplice").decode()
+                process_acl = open_member(
+                    data, "./usr/share/acl.d/flowsplice.json"
+                ).decode()
                 self.assertIn(
                     "option travel_authorization_state '/etc/flowsplice/state/server-authorization.json'",
                     packaged_config,
@@ -115,6 +119,15 @@ class IpkBuilderTest(unittest.TestCase):
                     packaged_config,
                 )
                 self.assertNotIn("option admin_socket", packaged_config)
+                self.assertEqual(
+                    json.loads(process_acl),
+                    {
+                        "user": "flowsplice",
+                        "access": {
+                            "network.interface.*": {"methods": ["status"]}
+                        },
+                    },
+                )
                 self.assertGreater(
                     len(open_member(data, "./usr/lib/lua/luci/i18n/flowsplice.zh-cn.lmo")),
                     100,
@@ -126,9 +139,12 @@ class IpkBuilderTest(unittest.TestCase):
                     {"./control", "./conffiles", "./postinst", "./prerm"},
                 )
                 metadata = open_member(control, "./control").decode()
+                postinst = open_member(control, "./postinst").decode()
                 self.assertIn("Package: flowsplice-openwrt\n", metadata)
                 self.assertIn("Architecture: aarch64_generic\n", metadata)
                 self.assertIn("Depends: luci-base\n", metadata)
+                self.assertIn("pidof ubusd", postinst)
+                self.assertIn("kill -HUP $ubusd_pids", postinst)
 
 
 if __name__ == "__main__":

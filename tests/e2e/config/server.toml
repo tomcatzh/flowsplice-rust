@@ -23,10 +23,9 @@ id = "home-2"
 
 [[relays]]
 id = "relay-1"
-management_addr = "relay1:8443"
-data_public_addr = "relay1:8444"
+connection_mode = "passive"
+connect_addr = "relay1:8443"
 
 [[relays]]
 id = "relay-2"
-management_addr = "relay2:8443"
-data_public_addr = "relay2:8444"
+connection_mode = "active"

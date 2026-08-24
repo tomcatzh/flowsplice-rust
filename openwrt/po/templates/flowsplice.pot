@@ -16,13 +16,10 @@ msgstr ""
 msgid "Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
 msgstr ""
 
-msgid "Advertised data address"
-msgstr ""
-
 msgid "All enabled FlowSplice instances are valid."
 msgstr ""
 
-msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
+msgid "Create separate named instances for each entry path. Every instance binds its OpenWrt network device, discovers the matching IPv4 or IPv6 address, and reports both listener endpoints to Server automatically."
 msgstr ""
 
 msgid "Data listen"
@@ -73,9 +70,6 @@ msgstr ""
 msgid "Management CA"
 msgstr ""
 
-msgid "Management address"
-msgstr ""
-
 msgid "Management certificate"
 msgstr ""
 
@@ -83,6 +77,9 @@ msgid "Management listen"
 msgstr ""
 
 msgid "Management private key"
+msgstr ""
+
+msgid "OpenWrt network"
 msgstr ""
 
 msgid "Maximum pending routes"
@@ -179,9 +176,6 @@ msgstr ""
 msgid "The file must be readable by the flowsplice service user."
 msgstr ""
 
-msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
-msgstr ""
-
 msgid "Trust and identity"
 msgstr ""
 
@@ -210,4 +204,22 @@ msgid "The deployment root must certify its public key."
 msgstr ""
 
 msgid "Signed control snapshot TTL (seconds)"
+msgstr ""
+
+msgid "Connection mode"
+msgstr ""
+
+msgid "Active (Relay connects to Server)"
+msgstr ""
+
+msgid "Passive (Server connects to Relay)"
+msgstr ""
+
+msgid "Server control address"
+msgstr ""
+
+msgid "Passive management seed"
+msgstr ""
+
+msgid "Choose who initiates each authenticated control session. Passive Relays require one stable management seed; active Relays connect to Server and require no stored Relay address. Published management and data endpoints always come from the authenticated Relay."
 msgstr ""
