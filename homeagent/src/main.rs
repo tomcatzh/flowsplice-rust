@@ -25,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
@@ -40,7 +41,7 @@ use flowsplice_core::{
         DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential,
         load_verified_deployment_trust,
     },
-    frame::{JsonFrameReader, write_json},
+    frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
     init_crypto,
     protocol::{
         CONTROL_PROTOCOL_VERSION, ControlMessage, DataFrame, HomeCatalog, Role, Service,
@@ -311,7 +312,7 @@ const fn default_max_carriers_per_flow() -> usize {
 }
 
 const fn default_carrier_heartbeat() -> u64 {
-    5
+    10
 }
 
 const fn default_carrier_timeout() -> u64 {
@@ -2124,10 +2125,12 @@ async fn run_work(
         carrier_id,
         service_id,
         protocol,
+        data_protocol_version,
     } = open
     else {
         bail!("first business frame must be OPEN");
     };
+    let data_codec = DataFrameCodec::negotiate(data_protocol_version);
     let service = config
         .services
         .iter()
@@ -2152,6 +2155,7 @@ async fn run_work(
                         stream,
                         global_permit: None,
                         flow_permit: None,
+                        data_codec,
                     },
                     not_after_unix_secs,
                 )
@@ -2173,6 +2177,7 @@ async fn run_work(
                 tcp_flows.statistics(),
                 identity.id,
                 relay_id,
+                data_codec,
             )
             .await
         }
@@ -2192,6 +2197,7 @@ async fn serve_udp(
     statistics: Arc<LocalStatistics>,
     travel_id: String,
     relay_id: String,
+    data_codec: DataFrameCodec,
 ) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let target_started = Instant::now();
@@ -2215,7 +2221,7 @@ async fn serve_udp(
         1,
     );
     let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
-    let mut tls_reader = JsonFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT);
+    let mut tls_reader = DataFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT, data_codec);
     write_json(
         &mut tls_writer,
         &DataFrame::OpenOk {
@@ -2223,6 +2229,7 @@ async fn serve_udp(
             carrier_id,
             receive_offset: 0,
             send_offset: 0,
+            data_protocol_version: data_codec.version(),
         },
         DATA_FRAME_LIMIT,
     )
@@ -2230,20 +2237,23 @@ async fn serve_udp(
     let mut send_sequence = 0_u64;
     let mut receive_sequence = 0_u64;
     let mut buffer = vec![0_u8; 65_507];
+    let mut downloaded_bytes = 0_u64;
+    let mut uploaded_bytes = 0_u64;
+    let result: Result<()> = async {
     loop {
         tokio::select! {
             response = timeout(Duration::from_secs(idle_secs), socket.recv(&mut buffer)) => {
                 let count = response.context("UDP association idle timeout")??;
-                record_home_udp_metric(&statistics, &travel_id, service, &relay_id, "home_flow_download_observed_datagram_bytes", count as u64);
-                write_json(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: buffer[..count].to_vec() }, DATA_FRAME_LIMIT).await?;
+                downloaded_bytes = downloaded_bytes.saturating_add(count as u64);
+                write_data_frame(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: Bytes::copy_from_slice(&buffer[..count]) }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(idle_secs), tls_reader.read::<DataFrame>()) => {
+            frame = timeout(Duration::from_secs(idle_secs), tls_reader.read()) => {
                 match frame.context("UDP association idle timeout")?? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
                             socket.send(&bytes).await?;
-                            record_home_udp_metric(&statistics, &travel_id, service, &relay_id, "delivered_upload_datagram_bytes", bytes.len() as u64);
+                            uploaded_bytes = uploaded_bytes.saturating_add(bytes.len() as u64);
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
@@ -2260,6 +2270,25 @@ async fn serve_udp(
             }
         }
     }
+    }
+    .await;
+    record_home_udp_metric(
+        &statistics,
+        &travel_id,
+        service,
+        &relay_id,
+        "home_flow_download_observed_datagram_bytes",
+        downloaded_bytes,
+    );
+    record_home_udp_metric(
+        &statistics,
+        &travel_id,
+        service,
+        &relay_id,
+        "delivered_upload_datagram_bytes",
+        uploaded_bytes,
+    );
+    result
 }
 
 fn record_home_udp_metric(
@@ -2270,6 +2299,9 @@ fn record_home_udp_metric(
     family: &str,
     value: u64,
 ) {
+    if value == 0 {
+        return;
+    }
     record_home_udp_metric_sample(
         statistics, travel_id, service, relay_id, family, value, None,
     );

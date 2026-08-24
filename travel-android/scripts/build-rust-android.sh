@@ -33,13 +33,13 @@ build_abi() {
     "${ar_name}=${toolchain_bin}/llvm-ar" \
     cargo build \
       --locked \
-      --release \
+      --profile android-release \
       --target "${rust_target}" \
       -p flowsplice-travel-android
 
   mkdir -p "${output_root}/${android_abi}"
   cp \
-    "${repo_root}/target/${rust_target}/release/libflowsplice_travel_android.so" \
+    "${repo_root}/target/${rust_target}/android-release/libflowsplice_travel_android.so" \
     "${output_root}/${android_abi}/libflowsplice_travel_android.so"
 }
 

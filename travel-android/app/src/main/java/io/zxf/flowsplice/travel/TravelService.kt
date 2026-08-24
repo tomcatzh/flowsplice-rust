@@ -157,12 +157,14 @@ class TravelService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollingJob: Job? = null
     private var commandJob: Job? = null
-    private val commands = Channel<ServiceCommand>(Channel.UNLIMITED)
+    private var reconnectJob: Job? = null
+    private val commands = Channel<ServiceCommand>(64)
     private lateinit var connectivityManager: ConnectivityManager
     private var currentNetwork: Network? = null
     private val networkLock = Any()
     private var networkCallbackRegistered = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private var publishedCatalogGeneration = Long.MIN_VALUE
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -239,6 +241,7 @@ class TravelService : Service() {
         commands.close()
         commandJob?.cancel()
         pollingJob?.cancel()
+        reconnectJob?.cancel()
         runCatching { NativeTravel.stop() }
         releaseWakeLock()
         if (networkCallbackRegistered) {
@@ -378,11 +381,12 @@ class TravelService : Service() {
             failAndStop(snapshot.error ?: "Travel Core failed to start", startId)
             return
         }
-        publishCurrentCatalog()
+        publishedCatalogGeneration = Long.MIN_VALUE
+        publishCurrentCatalog(snapshot.catalogGeneration)
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, true) }
         pollingJob = serviceScope.launch {
             while (isActive) {
-                delay(1_000)
+                delay(STATUS_POLL_MILLIS)
                 val next = runCatching {
                     TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
                 }.getOrElse { error ->
@@ -393,7 +397,9 @@ class TravelService : Service() {
                     )
                 }
                 TravelRepository.publish(next)
-                if (next.phase == TravelPhase.RUNNING) publishCurrentCatalog()
+                if (next.phase == TravelPhase.RUNNING) {
+                    publishCurrentCatalog(next.catalogGeneration)
+                }
                 updateNotification(travelNotification(next))
             }
         }
@@ -444,9 +450,13 @@ class TravelService : Service() {
         updateNotification(travelNotification(next))
     }
 
-    private fun publishCurrentCatalog() {
+    private fun publishCurrentCatalog(generation: Long) {
+        if (generation == publishedCatalogGeneration) return
         runCatching { TravelCatalog.fromNative(NativeTravel.catalog()) }
-            .onSuccess(TravelRepository::publishCatalog)
+            .onSuccess { catalog ->
+                TravelRepository.publishCatalog(catalog)
+                publishedCatalogGeneration = catalog.generation
+            }
     }
 
     private fun failEnrollment(message: String, startId: Int) {
@@ -475,7 +485,9 @@ class TravelService : Service() {
     }
 
     private fun requestReconnect() {
-        serviceScope.launch {
+        reconnectJob?.cancel()
+        reconnectJob = serviceScope.launch {
+            delay(NETWORK_CHANGE_DEBOUNCE_MILLIS)
             runCatching { NativeTravel.networkChanged() }
         }
     }
@@ -602,6 +614,8 @@ class TravelService : Service() {
         const val AUTO_START = "auto-start"
         private const val CHANNEL_ID = "travel-status"
         private const val NOTIFICATION_ID = 3103
+        private const val STATUS_POLL_MILLIS = 2_000L
+        private const val NETWORK_CHANGE_DEBOUNCE_MILLIS = 250L
 
         fun shouldAutoStart(context: Context): Boolean =
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)

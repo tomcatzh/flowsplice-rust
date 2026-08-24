@@ -277,6 +277,12 @@ fn response_json(result: Result<serde_json::Value>) -> String {
     })
 }
 
+fn required_string(env: &mut Env<'_>, value: &JString<'_>, name: &str) -> Result<String> {
+    value
+        .try_to_string(env)
+        .map_err(|error| anyhow!("could not read JNI {name}: {error}"))
+}
+
 fn jni_string<'caller>(
     unowned_env: &mut EnvUnowned<'caller>,
     action: impl FnOnce(&mut Env<'caller>) -> String,
@@ -301,14 +307,21 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_beginEnrollmen
     selected_relay: JString<'caller>,
     password: JString<'caller>,
 ) -> JString<'caller> {
-    jni_string(&mut unowned_env, |_env| {
-        response_json(begin_enrollment(
-            &install_dir.to_string(),
-            &travel_id.to_string(),
-            &home_id.to_string(),
-            &selected_relay.to_string(),
-            &password.to_string(),
-        ))
+    jni_string(&mut unowned_env, |env| {
+        response_json((|| {
+            let install_dir = required_string(env, &install_dir, "install directory")?;
+            let travel_id = required_string(env, &travel_id, "Travel id")?;
+            let home_id = required_string(env, &home_id, "Home id")?;
+            let selected_relay = required_string(env, &selected_relay, "Relay")?;
+            let password = required_string(env, &password, "private-key password")?;
+            begin_enrollment(
+                &install_dir,
+                &travel_id,
+                &home_id,
+                &selected_relay,
+                &password,
+            )
+        })())
     })
 }
 
@@ -335,11 +348,12 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_start<'caller>
     config_path: JString<'caller>,
     password: JString<'caller>,
 ) -> JString<'caller> {
-    jni_string(&mut unowned_env, |_env| {
-        response_json(start_engine(
-            &config_path.to_string(),
-            &password.to_string(),
-        ))
+    jni_string(&mut unowned_env, |env| {
+        response_json((|| {
+            let config_path = required_string(env, &config_path, "config path")?;
+            let password = required_string(env, &password, "private-key password")?;
+            start_engine(&config_path, &password)
+        })())
     })
 }
 
@@ -383,8 +397,11 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_upsertMapping<
     _class: JClass<'caller>,
     mapping_json: JString<'caller>,
 ) -> JString<'caller> {
-    jni_string(&mut unowned_env, |_env| {
-        response_json(upsert_mapping(&mapping_json.to_string()))
+    jni_string(&mut unowned_env, |env| {
+        response_json((|| {
+            let mapping_json = required_string(env, &mapping_json, "mapping JSON")?;
+            upsert_mapping(&mapping_json)
+        })())
     })
 }
 
@@ -396,12 +413,13 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_deleteMapping<
     service_id: JString<'caller>,
     protocol: JString<'caller>,
 ) -> JString<'caller> {
-    jni_string(&mut unowned_env, |_env| {
-        response_json(delete_mapping(
-            &home_id.to_string(),
-            &service_id.to_string(),
-            &protocol.to_string(),
-        ))
+    jni_string(&mut unowned_env, |env| {
+        response_json((|| {
+            let home_id = required_string(env, &home_id, "Home id")?;
+            let service_id = required_string(env, &service_id, "service id")?;
+            let protocol = required_string(env, &protocol, "protocol")?;
+            delete_mapping(&home_id, &service_id, &protocol)
+        })())
     })
 }
 

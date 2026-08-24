@@ -1,4 +1,5 @@
 use aws_lc_rs::digest;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -7,6 +8,8 @@ use crate::deployment::{SignedControlSnapshot, SignedHomeEndpointCredential};
 use crate::statistics::SignedStatisticsReport;
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const DATA_PROTOCOL_JSON: u16 = 0;
+pub const DATA_PROTOCOL_BINARY_V1: u16 = 1;
 
 /// Returns the short human comparison code for one first-enrollment request and its private
 /// retrieval token. This code is not an authentication secret; it lets the Home operator confirm
@@ -336,12 +339,16 @@ pub enum DataFrame {
         carrier_id: Uuid,
         service_id: String,
         protocol: ServiceProtocol,
+        #[serde(default)]
+        data_protocol_version: u16,
     },
     OpenOk {
         flow_id: Uuid,
         carrier_id: Uuid,
         receive_offset: u64,
         send_offset: u64,
+        #[serde(default)]
+        data_protocol_version: u16,
     },
     OpenError {
         flow_id: Uuid,
@@ -366,7 +373,7 @@ pub enum DataFrame {
     Data {
         flow_id: Uuid,
         offset: u64,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     },
     Ack {
         flow_id: Uuid,
@@ -380,7 +387,7 @@ pub enum DataFrame {
     Datagram {
         flow_id: Uuid,
         sequence: u64,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     },
     Fin {
         flow_id: Uuid,
@@ -616,6 +623,24 @@ mod tests {
             panic!("wrong control message variant");
         };
         assert_eq!(home_id, "home-2");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_data_protocol_version_selects_legacy_json() -> Result<(), serde_json::Error> {
+        let flow_id = Uuid::new_v4();
+        let carrier_id = Uuid::new_v4();
+        let encoded = format!(
+            r#"{{"type":"open","flow_id":"{flow_id}","carrier_id":"{carrier_id}","service_id":"echo","protocol":"tcp"}}"#,
+        );
+        let decoded: DataFrame = serde_json::from_str(&encoded)?;
+        match decoded {
+            DataFrame::Open {
+                data_protocol_version,
+                ..
+            } => assert_eq!(data_protocol_version, 0),
+            _ => panic!("wrong data frame variant"),
+        }
         Ok(())
     }
 }

@@ -5,10 +5,11 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use bytes::Bytes;
 use flowsplice_core::{
     DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::unix_time_secs,
-    frame::{JsonFrameReader, write_json},
+    frame::{DataFrameReader, write_data_frame},
     protocol::{DataFrame, ServiceProtocol},
 };
 use tokio::{
@@ -24,11 +25,14 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{AppState, BusinessCarrier, Mapping, open_business_on, relay_candidates};
+use super::{
+    AppState, BusinessCarrier, Mapping, jittered_retry_delay, open_business_on, relay_candidates,
+    uuid_seed,
+};
 
 struct Segment {
     offset: u64,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     _credit: OwnedSemaphorePermit,
 }
 
@@ -40,7 +44,7 @@ struct CarrierHandle {
 
 enum FlowEvent {
     LocalData {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         credit: OwnedSemaphorePermit,
     },
     LocalEof,
@@ -159,6 +163,7 @@ async fn run_inner(
     let mut active = None;
     let mut recovery_started = Instant::now();
     let mut retry_backoff = Duration::from_millis(250);
+    let mut recovery_jitter = None;
     let mut reevaluate_secs = state.config.carrier_reevaluate_secs;
     let mut next_reevaluation = Instant::now();
 
@@ -172,6 +177,11 @@ async fn run_inner(
         }
 
         if active.is_none() || Instant::now() >= next_reevaluation {
+            if active.is_none()
+                && let Some(delay) = recovery_jitter.take()
+            {
+                sleep(delay).await;
+            }
             let previous_active = active;
             if active.is_none()
                 && recovery_started.elapsed()
@@ -248,7 +258,12 @@ async fn run_inner(
                         retry_after_ms = retry_backoff.as_millis(),
                         "carrier race found no usable relay"
                     );
-                    sleep(retry_backoff).await;
+                    let generation = *state.network_generation.borrow();
+                    sleep(jittered_retry_delay(
+                        retry_backoff,
+                        uuid_seed(flow_id) ^ generation,
+                    ))
+                    .await;
                     retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(5));
                     continue;
                 }
@@ -268,6 +283,10 @@ async fn run_inner(
                 .await?;
                 if closed_active {
                     active = None;
+                    let generation = *state.network_generation.borrow();
+                    recovery_jitter = Some(Duration::from_millis(
+                        (uuid_seed(flow_id) ^ generation) % 251,
+                    ));
                     state.flow_relays.lock().await.remove(&flow_id);
                     recovery_started = Instant::now();
                     reevaluate_secs = state.config.carrier_reevaluate_secs;
@@ -865,7 +884,7 @@ fn spawn_local_reader(
                     };
                     if events
                         .send(FlowEvent::LocalData {
-                            bytes: buffer[..count].to_vec(),
+                            bytes: Bytes::copy_from_slice(&buffer[..count]),
                             credit,
                         })
                         .await
@@ -898,6 +917,7 @@ fn spawn_carrier(
         stream,
         home_receive_offset: _,
         home_send_offset: _,
+        data_codec,
     } = carrier;
     let handle_relay_id = relay_id.clone();
     let (tx, mut outgoing) = mpsc::channel(128);
@@ -905,7 +925,7 @@ fn spawn_carrier(
     tokio::spawn(async move {
         let _carrier_permit = carrier_permit;
         let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = JsonFrameReader::new(reader, DATA_FRAME_LIMIT);
+        let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, data_codec);
         let mut heartbeat = interval(heartbeat_period);
         let mut nonce = 0_u64;
         let mut last_received = Instant::now();
@@ -923,13 +943,13 @@ fn spawn_carrier(
                     }
                     frame = outgoing.recv() => {
                         let Some(frame) = frame else { return Ok(()); };
-                        write_json(&mut writer, &frame, DATA_FRAME_LIMIT).await?;
+                        write_data_frame(&mut writer, &frame, DATA_FRAME_LIMIT, data_codec).await?;
                     }
-                    frame = reader.read::<DataFrame>() => {
+                    frame = reader.read() => {
                         last_received = Instant::now();
                         match frame? {
                             DataFrame::Ping { nonce } => {
-                                write_json(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT).await?;
+                                write_data_frame(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
                             }
                             DataFrame::Pong { .. } => {}
                             frame => {
@@ -943,7 +963,7 @@ fn spawn_carrier(
                             bail!("carrier heartbeat timed out");
                         }
                         nonce = nonce.wrapping_add(1);
-                        write_json(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT).await?;
+                        write_data_frame(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
                     }
                 }
             }

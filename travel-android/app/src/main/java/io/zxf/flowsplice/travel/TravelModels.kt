@@ -162,6 +162,7 @@ data class TravelSnapshot(
     val uploadedBytes: Long = 0,
     val downloadedBytes: Long = 0,
     val relayCount: Int = 0,
+    val catalogGeneration: Long = 0,
     val mappings: List<TravelMapping> = emptyList(),
     val error: String? = null,
 ) {
@@ -202,6 +203,7 @@ data class TravelSnapshot(
                 uploadedBytes = data.optLong("session_uploaded_bytes"),
                 downloadedBytes = data.optLong("session_downloaded_bytes"),
                 relayCount = data.optJSONArray("active_relays")?.length() ?: 0,
+                catalogGeneration = data.optLong("catalog_generation"),
                 mappings = mappings,
             )
         }

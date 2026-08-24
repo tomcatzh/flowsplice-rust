@@ -34,11 +34,12 @@ use flowsplice_core::{
         DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust, VerifiedControlSnapshot,
         load_verified_deployment_trust,
     },
-    frame::{JsonFrameReader, write_json},
+    frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
     init_crypto,
     protocol::{
-        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DataFrame, RelayDirectory, Role,
-        ServiceProtocol, TravelConnectionPurpose, bootstrap_verification_code,
+        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DATA_PROTOCOL_BINARY_V1, DataFrame,
+        RelayDirectory, Role, ServiceProtocol, TravelConnectionPurpose,
+        bootstrap_verification_code,
     },
     route::{RouteSide, write_preface},
     statistics::statistics_signing_key,
@@ -388,11 +389,11 @@ const fn default_max_carriers_per_flow() -> usize {
 }
 
 const fn default_carrier_heartbeat() -> u64 {
-    2
+    10
 }
 
 const fn default_carrier_timeout() -> u64 {
-    8
+    30
 }
 
 const fn default_carrier_race_timeout() -> u64 {
@@ -788,7 +789,13 @@ impl TravelCore {
     /// Returns an error if configuration, state, credentials, or initial mapping listeners fail.
     pub async fn start(config_path: &Path, private_key_password: &str) -> Result<Self> {
         init_crypto();
-        let state = load_app_state(config_path, Some(private_key_password))?;
+        let config_path = config_path.to_path_buf();
+        let private_key_password = Zeroizing::new(private_key_password.to_owned());
+        let state = tokio::task::spawn_blocking(move || {
+            load_app_state(&config_path, Some(private_key_password.as_str()))
+        })
+        .await
+        .context("Travel state loading task failed")??;
         start_initial_mapping_listeners(&state).await?;
         let catalog_state = state.clone();
         let catalog = tokio::spawn(async move {
@@ -2012,6 +2019,8 @@ fn configured_home_ids(homes: &[ConfiguredHome]) -> Result<HashSet<&str>> {
 }
 
 async fn run_catalog_subscription(state: AppState) -> Result<()> {
+    let mut network_changes = state.network_generation.subscribe();
+    let mut retry_backoff = Duration::from_secs(1);
     loop {
         let mut connected = false;
         for relay in bootstrap_candidates(&state).await {
@@ -2043,8 +2052,46 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
         if !connected {
             warn!("all catalog subscription candidates failed");
         }
-        sleep(Duration::from_secs(1)).await;
+        let delay = jittered_retry_delay(
+            if connected {
+                Duration::from_secs(1)
+            } else {
+                retry_backoff
+            },
+            uuid_seed(state.session_id) ^ *network_changes.borrow(),
+        );
+        tokio::select! {
+            () = sleep(delay) => {
+                retry_backoff = if connected {
+                    Duration::from_secs(1)
+                } else {
+                    retry_backoff.saturating_mul(2).min(Duration::from_secs(60))
+                };
+            }
+            changed = network_changes.changed() => {
+                changed.context("network change notifier stopped")?;
+                retry_backoff = Duration::from_secs(1);
+            }
+        }
     }
+}
+
+fn jittered_retry_delay(base: Duration, seed: u64) -> Duration {
+    let spread = (base.as_millis() / 5).max(1);
+    let mixed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17);
+    let offset = u128::from(mixed) % (spread.saturating_mul(2) + 1);
+    let millis = base
+        .as_millis()
+        .saturating_sub(spread)
+        .saturating_add(offset);
+    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+fn uuid_seed(id: Uuid) -> u64 {
+    let value = id.as_u128();
+    let low = u64::try_from(value & u128::from(u64::MAX)).unwrap_or_default();
+    let high = u64::try_from(value >> 64).unwrap_or_default();
+    low ^ high
 }
 
 async fn run_catalog_session(
@@ -2058,6 +2105,7 @@ async fn run_catalog_session(
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut statistics_tick = interval(Duration::from_secs(5));
+    let mut enrollment_tick = interval(Duration::from_secs(5));
     let mut report_keys = HashMap::<String, Vec<u8>>::new();
     let mut enrollment_inflight = None::<(Uuid, Instant)>;
     let mut nonce = 0_u64;
@@ -2126,6 +2174,8 @@ async fn run_catalog_session(
             }
             _ = statistics_tick.tick() => {
                 flush_and_send_travel_statistics(state, &mut writer, &mut report_keys).await?;
+            }
+            _ = enrollment_tick.tick() => {
                 if enrollment_inflight
                     .is_some_and(|(_, started)| started.elapsed() > Duration::from_secs(30))
                 {
@@ -2493,6 +2543,7 @@ struct BusinessCarrier {
     stream: TlsStream<TcpStream>,
     home_receive_offset: u64,
     home_send_offset: u64,
+    data_codec: DataFrameCodec,
 }
 
 async fn open_business_on(
@@ -2565,6 +2616,7 @@ async fn open_business_on(
             carrier_id,
             service_id: service_id.to_owned(),
             protocol,
+            data_protocol_version: DATA_PROTOCOL_BINARY_V1,
         },
         DATA_FRAME_LIMIT,
     )
@@ -2578,12 +2630,14 @@ async fn open_business_on(
             carrier_id: response_carrier,
             receive_offset,
             send_offset,
+            data_protocol_version,
         } if response_flow == flow_id && response_carrier == carrier_id => Ok(BusinessCarrier {
             carrier_id,
             relay_id,
             stream,
             home_receive_offset: receive_offset,
             home_send_offset: send_offset,
+            data_codec: DataFrameCodec::negotiate(data_protocol_version),
         }),
         DataFrame::OpenError { reason, .. } => bail!("home rejected carrier: {reason}"),
         _ => bail!("invalid carrier OPEN response"),
@@ -2809,16 +2863,25 @@ async fn apply_control_snapshot(
 
 async fn record_relay_success(state: &AppState, relay_id: &str) -> Result<()> {
     let now = unix_time_secs()?;
-    let mut history = state.relay_history.write().await;
-    let Some(record) = history
-        .iter_mut()
-        .find(|record| record.relay_id == relay_id)
-    else {
+    let record = {
+        let mut history = state.relay_history.write().await;
+        let Some(record) = history
+            .iter_mut()
+            .find(|record| record.relay_id == relay_id)
+        else {
+            return Ok(());
+        };
+        let should_persist = record.consecutive_failures > 0
+            || record
+                .last_success_unix_secs
+                .is_none_or(|last| now.saturating_sub(last) >= 300);
+        record.last_success_unix_secs = Some(now);
+        record.consecutive_failures = 0;
+        should_persist.then(|| record.clone())
+    };
+    let Some(record) = record else {
         return Ok(());
     };
-    record.last_success_unix_secs = Some(now);
-    record.consecutive_failures = 0;
-    let record = record.clone();
     let batch = WriteBatch::new().put_json(
         Table::RelayHistory,
         record.relay_id.as_bytes().to_vec(),
@@ -2833,20 +2896,28 @@ async fn record_relay_success(state: &AppState, relay_id: &str) -> Result<()> {
 
 async fn record_relay_failure(state: &AppState, relay: &RelayCandidate) -> Result<()> {
     let now = unix_time_secs()?;
-    let mut history = state.relay_history.write().await;
-    let Some(record) = history.iter_mut().find(|record| {
-        relay
-            .expected_id
-            .as_ref()
-            .map_or(record.management_addr == relay.management_addr, |id| {
-                record.relay_id == *id
-            })
-    }) else {
+    let record = {
+        let mut history = state.relay_history.write().await;
+        let Some(record) = history.iter_mut().find(|record| {
+            relay
+                .expected_id
+                .as_ref()
+                .map_or(record.management_addr == relay.management_addr, |id| {
+                    record.relay_id == *id
+                })
+        }) else {
+            return Ok(());
+        };
+        let previous_failure = record.last_failure_unix_secs;
+        record.last_failure_unix_secs = Some(now);
+        record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        let should_persist =
+            should_persist_relay_failure(record.consecutive_failures, previous_failure, now);
+        should_persist.then(|| record.clone())
+    };
+    let Some(record) = record else {
         return Ok(());
     };
-    record.last_failure_unix_secs = Some(now);
-    record.consecutive_failures = record.consecutive_failures.saturating_add(1);
-    let record = record.clone();
     let batch = WriteBatch::new().put_json(
         Table::RelayHistory,
         record.relay_id.as_bytes().to_vec(),
@@ -2857,6 +2928,15 @@ async fn record_relay_failure(state: &AppState, relay: &RelayCandidate) -> Resul
         .await
         .context("Relay failure history commit task failed")??;
     Ok(())
+}
+
+fn should_persist_relay_failure(
+    consecutive_failures: u32,
+    previous_failure_unix_secs: Option<u64>,
+    now: u64,
+) -> bool {
+    consecutive_failures.is_power_of_two()
+        || previous_failure_unix_secs.is_none_or(|last| now.saturating_sub(last) >= 60)
 }
 
 fn require_control_snapshot_subject(
@@ -3132,11 +3212,15 @@ async fn run_udp_association(
     }
     let carrier = opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))?;
     let relay_id = carrier.relay_id.clone();
+    let data_codec = carrier.data_codec;
     let business = carrier.stream;
     let (mut reader, mut writer) = tokio::io::split(business);
-    let mut reader = JsonFrameReader::new(&mut reader, DATA_FRAME_LIMIT);
+    let mut reader = DataFrameReader::new(&mut reader, DATA_FRAME_LIMIT, data_codec);
     let mut send_sequence = 0_u64;
     let mut receive_sequence = 0_u64;
+    let mut uploaded_bytes = 0_u64;
+    let mut downloaded_bytes = 0_u64;
+    let result: Result<()> = async {
     loop {
         tokio::select! {
             changed = network_changes.changed() => {
@@ -3149,16 +3233,20 @@ async fn run_udp_association(
             }
             datagram = timeout(Duration::from_secs(config.udp_idle_secs), outgoing.recv()) => {
                 let Some(bytes) = datagram.context("UDP association idle timeout")? else { return Ok(()); };
-                record_travel_udp_metric(state, mapping, &relay_id, "travel_flow_upload_observed_bytes", bytes.len() as u64);
-                write_json(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes }, DATA_FRAME_LIMIT).await?;
+                let count = bytes.len() as u64;
+                uploaded_bytes = uploaded_bytes.saturating_add(count);
+                state.uploaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                write_data_frame(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: bytes.into() }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(config.udp_idle_secs), reader.read::<DataFrame>()) => {
+            frame = timeout(Duration::from_secs(config.udp_idle_secs), reader.read()) => {
                 match frame.context("UDP association idle timeout")?? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
                             socket.send_to(&bytes, peer).await?;
-                            record_travel_udp_metric(state, mapping, &relay_id, "delivered_download_datagram_bytes", bytes.len() as u64);
+                            let count = bytes.len() as u64;
+                            downloaded_bytes = downloaded_bytes.saturating_add(count);
+                            state.downloaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
@@ -3168,6 +3256,23 @@ async fn run_udp_association(
             }
         }
     }
+    }
+    .await;
+    record_travel_udp_metric(
+        state,
+        mapping,
+        &relay_id,
+        "travel_flow_upload_observed_bytes",
+        uploaded_bytes,
+    );
+    record_travel_udp_metric(
+        state,
+        mapping,
+        &relay_id,
+        "delivered_download_datagram_bytes",
+        downloaded_bytes,
+    );
+    result
 }
 
 fn record_travel_udp_metric(
@@ -3177,16 +3282,8 @@ fn record_travel_udp_metric(
     family: &str,
     value: u64,
 ) {
-    use std::sync::atomic::Ordering;
-
-    match family {
-        "travel_flow_upload_observed_bytes" => {
-            state.uploaded_bytes.fetch_add(value, Ordering::Relaxed);
-        }
-        "delivered_download_datagram_bytes" => {
-            state.downloaded_bytes.fetch_add(value, Ordering::Relaxed);
-        }
-        _ => {}
+    if value == 0 {
+        return;
     }
     let mut dimensions = BTreeMap::new();
     dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
@@ -3842,7 +3939,7 @@ mod tests {
         load_relay_history, local_ui_request_allowed, persist_runtime_mappings,
         remote_enrollment_capacity_available, remote_enrollment_outbox_expired,
         require_authenticated_relay_in_snapshot, require_control_snapshot_subject,
-        signed_directory_candidates, trusted_home_business_pins,
+        should_persist_relay_failure, signed_directory_candidates, trusted_home_business_pins,
     };
 
     #[test]
@@ -4246,5 +4343,15 @@ mod tests {
         assert_eq!(bootstrap[0].expected_id.as_deref(), Some("relay-1"));
         assert_eq!(bootstrap[0].management_addr, "10.0.2.2:18443");
         assert_eq!(bootstrap[1].expected_id, None);
+    }
+
+    #[test]
+    fn relay_failure_persistence_is_exponentially_throttled() {
+        assert!(should_persist_relay_failure(1, None, 100));
+        assert!(should_persist_relay_failure(2, Some(100), 101));
+        assert!(!should_persist_relay_failure(3, Some(101), 102));
+        assert!(should_persist_relay_failure(4, Some(102), 103));
+        assert!(!should_persist_relay_failure(5, Some(103), 104));
+        assert!(should_persist_relay_failure(5, Some(100), 160));
     }
 }

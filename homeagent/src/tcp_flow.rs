@@ -5,10 +5,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use flowsplice_core::{
     DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::{VerifiedAuthorization, unix_time_secs},
-    frame::{JsonFrameReader, write_json},
+    frame::{DataFrameCodec, DataFrameReader, write_data_frame, write_json},
     protocol::{DataFrame, Service},
 };
 use flowsplice_storage::LocalStatistics;
@@ -44,6 +45,7 @@ pub struct IncomingCarrier {
     pub stream: TlsStream<TcpStream>,
     pub global_permit: Option<OwnedSemaphorePermit>,
     pub flow_permit: Option<OwnedSemaphorePermit>,
+    pub data_codec: DataFrameCodec,
 }
 
 pub struct TcpFlowRegistry {
@@ -210,7 +212,7 @@ impl TcpFlowRegistry {
 
 struct Segment {
     offset: u64,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     _credit: OwnedSemaphorePermit,
 }
 
@@ -224,7 +226,7 @@ enum FlowEvent {
         reason: String,
     },
     TargetData {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         credit: OwnedSemaphorePermit,
     },
     TargetEof,
@@ -297,7 +299,7 @@ async fn run_flow(
                     };
                     if target_events
                         .send(FlowEvent::TargetData {
-                            bytes: buffer[..count].to_vec(),
+                            bytes: Bytes::copy_from_slice(&buffer[..count]),
                             credit,
                         })
                         .await
@@ -352,6 +354,7 @@ async fn run_flow(
                         carrier_id: carrier.carrier_id,
                         receive_offset,
                         send_offset: send_acked,
+                        data_protocol_version: carrier.data_codec.version(),
                     },
                     DATA_FRAME_LIMIT,
                 )
@@ -650,13 +653,14 @@ fn spawn_carrier(
         let IncomingCarrier {
             carrier_id,
             stream,
+            data_codec,
             global_permit,
             flow_permit,
             ..
         } = carrier;
         let _carrier_permits = (global_permit, flow_permit);
         let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = JsonFrameReader::new(reader, DATA_FRAME_LIMIT);
+        let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, data_codec);
         let mut heartbeat = interval(heartbeat_period);
         let mut nonce = 0_u64;
         let mut last_received = Instant::now();
@@ -665,13 +669,13 @@ fn spawn_carrier(
                 tokio::select! {
                     frame = outgoing.recv() => {
                         let Some(frame) = frame else { return Ok(()); };
-                        write_json(&mut writer, &frame, DATA_FRAME_LIMIT).await?;
+                        write_data_frame(&mut writer, &frame, DATA_FRAME_LIMIT, data_codec).await?;
                     }
-                    frame = reader.read::<DataFrame>() => {
+                    frame = reader.read() => {
                         last_received = Instant::now();
                         match frame? {
                             DataFrame::Ping { nonce } => {
-                                write_json(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT).await?;
+                                write_data_frame(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
                             }
                             DataFrame::Pong { .. } => {}
                             frame => {
@@ -685,7 +689,7 @@ fn spawn_carrier(
                             bail!("carrier heartbeat timed out");
                         }
                         nonce = nonce.wrapping_add(1);
-                        write_json(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT).await?;
+                        write_data_frame(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
                     }
                 }
             }

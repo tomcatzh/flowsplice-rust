@@ -8,6 +8,8 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -15,7 +17,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -72,6 +76,11 @@ class TravelCoreDockerE2ETest {
             }
 
             assertEcho("android-foreground-roundtrip")
+            val receiver = context.packageManager.getReceiverInfo(
+                ComponentName(context, BootReceiver::class.java),
+                0,
+            )
+            assertFalse("Boot receiver must not be exported", receiver.exported)
             val activity = Intent.makeMainActivity(ComponentName(context, MainActivity::class.java))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(activity)
@@ -79,7 +88,32 @@ class TravelCoreDockerE2ETest {
             InstrumentationRegistry.getInstrumentation().uiAutomation
                 .executeShellCommand("input keyevent KEYCODE_HOME")
                 .close()
-            delay(15_000)
+            delay(2_000)
+            val idleStarted = processSample()
+            delay(IDLE_SAMPLE_MILLIS)
+            val idleFinished = processSample()
+            val elapsedSeconds = IDLE_SAMPLE_MILLIS / 1_000.0
+            val clockTicks = Os.sysconf(OsConstants._SC_CLK_TCK).coerceAtLeast(1)
+            val idleCpuPercent =
+                (idleFinished.cpuTicks - idleStarted.cpuTicks).toDouble() /
+                    clockTicks.toDouble() / elapsedSeconds * 100.0
+            val idleWriteBytes =
+                (idleFinished.writeBytes - idleStarted.writeBytes).coerceAtLeast(0)
+            val wakeLockHeld = shell("dumpsys power").contains("$APP_ID:travel")
+            val performance = JSONObject()
+                .put("sample_seconds", elapsedSeconds)
+                .put("idle_cpu_percent_one_core", idleCpuPercent)
+                .put("rss_kib", idleFinished.rssKiB)
+                .put("threads", idleFinished.threads)
+                .put("write_bytes", idleWriteBytes)
+                .put("wake_lock_held", wakeLockHeld)
+            File(context.filesDir, "e2e-performance.json").writeText(performance.toString())
+            println("FLOWSPLICE_ANDROID_PERFORMANCE=$performance")
+            assertTrue("idle CPU exceeded 10% of one core: $idleCpuPercent", idleCpuPercent < 10.0)
+            assertTrue("resident memory exceeded 256 MiB", idleFinished.rssKiB < 256 * 1_024)
+            assertTrue("app process used too many threads", idleFinished.threads < 64)
+            assertTrue("idle persistence wrote more than 1 MiB", idleWriteBytes < 1_048_576)
+            assertTrue("the user-started session did not retain its wake lock", wakeLockHeld)
 
             assertTrue(TravelRepository.state.value.online)
             assertEcho("android-background-roundtrip")
@@ -248,13 +282,49 @@ class TravelCoreDockerE2ETest {
         error("emulator kept a default network during the outage")
     }
 
-    private fun shell(command: String) {
+    private fun processSample(): ProcessSample {
+        val pid = shell("pidof $APP_ID")
+            .trim()
+            .split(Regex("\\s+"))
+            .firstOrNull()
+            ?.toIntOrNull()
+            ?: error("could not locate the Travel app process")
+        val stat = shell("run-as $APP_ID cat /proc/$pid/stat").trim()
+        val fields = stat.substring(stat.lastIndexOf(')') + 2).split(' ')
+        val status = shell("run-as $APP_ID cat /proc/$pid/status")
+        val io = shell("run-as $APP_ID cat /proc/$pid/io")
+        return ProcessSample(
+            cpuTicks = fields[11].toLong() + fields[12].toLong(),
+            rssKiB = status.lineValue("VmRSS"),
+            threads = status.lineValue("Threads").toInt(),
+            writeBytes = io.lineValue("write_bytes"),
+        )
+    }
+
+    private fun String.lineValue(name: String): Long = lineSequence()
+        .first { it.startsWith("$name:") }
+        .substringAfter(':')
+        .trim()
+        .substringBefore(' ')
+        .toLong()
+
+    private fun shell(command: String): String {
         val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation
             .executeShellCommand(command)
-        ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
+        return ParcelFileDescriptor.AutoCloseInputStream(descriptor).use {
+            it.readBytes().toString(Charsets.UTF_8)
+        }
     }
+
+    private data class ProcessSample(
+        val cpuTicks: Long,
+        val rssKiB: Long,
+        val threads: Int,
+        val writeBytes: Long,
+    )
 
     companion object {
         private const val APP_ID = "io.zxf.flowsplice.travel"
+        private const val IDLE_SAMPLE_MILLIS = 20_000L
     }
 }
