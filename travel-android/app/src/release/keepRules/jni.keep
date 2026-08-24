@@ -1,0 +1,3 @@
+-keep class io.zxf.flowsplice.travel.NativeTravel {
+    native <methods>;
+}

@@ -3,6 +3,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val releaseAbi = providers.gradleProperty("flowspliceReleaseAbi")
+    .orElse("arm64-v8a")
+    .get()
+require(releaseAbi in setOf("arm64-v8a", "x86_64")) {
+    "flowspliceReleaseAbi must be arm64-v8a or x86_64"
+}
+
 android {
     namespace = "io.zxf.flowsplice.travel"
     compileSdk {
@@ -24,8 +31,14 @@ android {
     buildTypes {
         release {
             optimization {
-                enable = false
+                enable = true
             }
+            ndk {
+                abiFilters += releaseAbi
+            }
+            // The 0.3 artifact is for local sideloading. A publishing build must replace this
+            // with a private, durable release signing configuration.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
