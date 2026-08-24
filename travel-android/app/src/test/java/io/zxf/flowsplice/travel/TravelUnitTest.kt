@@ -28,4 +28,14 @@ class TravelUnitTest {
         assertFalse(RelayPreference.isValid("relay.example:0"))
         assertFalse(RelayPreference.isValid("2001:db8::1:8443"))
     }
+
+    @Test
+    fun relayHandshakeClosureBecomesAnActionableEnrollmentError() {
+        val raw = "peer closed connection without sending TLS close_notify: upstream details"
+        assertEquals(
+            "Could not establish a secure enrollment connection. Check that this is the " +
+                "Relay management port and that the Relay is running the same 0.3 build as this app.",
+            EnrollmentSnapshot.friendlyEnrollmentError(raw),
+        )
+    }
 }

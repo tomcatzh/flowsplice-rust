@@ -51,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -58,6 +59,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
 import io.zxf.flowsplice.travel.ui.theme.FlowSpliceTravelAgentTheme
 
 class MainActivity : ComponentActivity() {
@@ -73,10 +76,35 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+internal class EnrollmentFormViewModel : ViewModel() {
+    var password by mutableStateOf("")
+        private set
+    var confirmPassword by mutableStateOf("")
+        private set
+
+    fun updatePassword(value: String) {
+        password = value
+    }
+
+    fun updateConfirmPassword(value: String) {
+        confirmPassword = value
+    }
+
+    fun clearSecrets() {
+        password = ""
+        confirmPassword = ""
+    }
+
+    override fun onCleared() {
+        clearSecrets()
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TravelApp() {
     val context = LocalContext.current
+    val enrollmentForm: EnrollmentFormViewModel = viewModel()
     val snapshot by TravelRepository.state.collectAsStateWithLifecycle()
     val enrollment by TravelRepository.enrollment.collectAsStateWithLifecycle()
     var showMappingDialog by rememberSaveable { mutableStateOf(false) }
@@ -92,6 +120,9 @@ private fun TravelApp() {
 
     LaunchedEffect(Unit) {
         TravelRepository.initialize(context)
+    }
+    LaunchedEffect(snapshot.enrolled) {
+        if (snapshot.enrolled) enrollmentForm.clearSecrets()
     }
 
     Scaffold(
@@ -115,6 +146,7 @@ private fun TravelApp() {
                 item {
                     EnrollmentPane(
                         enrollment = enrollment,
+                        form = enrollmentForm,
                         notificationAllowed = notificationAllowed,
                         onPermission = { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
                         onEnroll = { travelId, homeId, relay, password ->
@@ -215,6 +247,7 @@ private fun TravelApp() {
 @Composable
 private fun EnrollmentPane(
     enrollment: EnrollmentSnapshot,
+    form: EnrollmentFormViewModel,
     notificationAllowed: Boolean,
     onPermission: () -> Unit,
     onEnroll: (String, String, String, String) -> Unit,
@@ -224,8 +257,8 @@ private fun EnrollmentPane(
     var travelId by rememberSaveable { mutableStateOf(DeviceIdentity.defaultTravelId(context)) }
     var homeId by rememberSaveable { mutableStateOf("home-1") }
     var relay by rememberSaveable { mutableStateOf(RelayPreference.load(context)) }
-    var password by remember { mutableStateOf("") }
-    var confirmPassword by remember { mutableStateOf("") }
+    val normalizedTravelId = remember(travelId) { DeviceIdentity.normalizeTravelId(travelId) }
+    val normalizedHomeId = remember(homeId) { DeviceIdentity.normalizeTravelId(homeId) }
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Card(
@@ -252,7 +285,7 @@ private fun EnrollmentPane(
                 Text("Device identity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 OutlinedTextField(
                     value = travelId,
-                    onValueChange = { travelId = DeviceIdentity.normalizeTravelId(it) },
+                    onValueChange = { travelId = it },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Travel ID") },
                     supportingText = { Text("Defaults to this Android device name and can be changed.") },
@@ -261,8 +294,8 @@ private fun EnrollmentPane(
                 )
                 OutlinedTextField(
                     value = homeId,
-                    onValueChange = { homeId = DeviceIdentity.normalizeTravelId(it) },
-                    modifier = Modifier.fillMaxWidth(),
+                    onValueChange = { homeId = it },
+                    modifier = Modifier.fillMaxWidth().testTag("enrollment-home-id"),
                     label = { Text("Home ID") },
                     supportingText = { Text("Enter the Home that will approve this device.") },
                     enabled = !enrollment.active,
@@ -281,9 +314,9 @@ private fun EnrollmentPane(
                     singleLine = true,
                 )
                 OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    modifier = Modifier.fillMaxWidth(),
+                    value = form.password,
+                    onValueChange = form::updatePassword,
+                    modifier = Modifier.fillMaxWidth().testTag("enrollment-password"),
                     label = { Text("Private-key password") },
                     supportingText = { Text("Use at least 12 characters.") },
                     visualTransformation = PasswordVisualTransformation(),
@@ -291,23 +324,23 @@ private fun EnrollmentPane(
                     singleLine = true,
                 )
                 OutlinedTextField(
-                    value = confirmPassword,
-                    onValueChange = { confirmPassword = it },
-                    modifier = Modifier.fillMaxWidth(),
+                    value = form.confirmPassword,
+                    onValueChange = form::updateConfirmPassword,
+                    modifier = Modifier.fillMaxWidth().testTag("enrollment-confirm-password"),
                     label = { Text("Confirm password") },
                     visualTransformation = PasswordVisualTransformation(),
                     enabled = !enrollment.active,
                     singleLine = true,
                 )
                 Button(
-                    onClick = { onEnroll(travelId, homeId, relay, password) },
+                    onClick = { onEnroll(normalizedTravelId, normalizedHomeId, relay, form.password) },
                     enabled = notificationAllowed &&
                         !enrollment.active &&
-                        travelId.isNotBlank() &&
-                        homeId.isNotBlank() &&
+                        normalizedTravelId.isNotEmpty() &&
+                        normalizedHomeId.isNotEmpty() &&
                         RelayPreference.isValid(relay) &&
-                        password.length >= 12 &&
-                        password == confirmPassword,
+                        form.password.length >= 12 &&
+                        form.password == form.confirmPassword,
                 ) {
                     Text(if (enrollment.phase == EnrollmentPhase.ERROR) "Retry enrollment" else "Enroll")
                 }
@@ -315,7 +348,10 @@ private fun EnrollmentPane(
         }
 
         if (enrollment.active || enrollment.phase == EnrollmentPhase.ERROR) {
-            EnrollmentStatusCard(enrollment, onCancel)
+            EnrollmentStatusCard(enrollment) {
+                form.clearSecrets()
+                onCancel()
+            }
         }
     }
 }

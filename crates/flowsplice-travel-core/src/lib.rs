@@ -1332,12 +1332,13 @@ async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap
         .context("Relay discovery TCP connection timed out")??;
     socket.set_nodelay(true)?;
     let connector = bootstrap_discovery_connector();
-    let mut stream = timeout(
+    let handshake = timeout(
         Duration::from_secs(10),
         connector.connect(identity_server_name()?, socket),
     )
     .await
-    .context("Relay discovery TLS handshake timed out")??;
+    .context("Relay discovery TLS handshake timed out")?;
+    let mut stream = handshake.context("Relay discovery TLS handshake failed")?;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
     require_peer(&identity, Role::Relay, None, &[])?;
     write_json(
@@ -1350,7 +1351,8 @@ async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap
     .await?;
     let result = JsonFrameReader::new(&mut stream, CONTROL_FRAME_LIMIT)
         .read_with_timeout::<ControlMessage>(Duration::from_secs(20))
-        .await?;
+        .await
+        .context("Relay discovery response failed")?;
     let ControlMessage::BootstrapDiscoveryResult {
         protocol_version,
         deployment_root_public_key,

@@ -35,7 +35,9 @@ data class EnrollmentSnapshot(
             if (!envelope.optBoolean("ok")) {
                 return EnrollmentSnapshot(
                     phase = EnrollmentPhase.ERROR,
-                    error = envelope.optString("error", "Remote enrollment failed"),
+                    error = friendlyEnrollmentError(
+                        envelope.optString("error", "Remote enrollment failed"),
+                    ),
                 )
             }
             val data = envelope.getJSONObject("data")
@@ -53,8 +55,21 @@ data class EnrollmentSnapshot(
                 travelId = data.optString("travel_id"),
                 requestId = optionalString("request_id"),
                 verificationCode = optionalString("verification_code"),
-                error = optionalString("error"),
+                error = optionalString("error")?.let(::friendlyEnrollmentError),
             )
+        }
+
+        internal fun friendlyEnrollmentError(error: String): String {
+            val lower = error.lowercase()
+            return if (
+                "relay discovery tls handshake failed" in lower ||
+                "peer closed connection without sending tls close_notify" in lower
+            ) {
+                "Could not establish a secure enrollment connection. Check that this is the " +
+                    "Relay management port and that the Relay is running the same 0.3 build as this app."
+            } else {
+                error
+            }
         }
     }
 }
