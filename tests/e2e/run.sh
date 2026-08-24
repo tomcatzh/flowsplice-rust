@@ -28,6 +28,9 @@ rm -rf \
   "${generated_dir}/dynamic-home-global" \
   "${generated_dir}/dynamic-home-third" \
   "${generated_dir}/dynamic-travel" \
+  "${generated_dir}/android-travel" \
+  "${generated_dir}/android-travel-profile.zip" \
+  "${generated_dir}/android-profile-password.txt" \
   "${generated_dir}/travel"
 
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
@@ -705,6 +708,58 @@ if grep -Eq '^(mappings =|\[\[mappings\]\])' \
   exit 1
 fi
 
+if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
+  mkdir -p "${generated_dir}/android-travel"
+  docker compose -f "${compose_file}" run --no-deps --rm androidtravel \
+    /usr/local/bin/flowsplice-travelagent enroll-remote \
+    --travel-id android-e2e-travel \
+    --home-id home-1 \
+    --install-dir /android-travel \
+    --bootstrap-config /config/travel-bootstrap.toml \
+    --test-password-file /offline/test-password.txt \
+    --wait-timeout-secs 180 \
+    >"${generated_dir}/android-travel/enroll.log" 2>&1 &
+  first_enroll_pid=$!
+  android_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+    --port 19081 \
+    --travel-id android-e2e-travel \
+    --wait-secs 120)"
+  android_travel_request_id="$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+    "${android_travel_pending}")"
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 19081 \
+    --request-id "${android_travel_request_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --scope global \
+    --valid-days 1 >/dev/null
+  wait "${first_enroll_pid}"
+  first_enroll_pid=""
+  cp "${generated_dir}/offline/test-password.txt" \
+    "${generated_dir}/android-profile-password.txt"
+  chmod 600 "${generated_dir}/android-profile-password.txt"
+  sed -i.bak \
+    -e 's/relay1:8443/10.0.2.2:18443/g' \
+    -e 's/relay2:8443/10.0.2.2:28443/g' \
+    "${generated_dir}/android-travel/travelagent.toml"
+  sed -i.bak '/^\[\[homes\]\]$/i\
+[[relay_address_overrides]]\
+id = "relay-1"\
+management_addr = "10.0.2.2:18443"\
+data_addr = "10.0.2.2:18444"\
+\
+[[relay_address_overrides]]\
+id = "relay-2"\
+management_addr = "10.0.2.2:28443"\
+data_addr = "10.0.2.2:28444"\
+' "${generated_dir}/android-travel/travelagent.toml"
+  rm -f "${generated_dir}/android-travel/travelagent.toml.bak"
+  (
+    cd "${generated_dir}/android-travel"
+    zip -q -r "${generated_dir}/android-travel-profile.zip" travelagent.toml cert state
+  )
+fi
+
 docker compose -f "${compose_file}" up -d travelagent
 configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
   home-1 tcp-echo tcp 0.0.0.0:10080
@@ -748,5 +803,12 @@ done
 if ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=false' "${log_file}"; then
   echo 'missing stable active-Carrier reevaluation result' >&2
   exit 1
+fi
+if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
+  docker compose -f "${compose_file}" up -d relay1 relay2 homeagent
+  "${repo_root}/tests/e2e/android/run.sh" \
+    "${generated_dir}/android-travel-profile.zip" \
+    "${generated_dir}/android-profile-password.txt"
+  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
 docker compose -f "${compose_file}" ps

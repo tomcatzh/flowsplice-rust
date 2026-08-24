@@ -55,6 +55,8 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
         command cargo "$@"; \
       fi; \
     }; \
+    find crates server relay homeagent travelagent foobar tests/fixtures/echo \
+      -type f -name '*.rs' -exec touch {} + && \
     cargo build --locked --release --bins \
       --features flowsplice-homeagent/e2e-remote-ui,flowsplice-travelagent/e2e-remote-ui \
       -p flowsplice-server \

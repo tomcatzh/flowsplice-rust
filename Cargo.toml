@@ -4,6 +4,8 @@ members = [
     "crates/flowsplice-core",
     "crates/flowsplice-enrollment",
     "crates/flowsplice-storage",
+    "crates/flowsplice-travel-core",
+    "crates/flowsplice-travel-android",
     "server",
     "relay",
     "homeagent",
@@ -27,6 +29,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 flowsplice-core = { path = "crates/flowsplice-core" }
 flowsplice-enrollment = { path = "crates/flowsplice-enrollment" }
 flowsplice-storage = { path = "crates/flowsplice-storage" }
+flowsplice-travel-core = { path = "crates/flowsplice-travel-core" }
 futures-util = "0.3"
 hex = "0.4"
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }

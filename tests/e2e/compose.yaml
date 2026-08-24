@@ -25,6 +25,7 @@ services:
       - ./generated/state:/state
     ports:
       - "127.0.0.1:18443:8443"
+      - "127.0.0.1:18444:8444"
     networks: [flowsplice]
 
   relay2:
@@ -39,6 +40,7 @@ services:
       - ./generated/state:/state
     ports:
       - "127.0.0.1:28443:8443"
+      - "127.0.0.1:28444:8444"
     networks: [flowsplice]
 
   server:
@@ -168,7 +170,7 @@ services:
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/config/travelagent.toml"]
     environment:
-      RUST_LOG: flowsplice_travelagent=debug,info
+      RUST_LOG: flowsplice_travel_core=debug,flowsplice_travelagent=debug,info
       FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /travel/test-password.txt
       FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
@@ -191,12 +193,25 @@ services:
       - ./generated/state:/state
     networks: [flowsplice]
 
+  androidtravel:
+    image: flowsplice-e2e:local
+    user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
+    command: ["/bin/true"]
+    environment:
+      FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
+    volumes:
+      - ./generated/android-travel:/android-travel
+      - ./generated/config:/config:ro
+      - ./generated/certs:/certs:ro
+      - ./generated/offline:/offline:ro
+    networks: [flowsplice]
+
   firsttravel:
     image: flowsplice-e2e:local
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/first-travel/travelagent.toml"]
     environment:
-      RUST_LOG: flowsplice_travelagent=debug,info
+      RUST_LOG: flowsplice_travel_core=debug,flowsplice_travelagent=debug,info
       FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /first-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent]
@@ -213,7 +228,7 @@ services:
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/dynamic-travel/travelagent.toml"]
     environment:
-      RUST_LOG: flowsplice_travelagent=debug,info
+      RUST_LOG: flowsplice_travel_core=debug,flowsplice_travelagent=debug,info
       FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE: "1"
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /dynamic-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent, dynamichome-global]

@@ -303,6 +303,17 @@ fn record_flow_metric_sample(
     result: Option<&str>,
     histogram_sample: Option<u64>,
 ) {
+    use std::sync::atomic::Ordering;
+
+    match family {
+        "travel_flow_upload_observed_bytes" => {
+            state.uploaded_bytes.fetch_add(value, Ordering::Relaxed);
+        }
+        "delivered_download_bytes" => {
+            state.downloaded_bytes.fetch_add(value, Ordering::Relaxed);
+        }
+        _ => {}
+    }
     let mut dimensions = BTreeMap::new();
     dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
     dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
