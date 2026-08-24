@@ -59,7 +59,7 @@ order, persistent anti-rollback state, compromise boundaries, and implementation
 
 | Layer | Endpoints | Purpose |
 | --- | --- | --- |
-| Management TLS | Home→Server, Server→Relay, Travel→Relay | Mutual authentication for catalogs, heartbeats, route requests, and short-lived secrets. |
+| Management TLS | Home→Server, Relay↔Server, Travel→Relay | Mutual authentication for endpoint registration, catalogs, heartbeats, route requests, and short-lived secrets. |
 | Route admission | Travel→Relay and Home→Relay data sockets | HMAC-SHA256 proves possession of a single-use route/work secret before Relay pairs the sockets. |
 | Business TLS | Travel↔Home through one Relay | End-to-end mutual TLS protects the selected service ID, Flow frames, and business plaintext. |
 
@@ -211,7 +211,7 @@ my-travel/state/travel-state.redb
 ```
 
 No request or response file is transferred manually. The private keys never leave Travel, and the
-generated TOML contains paths and public Relay addresses but no private-key password. Start it:
+generated TOML contains paths and Relay bootstrap addresses but no private-key password. Start it:
 
 ```bash
 flowsplice-travelagent --config ./my-travel/travelagent.toml
@@ -316,6 +316,15 @@ The generic IPK contains Server, multiple named Relay instances, one procd servi
 and a Chinese/English LuCI page. It contains no deployment addresses, credentials, firewall policy,
 or private regression tooling. Installation is inert by default and does not create WAN firewall
 rules.
+
+Relay listener addresses are never duplicated as manually maintained advertised addresses. An exact
+IPv4 or IPv6 listener registers itself directly; an OpenWrt wildcard listener reads the selected
+logical network through netifd/ubus, binds its current L3 device, and registers the matching current
+address over its authenticated control session. A passive Relay is reached by Server through one
+stable management seed; an active Relay connects to Server and requires no Relay address in Server
+configuration. The reported listener endpoints, never the passive seed, are published. Server keeps
+one sorted, generation-numbered in-memory directory and broadcasts the complete replacement snapshot
+to every connected Relay whenever any Relay is added, updated, withdrawn, or disconnected.
 
 Build release binaries first, then the target-matched IPK:
 

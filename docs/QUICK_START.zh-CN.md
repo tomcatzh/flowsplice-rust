@@ -7,7 +7,7 @@
 公开包只允许包含：
 
 ```text
-flowsplice-travel-0.2.0-macos-arm64/
+flowsplice-travel-0.2.1-macos-arm64/
 ├── bin/flowsplice-travelagent
 ├── travel-bootstrap.example.toml
 ├── QUICK_START.zh-CN.md
@@ -128,7 +128,7 @@ my-travel/
 
 不要把 Home SPKI、完整 Relay 授权名单或密码手工写进 TOML。`[[seed_relays]]` 只是首次取得签名目录的联系地址。Travel 会把历史上从有效签名目录中验证过的 Relay 长期保存在 `travel-state.redb`，以后重启时把它们也当成 bootstrap 候选；旧记录永远不能代替新的 Server 签名目录授权。
 
-首次 enrollment 具体连接哪个 Relay，完全由 `travel-bootstrap.toml` 的 `bootstrap_relays` 决定。程序会规范化、排序、去重后逐一轮询；一个 Relay 失败会继续尝试下一个。Relay 地址变化只修改并重新分发配置文件，不重新编译二进制。
+首次 enrollment 具体连接哪个 Relay，完全由 `travel-bootstrap.toml` 的 `bootstrap_relays` 决定。程序会规范化、排序、去重后逐一轮询；一个 Relay 失败会继续尝试下一个。正常运行后，Relay 会在已认证的双向控制会话上报告当前监听端点：被动 Relay 由 Server 通过固定种子连接，主动 Relay 自行连接 Server。IPv4/IPv6 地址变化只更新签名目录，不需要 DDNS，也不需要修改 Travel 配置。只有所有 bootstrap 候选都永久失效时，才需要私下重新分发 bootstrap 配置。
 
 业务映射不再写入 TOML。在 `http://127.0.0.1:9080` 的“Service mappings”区域选择 Home 与业务，填写本地监听地址（例如 `127.0.0.1:10080`）并创建。修改已有监听的地址或端口后点击 Apply，会先确认新端口能够绑定，再原子写入 `travel-state.redb` 并切换监听；无需重启。若新端口无效或已占用，旧监听和持久状态保持不变。Remove 会停止该本地监听并删除其持久记录。
 

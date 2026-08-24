@@ -9,10 +9,14 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
 use rustls::{
-    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig,
+    ClientConfig, DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore,
+    ServerConfig,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::WebPkiSupportedAlgorithms,
-    server::{ParsedCertificate, WebPkiClientVerifier},
+    server::{
+        ParsedCertificate, WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -64,6 +68,47 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let bytes = read_private_key_file(path)?;
     PrivateKeyDer::from_pem_slice(&bytes)
         .with_context(|| format!("failed to parse private key {}", path.display()))
+}
+
+/// Requires the leaf certificate to declare the selected TLS endpoint usages explicitly.
+///
+/// # Errors
+///
+/// Returns an error when the certificate or its extended-key-usage extension is invalid or does
+/// not contain every requested purpose.
+pub fn validate_certificate_extended_key_usage(
+    path: &Path,
+    require_client_auth: bool,
+    require_server_auth: bool,
+) -> Result<()> {
+    let certificates = load_certs(path)?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| anyhow!("certificate file {} contains no leaf", path.display()))?;
+    let (_, certificate) = parse_x509_certificate(leaf.as_ref())
+        .with_context(|| format!("failed to parse leaf certificate {}", path.display()))?;
+    let usage = certificate
+        .extended_key_usage()
+        .context("invalid leaf certificate extended key usage")?
+        .ok_or_else(|| {
+            anyhow!(
+                "leaf certificate {} has no extended key usage",
+                path.display()
+            )
+        })?;
+    if require_client_auth && !usage.value.client_auth {
+        bail!(
+            "leaf certificate {} must allow TLS client authentication",
+            path.display()
+        );
+    }
+    if require_server_auth && !usage.value.server_auth {
+        bail!(
+            "leaf certificate {} must allow TLS server authentication",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Rejects symlinks, non-regular files, and group/world-readable private keys.
@@ -198,6 +243,93 @@ impl ServerCertVerifier for CertificateChainVerifier {
     }
 }
 
+/// Accepts ordinary management clients with `clientAuth` as well as Relay endpoint identities
+/// with `serverAuth`.
+///
+/// An active Relay proves possession of the same certificate used by its management listener.
+/// Requiring a second EKU on that existing endpoint certificate would force an otherwise
+/// unnecessary leaf replacement. The fallback verifier itself requires a Relay URI identity;
+/// application code must additionally restrict it to the exact configured Relay ID and active
+/// connection mode.
+#[derive(Debug)]
+struct ManagementIdentityClientVerifier {
+    client_auth: Arc<dyn ClientCertVerifier>,
+    roots: RootCertStore,
+    signature_algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ClientCertVerifier for ManagementIdentityClientVerifier {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.client_auth.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        if let Ok(verified) = self
+            .client_auth
+            .verify_client_cert(end_entity, intermediates, now)
+        {
+            return Ok(verified);
+        }
+        let certificate = ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &certificate,
+            &self.roots,
+            intermediates,
+            now,
+            self.signature_algorithms.all,
+        )?;
+        let identity = peer_identity(Some(std::slice::from_ref(end_entity)))
+            .map_err(|error| RustlsError::General(format!("invalid Relay identity: {error}")))?;
+        if identity.role != Role::Relay {
+            return Err(RustlsError::General(
+                "serverAuth client fallback is restricted to Relay identities".to_owned(),
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_algorithms.supported_schemes()
+    }
+}
+
 /// Builds a mutual-TLS server acceptor backed by rustls and AWS-LC.
 ///
 /// # Errors
@@ -234,6 +366,40 @@ pub fn optional_client_server_acceptor(
         .with_client_cert_verifier(verifier)
         .with_single_cert(load_certs(cert)?, load_private_key(key)?)
         .context("failed to build optional-client TLS server config")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Builds the Server management acceptor used by Home clients, anonymous bootstrap clients, and
+/// active Relay control sessions.
+///
+/// Ordinary clients are validated for `clientAuth`; a Relay may instead present its existing
+/// `serverAuth` endpoint certificate when it initiates the control connection. The fallback
+/// accepts only a Relay URI identity. Callers must still authorize the exact Relay ID and active
+/// connection mode before accepting any application message.
+///
+/// # Errors
+///
+/// Returns an error when certificate material is missing, malformed, or inconsistent.
+pub fn optional_management_identity_server_acceptor(
+    cert: &Path,
+    key: &Path,
+    client_ca: &Path,
+) -> Result<TlsAcceptor> {
+    let roots = load_roots(client_ca)?;
+    let client_auth = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
+        .allow_unauthenticated()
+        .build()
+        .context("failed to build optional client certificate verifier")?;
+    let verifier = ManagementIdentityClientVerifier {
+        client_auth,
+        roots,
+        signature_algorithms: rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms,
+    };
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_client_cert_verifier(Arc::new(verifier))
+        .with_single_cert(load_certs(cert)?, load_private_key(key)?)
+        .context("failed to build management TLS server config")?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

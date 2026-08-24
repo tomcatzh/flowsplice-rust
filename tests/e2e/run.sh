@@ -64,6 +64,17 @@ docker build \
   -t flowsplice-e2e:local \
   "${repo_root}"
 
+expected_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${repo_root}/Cargo.toml" | head -n 1)"
+for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent; do
+  actual_version="$(docker run --rm flowsplice-e2e:local "/usr/local/bin/${binary}" --version)"
+  if [[ "${actual_version}" != "${binary} ${expected_version}" ]]; then
+    printf 'E2E image contains stale %s: expected %s, got %s\n' \
+      "${binary}" "${expected_version}" "${actual_version}" >&2
+    exit 1
+  fi
+done
+printf '{"checkpoint": "e2e-image-version", "version": "%s"}\n' "${expected_version}"
+
 binary_audit_dir="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-e2e-binary-audit.XXXXXX")"
 binary_audit_container="$(docker create flowsplice-e2e:local /bin/true)"
 docker cp "${binary_audit_container}:/usr/local/bin/flowsplice-homeagent" \
@@ -237,6 +248,15 @@ printf '%s\n' '{"checkpoint": "authorization-state-explicit-initialization"}'
 
 teardown() {
   docker compose -f "${compose_file}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  local container_ids=()
+  while IFS= read -r container_id; do
+    if [[ -n "${container_id}" ]]; then
+      container_ids+=("${container_id}")
+    fi
+  done < <(docker ps -aq --filter label=com.docker.compose.project=e2e)
+  if (( ${#container_ids[@]} > 0 )); then
+    docker rm -f "${container_ids[@]}" >/dev/null 2>&1 || true
+  fi
 }
 
 first_enroll_pid=""
@@ -264,6 +284,44 @@ finish() {
 teardown
 trap finish EXIT
 docker compose -f "${compose_file}" up -d echo echo2 relay1 relay2 server homeagent homeagent2
+
+wait_for_relay_control_mode() {
+  local relay_id="$1"
+  local connection_mode="$2"
+  for _ in $(seq 1 60); do
+    if docker compose -f "${compose_file}" logs --no-color server 2>/dev/null \
+      | grep -F "relay_id=${relay_id}" \
+      | grep -F "connection_mode=${connection_mode}" \
+      | grep -Fq 'relay control connected'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Server did not establish ${connection_mode} control for ${relay_id}" >&2
+  exit 1
+}
+
+wait_for_relay_control_mode relay-1 passive
+wait_for_relay_control_mode relay-2 active
+printf '%s\n' '{"checkpoint": "passive-and-active-relay-control"}'
+
+wait_for_complete_relay_directory() {
+  local service="$1"
+  for _ in $(seq 1 60); do
+    if docker compose -f "${compose_file}" logs --no-color "${service}" 2>/dev/null \
+      | grep -F 'event="relay_directory_applied"' \
+      | grep -Fq 'relay_count=2'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${service} did not receive the complete in-memory Relay directory" >&2
+  exit 1
+}
+
+wait_for_complete_relay_directory relay1
+wait_for_complete_relay_directory relay2
+printf '%s\n' '{"checkpoint": "complete-relay-directory-broadcast"}'
 
 configure_travel_mapping() {
   local service="$1"

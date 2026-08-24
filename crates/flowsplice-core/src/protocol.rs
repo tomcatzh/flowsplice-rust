@@ -29,6 +29,15 @@ pub enum Role {
     Travel,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayConnectionMode {
+    /// Server dials a stable Relay management seed.
+    Passive,
+    /// Relay dials Server and keeps that authenticated stream as its control session.
+    Active,
+}
+
 impl Role {
     #[must_use]
     pub const fn as_uri_part(self) -> &'static str {
@@ -99,6 +108,15 @@ pub enum ControlMessage {
         protocol_version: u32,
         role: Role,
         id: String,
+    },
+    RelayEndpointUpdate {
+        management_addr: String,
+        data_public_addr: String,
+    },
+    RelayEndpointWithdraw,
+    RelayEndpointAccepted,
+    RelayDirectorySnapshot {
+        directory: RelayDirectory,
     },
     TravelHello {
         protocol_version: u32,
@@ -378,8 +396,8 @@ pub enum DataFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DataFrame, HomeCatalog, Service,
-        ServiceProtocol, TravelConnectionPurpose,
+        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DataFrame, HomeCatalog, RelayDirectory,
+        RelayEndpoint, Service, ServiceProtocol, TravelConnectionPurpose,
     };
     use crate::deployment::{SignedControlSnapshot, SignedDeploymentTrust};
     use uuid::Uuid;
@@ -462,6 +480,53 @@ mod tests {
             }
             _ => panic!("wrong control message variant"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn relay_endpoint_registration_messages_round_trip() -> Result<(), serde_json::Error> {
+        let update = ControlMessage::RelayEndpointUpdate {
+            management_addr: "[2001:db8::1]:8443".to_owned(),
+            data_public_addr: "[2001:db8::1]:8444".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&update)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        assert!(matches!(
+            decoded,
+            ControlMessage::RelayEndpointUpdate {
+                management_addr,
+                data_public_addr,
+            } if management_addr == "[2001:db8::1]:8443" && data_public_addr == "[2001:db8::1]:8444"
+        ));
+
+        let withdraw = ControlMessage::RelayEndpointWithdraw;
+        let encoded = serde_json::to_vec(&withdraw)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        assert!(matches!(decoded, ControlMessage::RelayEndpointWithdraw));
+
+        let accepted = ControlMessage::RelayEndpointAccepted;
+        let encoded = serde_json::to_vec(&accepted)?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        assert!(matches!(decoded, ControlMessage::RelayEndpointAccepted));
+
+        let directory = RelayDirectory {
+            generation: 7,
+            relays: vec![RelayEndpoint {
+                id: "relay-1".to_owned(),
+                management_addr: "192.0.2.1:8443".to_owned(),
+                data_public_addr: "192.0.2.1:8444".to_owned(),
+                management_spki_sha256: "11".repeat(32),
+            }],
+        };
+        let encoded = serde_json::to_vec(&ControlMessage::RelayDirectorySnapshot {
+            directory: directory.clone(),
+        })?;
+        let decoded: ControlMessage = serde_json::from_slice(&encoded)?;
+        assert!(matches!(
+            decoded,
+            ControlMessage::RelayDirectorySnapshot { directory: decoded }
+                if decoded == directory
+        ));
         Ok(())
     }
 

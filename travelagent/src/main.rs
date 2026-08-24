@@ -89,6 +89,7 @@ static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
 });
 
 #[derive(Parser)]
+#[command(version)]
 struct Cli {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "travelagent.toml")]
     config: PathBuf,

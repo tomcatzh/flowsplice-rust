@@ -557,11 +557,41 @@ def check_serving_only_home2_profile() -> None:
 
 def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
     statistics = travel_request("GET", "/api/statistics?period=day")
-    learned = {row["relay_id"]: row for row in statistics["relay_discovery"]}
-    assert learned["relay-1"]["configured_seed"] is True, learned
+    relay_discovery = statistics["relay_discovery"]
+    learned = {
+        row["relay_id"]: row
+        for row in relay_discovery
+        if row["relay_id"] is not None
+    }
+    configured_seeds = [row for row in relay_discovery if row["configured_seed"]]
+    assert len(configured_seeds) == 1, relay_discovery
+    assert configured_seeds[0]["relay_id"] is None, configured_seeds
+    assert configured_seeds[0]["management_addr"] == "relay1:8443", configured_seeds
+    assert configured_seeds[0]["learned"] is False, configured_seeds
+    assert configured_seeds[0]["current_member"] is False, configured_seeds
+    assert learned["relay-1"]["configured_seed"] is False, learned
+    assert learned["relay-1"]["learned"] is True, learned
+    assert learned["relay-1"]["current_member"] is True, learned
     assert learned["relay-2"]["configured_seed"] is False, learned
     assert learned["relay-2"]["learned"] is True, learned
+    assert learned["relay-2"]["current_member"] is True, learned
     relay2_success_before = learned["relay-2"]["last_success_unix_secs"]
+
+    relay1_container = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "ps",
+            "-q",
+            "relay1",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert relay1_container
 
     subprocess.run(
         [
@@ -592,21 +622,6 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
         ],
         check=True,
     )
-    relay1_container = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(COMPOSE_FILE),
-            "ps",
-            "-aq",
-            "relay1",
-        ],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    ).stdout.strip()
-    assert relay1_container
     relay1_running = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", relay1_container],
         check=True,

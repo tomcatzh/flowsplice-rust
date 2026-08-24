@@ -24,6 +24,8 @@ chmod 600 \
 	/etc/flowsplice/state/server-authorization.json \
 	/etc/flowsplice/state/server-control-generation.json
 /etc/init.d/flowsplice enable
+ubusd_pids="$(pidof ubusd 2>/dev/null || true)"
+[ -z "$ubusd_pids" ] || kill -HUP $ubusd_pids
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 rm -rf /tmp/luci-modulecache
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true

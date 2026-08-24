@@ -13,8 +13,8 @@
 ## 1. 解包并验证
 
 ```bash
-tar -xzf flowsplice-home2-0.2.0-macos-arm64.tar.gz
-cd flowsplice-home2-0.2.0-macos-arm64
+tar -xzf flowsplice-home2-0.2.1-macos-arm64.tar.gz
+cd flowsplice-home2-0.2.1-macos-arm64
 shasum -a 256 -c SHA256SUMS
 codesign --verify --strict --verbose=2 ./bin/flowsplice-homeagent
 codesign -dvvv ./bin/flowsplice-homeagent 2>&1 \
@@ -28,7 +28,7 @@ codesign -dvvv ./bin/flowsplice-homeagent 2>&1 \
 解包后的包结构必须是：
 
 ```text
-flowsplice-home2-0.2.0-macos-arm64/
+flowsplice-home2-0.2.1-macos-arm64/
 ├── bin/flowsplice-homeagent
 ├── home-bootstrap.example.toml
 ├── QUICK_START.zh-CN.md

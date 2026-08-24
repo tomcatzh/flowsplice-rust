@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     io::{self, IsTerminal},
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -34,14 +35,14 @@ use flowsplice_core::{
     frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{
-        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, HomeCatalog, RelayDirectory,
-        RelayEndpoint, Role,
+        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, HomeCatalog, RelayConnectionMode,
+        RelayDirectory, RelayEndpoint, Role,
     },
     statistics::{SignedStatisticsReport, statistics_dashboard_html},
     tls::{
         PeerIdentity, identity_client_connector, identity_from_certificate_pem,
-        identity_server_name, load_private_key, optional_client_server_acceptor, peer_identity,
-        require_peer,
+        identity_server_name, load_private_key, optional_management_identity_server_acceptor,
+        peer_identity, require_peer,
     },
 };
 use flowsplice_enrollment::home::{HomeEnrollmentRequest, HomeEnrollmentResponse};
@@ -51,6 +52,7 @@ use flowsplice_storage::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
@@ -106,6 +108,13 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct ConfiguredRelay {
     id: String,
+    connection_mode: RelayConnectionMode,
+    #[serde(default)]
+    connect_addr: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RelayAdvertisement {
     management_addr: String,
     data_public_addr: String,
 }
@@ -217,24 +226,7 @@ impl ControlSigner {
         if current_trust != self.trust {
             bail!("Server deployment trust changed unexpectedly in memory");
         }
-        let generation = {
-            let mut next = self
-                .next_generation
-                .lock()
-                .map_err(|_| anyhow!("Server control generation lock is poisoned"))?;
-            let generation = *next;
-            let following = generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("Server control generation exhausted"))?;
-            store_json_atomic(
-                &self.generation_path,
-                &ControlGenerationState {
-                    next_generation: following,
-                },
-            )?;
-            *next = following;
-            generation
-        };
+        let generation = self.allocate_generation()?;
         SignedControlSnapshot::sign(
             self.signed_trust.clone(),
             &self.trust,
@@ -254,6 +246,25 @@ impl ControlSigner {
             },
             &self.key,
         )
+    }
+
+    fn allocate_generation(&self) -> Result<u64> {
+        let mut next = self
+            .next_generation
+            .lock()
+            .map_err(|_| anyhow!("Server control generation lock is poisoned"))?;
+        let generation = *next;
+        let following = generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Server control generation exhausted"))?;
+        store_json_atomic(
+            &self.generation_path,
+            &ControlGenerationState {
+                next_generation: following,
+            },
+        )?;
+        *next = following;
+        Ok(generation)
     }
 }
 
@@ -391,26 +402,79 @@ struct TravelSessionRegistry {
 #[derive(Default)]
 struct RelayDirectoryRegistry {
     generation: u64,
-    endpoints: HashMap<String, RelayEndpoint>,
+    sessions: HashMap<String, RelayDirectorySession>,
+}
+
+struct RelayDirectorySession {
+    session_id: Uuid,
+    endpoint: Option<RelayEndpoint>,
 }
 
 impl RelayDirectoryRegistry {
-    fn register(&mut self, endpoint: RelayEndpoint) -> RelayDirectory {
-        let changed = self.endpoints.get(&endpoint.id) != Some(&endpoint);
-        if changed {
-            self.endpoints.insert(endpoint.id.clone(), endpoint);
-            self.generation = self.generation.saturating_add(1);
-        }
+    fn replace_session(
+        &mut self,
+        relay_id: &str,
+        session_id: Uuid,
+        endpoint: Option<RelayEndpoint>,
+        generation: u64,
+    ) -> RelayDirectory {
+        self.sessions.insert(
+            relay_id.to_owned(),
+            RelayDirectorySession {
+                session_id,
+                endpoint,
+            },
+        );
+        self.generation = generation;
         self.directory()
     }
 
     fn directory(&self) -> RelayDirectory {
-        let mut relays = self.endpoints.values().cloned().collect::<Vec<_>>();
+        let mut relays = self
+            .sessions
+            .values()
+            .filter_map(|session| session.endpoint.clone())
+            .collect::<Vec<_>>();
         relays.sort_by(|left, right| left.id.cmp(&right.id));
         RelayDirectory {
             generation: self.generation,
             relays,
         }
+    }
+
+    fn update_session(
+        &mut self,
+        relay_id: &str,
+        session_id: Uuid,
+        endpoint: Option<RelayEndpoint>,
+        generation: u64,
+    ) -> Result<RelayDirectory> {
+        let session = self
+            .sessions
+            .get_mut(relay_id)
+            .filter(|session| session.session_id == session_id)
+            .ok_or_else(|| anyhow!("Relay session was superseded"))?;
+        session.endpoint = endpoint;
+        self.generation = generation;
+        Ok(self.directory())
+    }
+
+    fn unregister_session(
+        &mut self,
+        relay_id: &str,
+        session_id: Uuid,
+        generation: u64,
+    ) -> Option<RelayDirectory> {
+        let is_current = self
+            .sessions
+            .get(relay_id)
+            .is_some_and(|session| session.session_id == session_id);
+        if !is_current {
+            return None;
+        }
+        self.sessions.remove(relay_id);
+        self.generation = generation;
+        Some(self.directory())
     }
 }
 
@@ -475,8 +539,10 @@ impl TravelSessionRegistry {
 
 struct State {
     homes: Mutex<HomeRegistry>,
-    relay_txs: Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>,
+    relay_sessions: Mutex<HashMap<String, RelaySession>>,
     relay_directory: Mutex<RelayDirectoryRegistry>,
+    relay_directory_tx: watch::Sender<RelayDirectory>,
+    configured_relay_count: usize,
     travel_sessions: Mutex<TravelSessionRegistry>,
     pending_grants: Mutex<HashMap<Uuid, PendingRelayGrant>>,
     pending_enrollments: Mutex<HashMap<Uuid, PendingEnrollment>>,
@@ -488,21 +554,36 @@ struct State {
     statistics_store: Arc<StateStore>,
 }
 
+#[derive(Clone)]
+struct RelaySession {
+    session_id: Uuid,
+    tx: mpsc::Sender<ControlMessage>,
+    shutdown: watch::Sender<bool>,
+}
+
 impl State {
     fn new(
         authorization: ServerAuthorization,
-        relay_directory_generation: u64,
+        relays: &[ConfiguredRelay],
         control_signer: ControlSigner,
         statistics_store: StateStore,
-    ) -> Self {
+    ) -> Result<Self> {
         let (authorization_tx, _) = watch::channel(authorization.snapshot().generation);
-        Self {
+        let relay_directory_generation = control_signer.allocate_generation()?;
+        let initial_directory = RelayDirectory {
+            generation: relay_directory_generation,
+            relays: Vec::new(),
+        };
+        let (relay_directory_tx, _) = watch::channel(initial_directory);
+        Ok(Self {
             homes: Mutex::new(HomeRegistry::default()),
-            relay_txs: Mutex::new(HashMap::new()),
+            relay_sessions: Mutex::new(HashMap::new()),
             relay_directory: Mutex::new(RelayDirectoryRegistry {
                 generation: relay_directory_generation,
-                endpoints: HashMap::new(),
+                sessions: HashMap::new(),
             }),
+            relay_directory_tx,
+            configured_relay_count: relays.len(),
             travel_sessions: Mutex::new(TravelSessionRegistry::default()),
             pending_grants: Mutex::new(HashMap::new()),
             pending_enrollments: Mutex::new(HashMap::new()),
@@ -512,7 +593,7 @@ impl State {
             authorization_tx,
             control_signer,
             statistics_store: Arc::new(statistics_store),
-        }
+        })
     }
 }
 
@@ -540,13 +621,12 @@ async fn main() -> Result<()> {
         control_signer.trust.clone(),
         config.travel_authorization_state.clone(),
     )?;
-    let relay_directory_generation = 1;
     let state = Arc::new(State::new(
         authorization,
-        relay_directory_generation,
+        &config.relays,
         control_signer,
         statistics_store,
-    ));
+    )?);
 
     let control = run_home_listeners(config.clone(), Arc::clone(&state));
     let relay = run_relay_connectors(config.clone(), Arc::clone(&state));
@@ -591,7 +671,11 @@ fn validate_config(config: &Config) -> Result<()> {
     {
         bail!("server timeout and pending-work limits must be positive");
     }
-    let _ = optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let _ = optional_management_identity_server_acceptor(
+        &config.cert,
+        &config.key,
+        &config.management_ca,
+    )?;
     let _ = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
     Ok(())
 }
@@ -636,20 +720,73 @@ fn validate_relays(relays: &[ConfiguredRelay]) -> Result<()> {
     }
     let mut ids = std::collections::HashSet::new();
     for relay in relays {
-        if relay.id.is_empty()
-            || relay.management_addr.is_empty()
-            || relay.data_public_addr.is_empty()
-            || !ids.insert(&relay.id)
-        {
-            bail!("relay ids must be non-empty and unique, with non-empty addresses");
+        if relay.id.is_empty() || !ids.insert(&relay.id) {
+            bail!("relay ids must be non-empty and unique");
+        }
+        match (relay.connection_mode, relay.connect_addr.as_deref()) {
+            (RelayConnectionMode::Passive, Some(address)) => {
+                validate_passive_relay_seed(address)?;
+            }
+            (RelayConnectionMode::Passive, None) => {
+                bail!("passive Relay {} requires connect_addr", relay.id);
+            }
+            (RelayConnectionMode::Active, Some(_)) => {
+                bail!("active Relay {} must not configure connect_addr", relay.id);
+            }
+            (RelayConnectionMode::Active, None) => {}
         }
     }
     Ok(())
 }
 
+fn validate_passive_relay_seed(address: &str) -> Result<()> {
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .with_context(|| format!("invalid passive Relay seed {address}"))?;
+        let ip = host
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid passive Relay seed {address}"))?;
+        if !matches!(ip, IpAddr::V6(_)) {
+            bail!("invalid passive Relay seed {address}");
+        }
+        (host, port)
+    } else {
+        let (host, port) = address
+            .rsplit_once(':')
+            .with_context(|| format!("invalid passive Relay seed {address}"))?;
+        if host.contains(':') {
+            bail!("IPv6 passive Relay seeds must use bracket notation");
+        }
+        (host, port)
+    };
+
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid passive Relay seed {address}"))?;
+    if port == 0 || host.is_empty() || host.chars().any(char::is_whitespace) {
+        bail!("passive Relay seed must be a directly connectable host and nonzero port");
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() || ip.is_multicast() {
+            bail!("passive Relay seed must be a directly connectable host and nonzero port");
+        }
+    } else if !host
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+    {
+        bail!("invalid passive Relay seed hostname {host}");
+    }
+    Ok(())
+}
+
 async fn run_home_listeners(config: Config, state: Arc<State>) -> Result<()> {
-    let acceptor =
-        optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let acceptor = optional_management_identity_server_acceptor(
+        &config.cert,
+        &config.key,
+        &config.management_ca,
+    )?;
     let address = config.control_listen.clone();
     let listener = TcpListener::bind(&address)
         .await
@@ -689,7 +826,14 @@ async fn run_home_accept_loop(
                     .peer_certificates()
                     .is_some_and(|certs| !certs.is_empty())
                 {
-                    handle_home(stream, state, &config).await
+                    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+                    match identity.role {
+                        Role::Home => handle_home(stream, state, &config).await,
+                        Role::Relay => {
+                            handle_relay_registration(stream, identity, state, &config).await
+                        }
+                        _ => bail!("unsupported control peer role"),
+                    }
                 } else {
                     handle_home_bootstrap(stream, state, &config).await
                 }
@@ -833,6 +977,58 @@ async fn dispatch_home_enrollment(
         }
     }
     Ok(response_rx)
+}
+
+async fn handle_relay_registration(
+    stream: TlsStream<TcpStream>,
+    identity: PeerIdentity,
+    state: Arc<State>,
+    config: &Config,
+) -> Result<()> {
+    require_peer(&identity, Role::Relay, None, &[])?;
+    let relay = config
+        .relays
+        .iter()
+        .find(|relay| relay.id == identity.id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Relay {} is not configured", identity.id))?;
+    if relay.connection_mode != RelayConnectionMode::Active {
+        bail!(
+            "passive Relay {} cannot initiate a Server connection",
+            relay.id
+        );
+    }
+    run_relay_session(
+        stream,
+        config,
+        &relay,
+        identity,
+        &state,
+        RelaySessionDirection::RelayInitiated,
+    )
+    .await
+}
+
+fn validate_relay_advertisement(advertisement: &RelayAdvertisement) -> Result<()> {
+    for (label, address) in [
+        ("management", &advertisement.management_addr),
+        ("data", &advertisement.data_public_addr),
+    ] {
+        if address.len() > 512 {
+            bail!("Relay {label} endpoint advertisement is too long");
+        }
+        let address = address
+            .parse::<SocketAddr>()
+            .with_context(|| format!("Relay {label} endpoint must be a literal socket address"))?;
+        if address.port() == 0
+            || address.ip().is_unspecified()
+            || address.ip().is_loopback()
+            || address.ip().is_multicast()
+        {
+            bail!("Relay {label} endpoint advertisement is not directly connectable");
+        }
+    }
+    Ok(())
 }
 
 async fn complete_home_enrollment(
@@ -1291,12 +1487,20 @@ async fn clear_home_session(state: &Arc<State>, session_id: Uuid, home_id: &str)
 
 async fn run_relay_connectors(config: Config, state: Arc<State>) -> Result<()> {
     let mut tasks = JoinSet::new();
-    for relay in config.relays.clone() {
+    for relay in config
+        .relays
+        .iter()
+        .filter(|relay| relay.connection_mode == RelayConnectionMode::Passive)
+        .cloned()
+    {
         tasks.spawn(run_relay_connector(
             config.clone(),
             relay,
             Arc::clone(&state),
         ));
+    }
+    if tasks.is_empty() {
+        return std::future::pending::<Result<()>>().await;
     }
     while let Some(result) = tasks.join_next().await {
         result??;
@@ -1310,9 +1514,13 @@ async fn run_relay_connector(
     state: Arc<State>,
 ) -> Result<()> {
     let connector = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
+    let connect_addr = relay
+        .connect_addr
+        .as_deref()
+        .ok_or_else(|| anyhow!("passive Relay {} has no connect_addr", relay.id))?;
     loop {
         let result = async {
-            let socket = TcpStream::connect(&relay.management_addr).await?;
+            let socket = TcpStream::connect(connect_addr).await?;
             socket.set_nodelay(true)?;
             let stream = timeout(
                 Duration::from_secs(config.handshake_timeout_secs),
@@ -1322,62 +1530,69 @@ async fn run_relay_connector(
             .context("relay TLS handshake timed out")??;
             let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
             require_peer(&identity, Role::Relay, Some(&relay.id), &[])?;
-            let endpoint = RelayEndpoint {
-                id: relay.id.clone(),
-                management_addr: relay.management_addr.clone(),
-                data_public_addr: relay.data_public_addr.clone(),
-                management_spki_sha256: identity.spki_sha256.clone(),
-            };
-            run_relay_session(stream, &config, &relay, endpoint, identity, &state).await
+            run_relay_session(
+                stream,
+                &config,
+                &relay,
+                identity,
+                &state,
+                RelaySessionDirection::ServerInitiated,
+            )
+            .await
         }
         .await;
         if let Err(error) = result {
             warn!(relay_id = %relay.id, %error, "relay control disconnected; reconnecting");
         }
-        state.relay_txs.lock().await.remove(&relay.id);
-        state
-            .authorization_acks
-            .lock()
-            .await
-            .remove(&format!("relay:{}", relay.id));
         sleep(Duration::from_secs(1)).await;
     }
 }
 
+#[derive(Clone, Copy)]
+enum RelaySessionDirection {
+    ServerInitiated,
+    RelayInitiated,
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run_relay_session(
-    stream: tokio_rustls::client::TlsStream<TcpStream>,
+async fn run_relay_session<S>(
+    stream: S,
     config: &Config,
     relay: &ConfiguredRelay,
-    endpoint: RelayEndpoint,
     relay_identity: PeerIdentity,
     state: &Arc<State>,
-) -> Result<()> {
+    direction: RelaySessionDirection,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    let server_hello = ControlMessage::Hello {
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+        role: Role::Server,
+        id: config.id.clone(),
+    };
+    match direction {
+        RelaySessionDirection::ServerInitiated => {
+            write_json(&mut writer, &server_hello, CONTROL_FRAME_LIMIT).await?;
+            require_relay_hello(&mut reader, setup_timeout, relay).await?;
+        }
+        RelaySessionDirection::RelayInitiated => {
+            require_relay_hello(&mut reader, setup_timeout, relay).await?;
+            write_json(&mut writer, &server_hello, CONTROL_FRAME_LIMIT).await?;
+        }
+    }
+
+    let mut endpoint =
+        read_relay_endpoint(&mut reader, setup_timeout, relay, &relay_identity).await?;
     write_json(
         &mut writer,
-        &ControlMessage::Hello {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            role: Role::Server,
-            id: config.id.clone(),
-        },
+        &ControlMessage::RelayEndpointAccepted,
         CONTROL_FRAME_LIMIT,
     )
     .await?;
-    match reader
-        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
-        .await?
-    {
-        ControlMessage::Hello {
-            protocol_version,
-            role,
-            id,
-        } if protocol_version == CONTROL_PROTOCOL_VERSION
-            && role == Role::Relay
-            && id == relay.id => {}
-        _ => bail!("relay HELLO does not match expected identity"),
-    }
 
     let snapshot = state.authorization.read().await.snapshot();
     write_json(
@@ -1401,11 +1616,31 @@ async fn run_relay_session(
     }
 
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
-    state
-        .relay_txs
-        .lock()
-        .await
-        .insert(relay.id.clone(), tx.clone());
+    let mut relay_directory_rx = state.relay_directory_tx.subscribe();
+    let session_id = Uuid::new_v4();
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let previous = state.relay_sessions.lock().await.insert(
+        relay.id.clone(),
+        RelaySession {
+            session_id,
+            tx: tx.clone(),
+            shutdown,
+        },
+    );
+    if let Some(previous) = previous {
+        warn!(
+            relay_id = %relay.id,
+            old_session_id = %previous.session_id,
+            new_session_id = %session_id,
+            "superseding existing authenticated Relay control session"
+        );
+        let _ = previous.shutdown.send(true);
+    }
+    let connection_mode = match relay.connection_mode {
+        RelayConnectionMode::Passive => "passive",
+        RelayConnectionMode::Active => "active",
+    };
+    let result = async {
     let current_snapshot = state.authorization.read().await.snapshot();
     if current_snapshot.generation != snapshot.generation {
         tx.send(ControlMessage::TravelAuthorizationSnapshot {
@@ -1413,27 +1648,87 @@ async fn run_relay_session(
         })
         .await?;
     }
-    let directory = state.relay_directory.lock().await.register(endpoint);
+    replace_relay_session_endpoint(state, relay, session_id, endpoint.clone()).await?;
+    let directory = relay_directory_rx.borrow_and_update().clone();
+    write_json(
+        &mut writer,
+        &ControlMessage::RelayDirectorySnapshot { directory },
+        CONTROL_FRAME_LIMIT,
+    )
+    .await?;
     info!(
-        event = "relay_directory_updated",
-        generation = directory.generation,
-        relay_count = directory.relays.len(),
-        "updated authenticated Relay directory"
+        relay_id = %relay.id,
+        %session_id,
+        connection_mode = %connection_mode,
+        "relay control connected"
     );
-    info!(relay_id = %relay.id, "relay control connected");
 
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut nonce = 0_u64;
     let mut last_received = Instant::now();
     loop {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    bail!("Relay session was superseded");
+                }
+            }
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { bail!("relay writer channel closed"); };
                 write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
             }
+            changed = relay_directory_rx.changed() => {
+                changed.map_err(|_| anyhow!("Relay directory publisher closed"))?;
+                let directory = relay_directory_rx.borrow_and_update().clone();
+                write_json(
+                    &mut writer,
+                    &ControlMessage::RelayDirectorySnapshot { directory },
+                    CONTROL_FRAME_LIMIT,
+                ).await?;
+            }
             incoming = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match incoming? {
+                    ControlMessage::RelayEndpointUpdate {
+                        management_addr,
+                        data_public_addr,
+                    } => {
+                        let advertisement = RelayAdvertisement {
+                            management_addr,
+                            data_public_addr,
+                        };
+                        validate_relay_advertisement(&advertisement)?;
+                        let updated = RelayEndpoint {
+                            id: relay.id.clone(),
+                            management_addr: advertisement.management_addr,
+                            data_public_addr: advertisement.data_public_addr,
+                            management_spki_sha256: relay_identity.spki_sha256.clone(),
+                        };
+                        update_relay_session_endpoint(
+                            state,
+                            relay,
+                            session_id,
+                            Some(updated.clone()),
+                        )
+                        .await?;
+                        endpoint = Some(updated);
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::RelayEndpointAccepted,
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::RelayEndpointWithdraw => {
+                        update_relay_session_endpoint(state, relay, session_id, None).await?;
+                        endpoint = None;
+                        write_json(
+                            &mut writer,
+                            &ControlMessage::RelayEndpointAccepted,
+                            CONTROL_FRAME_LIMIT,
+                        )
+                        .await?;
+                    }
                     ControlMessage::TravelSessionAuthorize {
                         request_id,
                         travel_id,
@@ -1505,20 +1800,33 @@ async fn run_relay_session(
                         credential_id,
                         home_id,
                     } => {
-                        handle_route_request(
-                            RouteRequestContext {
-                                request: request_id,
-                                travel: travel_id,
-                                travel_session: travel_session_id,
-                                credential: credential_id,
-                                home: home_id,
-                            },
-                            config,
-                            relay,
-                            state,
-                            &mut writer,
-                        )
-                        .await?;
+                        if let Some(endpoint) = endpoint.as_ref() {
+                            handle_route_request(
+                                RouteRequestContext {
+                                    request: request_id,
+                                    travel: travel_id,
+                                    travel_session: travel_session_id,
+                                    credential: credential_id,
+                                    home: home_id,
+                                },
+                                config,
+                                relay,
+                                endpoint,
+                                state,
+                                &mut writer,
+                            )
+                            .await?;
+                        } else {
+                            write_json(
+                                &mut writer,
+                                &ControlMessage::RouteDenied {
+                                    request_id,
+                                    reason: "Relay endpoint is currently withdrawn".to_owned(),
+                                },
+                                CONTROL_FRAME_LIMIT,
+                            )
+                            .await?;
+                        }
                     }
                     ControlMessage::RelayWorkReady { request_id, work_id } => {
                         complete_relay_work(state, &relay.id, request_id, work_id).await?;
@@ -1526,7 +1834,7 @@ async fn run_relay_session(
                     ControlMessage::Heartbeat { nonce } => {
                         write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
                     }
-                    ControlMessage::HeartbeatAck { .. } => {}
+            ControlMessage::HeartbeatAck { .. } => {}
                     ControlMessage::TravelAuthorizationAck { generation } => {
                         record_authorization_ack(state, format!("relay:{}", relay.id), generation).await;
                     }
@@ -1626,12 +1934,192 @@ async fn run_relay_session(
             }
         }
     }
+    }
+    .await;
+
+    let current_session = {
+        let mut sessions = state.relay_sessions.lock().await;
+        if sessions
+            .get(&relay.id)
+            .is_some_and(|session| session.session_id == session_id)
+        {
+            sessions.remove(&relay.id);
+            true
+        } else {
+            false
+        }
+    };
+    let mut directory_cleanup = Ok(());
+    if current_session {
+        directory_cleanup = unregister_relay_session_endpoint(state, relay, session_id).await;
+        state
+            .pending_grants
+            .lock()
+            .await
+            .retain(|_, grant| grant.relay_id != relay.id);
+        state
+            .authorization_acks
+            .lock()
+            .await
+            .remove(&format!("relay:{}", relay.id));
+    }
+    directory_cleanup?;
+    result
+}
+
+async fn require_relay_hello<R>(
+    reader: &mut JsonFrameReader<R>,
+    setup_timeout: Duration,
+    relay: &ConfiguredRelay,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    {
+        ControlMessage::Hello {
+            protocol_version,
+            role,
+            id,
+        } if protocol_version == CONTROL_PROTOCOL_VERSION
+            && role == Role::Relay
+            && id == relay.id =>
+        {
+            Ok(())
+        }
+        _ => bail!("Relay HELLO does not match its certificate and configured identity"),
+    }
+}
+
+async fn read_relay_endpoint<R>(
+    reader: &mut JsonFrameReader<R>,
+    setup_timeout: Duration,
+    relay: &ConfiguredRelay,
+    identity: &PeerIdentity,
+) -> Result<Option<RelayEndpoint>>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    {
+        ControlMessage::RelayEndpointUpdate {
+            management_addr,
+            data_public_addr,
+        } => {
+            let advertisement = RelayAdvertisement {
+                management_addr,
+                data_public_addr,
+            };
+            validate_relay_advertisement(&advertisement)?;
+            Ok(Some(RelayEndpoint {
+                id: relay.id.clone(),
+                management_addr: advertisement.management_addr,
+                data_public_addr: advertisement.data_public_addr,
+                management_spki_sha256: identity.spki_sha256.clone(),
+            }))
+        }
+        ControlMessage::RelayEndpointWithdraw => Ok(None),
+        _ => bail!("Relay did not report or withdraw its endpoint after HELLO"),
+    }
+}
+
+async fn replace_relay_session_endpoint(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    session_id: Uuid,
+    endpoint: Option<RelayEndpoint>,
+) -> Result<()> {
+    let directory = {
+        let mut registry = state.relay_directory.lock().await;
+        let generation = state.control_signer.allocate_generation()?;
+        registry.replace_session(&relay.id, session_id, endpoint, generation)
+    };
+    state.relay_directory_tx.send_replace(directory.clone());
+    info!(
+        event = "relay_directory_updated",
+        generation = directory.generation,
+        relay_count = directory.relays.len(),
+        all_configured = directory.relays.len() == state.configured_relay_count,
+        relay_id = %relay.id,
+        %session_id,
+        "installed authenticated Relay session in directory"
+    );
+    Ok(())
+}
+
+async fn update_relay_session_endpoint(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    session_id: Uuid,
+    endpoint: Option<RelayEndpoint>,
+) -> Result<()> {
+    let directory = {
+        let mut registry = state.relay_directory.lock().await;
+        if registry
+            .sessions
+            .get(&relay.id)
+            .is_none_or(|session| session.session_id != session_id)
+        {
+            bail!("Relay session was superseded");
+        }
+        let generation = state.control_signer.allocate_generation()?;
+        registry.update_session(&relay.id, session_id, endpoint, generation)?
+    };
+    state.relay_directory_tx.send_replace(directory.clone());
+    info!(
+        event = "relay_directory_updated",
+        generation = directory.generation,
+        relay_count = directory.relays.len(),
+        all_configured = directory.relays.len() == state.configured_relay_count,
+        relay_id = %relay.id,
+        %session_id,
+        "updated authenticated Relay session directory entry"
+    );
+    Ok(())
+}
+
+async fn unregister_relay_session_endpoint(
+    state: &Arc<State>,
+    relay: &ConfiguredRelay,
+    session_id: Uuid,
+) -> Result<()> {
+    let directory = {
+        let mut registry = state.relay_directory.lock().await;
+        if registry
+            .sessions
+            .get(&relay.id)
+            .is_none_or(|session| session.session_id != session_id)
+        {
+            return Ok(());
+        }
+        let generation = state.control_signer.allocate_generation()?;
+        registry.unregister_session(&relay.id, session_id, generation)
+    };
+    let Some(directory) = directory else {
+        return Ok(());
+    };
+    state.relay_directory_tx.send_replace(directory.clone());
+    info!(
+        event = "relay_directory_updated",
+        generation = directory.generation,
+        relay_count = directory.relays.len(),
+        all_configured = directory.relays.len() == state.configured_relay_count,
+        relay_id = %relay.id,
+        %session_id,
+        "removed authenticated Relay session from directory"
+    );
+    Ok(())
 }
 
 async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     request: RouteRequestContext,
     config: &Config,
     relay: &ConfiguredRelay,
+    endpoint: &RelayEndpoint,
     state: &Arc<State>,
     writer: &mut W,
 ) -> Result<()> {
@@ -1701,7 +2189,7 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
                 work_secret: secret.clone(),
                 credential_id: request.credential,
                 relay_id: relay.id.clone(),
-                relay_data_addr: relay.data_public_addr.clone(),
+                relay_data_addr: endpoint.data_public_addr.clone(),
                 expires_at_unix_secs,
             },
             expires: Instant::now() + Duration::from_secs(config.work_ttl_secs),
@@ -2504,7 +2992,13 @@ async fn broadcast_authorization(state: &Arc<State>, snapshot: TravelAuthorizati
     let message = ControlMessage::TravelAuthorizationSnapshot {
         snapshot: snapshot.clone(),
     };
-    let relays = state.relay_txs.lock().await.clone();
+    let relays = state
+        .relay_sessions
+        .lock()
+        .await
+        .iter()
+        .map(|(id, session)| (id.clone(), session.tx.clone()))
+        .collect::<Vec<_>>();
     let mut publishes = JoinSet::new();
     for (relay_id, relay) in relays {
         let message = message.clone();
@@ -2547,15 +3041,19 @@ mod tests {
     use flowsplice_core::{
         authorization::{TravelCredential, TravelCredentialScope},
         deployment::{DeploymentTrust, HomeEndpointTrust},
-        protocol::{Catalog, HomeCatalog, RelayEndpoint, Role, Service, ServiceProtocol},
+        protocol::{
+            Catalog, HomeCatalog, RelayConnectionMode, RelayEndpoint, Role, Service,
+            ServiceProtocol,
+        },
     };
     use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
     use super::{
-        ConfiguredHome, HomeRegistry, HomeSession, PendingRelayGrant, RelayDirectoryRegistry,
-        TRAVEL_SESSION_LEASE, TravelSessionRegistry, catalog_for_credentials,
-        take_matching_pending_grant, validate_homes, validate_metric_ownership,
+        ConfiguredHome, ConfiguredRelay, HomeRegistry, HomeSession, PendingRelayGrant,
+        RelayAdvertisement, RelayDirectoryRegistry, TRAVEL_SESSION_LEASE, TravelSessionRegistry,
+        catalog_for_credentials, take_matching_pending_grant, validate_homes,
+        validate_metric_ownership, validate_relay_advertisement, validate_relays,
         validate_statistics_time_window,
     };
 
@@ -2707,32 +3205,152 @@ mod tests {
     }
 
     #[test]
+    fn configured_relays_require_consistent_modes_and_unique_ids() {
+        let active = ConfiguredRelay {
+            id: "relay-1".to_owned(),
+            connection_mode: RelayConnectionMode::Active,
+            connect_addr: None,
+        };
+        assert!(validate_relays(std::slice::from_ref(&active)).is_ok());
+
+        assert!(
+            validate_relays(&[ConfiguredRelay {
+                id: "relay-hostname".to_owned(),
+                connection_mode: RelayConnectionMode::Passive,
+                connect_addr: Some("relay1:8443".to_owned()),
+            }])
+            .is_ok()
+        );
+
+        let duplicate = ConfiguredRelay {
+            id: "relay-1".to_owned(),
+            connection_mode: RelayConnectionMode::Passive,
+            connect_addr: Some("192.0.2.1:8443".to_owned()),
+        };
+        assert!(validate_relays(&[active, duplicate]).is_err());
+        assert!(
+            validate_relays(&[ConfiguredRelay {
+                id: "relay-passive".to_owned(),
+                connection_mode: RelayConnectionMode::Passive,
+                connect_addr: None,
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_relays(&[ConfiguredRelay {
+                id: "relay-active".to_owned(),
+                connection_mode: RelayConnectionMode::Active,
+                connect_addr: Some("192.0.2.1:8443".to_owned()),
+            }])
+            .is_err()
+        );
+        for invalid_seed in ["0.0.0.0:8443", "[::]:8443", "relay1:0", "bad host:8443"] {
+            assert!(
+                validate_relays(&[ConfiguredRelay {
+                    id: "relay-passive".to_owned(),
+                    connection_mode: RelayConnectionMode::Passive,
+                    connect_addr: Some(invalid_seed.to_owned()),
+                }])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn relay_advertisements_require_literal_connectable_endpoints() {
+        assert!(
+            validate_relay_advertisement(&RelayAdvertisement {
+                management_addr: "192.0.2.1:8443".to_owned(),
+                data_public_addr: "192.0.2.1:8444".to_owned(),
+            })
+            .is_ok()
+        );
+        for advertisement in [
+            RelayAdvertisement {
+                management_addr: "relay.example:8443".to_owned(),
+                data_public_addr: "192.0.2.1:8444".to_owned(),
+            },
+            RelayAdvertisement {
+                management_addr: "0.0.0.0:8443".to_owned(),
+                data_public_addr: "192.0.2.1:8444".to_owned(),
+            },
+            RelayAdvertisement {
+                management_addr: "[2001:db8::1]:0".to_owned(),
+                data_public_addr: "[2001:db8::1]:8444".to_owned(),
+            },
+        ] {
+            assert!(validate_relay_advertisement(&advertisement).is_err());
+        }
+    }
+
+    #[test]
     fn relay_directory_uses_authenticated_spki_and_stable_generation() {
         let mut registry = RelayDirectoryRegistry::default();
+        let relay_two_session = Uuid::new_v4();
         let relay_two = RelayEndpoint {
             id: "relay-2".to_owned(),
             management_addr: "192.0.2.2:8443".to_owned(),
             data_public_addr: "192.0.2.2:8444".to_owned(),
             management_spki_sha256: "22".repeat(32),
         };
-        let first = registry.register(relay_two.clone());
+        let first =
+            registry.replace_session("relay-2", relay_two_session, Some(relay_two.clone()), 1);
         assert_eq!(first.generation, 1);
         assert_eq!(first.relays, vec![relay_two.clone()]);
 
-        let unchanged = registry.register(relay_two);
-        assert_eq!(unchanged.generation, 1);
+        let Ok(updated) = registry.update_session("relay-2", relay_two_session, Some(relay_two), 2)
+        else {
+            panic!("current Relay session update must succeed");
+        };
+        assert_eq!(updated.generation, 2);
 
+        let relay_one_session = Uuid::new_v4();
         let relay_one = RelayEndpoint {
             id: "relay-1".to_owned(),
             management_addr: "192.0.2.1:8443".to_owned(),
             data_public_addr: "192.0.2.1:8444".to_owned(),
             management_spki_sha256: "11".repeat(32),
         };
-        let complete = registry.register(relay_one);
-        assert_eq!(complete.generation, 2);
+        let complete =
+            registry.replace_session("relay-1", relay_one_session, Some(relay_one.clone()), 3);
+        assert_eq!(complete.generation, 3);
         assert_eq!(complete.relays[0].id, "relay-1");
         assert_eq!(complete.relays[1].id, "relay-2");
         assert_eq!(complete.relays[1].management_spki_sha256, "22".repeat(32));
+
+        let replacement_session = Uuid::new_v4();
+        let replacement = RelayEndpoint {
+            management_addr: "192.0.2.20:8443".to_owned(),
+            ..complete.relays[1].clone()
+        };
+        let replaced =
+            registry.replace_session("relay-2", replacement_session, Some(replacement.clone()), 4);
+        assert_eq!(replaced.relays[1], replacement);
+        assert!(
+            registry
+                .update_session("relay-2", relay_two_session, None, 5)
+                .is_err()
+        );
+        assert!(
+            registry
+                .unregister_session("relay-2", relay_two_session, 5)
+                .is_none()
+        );
+        assert_eq!(
+            registry.directory().relays[1].management_addr,
+            "192.0.2.20:8443"
+        );
+
+        let Some(removed) = registry.unregister_session("relay-2", replacement_session, 5) else {
+            panic!("current Relay session removal must succeed");
+        };
+        assert_eq!(removed.generation, 5);
+        assert_eq!(removed.relays, vec![relay_one]);
+        assert!(
+            registry
+                .unregister_session("relay-2", replacement_session, 6)
+                .is_none()
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ received a different signed view.
 
 | Layer | Endpoints | Construction | Security purpose |
 | --- | --- | --- | --- |
-| Management TLS | Home→Server, Server→Relay, Travel→Relay | Mutual TLS 1.3 under the management CA, followed by application role/ID/SPKI/grant checks | Authenticates control peers and protects catalogs, heartbeats, authorization state, and route/work-secret delivery |
+| Management TLS | Home→Server, Relay↔Server, Travel→Relay | TLS 1.3 under the management CA, followed by application role/ID/SPKI/grant checks; passive Server→Relay and active Relay→Server connections converge on the same authenticated control session | Authenticates endpoint registration/control peers and protects catalogs, heartbeats, authorization state, and route/work-secret delivery |
 | Route admission | Travel→Relay and Home→Relay data sockets | HMAC-SHA256 over a fixed preface with an independent random 32-byte secret | Proves that a socket owns one allocated route or work item before Relay pairs it |
 | Business TLS | Travel↔Home through one Relay | End-to-end mutual TLS 1.3 under the business CA, followed by Home/Travel SPKI and grant checks | Protects the selected service ID, logical Flow frames, acknowledgements, and business plaintext |
 | Signed deployment state | Offline root→all components | ECDSA P-256/SHA-256 over exact serialized deployment-trust bytes | Binds every lower-level trust domain to one deployment root |
@@ -142,7 +142,7 @@ DER `SubjectPublicKeyInfo` and are always exactly 32 SHA-256 bytes.
 | Management CA | Issuer-side encrypted private key; CA certificate is public | Exact CA certificate is root-bound in deployment trust and carried in enrollment responses | Issues management certificates; compromise does not by itself create a valid Travel grant, but can impersonate roles where later SPKI/grant checks do not narrow the certificate |
 | Business CA | Issuer-side encrypted private key; CA certificate is public | Exact CA certificate is root-bound in deployment trust and carried in enrollment responses | Issues business certificates; Travel/Home still apply root-bound Home SPKI or signed Travel-grant checks |
 | Server control-signing key | Server runtime as an unencrypted PKCS#8 file protected by host/file permissions | Public key, Server ID, and epoch are root-bound | Signs Travel-specific Relay/Catalog snapshots; compromise controls discovery integrity and availability until its epoch is removed |
-| Server/Relay/Home management TLS keys | Their respective runtime hosts | Management-CA certificates plus configured or root-derived identity checks | Authenticate management links; key rotation must preserve or update the corresponding pins/trust |
+| Server/Relay/Home management TLS keys | Their respective runtime hosts | Management-CA certificates plus configured or root-derived identity checks; existing Relay `serverAuth` leaves also authenticate active Relay control and require no reissuance | Authenticate management links and Relay endpoint reporting; key rotation must preserve or update the corresponding pins/trust |
 | Home business TLS key | Home runtime | Business certificate plus root-bound Home business SPKI set | Terminates business TLS for that Home; compromise exposes that Home's plaintext |
 | Home Travel authority | Issuing Home, password-encrypted | Public key, epoch, owner Home, and role are root-bound | May issue Home- or Service-scoped grants only for its own Home |
 | Global Travel authority | One explicitly designated issuing Home, password-encrypted | Public key, epoch, owner Home, and Global role are root-bound | May issue grants for every Home; it is intentionally higher privilege |
@@ -178,10 +178,15 @@ certificate and requires:
 6. for business access, the exact routed credential ID and its authorization scope.
 
 Home→Server uses normal certificate-chain and configured DNS/IP server-name verification, then checks
-the Server role, stable ID, and configured Server SPKI. Relay also pins Server. Connections for which
-FlowSplice identity is intentionally independent of DNS—Server→Relay discovery, Travel→Relay, and
-Travel→Home business TLS—validate the CA chain first, then use the exact URI role/ID and SPKI checks
-above. The SNI value used for those connections is not treated as endpoint identity.
+the Server role, stable ID, and configured Server SPKI. Relay also pins Server. A passive Relay accepts
+the Server-initiated management connection; an active Relay initiates the Server connection and
+narrowly reuses its existing `serverAuth` endpoint identity. Either direction becomes the same
+authenticated bidirectional control session, where Relay reports its current endpoints. Connections
+for which FlowSplice identity is intentionally independent of DNS—Relay↔Server control,
+Travel→Relay, and Travel→Home business TLS—validate the CA chain first, then use the exact URI
+role/ID and SPKI checks above. The SNI value used for those connections is not treated as endpoint
+identity. Server broadcasts the complete generation-numbered Relay directory over those authenticated
+control sessions; each Relay validates and atomically replaces its in-memory copy.
 
 SPKI pins hash the leaf certificate's DER `SubjectPublicKeyInfo`, not the complete certificate. A
 certificate may therefore be renewed with the same key without changing its pin. A key rotation

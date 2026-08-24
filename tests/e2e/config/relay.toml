@@ -1,7 +1,7 @@
 id = "relay-1"
+connection_mode = "passive"
 management_listen = "0.0.0.0:8443"
 data_listen = "0.0.0.0:8444"
-data_public_addr = "relay1:8444"
 server_id = "server-1"
 cert = "/certs/relay1.crt"
 key = "/certs/relay1.key"

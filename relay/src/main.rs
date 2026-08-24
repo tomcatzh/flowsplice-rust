@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::{self, IsTerminal},
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,28 +33,38 @@ use flowsplice_core::{
     deployment::{DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust},
     frame::{JsonFrameReader, write_json},
     init_crypto,
-    protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, Role, TravelConnectionPurpose},
+    protocol::{
+        CONTROL_PROTOCOL_VERSION, ControlMessage, RelayConnectionMode, RelayDirectory, Role,
+        TravelConnectionPurpose,
+    },
     route::{RouteSide, read_preface, verify_preface},
     statistics::{SignedStatisticsReport, statistics_dashboard_html, statistics_signing_key},
     tls::{
-        PeerIdentity, identity_from_certificate_pem, load_private_key,
-        optional_client_server_acceptor, peer_identity, require_peer, validate_spki_pins,
+        PeerIdentity, identity_client_connector, identity_from_certificate_pem,
+        identity_server_name, load_private_key, optional_client_server_acceptor, peer_identity,
+        require_peer, validate_certificate_extended_key_usage, validate_spki_pin,
+        validate_spki_pins,
     },
 };
 use flowsplice_storage::{
     LocalStatistics, MetricPoint, MetricRollup, StateStore, summarize_metric_points,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use socket2::{Domain, Protocol, Socket, Type};
 #[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional;
 use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream, lookup_host},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch},
     time::{interval, timeout},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+mod openwrt;
 
 #[derive(Parser)]
 #[command(version)]
@@ -71,10 +82,14 @@ struct Args {
 #[serde(deny_unknown_fields)]
 struct Config {
     id: String,
+    connection_mode: RelayConnectionMode,
     management_listen: String,
     data_listen: String,
-    data_public_addr: String,
+    #[serde(default)]
+    openwrt_network: Option<String>,
     server_id: String,
+    #[serde(default)]
+    server_control_addr: Option<String>,
     cert: PathBuf,
     key: PathBuf,
     management_ca: PathBuf,
@@ -176,8 +191,15 @@ struct ServerSession {
     shutdown: watch::Sender<bool>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdvertisedEndpoint {
+    management_addr: String,
+    data_public_addr: String,
+}
+
 struct State {
     server_session: Mutex<Option<ServerSession>>,
+    relay_directory: RwLock<RelayDirectory>,
     requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
     session_requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<SignedControlSnapshot, String>>>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
@@ -194,6 +216,7 @@ struct State {
         Mutex<HashMap<Uuid, oneshot::Sender<RemoteEnrollmentInstalledResponse>>>,
     bootstrap_enrollment_requests:
         Mutex<HashMap<Uuid, oneshot::Sender<BootstrapEnrollmentResponse>>>,
+    advertised_endpoint: watch::Receiver<Option<AdvertisedEndpoint>>,
 }
 
 impl State {
@@ -204,10 +227,12 @@ impl State {
         statistics: LocalStatistics,
         statistics_signer: EcdsaKeyPair,
         statistics_certificate_pem: String,
+        advertised_endpoint: watch::Receiver<Option<AdvertisedEndpoint>>,
     ) -> Self {
         let (authorization_tx, _) = watch::channel(None);
         Self {
             server_session: Mutex::new(None),
+            relay_directory: RwLock::new(RelayDirectory::default()),
             requests: Mutex::new(HashMap::new()),
             session_requests: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
@@ -222,6 +247,7 @@ impl State {
             enrollment_requests: Mutex::new(HashMap::new()),
             enrollment_install_requests: Mutex::new(HashMap::new()),
             bootstrap_enrollment_requests: Mutex::new(HashMap::new()),
+            advertised_endpoint,
         }
     }
 }
@@ -266,6 +292,13 @@ async fn main() -> Result<()> {
         .context("failed to read Relay statistics signing certificate")?;
     let statistics_private_key = load_private_key(&config.key)?;
     let statistics_signer = statistics_signing_key(&statistics_private_key)?;
+    let initial_endpoint = if config.openwrt_network.is_some() {
+        None
+    } else {
+        configured_endpoint(&config)?
+    };
+    let (network_sender, network_receiver) = watch::channel(None);
+    let (endpoint_sender, endpoint_receiver) = watch::channel(initial_endpoint);
     let state = Arc::new(State::new(
         authorization_cache,
         deployment_trust.clone(),
@@ -273,11 +306,30 @@ async fn main() -> Result<()> {
         statistics,
         statistics_signer,
         statistics_certificate_pem,
+        endpoint_receiver.clone(),
     ));
     let trust_expiry = monitor_trust_expiry(deployment_trust.not_after_unix_secs);
     tokio::try_join!(
-        run_management(config.clone(), Arc::clone(&state)),
-        run_data(config.clone(), Arc::clone(&state)),
+        run_endpoint_source(
+            config.clone(),
+            network_sender,
+            network_receiver.clone(),
+            endpoint_sender.clone(),
+        ),
+        run_endpoint_reporter(
+            config.clone(),
+            endpoint_sender.clone(),
+            endpoint_receiver.clone(),
+            Arc::clone(&state),
+        ),
+        run_management(
+            config.clone(),
+            Arc::clone(&state),
+            network_receiver.clone(),
+            endpoint_sender,
+            endpoint_receiver,
+        ),
+        run_data(config.clone(), Arc::clone(&state), network_receiver),
         cleanup_routes(Arc::clone(&state)),
         run_statistics_ui(config.ui_listen.clone(), Arc::clone(&state)),
         trust_expiry,
@@ -295,8 +347,23 @@ async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
 }
 
 fn validate_config(config: &Config) -> Result<DeploymentTrust> {
-    if config.id.is_empty() || config.server_id.is_empty() || config.data_public_addr.is_empty() {
-        bail!("Relay ids and advertised addresses must be non-empty");
+    if config.id.is_empty() || config.server_id.is_empty() {
+        bail!("Relay id and Server id must be non-empty");
+    }
+    match (
+        config.connection_mode,
+        config.server_control_addr.as_deref(),
+    ) {
+        (RelayConnectionMode::Passive, Some(_)) => {
+            bail!("passive Relay must not configure server_control_addr");
+        }
+        (RelayConnectionMode::Active, Some("")) => {
+            bail!("active Relay server_control_addr must be non-empty");
+        }
+        (RelayConnectionMode::Active, None) => {
+            bail!("active Relay requires server_control_addr");
+        }
+        (RelayConnectionMode::Passive, None) | (RelayConnectionMode::Active, Some(_)) => {}
     }
     if config.state_store.as_os_str().is_empty() {
         bail!("state_store must be non-empty");
@@ -308,13 +375,52 @@ fn validate_config(config: &Config) -> Result<DeploymentTrust> {
     if !ui_address.ip().is_loopback() {
         bail!("Relay statistics UI must bind an exact loopback address");
     }
+    let mut listeners = Vec::new();
     for (label, address) in [
         ("management", config.management_listen.as_str()),
         ("data", config.data_listen.as_str()),
     ] {
-        address
+        let parsed = address
             .parse::<std::net::SocketAddr>()
             .with_context(|| format!("invalid Relay {label} listener {address}"))?;
+        if parsed.port() == 0 {
+            bail!("Relay {label} listener port must be non-zero");
+        }
+        listeners.push((label, parsed));
+    }
+    if let Some(network) = &config.openwrt_network {
+        if network.is_empty()
+            || network.len() > 64
+            || !network.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            })
+        {
+            bail!(
+                "openwrt_network must be at most 64 ASCII letters, digits, underscores, hyphens, or dots"
+            );
+        }
+        if listeners[0].1.is_ipv4() != listeners[1].1.is_ipv4() {
+            bail!("OpenWrt-managed Relay listeners must use the same IP address family");
+        }
+        for (label, listener) in &listeners {
+            if listener.ip().is_multicast() {
+                bail!("OpenWrt-managed Relay {label} listener cannot use a multicast address");
+            }
+        }
+    } else if listeners
+        .iter()
+        .any(|(_, listener)| listener.ip().is_unspecified())
+        && listeners[0].1.is_ipv4() != listeners[1].1.is_ipv4()
+    {
+        bail!(
+            "wildcard Relay listeners must use the same IP address family for automatic discovery"
+        );
+    } else {
+        for (label, listener) in &listeners {
+            if listener.ip().is_multicast() {
+                bail!("Relay {label} listener cannot use a multicast address");
+            }
+        }
     }
     if config.handshake_timeout_secs == 0
         || config.route_ttl_secs == 0
@@ -336,62 +442,381 @@ fn validate_config(config: &Config) -> Result<DeploymentTrust> {
         let _: AuthorizationCache = load_json(&config.travel_authorization_cache)?;
     }
     let _ = optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
+    let _ = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
+    validate_certificate_extended_key_usage(&config.cert, false, true)?;
     Ok(trust)
 }
 
-async fn run_management(config: Config, state: Arc<State>) -> Result<()> {
-    let listener = TcpListener::bind(&config.management_listen)
+fn configured_endpoint(config: &Config) -> Result<Option<AdvertisedEndpoint>> {
+    endpoint_for_discovered_address(config, None)
+}
+
+fn endpoint_for_discovered_address(
+    config: &Config,
+    discovered_address: Option<IpAddr>,
+) -> Result<Option<AdvertisedEndpoint>> {
+    let management = config
+        .management_listen
+        .parse::<SocketAddr>()
+        .context("invalid Relay management listener")?;
+    let data = config
+        .data_listen
+        .parse::<SocketAddr>()
+        .context("invalid Relay data listener")?;
+    Ok(endpoint_for_listener_addresses(
+        management,
+        data,
+        discovered_address,
+    ))
+}
+
+fn endpoint_for_listener_addresses(
+    management: SocketAddr,
+    data: SocketAddr,
+    discovered_address: Option<IpAddr>,
+) -> Option<AdvertisedEndpoint> {
+    let resolve = |listener: SocketAddr| {
+        if listener.ip().is_unspecified() {
+            discovered_address
+                .filter(|address| address.is_ipv4() == listener.is_ipv4())
+                .map(|address| SocketAddr::new(address, listener.port()))
+        } else {
+            Some(listener)
+        }
+    };
+    resolve(management)
+        .zip(resolve(data))
+        .map(|(management_addr, data_public_addr)| AdvertisedEndpoint {
+            management_addr: management_addr.to_string(),
+            data_public_addr: data_public_addr.to_string(),
+        })
+}
+
+fn endpoint_for_network(
+    config: &Config,
+    network: Option<&openwrt::NetworkState>,
+) -> Result<Option<AdvertisedEndpoint>> {
+    let Some(network) = network else {
+        return Ok(None);
+    };
+    let management = config
+        .management_listen
+        .parse::<SocketAddr>()
+        .context("invalid dynamic management listener")?;
+    let address = if management.is_ipv4() {
+        network.ipv4_address.map(IpAddr::V4)
+    } else {
+        network.ipv6_address.map(IpAddr::V6)
+    };
+    endpoint_for_discovered_address(config, address)
+}
+
+async fn run_endpoint_source(
+    config: Config,
+    network_sender: watch::Sender<Option<openwrt::NetworkState>>,
+    mut network_receiver: watch::Receiver<Option<openwrt::NetworkState>>,
+    endpoint_sender: watch::Sender<Option<AdvertisedEndpoint>>,
+) -> Result<()> {
+    let Some(network) = config.openwrt_network.clone() else {
+        return std::future::pending::<Result<()>>().await;
+    };
+    let monitor = openwrt::monitor(network, network_sender);
+    let project = async move {
+        loop {
+            network_receiver
+                .changed()
+                .await
+                .map_err(|_| anyhow!("OpenWrt network monitor closed"))?;
+            let endpoint = endpoint_for_network(&config, network_receiver.borrow().as_ref())?;
+            endpoint_sender.send_replace(endpoint);
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(monitor, project)?;
+    Ok(())
+}
+
+async fn run_endpoint_reporter(
+    config: Config,
+    endpoint_sender: watch::Sender<Option<AdvertisedEndpoint>>,
+    mut endpoint_receiver: watch::Receiver<Option<AdvertisedEndpoint>>,
+    state: Arc<State>,
+) -> Result<()> {
+    if config.connection_mode == RelayConnectionMode::Passive {
+        return std::future::pending::<Result<()>>().await;
+    }
+    loop {
+        if let Err(error) = run_endpoint_reporter_session(
+            &config,
+            &endpoint_sender,
+            &mut endpoint_receiver,
+            Arc::clone(&state),
+        )
         .await
-        .with_context(|| format!("failed to bind management {}", config.management_listen))?;
+        {
+            warn!(%error, "active Relay control disconnected; reconnecting");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn write_endpoint_advertisement<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    endpoint: Option<&AdvertisedEndpoint>,
+) -> Result<()> {
+    let message = endpoint.map_or(ControlMessage::RelayEndpointWithdraw, |endpoint| {
+        ControlMessage::RelayEndpointUpdate {
+            management_addr: endpoint.management_addr.clone(),
+            data_public_addr: endpoint.data_public_addr.clone(),
+        }
+    });
+    write_json(writer, &message, CONTROL_FRAME_LIMIT).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_endpoint_reporter_session(
+    config: &Config,
+    endpoint_sender: &watch::Sender<Option<AdvertisedEndpoint>>,
+    endpoint_receiver: &mut watch::Receiver<Option<AdvertisedEndpoint>>,
+    state: Arc<State>,
+) -> Result<()> {
+    let connector = identity_client_connector(&config.cert, &config.key, &config.management_ca)?;
+    let socket = connect_server_registration(config).await?;
+    socket.set_nodelay(true)?;
+    let stream = timeout(
+        Duration::from_secs(config.handshake_timeout_secs),
+        connector.connect(identity_server_name()?, socket),
+    )
+    .await
+    .context("Server registration TLS handshake timed out")??;
+    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    require_peer(
+        &identity,
+        Role::Server,
+        Some(&config.server_id),
+        &config.server_spki_pins,
+    )?;
+    if config.openwrt_network.is_none() && configured_endpoint(config)?.is_none() {
+        let local_address = stream.get_ref().0.local_addr()?.ip();
+        if local_address.is_unspecified() || local_address.is_loopback() {
+            bail!(
+                "cannot automatically discover a routable Relay address from Server connection source {local_address}; use exact listener addresses or an OpenWrt network"
+            );
+        }
+        let endpoint = endpoint_for_discovered_address(config, Some(local_address))?;
+        if endpoint.is_none() {
+            bail!("Server connection address family does not match the wildcard Relay listeners");
+        }
+        endpoint_sender.send_replace(endpoint);
+    }
+    run_server_control_session(
+        stream,
+        ServerSessionDirection::RelayInitiated,
+        config,
+        state,
+        endpoint_receiver,
+    )
+    .await
+}
+
+async fn connect_server_registration(config: &Config) -> Result<TcpStream> {
+    let server_control_addr = config
+        .server_control_addr
+        .as_deref()
+        .ok_or_else(|| anyhow!("active Relay has no Server control address"))?;
+    let discovery_family =
+        if config.openwrt_network.is_none() && configured_endpoint(config)?.is_none() {
+            Some(
+                config
+                    .management_listen
+                    .parse::<SocketAddr>()
+                    .context("invalid Relay management listener")?
+                    .is_ipv4(),
+            )
+        } else {
+            None
+        };
+    let timeout_duration = Duration::from_secs(config.handshake_timeout_secs);
+    let addresses = timeout(timeout_duration, lookup_host(server_control_addr))
+        .await
+        .context("Server registration address lookup timed out")?
+        .with_context(|| format!("failed to resolve Server control {server_control_addr}"))?
+        .filter(|address| discovery_family.is_none_or(|is_ipv4| address.is_ipv4() == is_ipv4))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!(
+            "Server control address {server_control_addr} has no address matching the wildcard Relay listeners"
+        );
+    }
+    let mut last_error = None;
+    for address in addresses {
+        match timeout(timeout_duration, TcpStream::connect(address)).await {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => last_error = Some("connection timed out".to_owned()),
+        }
+    }
+    bail!(
+        "failed to connect Server control {}: {}",
+        server_control_addr,
+        last_error.unwrap_or_else(|| "no resolved address was connectable".to_owned())
+    )
+}
+
+async fn bind_listener(address: &str, device: Option<&str>, backlog: i32) -> Result<TcpListener> {
+    let socket_address = address
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid listener {address}"))?;
+    let Some(device) = device else {
+        return TcpListener::bind(socket_address)
+            .await
+            .with_context(|| format!("failed to bind listener {address}"));
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let domain = Domain::for_address(socket_address);
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        if socket_address.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        socket
+            .bind_device(Some(device.as_bytes()))
+            .with_context(|| format!("failed to bind socket to device {device}"))?;
+        socket
+            .bind(&socket_address.into())
+            .with_context(|| format!("failed to bind listener {address} on {device}"))?;
+        socket.listen(backlog)?;
+        socket.set_nonblocking(true)?;
+        let listener: std::net::TcpListener = socket.into();
+        return TcpListener::from_std(listener).context("failed to create Tokio listener");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = backlog;
+        bail!("device-bound listeners require Linux (requested device {device})");
+    }
+}
+
+async fn wait_for_listener_device(
+    dynamic: bool,
+    receiver: &mut watch::Receiver<Option<openwrt::NetworkState>>,
+) -> Result<Option<String>> {
+    if !dynamic {
+        return Ok(None);
+    }
+    loop {
+        if let Some(state) = receiver.borrow().as_ref() {
+            return Ok(Some(state.l3_device.clone()));
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| anyhow!("OpenWrt network monitor closed"))?;
+    }
+}
+
+async fn run_management(
+    config: Config,
+    state: Arc<State>,
+    mut network_receiver: watch::Receiver<Option<openwrt::NetworkState>>,
+    endpoint_sender: watch::Sender<Option<AdvertisedEndpoint>>,
+    endpoint_receiver: watch::Receiver<Option<AdvertisedEndpoint>>,
+) -> Result<()> {
     let acceptor =
         optional_client_server_acceptor(&config.cert, &config.key, &config.management_ca)?;
     let permits = Arc::new(Semaphore::new(config.max_management_connections));
-    info!(address = %config.management_listen, "relay management listener ready");
     loop {
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("Relay management connection budget closed"))?;
-        let (socket, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let config = config.clone();
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let result = async {
-                let stream = timeout(
-                    Duration::from_secs(config.handshake_timeout_secs),
-                    acceptor.accept(socket),
-                )
+        let dynamic = config.openwrt_network.is_some();
+        let device = wait_for_listener_device(dynamic, &mut network_receiver).await?;
+        let listener = bind_listener(
+            &config.management_listen,
+            device.as_deref(),
+            i32::try_from(config.max_management_connections).unwrap_or(i32::MAX),
+        )
+        .await?;
+        info!(
+            address = %config.management_listen,
+            device = device.as_deref().unwrap_or("all"),
+            "relay management listener ready"
+        );
+        loop {
+            let permit = Arc::clone(&permits)
+                .acquire_owned()
                 .await
-                .context("management TLS handshake timed out")??;
-                if stream.get_ref().1.peer_certificates().is_none() {
-                    return handle_bootstrap_travel(stream, &config, state).await;
+                .map_err(|_| anyhow!("Relay management connection budget closed"))?;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (socket, peer) = accepted?;
+                    let acceptor = acceptor.clone();
+                    let config = config.clone();
+                    let state = Arc::clone(&state);
+                    let endpoint_sender = endpoint_sender.clone();
+                    let endpoint_receiver = endpoint_receiver.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let result = async {
+                            let stream = timeout(
+                                Duration::from_secs(config.handshake_timeout_secs),
+                                acceptor.accept(socket),
+                            )
+                            .await
+                            .context("management TLS handshake timed out")??;
+                            if stream.get_ref().1.peer_certificates().is_none() {
+                                return handle_bootstrap_travel(stream, &config, state).await;
+                            }
+                            let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+                            match identity.role {
+                                Role::Server => {
+                                    if config.connection_mode != RelayConnectionMode::Passive {
+                                        bail!("active Relay does not accept Server-initiated control connections");
+                                    }
+                                    require_peer(
+                                        &identity,
+                                        Role::Server,
+                                        Some(&config.server_id),
+                                        &config.server_spki_pins,
+                                    )?;
+                                    handle_server(
+                                        stream,
+                                        &config,
+                                        state,
+                                        &endpoint_sender,
+                                        endpoint_receiver,
+                                    )
+                                    .await
+                                }
+                                Role::Travel => {
+                                    require_peer(&identity, Role::Travel, None, &[])?;
+                                    let authorization_rx = state.authorization_tx.subscribe();
+                                    handle_travel(stream, identity, authorization_rx, &config, state).await
+                                }
+                                _ => bail!("unsupported management peer role"),
+                            }
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            warn!(%peer, %error, "management connection closed");
+                        }
+                    });
                 }
-                let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-                match identity.role {
-                    Role::Server => {
-                        require_peer(
-                            &identity,
-                            Role::Server,
-                            Some(&config.server_id),
-                            &config.server_spki_pins,
-                        )?;
-                        handle_server(stream, identity.id, &config, state).await
+                changed = network_receiver.changed(), if dynamic => {
+                    drop(permit);
+                    changed.map_err(|_| anyhow!("OpenWrt network monitor closed"))?;
+                    let next_device = network_receiver
+                        .borrow()
+                        .as_ref()
+                        .map(|network| network.l3_device.clone());
+                    if next_device.as_deref() != device.as_deref() {
+                        break;
                     }
-                    Role::Travel => {
-                        require_peer(&identity, Role::Travel, None, &[])?;
-                        let authorization_rx = state.authorization_tx.subscribe();
-                        handle_travel(stream, identity, authorization_rx, &config, state).await
-                    }
-                    _ => bail!("unsupported management peer role"),
                 }
             }
-            .await;
-            if let Err(error) = result {
-                warn!(%peer, %error, "management connection closed");
-            }
-        });
+        }
     }
 }
 
@@ -528,40 +953,83 @@ async fn forward_bootstrap_enrollment(
 #[allow(clippy::too_many_lines)]
 async fn handle_server(
     stream: TlsStream<TcpStream>,
-    server_id: String,
     config: &Config,
     state: Arc<State>,
+    endpoint_sender: &watch::Sender<Option<AdvertisedEndpoint>>,
+    mut endpoint_receiver: watch::Receiver<Option<AdvertisedEndpoint>>,
 ) -> Result<()> {
+    if config.openwrt_network.is_none() && configured_endpoint(config)?.is_none() {
+        let local_address = stream.get_ref().0.local_addr()?.ip();
+        if local_address.is_unspecified() || local_address.is_loopback() {
+            bail!(
+                "cannot discover a routable Relay address from accepted Server connection destination {local_address}"
+            );
+        }
+        let endpoint = endpoint_for_discovered_address(config, Some(local_address))?;
+        if endpoint.is_none() {
+            bail!("Server connection address family does not match wildcard Relay listeners");
+        }
+        endpoint_sender.send_replace(endpoint);
+    }
+    run_server_control_session(
+        stream,
+        ServerSessionDirection::ServerInitiated,
+        config,
+        state,
+        &mut endpoint_receiver,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ServerSessionDirection {
+    ServerInitiated,
+    RelayInitiated,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_server_control_session<S>(
+    stream: S,
+    direction: ServerSessionDirection,
+    config: &Config,
+    state: Arc<State>,
+    endpoint_receiver: &mut watch::Receiver<Option<AdvertisedEndpoint>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
+    let setup_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    let relay_hello = ControlMessage::Hello {
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+        role: Role::Relay,
+        id: config.id.clone(),
+    };
+    match direction {
+        ServerSessionDirection::ServerInitiated => {
+            require_server_hello(&mut reader, setup_timeout, config).await?;
+            write_json(&mut writer, &relay_hello, CONTROL_FRAME_LIMIT).await?;
+        }
+        ServerSessionDirection::RelayInitiated => {
+            write_json(&mut writer, &relay_hello, CONTROL_FRAME_LIMIT).await?;
+            require_server_hello(&mut reader, setup_timeout, config).await?;
+        }
+    }
+    let advertised_endpoint = endpoint_receiver.borrow().clone();
+    write_endpoint_advertisement(&mut writer, advertised_endpoint.as_ref()).await?;
     match reader
-        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     {
-        ControlMessage::Hello {
-            protocol_version,
-            role,
-            id,
-        } if protocol_version == CONTROL_PROTOCOL_VERSION
-            && role == Role::Server
-            && id == server_id => {}
-        _ => bail!("server HELLO does not match its certificate"),
+        ControlMessage::RelayEndpointAccepted => {}
+        _ => bail!("Server did not accept the Relay endpoint advertisement"),
     }
-    write_json(
-        &mut writer,
-        &ControlMessage::Hello {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            role: Role::Relay,
-            id: config.id.clone(),
-        },
-        CONTROL_FRAME_LIMIT,
-    )
-    .await?;
 
     let ControlMessage::TravelAuthorizationSnapshot {
         snapshot: initial_snapshot,
     } = reader
-        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
+        .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     else {
         bail!("server did not provide the initial Travel authorization snapshot");
@@ -586,12 +1054,12 @@ async fn handle_server(
         warn!(
             old_session_id = %previous.session_id,
             new_session_id = %session_id,
-            %server_id,
+            server_id = %config.server_id,
             "superseding existing Server session"
         );
         let _ = previous.shutdown.send(true);
     }
-    info!(%server_id, "server connected to relay");
+    info!(server_id = %config.server_id, "server control connected to relay");
 
     let mut liveness = interval(Duration::from_secs(10));
     let mut statistics_tick = interval(Duration::from_secs(5));
@@ -609,6 +1077,15 @@ async fn handle_server(
                     let Some(outgoing) = outgoing else { bail!("server writer channel closed"); };
                     write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
                 }
+                changed = endpoint_receiver.changed() => {
+                    changed.map_err(|_| anyhow!("Relay endpoint source closed"))?;
+                    let advertised_endpoint = endpoint_receiver.borrow().clone();
+                    write_endpoint_advertisement(
+                        &mut writer,
+                        advertised_endpoint.as_ref(),
+                    )
+                    .await?;
+                }
                 incoming = reader.read::<ControlMessage>() => {
                     last_received = Instant::now();
                     match incoming? {
@@ -620,6 +1097,9 @@ async fn handle_server(
                                 CONTROL_FRAME_LIMIT,
                             )
                             .await?;
+                        }
+                        ControlMessage::RelayDirectorySnapshot { directory } => {
+                            apply_relay_directory(&state, directory).await?;
                         }
                         ControlMessage::ServerRelayGrant { request_id, work_id, work_secret, credential_id, home_id, expires_at_unix_secs } => {
                             if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
@@ -644,7 +1124,8 @@ async fn handle_server(
                         ControlMessage::Heartbeat { nonce } => {
                             write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
                         }
-                        ControlMessage::HeartbeatAck { .. } => {}
+                        ControlMessage::HeartbeatAck { .. }
+                        | ControlMessage::RelayEndpointAccepted => {}
                         ControlMessage::StatisticsReportAck { digest_sha256, accepted, error } => {
                             if let Some(response) = state.report_requests.lock().await.remove(&digest_sha256) {
                                 let _ = response.send(if accepted {
@@ -717,6 +1198,32 @@ async fn handle_server(
         *current = None;
     }
     result
+}
+
+async fn require_server_hello<R>(
+    reader: &mut JsonFrameReader<R>,
+    setup_timeout: Duration,
+    config: &Config,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader
+        .read_with_timeout::<ControlMessage>(setup_timeout)
+        .await?
+    {
+        ControlMessage::Hello {
+            protocol_version,
+            role,
+            id,
+        } if protocol_version == CONTROL_PROTOCOL_VERSION
+            && role == Role::Server
+            && id == config.server_id =>
+        {
+            Ok(())
+        }
+        _ => bail!("Server HELLO does not match its certificate and configured identity"),
+    }
 }
 
 async fn flush_and_send_relay_statistics<W: tokio::io::AsyncWrite + Unpin>(
@@ -1417,6 +1924,30 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     };
+    let Some(data_addr) = state
+        .advertised_endpoint
+        .borrow()
+        .as_ref()
+        .map(|endpoint| endpoint.data_public_addr.clone())
+    else {
+        record_relay_metric(
+            state,
+            "relay_route_denied",
+            &request.travel,
+            &request.home,
+            1,
+        );
+        write_json(
+            writer,
+            &ControlMessage::RouteDenied {
+                request_id: request.request,
+                reason: "relay public endpoint is unavailable".to_owned(),
+            },
+            CONTROL_FRAME_LIMIT,
+        )
+        .await?;
+        return Ok(());
+    };
     match request_server_route(&request, state).await {
         Ok(grant) if grant.credential_id == request.credential && grant.home_id == request.home => {
             let now = unix_time_secs()?;
@@ -1486,7 +2017,7 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
                     request_id: request.request,
                     route_id,
                     route_secret,
-                    data_addr: config.data_public_addr.clone(),
+                    data_addr,
                 },
                 CONTROL_FRAME_LIMIT,
             )
@@ -1570,20 +2101,36 @@ async fn request_server_route(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
-    let listener = TcpListener::bind(&config.data_listen)
-        .await
-        .with_context(|| format!("failed to bind relay data {}", config.data_listen))?;
-    info!(address = %config.data_listen, "relay data listener ready");
+async fn run_data(
+    config: Config,
+    state: Arc<State>,
+    mut network_receiver: watch::Receiver<Option<openwrt::NetworkState>>,
+) -> Result<()> {
     let permits = Arc::new(Semaphore::new(config.max_data_connections));
     loop {
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("Relay data connection budget closed"))?;
-        let (stream, peer) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        let dynamic = config.openwrt_network.is_some();
+        let device = wait_for_listener_device(dynamic, &mut network_receiver).await?;
+        let listener = bind_listener(
+            &config.data_listen,
+            device.as_deref(),
+            i32::try_from(config.max_data_connections).unwrap_or(i32::MAX),
+        )
+        .await?;
+        info!(
+            address = %config.data_listen,
+            device = device.as_deref().unwrap_or("all"),
+            "relay data listener ready"
+        );
+        loop {
+            let permit = Arc::clone(&permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("Relay data connection budget closed"))?;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
             let result = async {
                 let mut socket = Some(BudgetedSocket {
                     stream,
@@ -1703,7 +2250,21 @@ async fn run_data(config: Config, state: Arc<State>) -> Result<()> {
             if let Err(error) = result {
                 warn!(%peer, %error, "relay data connection closed");
             }
-        });
+                    });
+                }
+                changed = network_receiver.changed(), if dynamic => {
+                    drop(permit);
+                    changed.map_err(|_| anyhow!("OpenWrt network monitor closed"))?;
+                    let next_device = network_receiver
+                        .borrow()
+                        .as_ref()
+                        .map(|network| network.l3_device.clone());
+                    if next_device.as_deref() != device.as_deref() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1918,12 +2479,141 @@ async fn apply_authorization_snapshot(
     Ok(generation)
 }
 
+fn validate_relay_directory(directory: &RelayDirectory) -> Result<()> {
+    if directory.generation == 0 {
+        bail!("Relay directory generation must be positive");
+    }
+    let mut previous_id: Option<&str> = None;
+    for endpoint in &directory.relays {
+        if endpoint.id.is_empty()
+            || previous_id.is_some_and(|previous| previous >= endpoint.id.as_str())
+        {
+            bail!("Relay directory IDs must be non-empty, unique, and sorted");
+        }
+        previous_id = Some(&endpoint.id);
+        validate_spki_pin(
+            &endpoint.management_spki_sha256,
+            "Relay directory management",
+        )?;
+        for (label, address) in [
+            ("management", &endpoint.management_addr),
+            ("data", &endpoint.data_public_addr),
+        ] {
+            let address = address.parse::<SocketAddr>().with_context(|| {
+                format!("Relay directory {label} endpoint must be a literal socket address")
+            })?;
+            if address.port() == 0
+                || address.ip().is_unspecified()
+                || address.ip().is_loopback()
+                || address.ip().is_multicast()
+            {
+                bail!("Relay directory {label} endpoint is not directly connectable");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_relay_directory(state: &Arc<State>, directory: RelayDirectory) -> Result<()> {
+    validate_relay_directory(&directory)?;
+    let mut current = state.relay_directory.write().await;
+    if directory.generation < current.generation {
+        warn!(
+            received_generation = directory.generation,
+            current_generation = current.generation,
+            "ignored stale Relay directory snapshot"
+        );
+        return Ok(());
+    }
+    if directory.generation == current.generation {
+        if directory != *current {
+            bail!("Server sent different Relay directories with the same generation");
+        }
+        return Ok(());
+    }
+    let generation = directory.generation;
+    let relay_count = directory.relays.len();
+    *current = directory;
+    drop(current);
+    info!(
+        event = "relay_directory_applied",
+        generation, relay_count, "Relay replaced its complete in-memory Relay directory"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use flowsplice_core::route::{RoutePreface, read_preface, write_preface};
     use tokio::io::duplex;
+
+    #[test]
+    fn endpoint_registration_derives_exact_and_wildcard_listener_addresses() {
+        let exact = endpoint_for_listener_addresses(
+            "192.0.2.1:8443".parse().unwrap(),
+            "192.0.2.1:8444".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.management_addr, "192.0.2.1:8443");
+        assert_eq!(exact.data_public_addr, "192.0.2.1:8444");
+
+        let ipv4 = endpoint_for_listener_addresses(
+            "0.0.0.0:8443".parse().unwrap(),
+            "0.0.0.0:8444".parse().unwrap(),
+            Some("198.51.100.10".parse().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(ipv4.management_addr, "198.51.100.10:8443");
+        assert_eq!(ipv4.data_public_addr, "198.51.100.10:8444");
+
+        let ipv6 = endpoint_for_listener_addresses(
+            "[::]:8443".parse().unwrap(),
+            "[::]:8444".parse().unwrap(),
+            Some("2001:db8::10".parse().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(ipv6.management_addr, "[2001:db8::10]:8443");
+        assert_eq!(ipv6.data_public_addr, "[2001:db8::10]:8444");
+
+        assert!(
+            endpoint_for_listener_addresses(
+                "0.0.0.0:8443".parse().unwrap(),
+                "0.0.0.0:8444".parse().unwrap(),
+                Some("2001:db8::10".parse().unwrap()),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn relay_directory_snapshots_are_complete_sorted_and_connectable() {
+        let endpoint =
+            |id: &str, address: &str, pin_byte: &str| flowsplice_core::protocol::RelayEndpoint {
+                id: id.to_owned(),
+                management_addr: format!("{address}:8443"),
+                data_public_addr: format!("{address}:8444"),
+                management_spki_sha256: pin_byte.repeat(64),
+            };
+        let complete = RelayDirectory {
+            generation: 3,
+            relays: vec![
+                endpoint("relay-1", "192.0.2.1", "1"),
+                endpoint("relay-2", "192.0.2.2", "2"),
+            ],
+        };
+        assert!(validate_relay_directory(&complete).is_ok());
+
+        let mut unsorted = complete.clone();
+        unsorted.relays.reverse();
+        assert!(validate_relay_directory(&unsorted).is_err());
+
+        let mut unusable = complete;
+        unusable.relays[0].management_addr = "0.0.0.0:8443".to_owned();
+        assert!(validate_relay_directory(&unusable).is_err());
+    }
 
     async fn authenticated_preface(
         side: RouteSide,

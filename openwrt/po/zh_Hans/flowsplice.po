@@ -17,14 +17,11 @@ msgstr "添加目录项"
 msgid "Add every Home Agent that may host a logical service. Its SPKI key set is read automatically from the signed deployment trust. A Travel mapping selects one Home ID and one service; it never falls back to another Home."
 msgstr "请添加所有可能承载逻辑业务的家庭端，其 SPKI 密钥集合会自动从已签名的部署信任中读取。每条旅行端映射会选择一个家庭端 ID 和一个服务，绝不会自动切换到其他家庭端。"
 
-msgid "Advertised data address"
-msgstr "对外发布的数据地址"
-
 msgid "All enabled FlowSplice instances are valid."
 msgstr "所有已启用的 FlowSplice 实例配置均有效。"
 
-msgid "Create separate named instances for LAN and WAN6. Each instance has its own identity, listeners, advertised data address, logs, and procd lifecycle."
-msgstr "请为局域网和 WAN IPv6 分别创建具名中继实例。每个实例都有独立的身份、监听地址、对外发布地址、日志和 procd 生命周期。"
+msgid "Create separate named instances for each entry path. Every instance binds its OpenWrt network device, discovers the matching IPv4 or IPv6 address, and reports both listener endpoints to Server automatically."
+msgstr "请为每条入口路径创建独立的具名中继实例。每个实例会绑定对应的 OpenWrt 网络设备，自动发现匹配的 IPv4 或 IPv6 地址，并将两个监听端点报告给服务端。"
 
 msgid "Data listen"
 msgstr "数据监听地址"
@@ -74,9 +71,6 @@ msgstr "在同一页面管理 OpenWrt 上的服务端和多个逻辑中继实例
 msgid "Management CA"
 msgstr "管理 CA"
 
-msgid "Management address"
-msgstr "管理地址"
-
 msgid "Management certificate"
 msgstr "管理证书"
 
@@ -85,6 +79,9 @@ msgstr "管理监听地址"
 
 msgid "Management private key"
 msgstr "管理私钥"
+
+msgid "OpenWrt network"
+msgstr "OpenWrt 网络"
 
 msgid "Maximum pending routes"
 msgstr "最大待处理路由数"
@@ -180,9 +177,6 @@ msgstr "停止"
 msgid "The file must be readable by the flowsplice service user."
 msgstr "flowsplice 服务用户必须能够读取此文件。"
 
-msgid "These entries are published to Travel Agents. Add every local and VPS Relay with a distinct Relay ID."
-msgstr "这些条目会发布给旅行端。请添加所有本地和 VPS 中继，并为每个中继使用不同的 ID。"
-
 msgid "Trust and identity"
 msgstr "信任与身份"
 
@@ -212,3 +206,21 @@ msgstr "其公钥必须由部署根认证。"
 
 msgid "Signed control snapshot TTL (seconds)"
 msgstr "签名控制快照有效期（秒）"
+
+msgid "Connection mode"
+msgstr "连接模式"
+
+msgid "Active (Relay connects to Server)"
+msgstr "主动（中继连接服务端）"
+
+msgid "Passive (Server connects to Relay)"
+msgstr "被动（服务端连接中继）"
+
+msgid "Server control address"
+msgstr "服务端控制地址"
+
+msgid "Passive management seed"
+msgstr "被动模式管理种子地址"
+
+msgid "Choose who initiates each authenticated control session. Passive Relays require one stable management seed; active Relays connect to Server and require no stored Relay address. Published management and data endpoints always come from the authenticated Relay."
+msgstr "请选择每条认证控制连接由哪一端发起。被动中继需要一个固定的管理种子地址；主动中继自行连接服务端，服务端不保存中继地址。最终发布的管理和数据端点始终来自已认证中继的上报。"
