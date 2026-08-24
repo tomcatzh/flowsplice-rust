@@ -100,15 +100,22 @@ fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> 
 }
 
 fn stop_engine() -> Result<serde_json::Value> {
-    let Some(engine) = ENGINE
+    let mut slot = ENGINE
         .lock()
-        .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?
-        .take()
-    else {
+        .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?;
+    let Some(engine) = slot.take() else {
         return Ok(serde_json::json!({ "running": false }));
     };
+    // Keep the lifecycle lock until every listener owned by the old engine has closed. A Start
+    // arriving immediately after Stop must not race those listeners for the same local ports.
     runtime()?.block_on(engine.shutdown());
     Ok(serde_json::json!({ "running": false }))
+}
+
+fn notify_network_changed() -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    engine.notify_network_changed();
+    Ok(serde_json::json!({ "reconnect_requested": true }))
 }
 
 fn status() -> Result<serde_json::Value> {
@@ -342,6 +349,16 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_stop<'caller>(
     _class: JClass<'caller>,
 ) -> JString<'caller> {
     jni_string(&mut unowned_env, |_env| response_json(stop_engine()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_networkChanged<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    jni_string(&mut unowned_env, |_env| {
+        response_json(notify_network_changed())
+    })
 }
 
 #[unsafe(no_mangle)]

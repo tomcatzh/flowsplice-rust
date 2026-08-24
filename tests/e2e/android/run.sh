@@ -98,4 +98,4 @@ if [[ "${instrumentation_status}" -ne 0 ]] || ! grep -Fq 'OK (1 test)' "${instru
   echo 'Android Travel instrumentation E2E did not pass' >&2
   exit 1
 fi
-printf '%s\n' '{"checkpoint":"android-relay-discovery-enrollment-background-roundtrip"}'
+printf '%s\n' '{"checkpoint":"android-network-switch-short-outage-idle-restart-mapping-roundtrip"}'

@@ -488,6 +488,7 @@ async fn perform_race(
                                 events_tx.clone(),
                                 Duration::from_secs(state.config.carrier_heartbeat_secs),
                                 Duration::from_secs(state.config.carrier_timeout_secs),
+                                state.network_generation.subscribe(),
                                 carrier_permit,
                             );
                             carriers.insert(carrier_id, handle);
@@ -888,6 +889,7 @@ fn spawn_carrier(
     events: mpsc::Sender<FlowEvent>,
     heartbeat_period: Duration,
     timeout_period: Duration,
+    mut network_changes: watch::Receiver<u64>,
     carrier_permit: OwnedSemaphorePermit,
 ) -> CarrierHandle {
     let BusinessCarrier {
@@ -910,6 +912,10 @@ fn spawn_carrier(
         let result: Result<()> = async {
             loop {
                 tokio::select! {
+                    changed = network_changes.changed() => {
+                        changed.map_err(|_| anyhow!("network change notifier stopped"))?;
+                        bail!("default network changed");
+                    }
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             return Ok(());

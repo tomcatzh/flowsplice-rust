@@ -1,5 +1,6 @@
 package io.zxf.flowsplice.travel
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,8 +9,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +27,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.cancelAndJoin
 import org.json.JSONObject
 import java.util.Locale
 
@@ -150,25 +156,79 @@ private object EnrollmentStore {
 class TravelService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollingJob: Job? = null
+    private var commandJob: Job? = null
+    private val commands = Channel<ServiceCommand>(Channel.UNLIMITED)
+    private lateinit var connectivityManager: ConnectivityManager
+    private var currentNetwork: Network? = null
+    private val networkLock = Any()
+    private var networkCallbackRegistered = false
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val changed = synchronized(networkLock) {
+                if (currentNetwork == network) false else {
+                    currentNetwork = network
+                    true
+                }
+            }
+            if (changed) requestReconnect()
+        }
+
+        override fun onLost(network: Network) {
+            val changed = synchronized(networkLock) {
+                if (currentNetwork != network) false else {
+                    currentNetwork = null
+                    true
+                }
+            }
+            if (changed) requestReconnect()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        connectivityManager = getSystemService(ConnectivityManager::class.java)
+        synchronized(networkLock) {
+            currentNetwork = connectivityManager.activeNetwork
+        }
+        connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        networkCallbackRegistered = true
+        commandJob = serviceScope.launch {
+            for (command in commands) handleCommand(command)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_ENROLL -> startEnrollment()
-            ACTION_CANCEL_ENROLLMENT -> cancelEnrollment()
-            ACTION_STOP -> stopTravel()
-            ACTION_UPSERT -> intent.getStringExtra(EXTRA_MAPPING)?.let(::upsertMapping)
-            ACTION_DELETE -> deleteMapping(intent)
-            ACTION_START -> startTravel()
-            null -> when {
-                TravelInstallation.isInstalled(this) -> startTravel()
-                EnrollmentStore.load(this) != null -> startEnrollment()
-                else -> stopSelf()
+        val command = when (intent?.action) {
+            ACTION_ENROLL -> ServiceCommand.Enroll(startId)
+            ACTION_CANCEL_ENROLLMENT -> ServiceCommand.CancelEnrollment(startId)
+            ACTION_STOP -> ServiceCommand.Stop(startId)
+            ACTION_UPSERT -> intent.getStringExtra(EXTRA_MAPPING)
+                ?.let { ServiceCommand.Upsert(it) }
+            ACTION_DELETE -> {
+                val homeId = intent.getStringExtra(EXTRA_HOME_ID)
+                val serviceId = intent.getStringExtra(EXTRA_SERVICE_ID)
+                val protocol = intent.getStringExtra(EXTRA_PROTOCOL)
+                if (homeId != null && serviceId != null && protocol != null) {
+                    ServiceCommand.Delete(homeId, serviceId, protocol)
+                } else {
+                    null
+                }
             }
+            ACTION_START -> ServiceCommand.Start(startId)
+            null -> when {
+                TravelInstallation.isInstalled(this) -> ServiceCommand.Start(startId)
+                EnrollmentStore.load(this) != null -> ServiceCommand.Enroll(startId)
+                else -> null
+            }
+            else -> null
+        }
+        if (command == null) {
+            stopSelfResult(startId)
+        } else if (commands.trySend(command).isFailure) {
+            stopSelfResult(startId)
         }
         return START_STICKY
     }
@@ -176,16 +236,38 @@ class TravelService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        commands.close()
+        commandJob?.cancel()
         pollingJob?.cancel()
         runCatching { NativeTravel.stop() }
+        releaseWakeLock()
+        if (networkCallbackRegistered) {
+            runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+            networkCallbackRegistered = false
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
 
-    private fun startEnrollment() {
+    private suspend fun handleCommand(command: ServiceCommand) {
+        when (command) {
+            is ServiceCommand.Enroll -> startEnrollment(command.startId)
+            is ServiceCommand.CancelEnrollment -> cancelEnrollment(command.startId)
+            is ServiceCommand.Start -> startTravel(command.startId)
+            is ServiceCommand.Stop -> stopTravel(command.startId)
+            is ServiceCommand.Upsert -> upsertMapping(command.mappingJson)
+            is ServiceCommand.Delete -> deleteMapping(
+                command.homeId,
+                command.serviceId,
+                command.protocol,
+            )
+        }
+    }
+
+    private suspend fun startEnrollment(startId: Int) {
         val inputs = EnrollmentStore.load(this)
         if (inputs == null) {
-            failEnrollment("Enrollment inputs are unavailable")
+            failEnrollment("Enrollment inputs are unavailable", startId)
             return
         }
         val initial = EnrollmentSnapshot(
@@ -193,162 +275,160 @@ class TravelService : Service() {
             travelId = inputs.travelId,
         )
         startForegroundNow(enrollmentNotification(initial))
-        serviceScope.launch {
-            val password = CredentialStore.load(this@TravelService)
-            if (password.isNullOrEmpty()) {
-                failEnrollment("The private-key password is unavailable")
-                return@launch
-            }
-            val first = runCatching {
-                EnrollmentSnapshot.fromNative(
-                    NativeTravel.beginEnrollment(
-                        TravelInstallation.directory(this@TravelService).absolutePath,
-                        inputs.travelId,
-                        inputs.homeId,
-                        inputs.relay,
-                        password,
-                    ),
-                )
-            }.getOrElse { error ->
-                failEnrollment(error.message ?: "Could not start remote enrollment")
-                return@launch
-            }
-            TravelRepository.publishEnrollment(first)
-            updateNotification(enrollmentNotification(first))
-            pollingJob?.cancel()
-            pollingJob = launch {
-                while (isActive) {
-                    delay(1_000)
-                    val next = runCatching {
-                        EnrollmentSnapshot.fromNative(NativeTravel.enrollmentStatus())
-                    }.getOrElse { error ->
-                        EnrollmentSnapshot(
-                            phase = EnrollmentPhase.ERROR,
-                            travelId = inputs.travelId,
-                            error = error.message ?: "Remote enrollment failed",
-                        )
+        acquireWakeLock()
+        val password = CredentialStore.load(this@TravelService)
+        if (password.isNullOrEmpty()) {
+            failEnrollment("The private-key password is unavailable", startId)
+            return
+        }
+        val first = runCatching {
+            EnrollmentSnapshot.fromNative(
+                NativeTravel.beginEnrollment(
+                    TravelInstallation.directory(this@TravelService).absolutePath,
+                    inputs.travelId,
+                    inputs.homeId,
+                    inputs.relay,
+                    password,
+                ),
+            )
+        }.getOrElse { error ->
+            failEnrollment(error.message ?: "Could not start remote enrollment", startId)
+            return
+        }
+        TravelRepository.publishEnrollment(first)
+        updateNotification(enrollmentNotification(first))
+        pollingJob?.cancelAndJoin()
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                delay(1_000)
+                val next = runCatching {
+                    EnrollmentSnapshot.fromNative(NativeTravel.enrollmentStatus())
+                }.getOrElse { error ->
+                    EnrollmentSnapshot(
+                        phase = EnrollmentPhase.ERROR,
+                        travelId = inputs.travelId,
+                        error = error.message ?: "Remote enrollment failed",
+                    )
+                }
+                TravelRepository.publishEnrollment(next)
+                updateNotification(enrollmentNotification(next))
+                when (next.phase) {
+                    EnrollmentPhase.INSTALLED -> {
+                        EnrollmentStore.clear(this@TravelService)
+                        TravelRepository.publish(TravelSnapshot(enrolled = true, travelId = inputs.travelId))
+                        commands.send(ServiceCommand.Start(startId))
+                        return@launch
                     }
-                    TravelRepository.publishEnrollment(next)
-                    updateNotification(enrollmentNotification(next))
-                    when (next.phase) {
-                        EnrollmentPhase.INSTALLED -> {
-                            EnrollmentStore.clear(this@TravelService)
-                            TravelRepository.publish(TravelSnapshot(enrolled = true, travelId = inputs.travelId))
-                            pollingJob = null
-                            startTravel()
-                            return@launch
-                        }
-                        EnrollmentPhase.ERROR, EnrollmentPhase.CANCELLED -> {
-                            failEnrollment(next.error ?: "Remote enrollment stopped")
-                            return@launch
-                        }
-                        else -> Unit
+                    EnrollmentPhase.ERROR, EnrollmentPhase.CANCELLED -> {
+                        failEnrollment(next.error ?: "Remote enrollment stopped", startId)
+                        return@launch
                     }
+                    else -> Unit
                 }
             }
         }
     }
 
-    private fun cancelEnrollment() {
-        pollingJob?.cancel()
-        serviceScope.launch {
-            runCatching { NativeTravel.cancelEnrollment() }
-            EnrollmentStore.clear(this@TravelService)
-            TravelInstallation.discardPending(this@TravelService)
-            CredentialStore.clear(this@TravelService)
-            TravelRepository.publishEnrollment(EnrollmentSnapshot())
-            TravelRepository.publish(TravelSnapshot())
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
+    private suspend fun cancelEnrollment(startId: Int) {
+        pollingJob?.cancelAndJoin()
+        pollingJob = null
+        runCatching { NativeTravel.cancelEnrollment() }
+        EnrollmentStore.clear(this@TravelService)
+        TravelInstallation.discardPending(this@TravelService)
+        CredentialStore.clear(this@TravelService)
+        TravelRepository.publishEnrollment(EnrollmentSnapshot())
+        TravelRepository.publish(TravelSnapshot())
+        releaseWakeLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelfResult(startId)
     }
 
-    private fun startTravel() {
+    private suspend fun startTravel(startId: Int) {
         startForegroundNow(
             travelNotification(TravelSnapshot(phase = TravelPhase.STARTING, enrolled = true)),
         )
-        serviceScope.launch {
-            if (!TravelInstallation.isInstalled(this@TravelService)) {
-                failAndStop("Complete remote enrollment before starting")
-                return@launch
-            }
-            val password = CredentialStore.load(this@TravelService)
-            if (password.isNullOrEmpty()) {
-                failAndStop("The private-key password is unavailable")
-                return@launch
-            }
-            val snapshot = runCatching {
-                TravelSnapshot.fromNative(
-                    NativeTravel.start(TravelInstallation.config(this@TravelService).absolutePath, password),
-                    enrolled = true,
-                )
-            }.getOrElse { error ->
-                TravelSnapshot(
-                    phase = TravelPhase.ERROR,
-                    enrolled = true,
-                    error = error.message ?: "Travel Core failed to start",
-                )
-            }
-            TravelRepository.publish(snapshot)
-            updateNotification(travelNotification(snapshot))
-            if (snapshot.phase == TravelPhase.ERROR) {
-                failAndStop(snapshot.error ?: "Travel Core failed to start")
-                return@launch
-            }
-            publishCurrentCatalog()
-            getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, true) }
-            pollingJob?.cancel()
-            pollingJob = launch {
-                while (isActive) {
-                    delay(1_000)
-                    val next = runCatching {
-                        TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
-                    }.getOrElse { error ->
-                        TravelRepository.state.value.copy(
-                            phase = TravelPhase.ERROR,
-                            online = false,
-                            error = error.message,
-                        )
-                    }
-                    TravelRepository.publish(next)
-                    if (next.phase == TravelPhase.RUNNING) publishCurrentCatalog()
-                    updateNotification(travelNotification(next))
+        acquireWakeLock()
+        if (!TravelInstallation.isInstalled(this@TravelService)) {
+            failAndStop("Complete remote enrollment before starting", startId)
+            return
+        }
+        val password = CredentialStore.load(this@TravelService)
+        if (password.isNullOrEmpty()) {
+            failAndStop("The private-key password is unavailable", startId)
+            return
+        }
+        pollingJob?.cancelAndJoin()
+        pollingJob = null
+        val snapshot = runCatching {
+            TravelSnapshot.fromNative(
+                NativeTravel.start(TravelInstallation.config(this@TravelService).absolutePath, password),
+                enrolled = true,
+            )
+        }.getOrElse { error ->
+            TravelRepository.state.value.copy(
+                phase = TravelPhase.ERROR,
+                online = false,
+                enrolled = true,
+                error = error.message ?: "Travel Core failed to start",
+            )
+        }
+        TravelRepository.publish(snapshot)
+        updateNotification(travelNotification(snapshot))
+        if (snapshot.phase == TravelPhase.ERROR) {
+            failAndStop(snapshot.error ?: "Travel Core failed to start", startId)
+            return
+        }
+        publishCurrentCatalog()
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, true) }
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                delay(1_000)
+                val next = runCatching {
+                    TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
+                }.getOrElse { error ->
+                    TravelRepository.state.value.copy(
+                        phase = TravelPhase.ERROR,
+                        online = false,
+                        error = error.message,
+                    )
                 }
+                TravelRepository.publish(next)
+                if (next.phase == TravelPhase.RUNNING) publishCurrentCatalog()
+                updateNotification(travelNotification(next))
             }
         }
     }
 
-    private fun stopTravel() {
-        pollingJob?.cancel()
-        serviceScope.launch {
-            runCatching { NativeTravel.stop() }
-            getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, false) }
-            TravelRepository.publish(
-                TravelSnapshot(enrolled = TravelInstallation.isInstalled(this@TravelService)),
-            )
-            TravelRepository.publishCatalog(TravelCatalog())
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
+    private suspend fun stopTravel(startId: Int) {
+        pollingJob?.cancelAndJoin()
+        pollingJob = null
+        runCatching { NativeTravel.stop() }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, false) }
+        TravelRepository.publish(
+            TravelRepository.state.value.copy(
+                phase = TravelPhase.STOPPED,
+                online = false,
+                enrolled = TravelInstallation.isInstalled(this@TravelService),
+                activeFlows = 0,
+                relayCount = 0,
+                error = null,
+            ),
+        )
+        releaseWakeLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelfResult(startId)
     }
 
     private fun upsertMapping(mappingJson: String) {
-        serviceScope.launch {
-            val response = runCatching { NativeTravel.upsertMapping(mappingJson) }
-                .getOrElse { error -> nativeError(error.message ?: "Could not save the mapping") }
-            applyMutationResult(response)
-        }
+        val response = runCatching { NativeTravel.upsertMapping(mappingJson) }
+            .getOrElse { error -> nativeError(error.message ?: "Could not save the mapping") }
+        applyMutationResult(response)
     }
 
-    private fun deleteMapping(intent: Intent) {
-        val homeId = intent.getStringExtra(EXTRA_HOME_ID) ?: return
-        val serviceId = intent.getStringExtra(EXTRA_SERVICE_ID) ?: return
-        val protocol = intent.getStringExtra(EXTRA_PROTOCOL) ?: return
-        serviceScope.launch {
-            val response = runCatching { NativeTravel.deleteMapping(homeId, serviceId, protocol) }
-                .getOrElse { error -> nativeError(error.message ?: "Could not delete the mapping") }
-            applyMutationResult(response)
-        }
+    private fun deleteMapping(homeId: String, serviceId: String, protocol: String) {
+        val response = runCatching { NativeTravel.deleteMapping(homeId, serviceId, protocol) }
+            .getOrElse { error -> nativeError(error.message ?: "Could not delete the mapping") }
+        applyMutationResult(response)
     }
 
     private fun applyMutationResult(response: String) {
@@ -369,26 +449,48 @@ class TravelService : Service() {
             .onSuccess(TravelRepository::publishCatalog)
     }
 
-    private fun failEnrollment(message: String) {
+    private fun failEnrollment(message: String, startId: Int) {
         val current = TravelRepository.enrollment.value
         TravelRepository.publishEnrollment(
             current.copy(phase = EnrollmentPhase.ERROR, error = message),
         )
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopSelfResult(startId)
     }
 
-    private fun failAndStop(message: String) {
+    private fun failAndStop(message: String, startId: Int) {
+        val previous = TravelRepository.state.value
         TravelRepository.publish(
-            TravelSnapshot(
+            previous.copy(
                 phase = TravelPhase.ERROR,
+                online = false,
                 enrolled = TravelInstallation.isInstalled(this),
                 error = message,
             ),
         )
-        TravelRepository.publishCatalog(TravelCatalog())
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopSelfResult(startId)
+    }
+
+    private fun requestReconnect() {
+        serviceScope.launch {
+            runCatching { NativeTravel.networkChanged() }
+        }
+    }
+
+    @SuppressLint("WakelockTimeout")
+    private fun acquireWakeLock() {
+        val lock = wakeLock ?: getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:travel")
+            .apply { setReferenceCounted(false) }
+            .also { wakeLock = it }
+        if (!lock.isHeld) lock.acquire()
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.takeIf(PowerManager.WakeLock::isHeld)?.release()
     }
 
     private fun startForegroundNow(notification: Notification) {
@@ -522,5 +624,18 @@ class TravelService : Service() {
             .put("data", JSONObject.NULL)
             .put("error", message)
             .toString()
+    }
+
+    private sealed interface ServiceCommand {
+        data class Enroll(val startId: Int) : ServiceCommand
+        data class CancelEnrollment(val startId: Int) : ServiceCommand
+        data class Start(val startId: Int) : ServiceCommand
+        data class Stop(val startId: Int) : ServiceCommand
+        data class Upsert(val mappingJson: String) : ServiceCommand
+        data class Delete(
+            val homeId: String,
+            val serviceId: String,
+            val protocol: String,
+        ) : ServiceCommand
     }
 }

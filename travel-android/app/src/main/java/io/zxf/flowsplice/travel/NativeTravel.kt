@@ -16,6 +16,7 @@ object NativeTravel {
     external fun cancelEnrollment(): String
     external fun start(configPath: String, privateKeyPassword: String): String
     external fun stop(): String
+    external fun networkChanged(): String
     external fun status(): String
     external fun catalog(): String
     external fun upsertMapping(mappingJson: String): String

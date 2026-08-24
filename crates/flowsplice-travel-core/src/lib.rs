@@ -523,6 +523,7 @@ struct AppState {
     uploaded_bytes: Arc<std::sync::atomic::AtomicU64>,
     downloaded_bytes: Arc<std::sync::atomic::AtomicU64>,
     connected_relays: Arc<RwLock<HashSet<String>>>,
+    network_generation: watch::Sender<u64>,
     permits: Arc<Semaphore>,
     carrier_permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
@@ -748,6 +749,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         uploaded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         downloaded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connected_relays: Arc::new(RwLock::new(HashSet::new())),
+        network_generation: watch::channel(0).0,
         permits,
         carrier_permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
@@ -819,6 +821,17 @@ impl TravelCore {
     /// Returns the signed Relay directory currently accepted by the runtime.
     pub async fn relay_directory(&self) -> RelayDirectory {
         self.state.directory.read().await.clone()
+    }
+
+    /// Immediately retires connections created on the previous default network.
+    ///
+    /// Native shells call this after their platform reports that the default network changed or
+    /// disappeared. Local listeners and flow state remain alive while control and business
+    /// connections reconnect through the current route.
+    pub fn notify_network_changed(&self) {
+        self.state
+            .network_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Creates or updates a local mapping with bind-before-commit semantics.
@@ -2040,6 +2053,7 @@ async fn run_catalog_session(
     relay_spki: &str,
     stream: TlsStream<TcpStream>,
 ) -> Result<()> {
+    let mut network_changes = state.network_generation.subscribe();
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
     let mut heartbeat = interval(Duration::from_secs(10));
@@ -2050,6 +2064,10 @@ async fn run_catalog_session(
     let mut last_received = Instant::now();
     loop {
         tokio::select! {
+            changed = network_changes.changed() => {
+                changed.context("network change notifier stopped")?;
+                bail!("default network changed");
+            }
             message = reader.read::<ControlMessage>() => {
                 last_received = Instant::now();
                 match message? {
@@ -3090,6 +3108,7 @@ async fn run_udp_association(
 ) -> Result<()> {
     let config = &state.config;
     let flow_id = Uuid::new_v4();
+    let mut network_changes = state.network_generation.subscribe();
     let mut opened = None;
     for relay in relay_candidates(state).await {
         let carrier_id = Uuid::new_v4();
@@ -3120,6 +3139,10 @@ async fn run_udp_association(
     let mut receive_sequence = 0_u64;
     loop {
         tokio::select! {
+            changed = network_changes.changed() => {
+                changed.context("network change notifier stopped")?;
+                return Ok(());
+            }
             changed = shutdown.changed() => {
                 let _ = changed;
                 return Ok(());
