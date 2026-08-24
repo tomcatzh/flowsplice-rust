@@ -35,7 +35,7 @@ fi
 
 app_id='io.zxf.flowsplice.travel'
 remote_profile='/data/local/tmp/flowsplice-android-travel-profile.zip'
-"${adb}" install -r "${android_root}/app/build/outputs/apk/debug/app-debug.apk" >/dev/null
+"${adb}" install -r "${android_root}/app/build/outputs/apk/debug/flowsplice-travel.apk" >/dev/null
 "${adb}" install -r "${android_root}/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" >/dev/null
 "${adb}" shell pm clear "${app_id}" >/dev/null
 "${adb}" push "${profile_zip}" "${remote_profile}" >/dev/null

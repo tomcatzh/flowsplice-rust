@@ -40,6 +40,14 @@ android {
     }
 }
 
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("flowsplice-travel.apk")
+        }
+    }
+}
+
 val repositoryRoot = rootProject.projectDir.parentFile
 val rustJniOutput = layout.buildDirectory.dir("generated/rustJniLibs")
 val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
