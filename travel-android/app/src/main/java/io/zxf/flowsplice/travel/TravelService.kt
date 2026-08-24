@@ -29,8 +29,10 @@ import java.util.Locale
 object TravelRepository {
     private val mutableState = MutableStateFlow(TravelSnapshot())
     private val mutableEnrollment = MutableStateFlow(EnrollmentSnapshot())
+    private val mutableCatalog = MutableStateFlow(TravelCatalog())
     val state: StateFlow<TravelSnapshot> = mutableState.asStateFlow()
     val enrollment: StateFlow<EnrollmentSnapshot> = mutableEnrollment.asStateFlow()
+    val catalog: StateFlow<TravelCatalog> = mutableCatalog.asStateFlow()
 
     fun initialize(context: Context) {
         val enrolled = TravelInstallation.isInstalled(context)
@@ -50,6 +52,10 @@ object TravelRepository {
 
     fun publishEnrollment(snapshot: EnrollmentSnapshot) {
         mutableEnrollment.value = snapshot
+    }
+
+    fun publishCatalog(catalog: TravelCatalog) {
+        mutableCatalog.value = catalog
     }
 
     fun enroll(context: Context, travelId: String, homeId: String, relay: String, password: String) {
@@ -289,6 +295,7 @@ class TravelService : Service() {
                 failAndStop(snapshot.error ?: "Travel Core failed to start")
                 return@launch
             }
+            publishCurrentCatalog()
             getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, true) }
             pollingJob?.cancel()
             pollingJob = launch {
@@ -304,6 +311,7 @@ class TravelService : Service() {
                         )
                     }
                     TravelRepository.publish(next)
+                    if (next.phase == TravelPhase.RUNNING) publishCurrentCatalog()
                     updateNotification(travelNotification(next))
                 }
             }
@@ -318,6 +326,7 @@ class TravelService : Service() {
             TravelRepository.publish(
                 TravelSnapshot(enrolled = TravelInstallation.isInstalled(this@TravelService)),
             )
+            TravelRepository.publishCatalog(TravelCatalog())
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -355,6 +364,11 @@ class TravelService : Service() {
         updateNotification(travelNotification(next))
     }
 
+    private fun publishCurrentCatalog() {
+        runCatching { TravelCatalog.fromNative(NativeTravel.catalog()) }
+            .onSuccess(TravelRepository::publishCatalog)
+    }
+
     private fun failEnrollment(message: String) {
         val current = TravelRepository.enrollment.value
         TravelRepository.publishEnrollment(
@@ -372,6 +386,7 @@ class TravelService : Service() {
                 error = message,
             ),
         )
+        TravelRepository.publishCatalog(TravelCatalog())
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

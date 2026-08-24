@@ -81,6 +81,77 @@ data class TravelMapping(
     val bind: String,
 )
 
+data class CatalogService(
+    val id: String,
+    val alias: String,
+    val protocol: String,
+) {
+    val key: String
+        get() = "$id/$protocol"
+
+    val displayName: String
+        get() = if (alias.isBlank() || alias == id) id else "$alias ($id)"
+}
+
+data class CatalogHome(
+    val id: String,
+    val alias: String,
+    val services: List<CatalogService>,
+) {
+    val displayName: String
+        get() = if (alias.isBlank() || alias == id) id else "$alias ($id)"
+}
+
+data class TravelCatalog(
+    val generation: Long = 0,
+    val homes: List<CatalogHome> = emptyList(),
+) {
+    companion object {
+        fun fromNative(json: String): TravelCatalog {
+            val envelope = JSONObject(json)
+            check(envelope.optBoolean("ok")) {
+                envelope.optString("error", "Could not load the Home service catalog")
+            }
+            val data = envelope.getJSONObject("data")
+            val homesJson = data.optJSONArray("homes")
+            val homes = buildList {
+                if (homesJson != null) {
+                    for (homeIndex in 0 until homesJson.length()) {
+                        val home = homesJson.getJSONObject(homeIndex)
+                        val servicesJson = home.optJSONArray("services")
+                        val services = buildList {
+                            if (servicesJson != null) {
+                                for (serviceIndex in 0 until servicesJson.length()) {
+                                    val service = servicesJson.getJSONObject(serviceIndex)
+                                    add(
+                                        CatalogService(
+                                            id = service.getString("id"),
+                                            alias = service.optString("alias"),
+                                            protocol = service.getString("protocol"),
+                                        ),
+                                    )
+                                }
+                            }
+                        }.sortedWith(compareBy(CatalogService::displayName, CatalogService::id, CatalogService::protocol))
+                        add(
+                            CatalogHome(
+                                id = home.getString("home_id"),
+                                alias = home.optString("home_alias"),
+                                services = services,
+                            ),
+                        )
+                    }
+                }
+            }.filter { it.services.isNotEmpty() }
+                .sortedWith(compareBy(CatalogHome::displayName, CatalogHome::id))
+            return TravelCatalog(
+                generation = data.optLong("generation"),
+                homes = homes,
+            )
+        }
+    }
+}
+
 data class TravelSnapshot(
     val phase: TravelPhase = TravelPhase.STOPPED,
     val online: Boolean = false,

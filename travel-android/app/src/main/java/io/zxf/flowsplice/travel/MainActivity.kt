@@ -29,7 +29,11 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -107,6 +111,7 @@ private fun TravelApp() {
     val enrollmentForm: EnrollmentFormViewModel = viewModel()
     val snapshot by TravelRepository.state.collectAsStateWithLifecycle()
     val enrollment by TravelRepository.enrollment.collectAsStateWithLifecycle()
+    val catalog by TravelRepository.catalog.collectAsStateWithLifecycle()
     var showMappingDialog by rememberSaveable { mutableStateOf(false) }
     var notificationAllowed by remember {
         mutableStateOf(
@@ -235,6 +240,7 @@ private fun TravelApp() {
 
     if (showMappingDialog) {
         MappingDialog(
+            catalog = catalog,
             onDismiss = { showMappingDialog = false },
             onSave = { mapping ->
                 TravelRepository.upsert(context, mapping)
@@ -564,29 +570,75 @@ private fun EmptyMappings() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MappingDialog(onDismiss: () -> Unit, onSave: (TravelMapping) -> Unit) {
+internal fun MappingDialog(
+    catalog: TravelCatalog,
+    onDismiss: () -> Unit,
+    onSave: (TravelMapping) -> Unit,
+) {
     var homeId by rememberSaveable { mutableStateOf("") }
-    var serviceId by rememberSaveable { mutableStateOf("") }
-    var protocol by rememberSaveable { mutableStateOf("tcp") }
+    var serviceKey by rememberSaveable { mutableStateOf("") }
     var port by rememberSaveable { mutableStateOf("") }
+    val selectedHome = catalog.homes.firstOrNull { it.id == homeId }
+    val selectedService = selectedHome?.services?.firstOrNull { it.key == serviceKey }
     val validPort = port.toIntOrNull()?.let { it in 1..65535 } == true
+
+    LaunchedEffect(catalog, homeId) {
+        if (selectedHome == null) {
+            homeId = catalog.homes.firstOrNull()?.id.orEmpty()
+            serviceKey = ""
+        }
+    }
+    LaunchedEffect(selectedHome, serviceKey) {
+        if (selectedService == null) {
+            serviceKey = selectedHome?.services?.firstOrNull()?.key.orEmpty()
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add local mapping") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(homeId, { homeId = it }, label = { Text("Home ID") }, singleLine = true)
-                OutlinedTextField(serviceId, { serviceId = it }, label = { Text("Service ID") }, singleLine = true)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (protocol == "tcp") Button({ protocol = "tcp" }) { Text("TCP") }
-                    else OutlinedButton({ protocol = "tcp" }) { Text("TCP") }
-                    if (protocol == "udp") Button({ protocol = "udp" }) { Text("UDP") }
-                    else OutlinedButton({ protocol = "udp" }) { Text("UDP") }
+                if (catalog.homes.isEmpty()) {
+                    Text(
+                        "Waiting for Home services…",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
+                CatalogDropdown(
+                    label = "Home",
+                    selectedKey = homeId,
+                    options = catalog.homes.map { CatalogOption(it.id, it.displayName) },
+                    testTag = "mapping-home-selector",
+                    onSelect = { selected ->
+                        homeId = selected
+                        serviceKey = ""
+                    },
+                )
+                CatalogDropdown(
+                    label = "Service",
+                    selectedKey = serviceKey,
+                    options = selectedHome?.services.orEmpty().map {
+                        CatalogOption(it.key, it.displayName)
+                    },
+                    testTag = "mapping-service-selector",
+                    onSelect = { serviceKey = it },
+                )
+                OutlinedTextField(
+                    value = selectedService?.protocol?.uppercase().orEmpty(),
+                    onValueChange = {},
+                    modifier = Modifier.fillMaxWidth().testTag("mapping-protocol"),
+                    label = { Text("Protocol") },
+                    enabled = selectedService != null,
+                    readOnly = true,
+                    singleLine = true,
+                )
                 OutlinedTextField(
                     value = port,
                     onValueChange = { port = it.filter(Char::isDigit).take(5) },
+                    modifier = Modifier.fillMaxWidth().testTag("mapping-local-port"),
                     label = { Text("Local port") },
                     prefix = { Text("127.0.0.1:") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -597,13 +649,63 @@ private fun MappingDialog(onDismiss: () -> Unit, onSave: (TravelMapping) -> Unit
         confirmButton = {
             Button(
                 onClick = {
-                    onSave(TravelMapping(homeId.trim(), serviceId.trim(), protocol, "127.0.0.1:$port"))
+                    val service = checkNotNull(selectedService)
+                    onSave(TravelMapping(homeId, service.id, service.protocol, "127.0.0.1:$port"))
                 },
-                enabled = homeId.isNotBlank() && serviceId.isNotBlank() && validPort,
+                enabled = selectedHome != null && selectedService != null && validPort,
             ) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+private data class CatalogOption(val key: String, val label: String)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CatalogDropdown(
+    label: String,
+    selectedKey: String,
+    options: List<CatalogOption>,
+    testTag: String,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val selected = options.firstOrNull { it.key == selectedKey }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { if (options.isNotEmpty()) expanded = it },
+    ) {
+        OutlinedTextField(
+            value = selected?.label.orEmpty(),
+            onValueChange = {},
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                .testTag(testTag),
+            label = { Text(label) },
+            placeholder = { Text("No choices available") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            enabled = options.isNotEmpty(),
+            readOnly = true,
+            singleLine = true,
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option.label) },
+                    onClick = {
+                        onSelect(option.key)
+                        expanded = false
+                    },
+                    modifier = Modifier.testTag("$testTag-option-${option.key}"),
+                )
+            }
+        }
+    }
 }
 
 @Composable

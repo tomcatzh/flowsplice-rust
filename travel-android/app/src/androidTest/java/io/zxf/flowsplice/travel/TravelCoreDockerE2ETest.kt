@@ -48,10 +48,16 @@ class TravelCoreDockerE2ETest {
             File(context.filesDir, "e2e-verification-code")
                 .writeText(requireNotNull(enrollment.verificationCode))
             awaitSnapshot("Travel Core did not come online") { it.phase == TravelPhase.RUNNING && it.online }
+            val service = awaitCatalog("Android did not receive the Home service catalog") { catalog ->
+                catalog.homes
+                    .firstOrNull { it.id == "home-1" }
+                    ?.services
+                    ?.firstOrNull { it.id == "tcp-echo" && it.protocol == "tcp" }
+            }
             val mapping = TravelMapping(
                 homeId = "home-1",
-                serviceId = "tcp-echo",
-                protocol = "tcp",
+                serviceId = service.id,
+                protocol = service.protocol,
                 bind = "127.0.0.1:10080",
             )
             TravelRepository.upsert(context, mapping)
@@ -120,6 +126,17 @@ class TravelCoreDockerE2ETest {
             delay(1_000)
         }
         error("$message: ${TravelRepository.state.value}")
+    }
+
+    private suspend fun awaitCatalog(
+        message: String,
+        select: (TravelCatalog) -> CatalogService?,
+    ): CatalogService {
+        repeat(180) {
+            select(TravelRepository.catalog.value)?.let { return it }
+            delay(1_000)
+        }
+        error("$message: ${TravelRepository.catalog.value}")
     }
 
     private fun assertEcho(payload: String) {
