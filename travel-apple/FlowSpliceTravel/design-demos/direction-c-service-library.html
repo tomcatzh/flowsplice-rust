@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FlowSplice Direction C — Service Library</title>
+  <link rel="stylesheet" href="prototype.css">
+  <style>
+    :root{--accent:#0b725c;--accent-text:#fff;--app-bg:#f7f5f0;--surface:#fffdfa;--soft:#e5f3ee;--sidebar:#07110f;--selection:#17332c;--bar:rgba(250,249,245,.92);--text:#17201d;--secondary:#66706c;--tertiary:#a5aaa7;--hairline:rgba(31,43,39,.11);--muted:#626a67;--good:#16835b;--indicator:rgba(0,0,0,.28)}
+    body{background:#deddd8}.board{background:#e9e7e1}.brief .eyebrow{color:#0b725c}.trait{background:#f4f2ed}.sidebar{color:#f2faf7}.sidebar .side-item{color:#9eafa9}.sidebar .side-item.selected{color:white}.sidebar .side-brand{color:white}.sidebar .caption{color:#7f948d}.sidebar .sf{background:#14241f;color:#70d8b6}.home-switch{display:flex;gap:7px;margin:14px 0}.home-chip{border:1px solid var(--hairline);background:var(--surface);color:var(--secondary);padding:8px 11px;border-radius:999px;font-size:13px}.home-chip.active{background:#07110f;color:#fff;border-color:#07110f}.service-list{overflow:hidden}.service-list .list-row{display:grid;grid-template-columns:40px 1fr auto;gap:12px;align-items:center}.service-list .selected-row{background:#edf7f3}.route-map{margin-top:15px;padding:20px}.route{display:grid;grid-template-columns:1fr 80px 1fr;align-items:center;text-align:center}.route-node{padding:14px;border:1px solid var(--hairline);border-radius:16px}.route-node strong{display:block;margin-top:5px}.route-line{height:2px;background:#80b9a6;position:relative}.route-line:after{content:"›";position:absolute;right:-2px;top:-14px;font-size:22px;color:#0b725c}.safe-note{margin-top:14px;font-size:13px;color:var(--secondary);display:flex;align-items:center;gap:8px}.phone-title{display:flex;align-items:center;justify-content:space-between}.phone-services{margin-top:16px}.phone-services .list-row{display:grid;grid-template-columns:38px 1fr auto;gap:10px;align-items:center}.mapping-sheet{padding-bottom:38px}.mapping-sheet .choice{padding:12px 0;display:flex;justify-content:space-between;align-items:center}.mapping-sheet .choice+.choice{border-top:1px solid var(--hairline)}.check{width:22px;height:22px;border-radius:50%;background:#0b725c;color:white;display:grid;place-items:center;font-size:12px}.catalog-age{font-size:12px;color:var(--secondary);padding:6px 9px;border-radius:9px;background:#edeae3}.device-status{margin-top:auto;background:#0d1c18;border-radius:16px;padding:13px;color:white}.device-status .caption{color:#8da29b}.device-status .dot{display:inline-block;margin-right:6px}.detail-grid{display:grid;grid-template-columns:245px 1fr;gap:14px;margin-top:15px;height:502px}.detail-grid>.card{overflow:hidden}.service-detail{padding:18px}.bind-box{margin-top:16px;padding:16px;border-radius:16px;background:#07110f;color:white}.bind-box .caption{color:#9cafaa}.bind-address{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;margin-top:7px}.i-pad-toolbar{display:flex;align-items:center;justify-content:space-between}.segmented{display:flex;padding:3px;background:#e8e6e0;border-radius:10px}.segmented button{border:0;background:transparent;padding:6px 12px;border-radius:8px;color:var(--secondary)}.segmented button.active{background:white;color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  </style>
+</head>
+<body>
+  <main class="board">
+    <section class="brief">
+      <div class="eyebrow">方向 C · Service Library</div>
+      <h1>从“我要访问什么”出发</h1>
+      <p>把 Home 业务目录放在中心，弱化网络术语。用户先选服务，再确认本地入口；适合把 Travel 当日常工具使用。</p>
+      <div class="traits">
+        <div class="trait">最强项：业务获取、选择与映射</div>
+        <div class="trait">iPhone：服务列表 + 原生底部 Sheet</div>
+        <div class="trait">iPad：Home / Service 主从浏览</div>
+      </div>
+    </section>
+
+    <section class="stage phone-stage">
+      <div data-ios-frame data-device="iphone" data-time="9:41" data-battery="91">
+        <template>
+          <div class="app-shell">
+            <section class="screen-pad" data-panel="services">
+              <div class="phone-title"><div><span class="caption">PRIMARY HOME</span><div class="nav-title">可用服务</div></div><img class="brand-icon" src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice"></div>
+              <div class="home-switch"><button class="home-chip active">Primary Home</button><button class="home-chip">Second Home</button></div>
+              <div class="row space" style="margin-bottom:8px"><span class="pill"><i class="dot"></i>Travel 在线</span><span class="catalog-age">刚刚更新</span></div>
+              <div class="card service-list phone-services"><div class="list-row"><span class="service-mark">S</span><span><b>Desktop Shell</b><small class="caption" style="display:block">TCP · dsh</small></span><span class="chevron">›</span></div><div class="list-row selected-row"><span class="service-mark">E</span><span><b>Echo</b><small class="caption" style="display:block">UDP · echo</small></span><span class="check">✓</span></div><div class="list-row"><span class="service-mark">N</span><span><b>Notes</b><small class="caption" style="display:block">TCP · notes</small></span><span class="chevron">›</span></div></div>
+              <div class="safe-note"><span class="sf">⌁</span>目录来自已批准的 Home，协议由服务自动确定。</div>
+            </section>
+            <section class="screen-pad" data-panel="overview" hidden><div class="phone-title"><span class="nav-title">我的入口</span><img class="brand-icon" src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice"></div><div class="card" style="padding:18px;margin-top:16px"><span class="pill"><i class="dot"></i>在线</span><h2>2 个本地入口</h2><p class="label">锁屏恢复后已自动校验。</p></div></section>
+            <div class="sheet mapping-sheet"><div class="sheet-handle"></div><div class="row space"><div><span class="caption">SECOND HOME</span><div class="section-title">映射 Echo</div></div><button class="native-button">添加</button></div><div style="margin-top:12px"><div class="choice"><span><small class="caption" style="display:block">服务</small><b>Echo</b></span><span class="check">✓</span></div><div class="choice"><span><small class="caption" style="display:block">协议</small><b>UDP（由 Home 提供）</b></span></div><div class="choice"><span><small class="caption" style="display:block">本地入口</small><b>127.0.0.1:9000</b></span><span class="chevron">›</span></div></div></div>
+            <nav class="tabbar" style="z-index:5"><button class="tab selected" data-screen="services"><b>▦</b>服务</button><button class="tab" data-screen="overview"><b>↔</b>入口</button></nav>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <section class="stage ipad-stage">
+      <div data-ios-frame data-device="ipad" data-time="9:41" data-battery="96">
+        <template>
+          <div class="app-shell split">
+            <aside class="sidebar">
+              <div class="side-brand"><img class="brand-icon" src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice">FlowSplice</div>
+              <span class="caption" style="padding:0 12px 7px;display:block">HOMES</span>
+              <button class="side-item selected" data-screen="primary"><span class="sf">⌂</span>Primary Home</button>
+              <button class="side-item" data-screen="second"><span class="sf">⌂</span>Second Home</button>
+              <span class="caption" style="padding:22px 12px 7px;display:block">DEVICE</span>
+              <button class="side-item" data-screen="mappings"><span class="sf">↔</span>我的入口</button>
+              <button class="side-item" data-screen="enrollment"><span class="sf">✓</span>注册信息</button>
+              <div class="device-status"><span class="caption">TOMCAT-IPAD-MINI</span><div style="margin-top:6px"><i class="dot"></i><b>在线</b></div><span class="caption">网络恢复已验证</span></div>
+            </aside>
+            <section class="detail" data-panel="primary">
+              <div class="i-pad-toolbar"><div><span class="caption">HOME / HOME-1</span><div class="nav-title">Primary Home</div></div><div class="segmented"><button class="active">服务</button><button>入口</button></div></div>
+              <div class="detail-grid">
+                <div class="card service-list"><div class="list-row selected-row"><span class="service-mark">S</span><span><b>Desktop Shell</b><small class="caption" style="display:block">TCP · dsh</small></span><span class="chevron">›</span></div><div class="list-row"><span class="service-mark">N</span><span><b>Notes</b><small class="caption" style="display:block">TCP · notes</small></span><span class="chevron">›</span></div><div class="list-row"><span class="service-mark">P</span><span><b>Photos</b><small class="caption" style="display:block">TCP · photos</small></span><span class="chevron">›</span></div></div>
+                <div class="card service-detail"><div class="row space"><span class="service-mark" style="width:46px;height:46px">S</span><span class="pill"><i class="dot"></i>服务可用</span></div><h2 style="font-size:26px;margin:14px 0 3px">Desktop Shell</h2><span class="caption">Primary Home · dsh · TCP</span><div class="route-map card"><div class="route"><div class="route-node"><span class="caption">这台 iPad</span><strong>本地入口</strong></div><div class="route-line"></div><div class="route-node"><span class="caption">Primary Home</span><strong>Desktop Shell</strong></div></div></div><div class="bind-box"><span class="caption">本地监听地址</span><div class="bind-address">127.0.0.1:1080</div><div class="row space" style="margin-top:13px"><span class="caption">仅此设备可访问</span><button class="native-button">编辑入口</button></div></div><div class="safe-note"><span class="sf">↻</span>业务目录 generation 18 · 最近刷新于 9:40:52</div></div>
+              </div>
+            </section>
+            <section class="detail" data-panel="second" hidden><div class="nav-title">Second Home</div><div class="card" style="padding:18px;margin-top:16px"><b>Echo</b><p class="label">UDP · echo · 可建立本地入口</p></div></section>
+            <section class="detail" data-panel="mappings" hidden><div class="nav-title">我的入口</div><div class="card" style="padding:18px;margin-top:16px"><b>127.0.0.1:1080</b><p class="label">Primary Home · Desktop Shell · TCP</p></div></section>
+            <section class="detail" data-panel="enrollment" hidden><div class="nav-title">注册信息</div><div class="card" style="padding:18px;margin-top:16px"><span class="pill"><i class="dot"></i>已批准</span><h2>Tomcat-iPad-mini</h2><p class="label">Home: home-1 · 凭据已存入钥匙串</p></div></section>
+          </div>
+        </template>
+      </div>
+    </section>
+  </main>
+  <script src="prototype.js"></script>
+</body>
+</html>

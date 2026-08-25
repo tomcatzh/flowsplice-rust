@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FlowSplice Direction B — Signal Console</title>
+  <link rel="stylesheet" href="prototype.css">
+  <style>
+    :root{--accent:#70d8b6;--accent-text:#07110f;--app-bg:#07110f;--surface:#101d1a;--soft:#152a24;--sidebar:#0a1512;--selection:#19332b;--bar:rgba(8,18,15,.92);--text:#f3faf7;--secondary:#9bb0a9;--tertiary:#60766f;--hairline:rgba(149,207,188,.15);--muted:#41524d;--good:#70d8b6;--indicator:rgba(255,255,255,.5)}
+    body{background:#07110f;color:#e8f4f0}.board{background:#0b1613}.brief p{color:#a4b7b1}.trait{background:#0f201b;border-color:#1c342d;color:#abc0b9}.eyebrow{color:#70d8b6}.ios-wrapper{box-shadow:0 0 0 2px #2d3935,0 28px 80px rgba(0,0,0,.48)}
+    .console-head{display:flex;align-items:center;justify-content:space-between}.console-head .brand-icon{border:1px solid #1d342e}.live-panel{margin-top:17px;padding:20px;border:1px solid #24433a;border-radius:22px;background:#0c1916}.signal-ring{width:114px;height:114px;border-radius:50%;border:12px solid #18322a;border-top-color:var(--accent);border-right-color:var(--accent);display:grid;place-items:center;margin:8px auto 18px;transform:rotate(18deg)}.signal-ring>span{transform:rotate(-18deg);text-align:center}.signal-ring b{display:block;font-size:27px}.signal-ring small{color:var(--secondary)}.readouts{display:grid;grid-template-columns:1fr 1fr;gap:8px}.readout{padding:12px;border:1px solid var(--hairline);border-radius:14px}.readout strong{display:block;font-size:18px;margin-top:4px}.event{display:grid;grid-template-columns:52px 10px 1fr;gap:9px;align-items:start;padding:10px 0;font-size:13px}.event time{color:var(--secondary)}.event i{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-top:5px}.service-table{margin-top:14px;overflow:hidden}.service-table .list-row{display:grid;grid-template-columns:40px 1fr 120px auto;gap:12px;align-items:center}.protocol{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--accent);border:1px solid #2f5b4c;border-radius:7px;padding:4px 6px;text-align:center}.top-status{border:1px solid #24433a;border-radius:18px;padding:17px 18px;display:flex;align-items:center;gap:16px}.pulse{width:52px;height:52px;border:1px solid #356353;border-radius:50%;display:grid;place-items:center}.pulse:after{content:"";width:18px;height:18px;background:var(--accent);border-radius:50%;box-shadow:0 0 0 8px rgba(112,216,182,.1)}.catalog-toolbar{display:flex;align-items:end;justify-content:space-between;margin-top:20px}.filter{display:flex;gap:7px}.filter button{border:1px solid var(--hairline);background:var(--surface);color:var(--secondary);padding:7px 10px;border-radius:9px}.filter button.active{color:var(--text);border-color:#356353}.add-sheet .field{background:#0c1714}.add-sheet{border:1px solid #2a493f}.live-strip{position:absolute;left:16px;right:16px;top:8px;height:43px;border-radius:22px;background:#020504;color:white;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:12px}.live-strip img{width:24px;height:24px;border-radius:7px}.live-strip .mini{display:flex;align-items:center;gap:8px}.live-strip .dot{width:6px;height:6px}.phone-stage .ios-content{top:54px}
+  </style>
+</head>
+<body>
+  <main class="board">
+    <section class="brief">
+      <div class="eyebrow">方向 B · Signal Console</div>
+      <h1>把连接态势放在最前</h1>
+      <p>Deep Ink 与 Flow Mint 成为主舞台。适合经常观察连接、切换网络和处理异常的用户，状态变化更醒目。</p>
+      <div class="traits">
+        <div class="trait">最强项：网络与恢复状态可见性</div>
+        <div class="trait">iPhone：运行态势 + Live Activity 感知</div>
+        <div class="trait">iPad：紧凑业务目录与映射控制台</div>
+      </div>
+    </section>
+
+    <section class="stage phone-stage">
+      <div data-ios-frame data-device="iphone" data-dark="true" data-time="9:41" data-battery="71">
+        <template>
+          <div class="app-shell">
+            <div class="live-strip"><span class="mini"><img src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice"><i class="dot"></i>Travel 在线</span><span>3 个流</span></div>
+            <section class="screen-pad" data-panel="overview" style="padding-top:61px">
+              <div class="console-head"><div><span class="caption">TOMCAT-IPHONE</span><div class="nav-title">连接</div></div><img class="brand-icon" src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice"></div>
+              <div class="live-panel"><div class="row space"><span class="pill"><i class="dot"></i>Relay 正常</span><button class="secondary-button">停止</button></div><div class="signal-ring"><span><b>在线</b><small>02:18:42</small></span></div><div class="readouts"><div class="readout"><span class="label">活动流</span><strong>3</strong></div><div class="readout"><span class="label">Relay</span><strong>2</strong></div><div class="readout"><span class="label">上传</span><strong>38 MB</strong></div><div class="readout"><span class="label">下载</span><strong>412 MB</strong></div></div></div>
+              <div style="margin:16px 2px 6px" class="section-title">最近恢复</div><div class="event"><time>09:37</time><i></i><span><b>网络路径改变</b><small class="caption" style="display:block">Wi‑Fi → 蜂窝测试链路</small></span></div><div class="event"><time>09:37</time><i></i><span><b>重连完成</b><small class="caption" style="display:block">映射已恢复</small></span></div>
+            </section>
+            <section class="screen-pad" data-panel="mappings" hidden><div class="console-head"><span class="nav-title">映射</span><button class="native-button">＋</button></div><div class="card" style="margin-top:16px"><div class="list-row"><b>Desktop Shell</b><span class="caption">TCP · 1080</span></div><div class="list-row"><b>Echo</b><span class="caption">UDP · 9000</span></div></div></section>
+            <nav class="tabbar"><button class="tab selected" data-screen="overview"><b>◉</b>态势</button><button class="tab" data-screen="mappings"><b>↔</b>映射</button></nav>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <section class="stage ipad-stage">
+      <div data-ios-frame data-device="ipad" data-dark="true" data-time="9:41" data-battery="84">
+        <template>
+          <div class="app-shell split">
+            <aside class="sidebar">
+              <div class="side-brand"><img class="brand-icon" src="../../../assets/brand/flowsplice-icon.svg" alt="FlowSplice">FlowSplice</div>
+              <button class="side-item" data-screen="overview"><span class="sf">◉</span>连接态势</button>
+              <button class="side-item selected" data-screen="catalog"><span class="sf">↔</span>服务与映射</button>
+              <button class="side-item" data-screen="events"><span class="sf">⌁</span>恢复事件</button>
+              <button class="side-item" data-screen="settings"><span class="sf">⋯</span>设备</button>
+              <div style="margin-top:auto;padding:18px 11px" class="caption">CATALOG GENERATION 18</div>
+            </aside>
+            <section class="detail" data-panel="catalog">
+              <div class="toolbar"><div><span class="caption">PRIMARY HOME</span><div class="nav-title">服务与映射</div></div><button class="native-button">＋ 新建映射</button></div>
+              <div class="top-status" style="margin-top:15px"><div class="pulse"></div><div style="flex:1"><span class="pill"><i class="dot"></i>目录已同步</span><h2 style="margin:6px 0 3px">4 个业务可用</h2><span class="caption">上次刷新 9:40:52 · Relay 2/2</span></div><button class="secondary-button">刷新</button></div>
+              <div class="catalog-toolbar"><div><span class="section-title">已映射业务</span><div class="caption">本机监听地址仅绑定回环接口</div></div><div class="filter"><button class="active">全部</button><button>TCP</button><button>UDP</button></div></div>
+              <div class="card service-table"><div class="list-row"><span class="service-mark">S</span><span><b>Desktop Shell</b><small class="caption" style="display:block">Primary Home / dsh</small></span><span class="protocol">TCP · 1080</span><span class="chevron">›</span></div><div class="list-row"><span class="service-mark">E</span><span><b>Echo</b><small class="caption" style="display:block">Second Home / echo</small></span><span class="protocol">UDP · 9000</span><span class="chevron">›</span></div></div>
+              <div class="sheet add-sheet"><div class="sheet-handle"></div><div class="row space"><div><span class="caption">新建</span><div class="section-title">添加本地映射</div></div><button class="native-button">存储</button></div><div style="display:grid;grid-template-columns:1fr 1fr 120px;gap:10px;margin-top:15px"><div class="field"><small>Home</small><span>Primary Home⌄</span></div><div class="field"><small>Service</small><span>Desktop Shell⌄</span></div><div class="field"><small>协议</small><span>TCP</span></div></div><div class="field" style="margin-top:10px"><small>本地端口</small><span>127.0.0.1: 1080</span></div></div>
+            </section>
+            <section class="detail" data-panel="overview" hidden><div class="nav-title">连接态势</div><div class="top-status" style="margin-top:16px"><div class="pulse"></div><div><h2>Travel 在线</h2><span class="caption">3 个活动流 · 2 个 Relay</span></div></div></section>
+            <section class="detail" data-panel="events" hidden><div class="nav-title">恢复事件</div><div class="card" style="padding:18px;margin-top:16px"><div class="event"><time>09:37</time><i></i><span>网络路径改变</span></div><div class="event"><time>09:37</time><i></i><span>Relay 重连成功</span></div></div></section>
+            <section class="detail" data-panel="settings" hidden><div class="nav-title">设备</div><div class="card" style="padding:18px;margin-top:16px"><b>Tomcat-iPad-mini</b><p class="label">注册证书已安装 · 钥匙串正常</p></div></section>
+          </div>
+        </template>
+      </div>
+    </section>
+  </main>
+  <script src="prototype.js"></script>
+</body>
+</html>

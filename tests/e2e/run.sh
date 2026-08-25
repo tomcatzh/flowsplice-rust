@@ -830,4 +830,20 @@ if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
     "10.0.2.2:18446"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
+if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" ]]; then
+  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:18447"
+  docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
+  docker compose -f "${compose_file}" up -d --no-deps relay2 homeagent
+  "${repo_root}/tests/e2e/apple/run.sh" \
+    "${generated_dir}/offline/test-password.txt" \
+    "127.0.0.1:18446" \
+    "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
+    "apple-e2e-iphone"
+  "${repo_root}/tests/e2e/apple/run.sh" \
+    "${generated_dir}/offline/test-password.txt" \
+    "127.0.0.1:18446" \
+    "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
+    "apple-e2e-ipad-mini"
+  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
+fi
 docker compose -f "${compose_file}" ps

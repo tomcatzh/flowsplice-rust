@@ -13,3 +13,6 @@
 /tests/e2e/generated/
 __pycache__/
 *.pyc
+**/xcuserdata/
+*.xcuserstate
+DerivedData/

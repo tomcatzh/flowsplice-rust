@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import shutil
+import argparse
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -41,18 +42,18 @@ def route_points():
     return points
 
 
-def render(size: int) -> Image.Image:
+def render(size: int, background: str = INK, foreground: str = MINT) -> Image.Image:
     scale = max(4, math.ceil(size / MASTER) * 4)
     canvas_size = size * scale
-    image = Image.new("RGB", (canvas_size, canvas_size), INK)
+    image = Image.new("RGB", (canvas_size, canvas_size), background)
     draw = ImageDraw.Draw(image)
     factor = canvas_size / MASTER
     points = [(round(x * factor), round(y * factor)) for x, y in route_points()]
     width = round(12 * factor)
-    draw.line(points, fill=MINT, width=width, joint="curve")
+    draw.line(points, fill=foreground, width=width, joint="curve")
     radius = width / 2
     for x, y in (points[0], points[-1]):
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=MINT)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=foreground)
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
@@ -88,10 +89,31 @@ def export_android_legacy() -> None:
             image.save(folder / name, format="WEBP", lossless=True, method=6)
 
 
+def export_apple() -> None:
+    app_icon = ROOT / "travel-apple/FlowSpliceTravel/FlowSpliceTravel/Assets.xcassets/AppIcon.appiconset"
+    app_icon.mkdir(parents=True, exist_ok=True)
+    render(1024).save(app_icon / "AppIcon.png", format="PNG", optimize=True)
+    render(1024, background="#050A09", foreground="#80E2C0").save(
+        app_icon / "AppIcon-Dark.png", format="PNG", optimize=True
+    )
+    render(1024, background="#111111", foreground="#F1F1F1").save(
+        app_icon / "AppIcon-Tinted.png", format="PNG", optimize=True
+    )
+
+
 def main() -> None:
-    for app in ("homeagent", "travelagent"):
-        export_web(ROOT / app / "web/public")
-    export_android_legacy()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--apple-only",
+        action="store_true",
+        help="Generate only the Apple asset-catalog app icons.",
+    )
+    args = parser.parse_args()
+    if not args.apple_only:
+        for app in ("homeagent", "travelagent"):
+            export_web(ROOT / app / "web/public")
+        export_android_legacy()
+    export_apple()
 
 
 if __name__ == "__main__":

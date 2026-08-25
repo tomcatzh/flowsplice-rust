@@ -6,6 +6,7 @@ members = [
     "crates/flowsplice-storage",
     "crates/flowsplice-travel-core",
     "crates/flowsplice-travel-android",
+    "crates/flowsplice-travel-apple",
     "server",
     "relay",
     "homeagent",
