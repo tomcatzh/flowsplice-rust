@@ -1,19 +1,22 @@
 package io.zxf.flowsplice.travel
 
-import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import kotlinx.coroutines.CoroutineScope
@@ -28,7 +31,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.cancelAndJoin
 import org.json.JSONObject
 import java.util.Locale
 
@@ -163,8 +165,29 @@ class TravelService : Service() {
     private var currentNetwork: Network? = null
     private val networkLock = Any()
     private var networkCallbackRegistered = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private var publishedCatalogGeneration = Long.MIN_VALUE
+    private lateinit var screenOffWakeLock: ScreenOffWakeLock
+    private var screenReceiverRegistered = false
+    @Volatile
+    private var sessionActive = false
+    @Volatile
+    private var screenOff = false
+    private val notificationGate = DistinctNotificationGate()
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenOff = true
+                    screenOffWakeLock.beginGracePeriod(sessionActive)
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    screenOff = false
+                    screenOffWakeLock.release()
+                }
+            }
+        }
+    }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -191,6 +214,16 @@ class TravelService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        screenOffWakeLock = ScreenOffWakeLock(this)
+        registerReceiver(
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            },
+            Context.RECEIVER_NOT_EXPORTED,
+        )
+        screenReceiverRegistered = true
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         synchronized(networkLock) {
             currentNetwork = connectivityManager.activeNetwork
@@ -242,8 +275,15 @@ class TravelService : Service() {
         commandJob?.cancel()
         pollingJob?.cancel()
         reconnectJob?.cancel()
+        runCatching { NativeTravel.wakeStatusWaiters() }
         runCatching { NativeTravel.stop() }
-        releaseWakeLock()
+        sessionActive = false
+        screenOff = false
+        screenOffWakeLock.release()
+        if (screenReceiverRegistered) {
+            runCatching { unregisterReceiver(screenReceiver) }
+            screenReceiverRegistered = false
+        }
         if (networkCallbackRegistered) {
             runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
             networkCallbackRegistered = false
@@ -278,7 +318,7 @@ class TravelService : Service() {
             travelId = inputs.travelId,
         )
         startForegroundNow(enrollmentNotification(initial))
-        acquireWakeLock()
+        markSessionActive()
         val password = CredentialStore.load(this@TravelService)
         if (password.isNullOrEmpty()) {
             failEnrollment("The private-key password is unavailable", startId)
@@ -300,7 +340,7 @@ class TravelService : Service() {
         }
         TravelRepository.publishEnrollment(first)
         updateNotification(enrollmentNotification(first))
-        pollingJob?.cancelAndJoin()
+        stopPolling()
         pollingJob = serviceScope.launch {
             while (isActive) {
                 delay(1_000)
@@ -333,16 +373,16 @@ class TravelService : Service() {
     }
 
     private suspend fun cancelEnrollment(startId: Int) {
-        pollingJob?.cancelAndJoin()
-        pollingJob = null
+        stopPolling()
         runCatching { NativeTravel.cancelEnrollment() }
         EnrollmentStore.clear(this@TravelService)
         TravelInstallation.discardPending(this@TravelService)
         CredentialStore.clear(this@TravelService)
         TravelRepository.publishEnrollment(EnrollmentSnapshot())
         TravelRepository.publish(TravelSnapshot())
-        releaseWakeLock()
+        markSessionInactive()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        notificationGate.reset()
         stopSelfResult(startId)
     }
 
@@ -350,7 +390,7 @@ class TravelService : Service() {
         startForegroundNow(
             travelNotification(TravelSnapshot(phase = TravelPhase.STARTING, enrolled = true)),
         )
-        acquireWakeLock()
+        markSessionActive()
         if (!TravelInstallation.isInstalled(this@TravelService)) {
             failAndStop("Complete remote enrollment before starting", startId)
             return
@@ -360,8 +400,7 @@ class TravelService : Service() {
             failAndStop("The private-key password is unavailable", startId)
             return
         }
-        pollingJob?.cancelAndJoin()
-        pollingJob = null
+        stopPolling()
         val snapshot = runCatching {
             TravelSnapshot.fromNative(
                 NativeTravel.start(TravelInstallation.config(this@TravelService).absolutePath, password),
@@ -385,17 +424,46 @@ class TravelService : Service() {
         publishCurrentCatalog(snapshot.catalogGeneration)
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, true) }
         pollingJob = serviceScope.launch {
+            var current = snapshot
+            var knownGeneration = 0L
+            val refreshPolicy = StatusRefreshPolicy(SystemClock.elapsedRealtime())
             while (isActive) {
-                delay(STATUS_POLL_MILLIS)
-                val next = runCatching {
-                    TravelSnapshot.fromNative(NativeTravel.status(), enrolled = true)
+                val timeoutMillis = refreshPolicy.nextTimeoutMillis(
+                    current,
+                    SystemClock.elapsedRealtime(),
+                )
+                val update = runCatching {
+                    NativeTravelStatusUpdate.fromNative(
+                        NativeTravel.waitForStatusChange(knownGeneration, timeoutMillis),
+                        enrolled = true,
+                    )
                 }.getOrElse { error ->
-                    TravelRepository.state.value.copy(
-                        phase = TravelPhase.ERROR,
-                        online = false,
-                        error = error.message,
+                    delay(STATUS_ACTIVE_REFRESH_MILLIS)
+                    NativeTravelStatusUpdate(
+                        generation = knownGeneration,
+                        snapshot = current.copy(
+                            phase = TravelPhase.ERROR,
+                            online = false,
+                            error = error.message,
+                        ),
                     )
                 }
+                knownGeneration = update.generation
+                val next = update.snapshot
+                val businessActivity =
+                    next.uploadedBytes > current.uploadedBytes ||
+                        next.downloadedBytes > current.downloadedBytes ||
+                        next.activeFlows > current.activeFlows
+                val changed = current.observableState() != next.observableState()
+                val nowMillis = SystemClock.elapsedRealtime()
+                if (businessActivity) {
+                    screenOffWakeLock.noteBusinessTraffic(sessionActive, screenOff)
+                    refreshPolicy.recordBusinessActivity(nowMillis)
+                } else if (changed) {
+                    refreshPolicy.recordChange(nowMillis)
+                }
+                current = next
+                if (!changed) continue
                 TravelRepository.publish(next)
                 if (next.phase == TravelPhase.RUNNING) {
                     publishCurrentCatalog(next.catalogGeneration)
@@ -406,8 +474,7 @@ class TravelService : Service() {
     }
 
     private suspend fun stopTravel(startId: Int) {
-        pollingJob?.cancelAndJoin()
-        pollingJob = null
+        stopPolling()
         runCatching { NativeTravel.stop() }
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit { putBoolean(AUTO_START, false) }
         TravelRepository.publish(
@@ -420,8 +487,9 @@ class TravelService : Service() {
                 error = null,
             ),
         )
-        releaseWakeLock()
+        markSessionInactive()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        notificationGate.reset()
         stopSelfResult(startId)
     }
 
@@ -464,8 +532,9 @@ class TravelService : Service() {
         TravelRepository.publishEnrollment(
             current.copy(phase = EnrollmentPhase.ERROR, error = message),
         )
-        releaseWakeLock()
+        markSessionInactive()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        notificationGate.reset()
         stopSelfResult(startId)
     }
 
@@ -479,8 +548,9 @@ class TravelService : Service() {
                 error = message,
             ),
         )
-        releaseWakeLock()
+        markSessionInactive()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        notificationGate.reset()
         stopSelfResult(startId)
     }
 
@@ -492,32 +562,43 @@ class TravelService : Service() {
         }
     }
 
-    @SuppressLint("WakelockTimeout")
-    private fun acquireWakeLock() {
-        val lock = wakeLock ?: getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:travel")
-            .apply { setReferenceCounted(false) }
-            .also { wakeLock = it }
-        if (!lock.isHeld) lock.acquire()
+    private suspend fun stopPolling() {
+        val job = pollingJob ?: return
+        job.cancel()
+        runCatching { NativeTravel.wakeStatusWaiters() }
+        job.join()
+        pollingJob = null
     }
 
-    private fun releaseWakeLock() {
-        wakeLock?.takeIf(PowerManager.WakeLock::isHeld)?.release()
+    private fun markSessionActive() {
+        sessionActive = true
+        screenOff = !getSystemService(PowerManager::class.java).isInteractive
+        if (screenOff) {
+            screenOffWakeLock.beginGracePeriod(sessionActive = true)
+        }
     }
 
-    private fun startForegroundNow(notification: Notification) {
+    private fun markSessionInactive() {
+        sessionActive = false
+        screenOffWakeLock.release()
+    }
+
+    private fun startForegroundNow(update: ServiceNotification) {
         startForeground(
             NOTIFICATION_ID,
-            notification,
+            update.notification,
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
+        notificationGate.recordForeground(update.contentKey)
     }
 
-    private fun updateNotification(notification: Notification) {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
+    private fun updateNotification(update: ServiceNotification) {
+        if (!notificationGate.accept(update.contentKey)) return
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, update.notification)
     }
 
-    private fun enrollmentNotification(snapshot: EnrollmentSnapshot): Notification {
+    private fun enrollmentNotification(snapshot: EnrollmentSnapshot): ServiceNotification {
         val status = when (snapshot.phase) {
             EnrollmentPhase.PREPARING -> "Preparing device keys"
             EnrollmentPhase.WAITING_FOR_APPROVAL -> "Waiting for Home approval"
@@ -527,9 +608,9 @@ class TravelService : Service() {
             EnrollmentPhase.IDLE -> "Ready to enroll"
         }
         val details = snapshot.verificationCode?.let { "Verification code: $it" } ?: status
-        return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_travel_notification)
-            .setContentTitle("${snapshot.travelId.ifEmpty { "FlowSplice Travel" }} · $status")
+        val title = "${snapshot.travelId.ifEmpty { "FlowSplice Travel" }} · $status"
+        val notification = systemNotificationBuilder()
+            .setContentTitle(title)
             .setContentText(details)
             .setStyle(Notification.BigTextStyle().bigText(details))
             .setContentIntent(openPendingIntent())
@@ -538,9 +619,13 @@ class TravelService : Service() {
             .setCategory(Notification.CATEGORY_SERVICE)
             .addAction(Notification.Action.Builder(null, "Cancel", cancelEnrollmentPendingIntent()).build())
             .build()
+        return ServiceNotification(
+            notification = notification,
+            contentKey = "$title\n$details\n${snapshot.active}\ncancel",
+        )
     }
 
-    private fun travelNotification(snapshot: TravelSnapshot): Notification {
+    private fun travelNotification(snapshot: TravelSnapshot): ServiceNotification {
         val status = when (snapshot.phase) {
             TravelPhase.STARTING -> "Connecting"
             TravelPhase.RUNNING -> if (snapshot.online) "Online" else "Waiting for Relay"
@@ -549,9 +634,9 @@ class TravelService : Service() {
             TravelPhase.STOPPED -> "Stopped"
         }
         val details = "↑ ${formatBytes(snapshot.uploadedBytes)}  ↓ ${formatBytes(snapshot.downloadedBytes)}  •  ${snapshot.activeFlows} active"
-        val builder = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_travel_notification)
-            .setContentTitle("${snapshot.travelId} · $status")
+        val title = "${snapshot.travelId} · $status"
+        val builder = systemNotificationBuilder()
+            .setContentTitle(title)
             .setContentText(details)
             .setStyle(Notification.BigTextStyle().bigText(details))
             .setContentIntent(openPendingIntent())
@@ -563,8 +648,14 @@ class TravelService : Service() {
             builder.setRequestPromotedOngoing(true)
             builder.setShortCriticalText(status)
         }
-        return builder.build()
+        return ServiceNotification(
+            notification = builder.build(),
+            contentKey = "$title\n$details\nstop",
+        )
     }
+
+    private fun systemNotificationBuilder(): Notification.Builder =
+        flowSpliceNotificationBuilder(this, CHANNEL_ID)
 
     private fun openPendingIntent(): PendingIntent = PendingIntent.getActivity(
         this,
@@ -599,6 +690,11 @@ class TravelService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
+    private data class ServiceNotification(
+        val notification: Notification,
+        val contentKey: String,
+    )
+
     companion object {
         const val ACTION_ENROLL = "io.zxf.flowsplice.travel.ENROLL"
         const val ACTION_CANCEL_ENROLLMENT = "io.zxf.flowsplice.travel.CANCEL_ENROLLMENT"
@@ -614,7 +710,7 @@ class TravelService : Service() {
         const val AUTO_START = "auto-start"
         private const val CHANNEL_ID = "travel-status"
         private const val NOTIFICATION_ID = 3103
-        private const val STATUS_POLL_MILLIS = 2_000L
+        private const val STATUS_ACTIVE_REFRESH_MILLIS = 2_000L
         private const val NETWORK_CHANGE_DEBOUNCE_MILLIS = 250L
 
         fun shouldAutoStart(context: Context): Boolean =
@@ -653,3 +749,19 @@ class TravelService : Service() {
         ) : ServiceCommand
     }
 }
+
+internal fun flowSpliceNotificationBuilder(
+    context: Context,
+    channelId: String,
+): Notification.Builder = Notification.Builder(context, channelId)
+    .setSmallIcon(R.drawable.ic_stat_flowsplice)
+    .setBadgeIconType(Notification.BADGE_ICON_SMALL)
+    .apply {
+        if (Build.VERSION.SDK_INT >= 37) {
+            addExtras(
+                Bundle().apply {
+                    putBoolean(Notification.EXTRA_PREFER_SMALL_ICON, true)
+                },
+            )
+        }
+    }

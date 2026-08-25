@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.system.Os
 import android.system.OsConstants
@@ -20,6 +21,7 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -99,21 +101,25 @@ class TravelCoreDockerE2ETest {
                     clockTicks.toDouble() / elapsedSeconds * 100.0
             val idleWriteBytes =
                 (idleFinished.writeBytes - idleStarted.writeBytes).coerceAtLeast(0)
-            val wakeLockHeld = shell("dumpsys power").contains("$APP_ID:travel")
+            val screenOffGraceLockHeld =
+                shell("dumpsys power").contains("$APP_ID:screen-off-grace")
             val performance = JSONObject()
                 .put("sample_seconds", elapsedSeconds)
                 .put("idle_cpu_percent_one_core", idleCpuPercent)
                 .put("rss_kib", idleFinished.rssKiB)
                 .put("threads", idleFinished.threads)
                 .put("write_bytes", idleWriteBytes)
-                .put("wake_lock_held", wakeLockHeld)
+                .put("screen_off_grace_lock_held_while_screen_on", screenOffGraceLockHeld)
             File(context.filesDir, "e2e-performance.json").writeText(performance.toString())
             println("FLOWSPLICE_ANDROID_PERFORMANCE=$performance")
             assertTrue("idle CPU exceeded 10% of one core: $idleCpuPercent", idleCpuPercent < 10.0)
             assertTrue("resident memory exceeded 256 MiB", idleFinished.rssKiB < 256 * 1_024)
             assertTrue("app process used too many threads", idleFinished.threads < 64)
             assertTrue("idle persistence wrote more than 1 MiB", idleWriteBytes < 1_048_576)
-            assertTrue("the user-started session did not retain its wake lock", wakeLockHeld)
+            assertFalse(
+                "screen-on idle must not retain the screen-off grace lock",
+                screenOffGraceLockHeld,
+            )
 
             assertTrue(TravelRepository.state.value.online)
             assertEcho("android-background-roundtrip")
@@ -187,12 +193,17 @@ class TravelCoreDockerE2ETest {
             val notifications = context.getSystemService(NotificationManager::class.java)
                 .activeNotifications
             assertTrue(notifications.isNotEmpty())
-            assertTrue(
-                notifications.any { notification ->
+            val ongoingNotification = notifications.firstOrNull { notification ->
                     notification.notification.category == Notification.CATEGORY_SERVICE &&
                         notification.notification.flags and Notification.FLAG_ONGOING_EVENT != 0
-                },
-            )
+                }
+            assertTrue(ongoingNotification != null)
+            val systemNotification = requireNotNull(ongoingNotification).notification
+            assertEquals(R.drawable.ic_stat_flowsplice, systemNotification.smallIcon.resId)
+            assertEquals(Notification.BADGE_ICON_SMALL, systemNotification.badgeIconType)
+            if (Build.VERSION.SDK_INT >= 37) {
+                assertTrue(systemNotification.extras.getBoolean(Notification.EXTRA_PREFER_SMALL_ICON))
+            }
         } finally {
             shell("dumpsys deviceidle unforce")
             shell("dumpsys battery reset")

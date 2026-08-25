@@ -93,6 +93,9 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
     );
     let result = run_inner(&state, &mapping, local, flow_id).await;
     let relay_id = state.flow_relays.lock().await.remove(&flow_id);
+    if relay_id.is_some() {
+        state.mark_status_changed();
+    }
     if let Ok((upload_bytes, download_bytes)) = result.as_ref() {
         record_flow_metric(
             &state,
@@ -212,6 +215,7 @@ async fn run_inner(
                         .lock()
                         .await
                         .insert(flow_id, relay_id.clone());
+                    state.mark_status_changed();
                     info!(event = "carrier_selected", %flow_id, carrier_id = %winner, %relay_id, "travel selected carrier");
                     recovery_started = Instant::now();
                     retry_backoff = Duration::from_millis(250);
@@ -287,7 +291,9 @@ async fn run_inner(
                     recovery_jitter = Some(Duration::from_millis(
                         (uuid_seed(flow_id) ^ generation) % 251,
                     ));
-                    state.flow_relays.lock().await.remove(&flow_id);
+                    if state.flow_relays.lock().await.remove(&flow_id).is_some() {
+                        state.mark_status_changed();
+                    }
                     recovery_started = Instant::now();
                     reevaluate_secs = state.config.carrier_reevaluate_secs;
                     info!(

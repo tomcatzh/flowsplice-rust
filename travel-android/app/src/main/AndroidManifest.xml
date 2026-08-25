@@ -14,13 +14,14 @@
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_flowsplice_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/ic_flowsplice_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.FlowSpliceTravelAgent">
         <service
             android:name=".TravelService"
+            android:icon="@mipmap/ic_flowsplice_launcher"
             android:exported="false"
             android:foregroundServiceType="specialUse">
             <property

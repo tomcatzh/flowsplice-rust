@@ -6,6 +6,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -121,6 +122,23 @@ fn notify_network_changed() -> Result<serde_json::Value> {
 fn status() -> Result<serde_json::Value> {
     let engine = with_engine()?;
     Ok(serde_json::to_value(runtime()?.block_on(engine.status()))?)
+}
+
+fn wait_for_status_change(known_generation: i64, timeout_millis: i64) -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    let known_generation = u64::try_from(known_generation).unwrap_or_default();
+    let timeout_millis = u64::try_from(timeout_millis)
+        .unwrap_or(30_000)
+        .clamp(250, 30_000);
+    Ok(serde_json::to_value(runtime()?.block_on(
+        engine.wait_for_status_change(known_generation, Duration::from_millis(timeout_millis)),
+    ))?)
+}
+
+fn wake_status_waiters() -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    engine.wake_status_observers();
+    Ok(serde_json::json!({ "woken": true }))
 }
 
 fn catalog() -> Result<serde_json::Value> {
@@ -381,6 +399,29 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_status<'caller
     _class: JClass<'caller>,
 ) -> JString<'caller> {
     jni_string(&mut unowned_env, |_env| response_json(status()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_waitForStatusChange<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    known_generation: i64,
+    timeout_millis: i64,
+) -> JString<'caller> {
+    jni_string(&mut unowned_env, |_env| {
+        response_json(wait_for_status_change(known_generation, timeout_millis))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_wakeStatusWaiters<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    jni_string(
+        &mut unowned_env,
+        |_env| response_json(wake_status_waiters()),
+    )
 }
 
 #[unsafe(no_mangle)]

@@ -18,6 +18,8 @@ object NativeTravel {
     external fun stop(): String
     external fun networkChanged(): String
     external fun status(): String
+    external fun waitForStatusChange(knownGeneration: Long, timeoutMillis: Long): String
+    external fun wakeStatusWaiters(): String
     external fun catalog(): String
     external fun upsertMapping(mappingJson: String): String
     external fun deleteMapping(homeId: String, serviceId: String, protocol: String): String

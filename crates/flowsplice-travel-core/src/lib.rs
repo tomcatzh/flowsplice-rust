@@ -525,6 +525,7 @@ struct AppState {
     downloaded_bytes: Arc<std::sync::atomic::AtomicU64>,
     connected_relays: Arc<RwLock<HashSet<String>>>,
     network_generation: watch::Sender<u64>,
+    status_generation: watch::Sender<u64>,
     permits: Arc<Semaphore>,
     carrier_permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
@@ -534,7 +535,9 @@ struct AppState {
     deployment_trust: Arc<RwLock<DeploymentTrust>>,
     management_spki_sha256: Arc<String>,
     state_store: Arc<StateStore>,
+    enrollment_outbox_generation: Arc<std::sync::atomic::AtomicU64>,
     statistics: Arc<LocalStatistics>,
+    statistics_outbox_pending_at_start: bool,
     statistics_signer: Arc<EcdsaKeyPair>,
     statistics_certificate_pem: Arc<String>,
     relay_history: Arc<RwLock<Vec<RelayHistoryRecord>>>,
@@ -542,6 +545,24 @@ struct AppState {
     mappings: Arc<RwLock<Vec<Mapping>>>,
     mapping_tasks: Arc<Mutex<HashMap<String, MappingTask>>>,
     mapping_operation: Arc<Mutex<()>>,
+}
+
+impl AppState {
+    fn mark_status_changed(&self) {
+        self.status_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn mark_enrollment_outbox_changed(&self) {
+        self.enrollment_outbox_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn has_enrollment_outbox_work(&self) -> bool {
+        self.enrollment_outbox_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
 }
 
 struct MappingTask {
@@ -574,6 +595,12 @@ pub struct StatusResponse {
     pub session_downloaded_bytes: u64,
     pub mappings: Vec<Mapping>,
     pub private_key_password_rotation_available: bool,
+}
+
+#[derive(Serialize)]
+pub struct StatusUpdate {
+    pub generation: u64,
+    pub status: StatusResponse,
 }
 
 #[derive(Deserialize)]
@@ -713,6 +740,10 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
     let statistics_certificate_pem = fs::read_to_string(&config.management_cert)
         .context("failed to read Travel statistics signing certificate")?;
     let statistics = LocalStatistics::new(state_store.clone());
+    let statistics_outbox_pending_at_start = !statistics.pending_reports(1)?.is_empty();
+    let enrollment_outbox_pending_at_start = !state_store
+        .scan_prefix(Table::EnrollmentOutbox, b"")?
+        .is_empty();
     let tls = Arc::new(TlsMaterial {
         management_connector: identity_client_connector_with_private_key(
             &config.management_cert,
@@ -751,6 +782,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         downloaded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connected_relays: Arc::new(RwLock::new(HashSet::new())),
         network_generation: watch::channel(0).0,
+        status_generation: watch::channel(0).0,
         permits,
         carrier_permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
@@ -760,7 +792,11 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         deployment_trust: Arc::new(RwLock::new(deployment_trust)),
         management_spki_sha256: Arc::new(management_identity.spki_sha256),
         state_store: Arc::new(state_store),
+        enrollment_outbox_generation: Arc::new(std::sync::atomic::AtomicU64::new(u64::from(
+            enrollment_outbox_pending_at_start,
+        ))),
         statistics: Arc::new(statistics),
+        statistics_outbox_pending_at_start,
         statistics_signer: Arc::new(statistics_signer),
         statistics_certificate_pem: Arc::new(statistics_certificate_pem),
         relay_history: Arc::new(RwLock::new(relay_history)),
@@ -820,6 +856,32 @@ impl TravelCore {
         travel_status(&self.state).await
     }
 
+    /// Waits until a status-relevant runtime transition occurs or the caller's refresh deadline
+    /// expires, then returns one consistent snapshot. Byte counters intentionally do not wake an
+    /// idle observer; shells use a short deadline while flows are active and a long one otherwise.
+    pub async fn wait_for_status_change(
+        &self,
+        known_generation: u64,
+        max_wait: Duration,
+    ) -> StatusUpdate {
+        let mut changes = self.state.status_generation.subscribe();
+        let unchanged = *changes.borrow_and_update() == known_generation;
+        if unchanged {
+            let _ = timeout(max_wait, changes.changed()).await;
+        }
+        let generation = *changes.borrow_and_update();
+        StatusUpdate {
+            generation,
+            status: travel_status(&self.state).await,
+        }
+    }
+
+    /// Wakes native status observers so a platform lifecycle operation never waits for an idle
+    /// refresh deadline to expire.
+    pub fn wake_status_observers(&self) {
+        self.state.mark_status_changed();
+    }
+
     /// Returns the signed service catalog currently accepted by the runtime.
     pub async fn catalog(&self) -> Catalog {
         self.state.catalog.read().await.clone()
@@ -839,6 +901,7 @@ impl TravelCore {
         self.state
             .network_generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.state.mark_status_changed();
     }
 
     /// Creates or updates a local mapping with bind-before-commit semantics.
@@ -866,6 +929,7 @@ impl TravelCore {
 
     /// Stops background subscriptions and all local mapping listeners.
     pub async fn shutdown(&self) {
+        self.state.mark_status_changed();
         let tasks = {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks)
@@ -2028,17 +2092,22 @@ async fn run_catalog_subscription(state: AppState) -> Result<()> {
                 Ok((stream, relay_id, relay_spki)) => {
                     info!(%relay_id, relay = %relay.management_addr, "catalog subscription connected");
                     connected = true;
-                    state
+                    let relay_became_connected = state
                         .connected_relays
                         .write()
                         .await
                         .insert(relay_id.clone());
+                    if relay_became_connected {
+                        state.mark_status_changed();
+                    }
                     if let Err(error) =
                         run_catalog_session(&state, &relay_id, &relay_spki, stream).await
                     {
                         warn!(%relay_id, %error, "catalog subscription disconnected");
                     }
-                    state.connected_relays.write().await.remove(&relay_id);
+                    if state.connected_relays.write().await.remove(&relay_id) {
+                        state.mark_status_changed();
+                    }
                     break;
                 }
                 Err(error) => {
@@ -2108,6 +2177,9 @@ async fn run_catalog_session(
     let mut enrollment_tick = interval(Duration::from_secs(5));
     let mut report_keys = HashMap::<String, Vec<u8>>::new();
     let mut enrollment_inflight = None::<(Uuid, Instant)>;
+    let mut enrollment_generation_checked = 0_u64;
+    let mut enrollment_pending = state.has_enrollment_outbox_work();
+    let mut statistics_pending = state.statistics_outbox_pending_at_start;
     let mut nonce = 0_u64;
     let mut last_received = Instant::now();
     loop {
@@ -2136,6 +2208,7 @@ async fn run_catalog_session(
                                     .context("Travel statistics acknowledgement task failed")??;
                             }
                         } else {
+                            report_keys.remove(&digest_sha256);
                             warn!(?error, %digest_sha256, "Server rejected Travel statistics report");
                         }
                     }
@@ -2173,46 +2246,100 @@ async fn run_catalog_session(
                 write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
             }
             _ = statistics_tick.tick() => {
-                flush_and_send_travel_statistics(state, &mut writer, &mut report_keys).await?;
+                flush_and_send_travel_statistics(
+                    state,
+                    &mut writer,
+                    &mut report_keys,
+                    &mut statistics_pending,
+                )
+                .await?;
             }
             _ = enrollment_tick.tick() => {
-                if enrollment_inflight
-                    .is_some_and(|(_, started)| started.elapsed() > Duration::from_secs(30))
-                {
-                    enrollment_inflight = None;
-                }
-                if enrollment_inflight.is_none()
-                    && let Some((request_id, message)) = next_remote_enrollment_message(state).await?
-                {
-                    write_json(&mut writer, &message, CONTROL_FRAME_LIMIT).await?;
-                    enrollment_inflight = Some((request_id, Instant::now()));
-                }
+                poll_remote_enrollment(
+                    state,
+                    &mut writer,
+                    &mut enrollment_pending,
+                    &mut enrollment_generation_checked,
+                    &mut enrollment_inflight,
+                )
+                .await?;
             }
         }
     }
 }
 
-async fn next_remote_enrollment_message(
+async fn poll_remote_enrollment<W: tokio::io::AsyncWrite + Unpin>(
     state: &AppState,
-) -> Result<Option<(Uuid, ControlMessage)>> {
+    writer: &mut W,
+    known_pending: &mut bool,
+    checked_generation: &mut u64,
+    in_flight: &mut Option<(Uuid, Instant)>,
+) -> Result<()> {
+    if in_flight.is_some_and(|(_, started)| started.elapsed() > Duration::from_secs(30)) {
+        *in_flight = None;
+    }
+    let outbox_generation = state
+        .enrollment_outbox_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    if !enrollment_outbox_scan_needed(
+        *known_pending,
+        outbox_generation,
+        *checked_generation,
+        in_flight.is_some(),
+    ) {
+        return Ok(());
+    }
+    let poll = next_remote_enrollment_message(state).await?;
+    *known_pending = poll.pending;
+    if !poll.pending {
+        *checked_generation = outbox_generation;
+    }
+    if let Some((request_id, message)) = poll.message {
+        write_json(writer, &message, CONTROL_FRAME_LIMIT).await?;
+        *in_flight = Some((request_id, Instant::now()));
+    }
+    Ok(())
+}
+
+fn enrollment_outbox_scan_needed(
+    known_pending: bool,
+    current_generation: u64,
+    checked_generation: u64,
+    in_flight: bool,
+) -> bool {
+    !in_flight && (known_pending || current_generation != checked_generation)
+}
+
+struct EnrollmentOutboxPoll {
+    message: Option<(Uuid, ControlMessage)>,
+    pending: bool,
+}
+
+async fn next_remote_enrollment_message(state: &AppState) -> Result<EnrollmentOutboxPoll> {
     let store = Arc::clone(&state.state_store);
     let travel_id = state.config.id.clone();
     let travel_session_id = state.session_id;
     let management_spki_sha256 = Arc::clone(&state.management_spki_sha256);
     tokio::task::spawn_blocking(move || {
         let now = unix_time_secs()?;
-        prune_remote_enrollment_outbox(&store, now)?;
+        let mut batch = WriteBatch::new();
+        let mut pending = false;
+        let mut selected = None;
         for (key, value) in store.scan_prefix(Table::EnrollmentOutbox, b"")? {
             let Ok(mut record) = serde_json::from_slice::<RemoteEnrollmentOutboxRecord>(&value)
             else {
                 warn!(?key, "ignored malformed remote enrollment outbox record");
                 continue;
             };
-            if record.version != REMOTE_ENROLLMENT_VERSION
-                || record
-                    .last_attempt_unix_secs
-                    .is_some_and(|attempt| now.saturating_sub(attempt) < 10)
-            {
+            if remote_enrollment_outbox_expired(
+                record.created_at_unix_secs,
+                record.installed_at_unix_secs,
+                now,
+            ) {
+                batch = batch.delete(Table::EnrollmentOutbox, key);
+                continue;
+            }
+            if record.version != REMOTE_ENROLLMENT_VERSION {
                 continue;
             }
             let request_id = record.request.request_id;
@@ -2242,15 +2369,25 @@ async fn next_remote_enrollment_message(
             } else {
                 continue;
             };
+            pending = true;
+            if selected.is_some()
+                || record
+                    .last_attempt_unix_secs
+                    .is_some_and(|attempt| now.saturating_sub(attempt) < 10)
+            {
+                continue;
+            }
             record.last_attempt_unix_secs = Some(now);
-            store.apply_immediate(WriteBatch::new().put_json(
-                Table::EnrollmentOutbox,
-                key,
-                &record,
-            )?)?;
-            return Ok(Some((request_id, message)));
+            batch = batch.put_json(Table::EnrollmentOutbox, key, &record)?;
+            selected = Some((request_id, message));
         }
-        Ok(None)
+        if !batch.is_empty() {
+            store.apply_immediate(batch)?;
+        }
+        Ok(EnrollmentOutboxPoll {
+            message: selected,
+            pending,
+        })
     })
     .await
     .context("Travel enrollment outbox query task failed")?
@@ -2309,6 +2446,7 @@ async fn acknowledge_remote_enrollment_install(state: &AppState, request_id: Uui
     })
     .await
     .context("Travel enrollment install acknowledgement task failed")??;
+    state.mark_enrollment_outbox_changed();
     info!(%request_id, "Home acknowledged installed remote enrollment");
     Ok(())
 }
@@ -2364,6 +2502,7 @@ async fn apply_remote_enrollment_result(
     })
     .await
     .context("Travel enrollment response commit task failed")??;
+    state.mark_enrollment_outbox_changed();
     info!(%request_id, "received and verified remote enrollment response");
     Ok(())
 }
@@ -2372,13 +2511,14 @@ async fn flush_and_send_travel_statistics<W: tokio::io::AsyncWrite + Unpin>(
     state: &AppState,
     writer: &mut W,
     report_keys: &mut HashMap<String, Vec<u8>>,
+    known_pending: &mut bool,
 ) -> Result<()> {
     let statistics = Arc::clone(&state.statistics);
     let deployment_id = state.deployment_trust.read().await.deployment_id.clone();
     let reporter_id = state.config.id.clone();
     let certificate_pem = Arc::clone(&state.statistics_certificate_pem);
     let signer = Arc::clone(&state.statistics_signer);
-    tokio::task::spawn_blocking(move || {
+    let staged = tokio::task::spawn_blocking(move || {
         statistics.flush_and_stage(
             &deployment_id,
             Role::Travel,
@@ -2389,12 +2529,19 @@ async fn flush_and_send_travel_statistics<W: tokio::io::AsyncWrite + Unpin>(
     })
     .await
     .context("Travel statistics flush task failed")??;
+    if !statistics_outbox_scan_needed(staged, *known_pending, !report_keys.is_empty()) {
+        return Ok(());
+    }
     let statistics = Arc::clone(&state.statistics);
     let reports = tokio::task::spawn_blocking(move || statistics.pending_reports(16))
         .await
         .context("Travel statistics outbox task failed")??;
+    *known_pending = !reports.is_empty();
     for (key, report) in reports {
         let digest = report.digest_sha256()?;
+        if report_keys.contains_key(&digest) {
+            continue;
+        }
         report_keys.insert(digest, key);
         write_json(
             writer,
@@ -2404,6 +2551,10 @@ async fn flush_and_send_travel_statistics<W: tokio::io::AsyncWrite + Unpin>(
         .await?;
     }
     Ok(())
+}
+
+fn statistics_outbox_scan_needed(staged: usize, known_pending: bool, in_flight: bool) -> bool {
+    staged > 0 || (known_pending && !in_flight)
 }
 
 async fn open_management(
@@ -2858,6 +3009,7 @@ async fn apply_control_snapshot(
     );
     *state.directory.write().await = directory;
     *state.catalog.write().await = catalog;
+    state.mark_status_changed();
     Ok(())
 }
 
@@ -3094,7 +3246,10 @@ async fn run_tcp_listener(
         let mapping = mapping.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
+            let _guard = FlowGuard::new(
+                Arc::clone(&state.active_flows),
+                state.status_generation.clone(),
+            );
             if let Err(error) = run_tcp_flow(&state, &mapping, local).await {
                 warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "TCP flow closed");
             }
@@ -3161,7 +3316,10 @@ async fn run_udp_listener(
         let association_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _guard = FlowGuard::new(Arc::clone(&state.active_flows));
+            let _guard = FlowGuard::new(
+                Arc::clone(&state.active_flows),
+                state.status_generation.clone(),
+            );
             if let Err(error) =
                 run_udp_association(&state, &mapping, socket, peer, rx, association_shutdown).await
             {
@@ -3400,6 +3558,7 @@ async fn upsert_mapping(state: &AppState, mapping: Mapping) -> Result<Mapping> {
     let task = spawn_mapping_listener(state.clone(), mapping.clone(), prepared);
     let old = state.mapping_tasks.lock().await.insert(key, task);
     *state.mappings.write().await = next;
+    state.mark_status_changed();
     if let Some(old) = old {
         stop_mapping_task(old).await;
     }
@@ -3452,6 +3611,7 @@ async fn delete_mapping(
         .context("Travel mapping persistence task failed")??;
     let old = state.mapping_tasks.lock().await.remove(&key);
     *state.mappings.write().await = next;
+    state.mark_status_changed();
     if let Some(old) = old {
         stop_mapping_task(old).await;
     }
@@ -3639,7 +3799,7 @@ async fn create_remote_enrollment(
     let travel_id = state.config.id.clone();
     let home_id = request.home_id;
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || {
+    let status = tokio::task::spawn_blocking(move || {
         let now = unix_time_secs()?;
         prune_remote_enrollment_outbox(&store, now)?;
         let queued = store.scan_prefix(Table::EnrollmentOutbox, b"")?.len();
@@ -3695,7 +3855,9 @@ async fn create_remote_enrollment(
         })
     })
     .await
-    .context("Travel remote enrollment creation task failed")?
+    .context("Travel remote enrollment creation task failed")??;
+    state.mark_enrollment_outbox_changed();
+    Ok(status)
 }
 
 fn remote_enrollment_capacity_available(current: usize, maximum: usize) -> bool {
@@ -3726,49 +3888,52 @@ async fn install_remote_enrollment(
     let request_id = request.request_id;
     let store = Arc::clone(&state.state_store);
     let root_public_key = Arc::clone(&state.deployment_root_public_key);
-    tokio::task::spawn_blocking(move || {
-        let mut record = store
-            .get_json::<RemoteEnrollmentOutboxRecord>(
-                Table::EnrollmentOutbox,
-                request_id.as_bytes(),
-            )?
-            .ok_or_else(|| anyhow!("unknown remote enrollment request"))?;
-        let response = record
-            .response
-            .as_ref()
-            .ok_or_else(|| anyhow!("remote enrollment is still awaiting Home approval"))?;
-        let credential = install_enrollment_response(
-            &record.enrollment_dir,
-            response,
-            &root_public_key,
-            password.as_bytes(),
-            unix_time_secs()?,
-        )?;
-        record.restart_required = true;
-        record.installed_credential_id = Some(credential.credential_id);
-        record.installed_at_unix_secs = Some(unix_time_secs()?);
-        record.last_attempt_unix_secs = None;
-        store.apply_immediate(
-            WriteBatch::new()
-                .put_json(
+    let response =
+        tokio::task::spawn_blocking(move || -> Result<InstallRemoteEnrollmentResponse> {
+            let mut record = store
+                .get_json::<RemoteEnrollmentOutboxRecord>(
                     Table::EnrollmentOutbox,
-                    request_id.as_bytes().to_vec(),
-                    &record,
+                    request_id.as_bytes(),
                 )?
-                .put(
-                    Table::Metadata,
-                    ACTIVE_IDENTITY_DIR_KEY.to_vec(),
-                    record.enrollment_dir.to_string_lossy().as_bytes().to_vec(),
-                ),
-        )?;
-        Ok(InstallRemoteEnrollmentResponse {
-            request_id,
-            credential_id: credential.credential_id,
-            restart_required: true,
+                .ok_or_else(|| anyhow!("unknown remote enrollment request"))?;
+            let response = record
+                .response
+                .as_ref()
+                .ok_or_else(|| anyhow!("remote enrollment is still awaiting Home approval"))?;
+            let credential = install_enrollment_response(
+                &record.enrollment_dir,
+                response,
+                &root_public_key,
+                password.as_bytes(),
+                unix_time_secs()?,
+            )?;
+            record.restart_required = true;
+            record.installed_credential_id = Some(credential.credential_id);
+            record.installed_at_unix_secs = Some(unix_time_secs()?);
+            record.last_attempt_unix_secs = None;
+            store.apply_immediate(
+                WriteBatch::new()
+                    .put_json(
+                        Table::EnrollmentOutbox,
+                        request_id.as_bytes().to_vec(),
+                        &record,
+                    )?
+                    .put(
+                        Table::Metadata,
+                        ACTIVE_IDENTITY_DIR_KEY.to_vec(),
+                        record.enrollment_dir.to_string_lossy().as_bytes().to_vec(),
+                    ),
+            )?;
+            Ok(InstallRemoteEnrollmentResponse {
+                request_id,
+                credential_id: credential.credential_id,
+                restart_required: true,
+            })
         })
-    })
-    .await
-    .context("Travel remote enrollment installation task failed")?
+        .await
+        .context("Travel remote enrollment installation task failed")??;
+    state.mark_enrollment_outbox_changed();
+    Ok(response)
 }
 
 async fn api_rotate_private_key_password(
@@ -3902,20 +4067,32 @@ fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
     true
 }
 
-struct FlowGuard(Arc<std::sync::atomic::AtomicUsize>);
+struct FlowGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    status_generation: watch::Sender<u64>,
+}
 
 impl FlowGuard {
-    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn new(
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+        status_generation: watch::Sender<u64>,
+    ) -> Self {
         use std::sync::atomic::Ordering;
         counter.fetch_add(1, Ordering::Relaxed);
-        Self(counter)
+        status_generation.send_modify(|generation| *generation = generation.wrapping_add(1));
+        Self {
+            counter,
+            status_generation,
+        }
     }
 }
 
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.status_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -3936,10 +4113,11 @@ mod tests {
         Cli, ConfiguredHome, ControlTrustState, Mapping, RELAY_HISTORY_VERSION,
         RelayAddressOverride, RelayHistoryRecord, SeedRelay, TRAVEL_MAPPINGS_KEY,
         bootstrap_candidate_pool, configured_home_ids, configured_homes_are_trusted,
-        load_relay_history, local_ui_request_allowed, persist_runtime_mappings,
-        remote_enrollment_capacity_available, remote_enrollment_outbox_expired,
-        require_authenticated_relay_in_snapshot, require_control_snapshot_subject,
-        should_persist_relay_failure, signed_directory_candidates, trusted_home_business_pins,
+        enrollment_outbox_scan_needed, load_relay_history, local_ui_request_allowed,
+        persist_runtime_mappings, remote_enrollment_capacity_available,
+        remote_enrollment_outbox_expired, require_authenticated_relay_in_snapshot,
+        require_control_snapshot_subject, should_persist_relay_failure,
+        signed_directory_candidates, statistics_outbox_scan_needed, trusted_home_business_pins,
     };
 
     #[test]
@@ -4006,6 +4184,19 @@ mod tests {
             Some(200),
             200 + 24 * 60 * 60
         ));
+    }
+
+    #[test]
+    fn idle_outbox_scans_are_gated_by_pending_work() {
+        assert!(!enrollment_outbox_scan_needed(false, 4, 4, false));
+        assert!(enrollment_outbox_scan_needed(true, 4, 4, false));
+        assert!(enrollment_outbox_scan_needed(false, 5, 4, false));
+        assert!(!enrollment_outbox_scan_needed(true, 5, 4, true));
+
+        assert!(!statistics_outbox_scan_needed(0, false, false));
+        assert!(statistics_outbox_scan_needed(1, false, true));
+        assert!(statistics_outbox_scan_needed(0, true, false));
+        assert!(!statistics_outbox_scan_needed(0, true, true));
     }
 
     #[test]

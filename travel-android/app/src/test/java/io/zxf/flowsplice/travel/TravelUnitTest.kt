@@ -4,6 +4,7 @@ import org.junit.Test
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 
 class TravelUnitTest {
     @Test
@@ -37,5 +38,48 @@ class TravelUnitTest {
                 "Relay management port and that the Relay is running the same 0.3 build as this app.",
             EnrollmentSnapshot.friendlyEnrollmentError(raw),
         )
+    }
+
+    @Test
+    fun idleStatusRefreshBacksOffButActiveFlowsStayFast() {
+        val policy = StatusRefreshPolicy(nowMillis = 0)
+        val onlineIdle = TravelSnapshot(phase = TravelPhase.RUNNING, online = true)
+        val offline = onlineIdle.copy(online = false)
+        val active = onlineIdle.copy(activeFlows = 1)
+
+        assertEquals(15_000, policy.nextTimeoutMillis(onlineIdle, 0))
+        assertEquals(2_000, policy.nextTimeoutMillis(offline, 10_000))
+        assertEquals(15_000, policy.nextTimeoutMillis(offline, 30_000))
+        assertEquals(30_000, policy.nextTimeoutMillis(onlineIdle, 120_000))
+        assertEquals(2_000, policy.nextTimeoutMillis(active, 120_000))
+        assertEquals(30_000, policy.nextTimeoutMillis(active, 180_000))
+        policy.recordBusinessActivity(180_000)
+        assertEquals(2_000, policy.nextTimeoutMillis(active, 359_999))
+        assertEquals(30_000, policy.nextTimeoutMillis(active, 360_000))
+    }
+
+    @Test
+    fun statusObserverIgnoresUptimeOnlyChanges() {
+        val first = TravelSnapshot(
+            phase = TravelPhase.RUNNING,
+            online = true,
+            uptimeSeconds = 10,
+        )
+        assertEquals(first.observableState(), first.copy(uptimeSeconds = 20).observableState())
+        assertFalse(
+            first.observableState() == first.copy(downloadedBytes = 1).observableState(),
+        )
+    }
+
+    @Test
+    fun duplicateNotificationContentIsSuppressed() {
+        val gate = DistinctNotificationGate()
+
+        gate.recordForeground("online-zero")
+        assertFalse(gate.accept("online-zero"))
+        assertTrue(gate.accept("online-one"))
+        assertFalse(gate.accept("online-one"))
+        gate.reset()
+        assertTrue(gate.accept("online-one"))
     }
 }
