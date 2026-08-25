@@ -42,13 +42,24 @@ final class FlowSpliceTravelUITests: XCTestCase {
         guard tcpPortIsReachable(host: "127.0.0.1", port: 18_446) else {
             throw XCTSkip("The local Docker Relay is not running.")
         }
-        let relay = environment["FLOWSPLICE_APPLE_E2E_RELAY"] ?? "127.0.0.1:18446"
+        let relay = argumentValue("--flowsplice-e2e-relay")
+            ?? environment["FLOWSPLICE_APPLE_E2E_RELAY"]
+            ?? "127.0.0.1:18446"
         let password = environment["FLOWSPLICE_APPLE_E2E_PASSWORD"] ?? "flowsplice-e2e-private-key-password"
         let defaultTravelID = UIDevice.current.userInterfaceIdiom == .pad ? "apple-e2e-ipad-mini" : "apple-e2e-iphone"
-        let travelID = environment["FLOWSPLICE_APPLE_E2E_TRAVEL_ID"] ?? defaultTravelID
+        let travelID = argumentValue("--flowsplice-e2e-travel-id")
+            ?? environment["FLOWSPLICE_APPLE_E2E_TRAVEL_ID"]
+            ?? defaultTravelID
         let backgroundSeconds = TimeInterval(
-            environment["FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS"] ?? "120"
+            argumentValue("--flowsplice-e2e-background-seconds")
+                ?? environment["FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS"]
+                ?? "120"
         ) ?? 120
+        let sustainedBackgroundSeconds = TimeInterval(
+            argumentValue("--flowsplice-e2e-sustained-seconds")
+                ?? environment["FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS"]
+                ?? "900"
+        ) ?? 900
         let app = XCUIApplication()
         app.launchEnvironment = [
             "FLOWSPLICE_UI_TEST_RESET": "1",
@@ -90,25 +101,42 @@ final class FlowSpliceTravelUITests: XCTestCase {
         try assertEcho("apple-foreground-roundtrip")
 
         XCUIDevice.shared.press(.home)
-        Thread.sleep(forTimeInterval: backgroundSeconds)
-        try assertEcho("apple-while-backgrounded")
+        try assertEchoContinuously(
+            "apple-sustained-background",
+            duration: sustainedBackgroundSeconds
+        )
         app.activate()
         XCTAssertTrue(app.navigationBars["Local Mappings"].waitForExistence(timeout: 30))
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].exists)
         try assertEcho("apple-background-recovery")
+
+        app.terminate()
+        app.launchEnvironment["FLOWSPLICE_UI_TEST_RESET"] = "0"
+        app.launch()
+        navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
+        let coldLaunchStart = app.buttons["device-start"]
+        XCTAssertTrue(coldLaunchStart.waitForExistence(timeout: 30))
+        XCTAssertTrue(coldLaunchStart.wait(for: \.isEnabled, toEqual: true, timeout: 30))
+        coldLaunchStart.tap()
+        XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 90))
+        assertLiveActivityIsVisible(in: app)
+        navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
+        XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].waitForExistence(timeout: 60))
+        try assertEcho("apple-after-cold-launch-restart")
 
         navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
         let outage = app.buttons["diagnostics-prepare-network-outage"]
         XCTAssertTrue(outage.waitForExistence(timeout: 20))
         outage.tap()
         XCUIDevice.shared.press(.home)
-        Thread.sleep(forTimeInterval: backgroundSeconds)
-        try assertEcho("apple-after-relay-outage-while-backgrounded")
+        try assertEchoContinuously(
+            "apple-after-relay-outage-while-backgrounded",
+            duration: backgroundSeconds
+        )
         app.activate()
         let networkChange = app.buttons["diagnostics-simulate-network-change"]
         XCTAssertTrue(networkChange.waitForExistence(timeout: 20))
         networkChange.tap()
-        XCTAssertTrue(app.staticTexts["Network change injected"].waitForExistence(timeout: 20))
         try assertEcho("apple-after-network-change")
 
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
@@ -142,12 +170,26 @@ final class FlowSpliceTravelUITests: XCTestCase {
         try assertEcho("apple-after-live-activity-stop-restart")
 
         navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
+        let expireContinuedSession = app.buttons["diagnostics-expire-continued-session"]
+        XCTAssertTrue(expireContinuedSession.waitForExistence(timeout: 20))
+        expireContinuedSession.tap()
+        navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
+        XCTAssertTrue(app.buttons["device-start"].waitForExistence(timeout: 30))
+        app.buttons["device-start"].tap()
+        XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 60))
+        assertLiveActivityIsVisible(in: app)
+        navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
+        try assertEcho("apple-after-continued-session-expiration-restart")
+
+        navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
         let screenOff = app.buttons["diagnostics-prepare-screen-off"]
         XCTAssertTrue(screenOff.waitForExistence(timeout: 20))
         screenOff.tap()
         XCUIDevice.shared.press(.home)
-        Thread.sleep(forTimeInterval: backgroundSeconds)
-        try assertEcho("apple-while-screen-off-backgrounded")
+        try assertEchoContinuously(
+            "apple-while-screen-off-backgrounded",
+            duration: backgroundSeconds
+        )
         app.activate()
         Thread.sleep(forTimeInterval: 2)
         try assertEcho("apple-after-screen-off")
@@ -227,6 +269,30 @@ final class FlowSpliceTravelUITests: XCTestCase {
         throw error
     }
 
+    private func assertEchoContinuously(
+        _ prefix: String,
+        duration: TimeInterval,
+        interval: TimeInterval = 5
+    ) throws {
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(duration)
+        var probe = 0
+        repeat {
+            try exchangeEcho("\(prefix)-\(probe)")
+            if probe.isMultiple(of: 6) {
+                print(
+                    "FLOWSPLICE_APPLE_E2E_HEARTBEAT phase=\(prefix) " +
+                    "elapsed=\(Int(Date().timeIntervalSince(startedAt))) probe=\(probe)"
+                )
+            }
+            probe += 1
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 {
+                Thread.sleep(forTimeInterval: min(interval, remaining))
+            }
+        } while Date() < deadline
+    }
+
     private func exchangeEcho(_ value: String) throws {
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw URLError(.cannotCreateFile) }
@@ -294,5 +360,13 @@ final class FlowSpliceTravelUITests: XCTestCase {
                 connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
+    }
+
+    private func argumentValue(_ name: String) -> String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: name) else { return nil }
+        let valueIndex = arguments.index(after: index)
+        guard arguments.indices.contains(valueIndex) else { return nil }
+        return arguments[valueIndex]
     }
 }

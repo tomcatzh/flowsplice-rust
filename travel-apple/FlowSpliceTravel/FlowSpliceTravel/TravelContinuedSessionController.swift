@@ -1,60 +1,116 @@
 import BackgroundTasks
 import Foundation
 
+nonisolated struct TravelContinuedSessionState: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case requested(UInt64)
+        case active(UInt64)
+    }
+
+    private(set) var phase: Phase = .idle
+    private var nextToken: UInt64 = 0
+
+    var isActiveOrRequested: Bool {
+        phase != .idle
+    }
+
+    var isActive: Bool {
+        if case .active = phase { return true }
+        return false
+    }
+
+    mutating func beginRequest() -> UInt64 {
+        nextToken &+= 1
+        phase = .requested(nextToken)
+        return nextToken
+    }
+
+    mutating func accept() -> UInt64 {
+        let token: UInt64
+        if case .requested(let requestedToken) = phase {
+            token = requestedToken
+        } else {
+            nextToken &+= 1
+            token = nextToken
+        }
+        phase = .active(token)
+        return token
+    }
+
+    mutating func reset(ifCurrent token: UInt64? = nil) -> Bool {
+        if let token {
+            let currentToken: UInt64?
+            switch phase {
+            case .idle: currentToken = nil
+            case .requested(let value), .active(let value): currentToken = value
+            }
+            guard currentToken == token else { return false }
+        }
+        nextToken &+= 1
+        phase = .idle
+        return true
+    }
+}
+
 @MainActor
 final class TravelContinuedSessionController {
     static let shared = TravelContinuedSessionController()
 
-    private static let identifierPrefix = "io.zxf.flowsplice.travel.session."
-    private static let storedIdentifierKey = "flowsplice.continued-session-identifier"
+    private static let identifier = "io.zxf.flowsplice.travel.session"
     private static let maximumSessionSeconds: Int64 = 8 * 60 * 60
 
-    private var registeredIdentifiers: Set<String> = []
-    private var requestedIdentifier: String?
+    private var registrationAttempted = false
+    private var registered = false
+    private var state = TravelContinuedSessionState()
     private var continuedTaskStorage: AnyObject?
 
     var onExpiration: (() -> Void)?
 
     var isActiveOrRequested: Bool {
-        if #available(iOS 26.0, *) {
-            return requestedIdentifier != nil || continuedTaskStorage as? BGContinuedProcessingTask != nil
-        }
+        if #available(iOS 26.0, *) { return state.isActiveOrRequested }
+        return false
+    }
+
+    var isActive: Bool {
+        if #available(iOS 26.0, *) { return state.isActive }
         return false
     }
 
     private init() {}
 
     func register() {
-        guard #available(iOS 26.0, *),
-              let identifier = UserDefaults.standard.string(forKey: Self.storedIdentifierKey),
-              identifier.hasPrefix(Self.identifierPrefix) else { return }
-        guard registerHandler(for: identifier) else {
-            clearStoredRequest()
-            return
+        guard #available(iOS 26.0, *), !registrationAttempted else { return }
+        registrationAttempted = true
+        registered = BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: Self.identifier,
+            using: nil
+        ) { task in
+            guard let continuedTask = task as? BGContinuedProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Task { @MainActor in
+                Self.shared.accept(continuedTask)
+            }
         }
-        requestedIdentifier = identifier
     }
 
     @available(iOS 26.0, *)
     func request(travelID: String) throws {
-        guard !isActiveOrRequested else { return }
-        let suffix = UUID().uuidString.lowercased()
-        let identifier = Self.identifierPrefix + suffix
-        guard registerHandler(for: identifier) else {
-            throw ContinuedSessionError.registrationRejected
-        }
+        guard registered else { throw ContinuedSessionError.registrationRejected }
+        guard !state.isActiveOrRequested else { return }
+        let token = state.beginRequest()
         let request = BGContinuedProcessingTaskRequest(
-            identifier: identifier,
+            identifier: Self.identifier,
             title: "FlowSplice Travel",
             subtitle: "Starting \(travelID)…"
         )
         request.strategy = .fail
-        UserDefaults.standard.set(identifier, forKey: Self.storedIdentifierKey)
-        requestedIdentifier = identifier
         do {
             try BGTaskScheduler.shared.submit(request)
         } catch {
-            clearStoredRequest()
+            _ = state.reset(ifCurrent: token)
             throw error
         }
     }
@@ -74,54 +130,42 @@ final class TravelContinuedSessionController {
 
     func complete(success: Bool) {
         guard #available(iOS 26.0, *) else { return }
-        if let requestedIdentifier {
-            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: requestedIdentifier)
-        }
-        (continuedTaskStorage as? BGContinuedProcessingTask)?.setTaskCompleted(success: success)
-        clearStoredRequest()
+        let task = continuedTaskStorage as? BGContinuedProcessingTask
         continuedTaskStorage = nil
+        _ = state.reset()
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+        task?.expirationHandler = nil
+        task?.setTaskCompleted(success: success)
     }
 
-    @available(iOS 26.0, *)
-    private func registerHandler(for identifier: String) -> Bool {
-        guard !registeredIdentifiers.contains(identifier) else { return true }
-        let registered = BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: identifier,
-            using: nil
-        ) { task in
-            guard let continuedTask = task as? BGContinuedProcessingTask else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            Task { @MainActor in
-                Self.shared.accept(continuedTask)
-            }
+    func simulateExpirationForTesting() {
+        guard ProcessInfo.processInfo.environment["FLOWSPLICE_E2E"] == "1" else { return }
+        if #available(iOS 26.0, *),
+           let continuedTask = continuedTaskStorage as? BGContinuedProcessingTask {
+            continuedTask.expirationHandler = nil
+            continuedTask.setTaskCompleted(success: false)
         }
-        if registered {
-            registeredIdentifiers.insert(identifier)
-        }
-        return registered
-    }
-
-    private func clearStoredRequest() {
-        requestedIdentifier = nil
-        UserDefaults.standard.removeObject(forKey: Self.storedIdentifierKey)
+        continuedTaskStorage = nil
+        _ = state.reset()
+        onExpiration?()
     }
 
     @available(iOS 26.0, *)
     private func accept(_ task: BGContinuedProcessingTask) {
-        continuedTaskStorage = task
-        if requestedIdentifier == nil {
-            requestedIdentifier = task.identifier
+        if let previous = continuedTaskStorage as? BGContinuedProcessingTask, previous !== task {
+            previous.expirationHandler = nil
+            previous.setTaskCompleted(success: false)
         }
-        UserDefaults.standard.set(task.identifier, forKey: Self.storedIdentifierKey)
+        continuedTaskStorage = task
+        let token = state.accept()
         task.progress.totalUnitCount = Self.maximumSessionSeconds
         task.progress.completedUnitCount = 1
         task.expirationHandler = { [weak self, weak task] in
             Task { @MainActor in
-                guard let self else { return }
-                task?.setTaskCompleted(success: false)
-                self.clearStoredRequest()
+                guard let self, let task else { return }
+                task.setTaskCompleted(success: false)
+                guard (self.continuedTaskStorage as? BGContinuedProcessingTask) === task,
+                      self.state.reset(ifCurrent: token) else { return }
                 self.continuedTaskStorage = nil
                 self.onExpiration?()
             }

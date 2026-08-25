@@ -136,4 +136,23 @@ struct FlowSpliceTravelTests {
         #expect(reconnecting.statusLabel == "Reconnecting")
         #expect(stopped.statusLabel == "Stopped")
     }
+
+    @Test("A stale continued-session expiration cannot end a replacement session")
+    func staleContinuedSessionExpirationIsIgnored() {
+        var state = TravelContinuedSessionState()
+        let first = state.beginRequest()
+        let acceptedFirst = state.accept()
+        #expect(acceptedFirst == first)
+        let resetFirst = state.reset(ifCurrent: first)
+        #expect(resetFirst)
+
+        let replacement = state.beginRequest()
+        #expect(replacement != first)
+        let staleReset = state.reset(ifCurrent: first)
+        #expect(!staleReset)
+        #expect(state.isActiveOrRequested)
+        let acceptedReplacement = state.accept()
+        #expect(acceptedReplacement == replacement)
+        #expect(state.isActive)
+    }
 }

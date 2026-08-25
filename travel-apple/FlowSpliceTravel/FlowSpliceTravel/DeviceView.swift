@@ -48,7 +48,7 @@ struct DeviceView: View {
             } header: {
                 Text("System Status")
             } footer: {
-                Text("The Live Activity follows the system appearance and provides a Stop action from the Lock Screen. iOS still controls suspension and final background lifetime.")
+                Text("The system activity follows the current appearance and provides a Stop action. It reports the session but does not override iPadOS background limits.")
             }
 
             Section {
@@ -64,7 +64,7 @@ struct DeviceView: View {
             } header: {
                 Text("Runtime")
             } footer: {
-                Text("Travel remains visible through a Live Activity. When iOS resumes the app, FlowSplice immediately reconciles the runtime, Relay connection, service catalog, and local mappings.")
+                Text("Starting Travel requests a user-visible continued-processing session. If iPadOS ends it, reopen FlowSplice and tap Start to resume without reinstalling mappings.")
             }
 
             Section("Privacy") {

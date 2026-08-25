@@ -33,7 +33,7 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>io.zxf.flowsplice.travel.session.*</string>
+		<string>io.zxf.flowsplice.travel.session</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
