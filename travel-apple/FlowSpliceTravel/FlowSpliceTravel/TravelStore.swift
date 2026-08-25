@@ -334,6 +334,7 @@ final class TravelStore: ObservableObject {
         snapshot.enrolled = true
         snapshot.error = nil
         do {
+            try TravelFiles.prepareRuntimeStorage()
             let status = try await native.start(config: TravelFiles.config, password: password)
             apply(status)
             EnrollmentStore.autoStart = true

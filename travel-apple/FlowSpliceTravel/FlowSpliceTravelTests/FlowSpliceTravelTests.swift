@@ -10,6 +10,63 @@ struct FlowSpliceTravelTests {
         #expect(TravelValidation.normalizedID(String(repeating: "a", count: 140)).count == 128)
     }
 
+    @Test("Generated config paths follow the current iOS data container")
+    func generatedConfigPathRebasing() {
+        let oldRoot = "/private/var/mobile/Containers/Data/Application/OLD/Library/Application Support/FlowSpliceTravel"
+        let currentRoot = URL(
+            fileURLWithPath: "/private/var/mobile/Containers/Data/Application/CURRENT/Library/Application Support/FlowSpliceTravel",
+            isDirectory: true
+        )
+        let managedPaths = [
+            "deployment_root_public_key": "cert/deployment-root.pub",
+            "deployment_trust": "cert/deployment-trust.json",
+            "management_cert": "cert/travel-management.crt",
+            "management_key": "cert/travel-management.key",
+            "management_ca": "cert/management-ca.crt",
+            "business_cert": "cert/travel-business.crt",
+            "business_key": "cert/travel-business.key",
+            "business_ca": "cert/business-ca.crt",
+            "state_store": "state/travel-state.redb",
+            "enrollment_work_dir": "state/enrollment",
+        ]
+        let source = (["id = \"example-ipad\""] + managedPaths.map {
+            "\($0.key) = \"\(oldRoot)/\($0.value)\""
+        } + ["ui_listen = \"127.0.0.1:9080\""]).joined(separator: "\n")
+
+        let migrated = TravelFiles.rebasedGeneratedConfig(
+            source,
+            installationDirectory: currentRoot
+        )
+
+        #expect(!migrated.contains(oldRoot))
+        for relativePath in managedPaths.values {
+            #expect(migrated.contains("\(currentRoot.path)/\(relativePath)"))
+        }
+        #expect(migrated.contains("ui_listen = \"127.0.0.1:9080\""))
+    }
+
+    @Test("Runtime storage migration rewrites config and prepares the state directory")
+    func runtimeStorageMigration() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appending(path: "flowsplice-storage-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? fileManager.removeItem(at: directory) }
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let config = directory.appending(path: "travelagent.toml")
+        try """
+        state_store = "/private/var/mobile/Containers/Data/Application/OLD/Library/Application Support/FlowSpliceTravel/state/travel-state.redb"
+        ui_listen = "127.0.0.1:9080"
+        """.write(to: config, atomically: true, encoding: .utf8)
+
+        try TravelFiles.prepareRuntimeStorage(at: directory)
+
+        let migrated = try String(contentsOf: config, encoding: .utf8)
+        #expect(migrated.contains("state_store = \"\(directory.path)/state/travel-state.redb\""))
+        #expect(fileManager.fileExists(atPath: directory.appending(path: "state").path))
+        let configAttributes = try fileManager.attributesOfItem(atPath: config.path)
+        #expect((configAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    }
+
     @Test("Relay addresses require an explicit valid port")
     func relayValidation() {
         #expect(TravelValidation.relayIsValid("relay.example:8443"))
