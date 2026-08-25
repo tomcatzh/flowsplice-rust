@@ -5,7 +5,7 @@ import Testing
 struct FlowSpliceTravelTests {
     @Test("IDs are normalized for generated device identities")
     func normalizedIDs() {
-        #expect(TravelValidation.normalizedID(" Tomcat's iPad mini ") == "Tomcat-s-iPad-mini")
+        #expect(TravelValidation.normalizedID(" Example's iPad mini ") == "Example-s-iPad-mini")
         #expect(TravelValidation.normalizedID("___") == "")
         #expect(TravelValidation.normalizedID(String(repeating: "a", count: 140)).count == 128)
     }
@@ -55,5 +55,28 @@ struct FlowSpliceTravelTests {
         #expect(status.travelID == "apple-e2e")
         #expect(status.mappings.first?.id == "home-1/tcp-echo/tcp")
         #expect(TravelSnapshot(native: status).online)
+    }
+
+    @Test("Live Activity content derives stable user-facing status")
+    func liveActivityContentStatus() {
+        let online = TravelActivityAttributes.ContentState(
+            phase: "running",
+            online: true,
+            activeFlows: 2,
+            uploadedBytes: 10,
+            downloadedBytes: 20,
+            relayCount: 1,
+            mappingCount: 3,
+            interfaceLabel: "Wi-Fi",
+            updatedAt: .now
+        )
+        var reconnecting = online
+        reconnecting.online = false
+        var stopped = reconnecting
+        stopped.phase = "stopped"
+
+        #expect(online.statusLabel == "Online")
+        #expect(reconnecting.statusLabel == "Reconnecting")
+        #expect(stopped.statusLabel == "Stopped")
     }
 }

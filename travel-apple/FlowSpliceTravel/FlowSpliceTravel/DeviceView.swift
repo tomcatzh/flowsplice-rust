@@ -39,6 +39,19 @@ struct DeviceView: View {
             }
 
             Section {
+                LabeledContent("Live Activity", value: store.liveActivityStatus.label)
+                    .accessibilityIdentifier("device-live-activity-status")
+                Text(store.liveActivityStatus.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("device-live-activity-detail")
+            } header: {
+                Text("System Status")
+            } footer: {
+                Text("The Live Activity follows the system appearance and provides a Stop action from the Lock Screen. iOS still controls suspension and final background lifetime.")
+            }
+
+            Section {
                 if store.snapshot.phase == .running || store.snapshot.phase == .starting {
                     Button("Stop Travel", role: .destructive) { store.stop() }
                         .disabled(store.isWorking)
@@ -51,7 +64,7 @@ struct DeviceView: View {
             } header: {
                 Text("Runtime")
             } footer: {
-                Text("When iOS returns the app to the foreground, FlowSplice reconciles the runtime, Relay connection, service catalog, and local mappings.")
+                Text("Travel remains visible through a Live Activity. When iOS resumes the app, FlowSplice immediately reconciles the runtime, Relay connection, service catalog, and local mappings.")
             }
 
             Section("Privacy") {

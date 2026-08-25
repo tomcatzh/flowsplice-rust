@@ -2,7 +2,7 @@
 //  FlowSpliceTravelUITestsLaunchTests.swift
 //  FlowSpliceTravelUITests
 //
-//  Created by Tomcat on 2026/8/25.
+//  Created for FlowSplice Travel.
 //
 
 import XCTest

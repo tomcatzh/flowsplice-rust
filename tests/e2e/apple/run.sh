@@ -8,6 +8,12 @@ password_file="${1:?Apple Travel private-key password file is required}"
 relay_address="${2:-127.0.0.1:18446}"
 simulator_name="${3:-iPhone 17 Pro}"
 travel_id="${4:-apple-e2e-travel}"
+background_seconds="${FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS:-120}"
+phase_wait_seconds="$((background_seconds + 180))"
+screen_off_seconds="$((background_seconds / 2))"
+if [[ "${screen_off_seconds}" -lt 15 ]]; then
+  screen_off_seconds=15
+fi
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 if [[ ! -s "${password_file}" ]]; then
@@ -79,10 +85,12 @@ plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E" -string "1" "${xctestr
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_RELAY" -string "${relay_address}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${private_key_password}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
+plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E" -string "1" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_RELAY" -string "${relay_address}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${private_key_password}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
+plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert 'TestConfigurations.0.TestTargets.0.CommandLineArguments.0' -string '--flowsplice-apple-e2e' "${xctestrun_file}"
 plutil -replace 'TestConfigurations.0.TestTargets.0.ParallelizationEnabled' -bool NO "${xctestrun_file}"
 xcodebuild \
@@ -126,7 +134,7 @@ python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
 wait_for_app_phase() {
   local phase="$1"
   local phase_path="${app_container}/Documents/e2e-phase-${phase}"
-  for _ in $(seq 1 180); do
+  for _ in $(seq 1 "${phase_wait_seconds}"); do
     if [[ -s "${phase_path}" ]]; then
       return 0
     fi
@@ -152,9 +160,13 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+wait_for_app_phase live-activity-stop-ready
+sleep 2
+xcrun simctl openurl "${simulator_id}" flowsplice://stop
+
 wait_for_app_phase screen-off-ready
 xcrun simctl io "${simulator_id}" screenConfig power off
-sleep 5
+sleep "${screen_off_seconds}"
 xcrun simctl io "${simulator_id}" screenConfig power on
 
 set +e
@@ -168,4 +180,4 @@ if [[ "${test_status}" -ne 0 ]] || ! grep -Fq 'FLOWSPLICE_APPLE_E2E_COMPLETE' "$
   exit 1
 fi
 test_succeeded=1
-printf '%s\n' "{\"checkpoint\":\"apple-remote-enrollment-catalog-mapping-network-screen-off-restart\",\"simulator\":\"${simulator_name}\"}"
+printf '%s\n' "{\"checkpoint\":\"apple-live-activity-continued-processing-enrollment-catalog-mapping-network-screen-off-stop-restart\",\"simulator\":\"${simulator_name}\",\"background_seconds\":${background_seconds}}"

@@ -42,11 +42,14 @@ final class TravelStore: ObservableObject {
     @Published var presentedError: String?
     @Published private(set) var networkAvailable = true
     @Published private(set) var interfaceLabel = "Checking…"
+    @Published private(set) var liveActivityStatus: TravelLiveActivityStatus = .checking
 
     let defaultTravelID: String
     let defaultHomeID = "home-1"
 
     private let native = NativeTravelClient()
+    private let liveActivity = TravelLiveActivityController()
+    private let continuedSession = TravelContinuedSessionController.shared
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private var lastNetworkSignature: String?
@@ -69,6 +72,18 @@ final class TravelStore: ObservableObject {
         if environment["FLOWSPLICE_E2E_RELAY"] != nil {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
         }
+        liveActivityStatus = liveActivity.currentStatus
+        continuedSession.onExpiration = { [weak self] in
+            guard let self else { return }
+            appendEvent(
+                .lifecycle,
+                title: "Background session ended",
+                detail: "iOS or the user ended continued processing. Travel is stopping cleanly."
+            )
+            if snapshot.phase == .running || snapshot.phase == .starting {
+                stop()
+            }
+        }
     }
 
     deinit {
@@ -89,7 +104,8 @@ final class TravelStore: ObservableObject {
             appendEvent(.lifecycle, title: "App active", detail: "Runtime and catalog reconciliation started.")
             Task { await reconcile(reason: "Returned to foreground") }
         case .background:
-            appendEvent(.lifecycle, title: "App backgrounded", detail: "Durable enrollment and mapping state were preserved.")
+            appendEvent(.lifecycle, title: "App backgrounded", detail: "Live Activity, durable enrollment, and mapping state were preserved.")
+            Task { await synchronizeLiveActivity(force: true, presentFailure: false) }
         case .inactive:
             break
         @unknown default:
@@ -172,7 +188,7 @@ final class TravelStore: ObservableObject {
     func start() {
         isWorking = true
         Task {
-            await startRuntime(userInitiated: true)
+            await startRuntime(userInitiated: true, requestContinuation: true)
             isWorking = false
         }
     }
@@ -180,21 +196,33 @@ final class TravelStore: ObservableObject {
     func stop() {
         isWorking = true
         pollTask?.cancel()
+        EnrollmentStore.autoStart = false
         snapshot.phase = .stopping
         Task {
             do {
                 try await native.stop()
-                EnrollmentStore.autoStart = false
                 snapshot.phase = .stopped
                 snapshot.online = false
                 snapshot.activeFlows = 0
                 snapshot.relayCount = 0
                 snapshot.error = nil
+                continuedSession.complete(success: true)
+                liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 appendEvent(.lifecycle, title: "Travel stopped", detail: "Mappings remain stored for the next start.")
             } catch {
+                continuedSession.complete(success: false)
+                liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 fail(error)
             }
             isWorking = false
+        }
+    }
+
+    func handleDeepLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "flowsplice" else { return }
+        selectedSection = .overview
+        if url.host?.lowercased() == "stop" {
+            stop()
         }
     }
 
@@ -285,7 +313,7 @@ final class TravelStore: ObservableObject {
 
         guard TravelFiles.isInstalled else { return }
         if EnrollmentStore.autoStart {
-            await startRuntime(userInitiated: false)
+            await startRuntime(userInitiated: false, requestContinuation: false)
         } else {
             snapshot.enrolled = true
             snapshot.phase = .stopped
@@ -293,7 +321,7 @@ final class TravelStore: ObservableObject {
         appendEvent(.lifecycle, title: "State reconciled", detail: reason)
     }
 
-    private func startRuntime(userInitiated: Bool) async {
+    private func startRuntime(userInitiated: Bool, requestContinuation: Bool) async {
         guard TravelFiles.isInstalled else {
             presentedError = "Complete remote enrollment before starting Travel."
             return
@@ -309,6 +337,10 @@ final class TravelStore: ObservableObject {
             let status = try await native.start(config: TravelFiles.config, password: password)
             apply(status)
             EnrollmentStore.autoStart = true
+            if requestContinuation {
+                requestContinuedSessionIfAvailable()
+            }
+            await synchronizeLiveActivity(force: true, presentFailure: userInitiated)
             await refreshStatusAndCatalog(forceCatalog: true)
             beginStatusPolling()
             if userInitiated {
@@ -336,7 +368,7 @@ final class TravelStore: ObservableObject {
                         EnrollmentStore.autoStart = true
                         snapshot.enrolled = true
                         appendEvent(.lifecycle, title: "Enrollment installed", detail: "Home approval and credential verification completed.")
-                        await startRuntime(userInitiated: false)
+                        await startRuntime(userInitiated: false, requestContinuation: true)
                         return
                     case .error:
                         if let error = next.error { fail(TravelError.native(error)) }
@@ -371,6 +403,7 @@ final class TravelStore: ObservableObject {
             let previousGeneration = snapshot.catalogGeneration
             let status = try await native.status()
             apply(status)
+            await synchronizeLiveActivity(force: forceCatalog, presentFailure: false)
             if forceCatalog || status.catalogGeneration != previousGeneration || catalog.generation == 0 {
                 let next = try await native.catalog()
                 let changed = next.generation != catalog.generation
@@ -410,6 +443,9 @@ final class TravelStore: ObservableObject {
                 lastNetworkSignature = signature
                 networkAvailable = path.status == .satisfied
                 interfaceLabel = label
+                if snapshot.phase == .running {
+                    await synchronizeLiveActivity(force: true, presentFailure: false)
+                }
                 guard let previous, previous != signature else { return }
                 appendEvent(.network, title: "Network path changed", detail: "Current path: \(label). Reconnection requested.")
                 do {
@@ -425,6 +461,51 @@ final class TravelStore: ObservableObject {
     private func appendEvent(_ kind: RecoveryEvent.Kind, title: String, detail: String) {
         recoveryEvents.insert(RecoveryEvent(date: .now, kind: kind, title: title, detail: detail), at: 0)
         if recoveryEvents.count > 30 { recoveryEvents.removeLast(recoveryEvents.count - 30) }
+    }
+
+    private func synchronizeLiveActivity(force: Bool, presentFailure: Bool) async {
+        if #available(iOS 26.0, *), continuedSession.isActiveOrRequested {
+            continuedSession.update(snapshot: snapshot)
+            liveActivityStatus = .active
+            _ = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
+            TravelFiles.writeE2EPhase("live-activity-active")
+            return
+        }
+        do {
+            liveActivityStatus = try await liveActivity.synchronize(
+                snapshot: snapshot,
+                interfaceLabel: interfaceLabel,
+                force: force
+            )
+            if liveActivityStatus == .active {
+                TravelFiles.writeE2EPhase("live-activity-active")
+            } else if liveActivityStatus == .disabled, presentFailure {
+                presentedError = "Travel is running, but Live Activities are disabled. Enable them for FlowSplice Travel in Settings to keep the session visible."
+            }
+        } catch {
+            let message = "Live Activity could not start: \(error.localizedDescription)"
+            liveActivityStatus = .failed(message)
+            appendEvent(.error, title: "Live Activity unavailable", detail: message)
+            if presentFailure { presentedError = message }
+        }
+    }
+
+    private func requestContinuedSessionIfAvailable() {
+        guard #available(iOS 26.0, *) else { return }
+        do {
+            try continuedSession.request(travelID: snapshot.travelID)
+            appendEvent(
+                .lifecycle,
+                title: "Continued session requested",
+                detail: "iOS 26 continued processing now owns the user-visible background session."
+            )
+        } catch {
+            appendEvent(
+                .error,
+                title: "Continued processing unavailable",
+                detail: "Falling back to the standard Live Activity: \(error.localizedDescription)"
+            )
+        }
     }
 
     private func fail(_ error: Error) {

@@ -5,6 +5,10 @@ struct FlowSpliceTravelApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = TravelStore()
 
+    init() {
+        TravelContinuedSessionController.shared.register()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -12,6 +16,9 @@ struct FlowSpliceTravelApp: App {
                 .task { store.bootstrap() }
                 .onChange(of: scenePhase) { _, next in
                     store.handleScenePhase(next)
+                }
+                .onOpenURL { url in
+                    store.handleDeepLink(url)
                 }
         }
     }

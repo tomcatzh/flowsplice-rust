@@ -46,6 +46,9 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let password = environment["FLOWSPLICE_APPLE_E2E_PASSWORD"] ?? "flowsplice-e2e-private-key-password"
         let defaultTravelID = UIDevice.current.userInterfaceIdiom == .pad ? "apple-e2e-ipad-mini" : "apple-e2e-iphone"
         let travelID = environment["FLOWSPLICE_APPLE_E2E_TRAVEL_ID"] ?? defaultTravelID
+        let backgroundSeconds = TimeInterval(
+            environment["FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS"] ?? "120"
+        ) ?? 120
         let app = XCUIApplication()
         app.launchEnvironment = [
             "FLOWSPLICE_UI_TEST_RESET": "1",
@@ -66,6 +69,8 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let status = app.descendants(matching: .any)["overview-status"]
         XCTAssertTrue(status.waitForExistence(timeout: 150))
         XCTAssertTrue(app.staticTexts["Online"].waitForExistence(timeout: 150))
+        navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
+        assertLiveActivityIsVisible(in: app)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         XCTAssertTrue(app.buttons["mapping-add"].waitForExistence(timeout: 90))
         app.buttons["mapping-add"].tap()
@@ -85,7 +90,8 @@ final class FlowSpliceTravelUITests: XCTestCase {
         try assertEcho("apple-foreground-roundtrip")
 
         XCUIDevice.shared.press(.home)
-        Thread.sleep(forTimeInterval: 4)
+        Thread.sleep(forTimeInterval: backgroundSeconds)
+        try assertEcho("apple-while-backgrounded")
         app.activate()
         XCTAssertTrue(app.navigationBars["Local Mappings"].waitForExistence(timeout: 30))
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].exists)
@@ -95,7 +101,9 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let outage = app.buttons["diagnostics-prepare-network-outage"]
         XCTAssertTrue(outage.waitForExistence(timeout: 20))
         outage.tap()
-        Thread.sleep(forTimeInterval: 15)
+        XCUIDevice.shared.press(.home)
+        Thread.sleep(forTimeInterval: backgroundSeconds)
+        try assertEcho("apple-after-relay-outage-while-backgrounded")
         app.activate()
         let networkChange = app.buttons["diagnostics-simulate-network-change"]
         XCTAssertTrue(networkChange.waitForExistence(timeout: 20))
@@ -113,11 +121,33 @@ final class FlowSpliceTravelUITests: XCTestCase {
         try assertEcho("apple-after-runtime-restart")
 
         navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
+        let liveActivityStop = app.buttons["diagnostics-prepare-live-activity-stop"]
+        XCTAssertTrue(liveActivityStop.waitForExistence(timeout: 20))
+        liveActivityStop.tap()
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 15))
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let openConfirmation = springboard.alerts.firstMatch
+        if openConfirmation.waitForExistence(timeout: 30) {
+            XCTAssertGreaterThanOrEqual(openConfirmation.buttons.count, 2)
+            openConfirmation.buttons.element(boundBy: openConfirmation.buttons.count - 1).tap()
+        }
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60))
+        navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
+        XCTAssertTrue(app.buttons["device-start"].waitForExistence(timeout: 30))
+        app.buttons["device-start"].tap()
+        XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 60))
+        assertLiveActivityIsVisible(in: app)
+        navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
+        try assertEcho("apple-after-live-activity-stop-restart")
+
+        navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
         let screenOff = app.buttons["diagnostics-prepare-screen-off"]
         XCTAssertTrue(screenOff.waitForExistence(timeout: 20))
         screenOff.tap()
         XCUIDevice.shared.press(.home)
-        Thread.sleep(forTimeInterval: 15)
+        Thread.sleep(forTimeInterval: backgroundSeconds)
+        try assertEcho("apple-while-screen-off-backgrounded")
         app.activate()
         Thread.sleep(forTimeInterval: 2)
         try assertEcho("apple-after-screen-off")
@@ -163,6 +193,21 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let sidebarTitle = app.staticTexts[regularTitle]
         XCTAssertTrue(sidebarTitle.wait(for: \.isHittable, toEqual: true, timeout: 20))
         sidebarTitle.tap()
+    }
+
+    @MainActor
+    private func assertLiveActivityIsVisible(in app: XCUIApplication) {
+        let status = app.staticTexts["device-live-activity-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 30))
+        let visible = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS[c] %@", "Visible"),
+            object: status
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [visible], timeout: 60),
+            .completed,
+            "Expected a visible Live Activity, got \(status.label)."
+        )
     }
 
     private func assertEcho(_ value: String, timeout: TimeInterval = 60) throws {
