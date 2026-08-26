@@ -51,14 +51,6 @@ struct DiagnosticsView: View {
                         Label("Prepare Live Activity Stop", systemImage: "stop.circle")
                     }
                     .accessibilityIdentifier("diagnostics-prepare-live-activity-stop")
-
-                    Button {
-                        store.simulateContinuedSessionExpirationForTesting()
-                    } label: {
-                        Label("Expire Continued Session", systemImage: "timer")
-                    }
-                    .disabled(store.snapshot.phase != .running)
-                    .accessibilityIdentifier("diagnostics-expire-continued-session")
                 } header: {
                     Text("Simulator Validation")
                 } footer: {

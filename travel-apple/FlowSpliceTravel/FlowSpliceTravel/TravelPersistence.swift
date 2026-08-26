@@ -159,7 +159,6 @@ enum TravelFiles {
             }
         }
         EnrollmentStore.reset()
-        UserDefaults.standard.removeObject(forKey: "flowsplice.continued-session-identifier")
         CredentialStore.clear()
     }
 }

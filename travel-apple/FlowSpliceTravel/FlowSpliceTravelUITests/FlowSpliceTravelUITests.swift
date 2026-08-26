@@ -114,10 +114,6 @@ final class FlowSpliceTravelUITests: XCTestCase {
         app.launchEnvironment["FLOWSPLICE_UI_TEST_RESET"] = "0"
         app.launch()
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
-        let coldLaunchStart = app.buttons["device-start"]
-        XCTAssertTrue(coldLaunchStart.waitForExistence(timeout: 30))
-        XCTAssertTrue(coldLaunchStart.wait(for: \.isEnabled, toEqual: true, timeout: 30))
-        coldLaunchStart.tap()
         XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 90))
         assertLiveActivityIsVisible(in: app)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
@@ -168,18 +164,6 @@ final class FlowSpliceTravelUITests: XCTestCase {
         assertLiveActivityIsVisible(in: app)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         try assertEcho("apple-after-live-activity-stop-restart")
-
-        navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
-        let expireContinuedSession = app.buttons["diagnostics-expire-continued-session"]
-        XCTAssertTrue(expireContinuedSession.waitForExistence(timeout: 20))
-        expireContinuedSession.tap()
-        navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
-        XCTAssertTrue(app.buttons["device-start"].waitForExistence(timeout: 30))
-        app.buttons["device-start"].tap()
-        XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 60))
-        assertLiveActivityIsVisible(in: app)
-        navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
-        try assertEcho("apple-after-continued-session-expiration-restart")
 
         navigate(in: app, compactLabel: "Diagnostics", regularIdentifier: "nav-diagnostics")
         let screenOff = app.buttons["diagnostics-prepare-screen-off"]

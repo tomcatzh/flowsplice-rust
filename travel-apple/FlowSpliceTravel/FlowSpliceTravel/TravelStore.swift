@@ -50,7 +50,6 @@ final class TravelStore: ObservableObject {
 
     private let native = NativeTravelClient()
     private let liveActivity = TravelLiveActivityController()
-    private let continuedSession = TravelContinuedSessionController.shared
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private let logger = Logger(subsystem: "io.zxf.flowsplice.travel", category: "lifecycle")
@@ -59,7 +58,6 @@ final class TravelStore: ObservableObject {
     private var bootstrapped = false
     private var reconciling = false
     private var runtimeStartedInProcess = false
-    private var requiresUserStart = false
 
     init() {
         TravelFiles.resetForUITesting()
@@ -78,10 +76,6 @@ final class TravelStore: ObservableObject {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
         }
         liveActivityStatus = liveActivity.currentStatus
-        continuedSession.onExpiration = { [weak self] in
-            guard let self else { return }
-            handleContinuedSessionExpiration()
-        }
     }
 
     deinit {
@@ -102,14 +96,11 @@ final class TravelStore: ObservableObject {
             appendEvent(.lifecycle, title: "App active", detail: "Runtime and catalog reconciliation started.")
             Task { await reconcile(reason: "Returned to foreground") }
         case .background:
-            appendEvent(.lifecycle, title: "App backgrounded", detail: "Live Activity, durable enrollment, and mapping state were preserved.")
-            if snapshot.phase == .running && !continuedSession.isActiveOrRequested {
-                appendEvent(
-                    .error,
-                    title: "Foreground-only session",
-                    detail: "iPadOS did not grant continued processing; the local mappings may suspend in the background."
-                )
-            }
+            appendEvent(
+                .lifecycle,
+                title: "App backgrounded",
+                detail: "Live Activity, durable enrollment, and mapping state were preserved. iPadOS may suspend the runtime."
+            )
             Task { await synchronizeLiveActivity(force: true, presentFailure: false) }
         case .inactive:
             break
@@ -193,12 +184,11 @@ final class TravelStore: ObservableObject {
     func start() {
         guard !isWorking else { return }
         isWorking = true
-        requiresUserStart = false
         snapshot.phase = .starting
         snapshot.error = nil
         logger.notice("Travel start requested")
         Task {
-            await startRuntime(userInitiated: true, requestContinuation: true)
+            await startRuntime(userInitiated: true)
             isWorking = false
         }
     }
@@ -208,7 +198,6 @@ final class TravelStore: ObservableObject {
         isWorking = true
         pollTask?.cancel()
         EnrollmentStore.autoStart = false
-        requiresUserStart = false
         snapshot.phase = .stopping
         logger.notice("Travel stop requested")
         Task {
@@ -220,12 +209,10 @@ final class TravelStore: ObservableObject {
                 snapshot.activeFlows = 0
                 snapshot.relayCount = 0
                 snapshot.error = nil
-                continuedSession.complete(success: true)
                 liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 appendEvent(.lifecycle, title: "Travel stopped", detail: "Mappings remain stored for the next start.")
                 logger.notice("Travel stop completed")
             } catch {
-                continuedSession.complete(success: false)
                 liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 failRuntime(error, operation: "stop")
             }
@@ -303,10 +290,6 @@ final class TravelStore: ObservableObject {
         TravelFiles.writeE2EPhase(phase)
     }
 
-    func simulateContinuedSessionExpirationForTesting() {
-        continuedSession.simulateExpirationForTesting()
-    }
-
     private func reconcile(reason: String) async {
         guard !reconciling else { return }
         guard !isWorking else {
@@ -338,34 +321,22 @@ final class TravelStore: ObservableObject {
         }
 
         guard TravelFiles.isInstalled else { return }
-        if requiresUserStart {
-            snapshot.enrolled = true
-            snapshot.phase = .stopped
-        } else if runtimeStartedInProcess {
+        if runtimeStartedInProcess {
             await refreshStatusAndCatalog(forceCatalog: true)
             if snapshot.phase == .running { beginStatusPolling() }
-        } else if EnrollmentStore.autoStart && continuedSession.isActive {
+        } else if EnrollmentStore.autoStart {
             isWorking = true
             snapshot.phase = .starting
-            await startRuntime(userInitiated: false, requestContinuation: false)
+            await startRuntime(userInitiated: false)
             isWorking = false
         } else {
-            if EnrollmentStore.autoStart {
-                appendEvent(
-                    .lifecycle,
-                    title: "Start required after launch",
-                    detail: "Tap Start to create a new user-initiated iPadOS background session."
-                )
-            }
-            EnrollmentStore.autoStart = false
-            requiresUserStart = true
             snapshot.enrolled = true
             snapshot.phase = .stopped
         }
         appendEvent(.lifecycle, title: "State reconciled", detail: reason)
     }
 
-    private func startRuntime(userInitiated: Bool, requestContinuation: Bool) async {
+    private func startRuntime(userInitiated: Bool) async {
         guard TravelFiles.isInstalled else {
             presentedError = "Complete remote enrollment before starting Travel."
             return
@@ -378,21 +349,11 @@ final class TravelStore: ObservableObject {
         snapshot.enrolled = true
         snapshot.error = nil
         let startedAt = Date()
-        if requestContinuation {
-            requestContinuedSessionIfAvailable()
-        }
         do {
             try TravelFiles.prepareRuntimeStorage()
             let status = try await native.start(config: TravelFiles.config, password: password)
             runtimeStartedInProcess = true
             apply(status)
-            if requiresUserStart {
-                snapshot.phase = .stopped
-                snapshot.online = false
-                snapshot.error = "Background permission ended while Travel was starting. Tap Start to resume without reloading credentials."
-                logger.error("Continued processing expired before Travel start completed")
-                return
-            }
             EnrollmentStore.autoStart = true
             await synchronizeLiveActivity(force: true, presentFailure: userInitiated)
             await refreshStatusAndCatalog(forceCatalog: true)
@@ -404,7 +365,6 @@ final class TravelStore: ObservableObject {
             }
         } catch {
             runtimeStartedInProcess = false
-            continuedSession.complete(success: false)
             failRuntime(error, operation: "start")
         }
     }
@@ -427,7 +387,7 @@ final class TravelStore: ObservableObject {
                         snapshot.enrolled = true
                         appendEvent(.lifecycle, title: "Enrollment installed", detail: "Home approval and credential verification completed.")
                         snapshot.phase = .starting
-                        await startRuntime(userInitiated: false, requestContinuation: true)
+                        await startRuntime(userInitiated: false)
                         return
                     case .error:
                         if let error = next.error { fail(TravelError.native(error)) }
@@ -523,13 +483,6 @@ final class TravelStore: ObservableObject {
     }
 
     private func synchronizeLiveActivity(force: Bool, presentFailure: Bool) async {
-        if #available(iOS 26.0, *), continuedSession.isActiveOrRequested {
-            continuedSession.update(snapshot: snapshot)
-            liveActivityStatus = .active
-            _ = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
-            TravelFiles.writeE2EPhase("live-activity-active")
-            return
-        }
         do {
             liveActivityStatus = try await liveActivity.synchronize(
                 snapshot: snapshot,
@@ -546,26 +499,6 @@ final class TravelStore: ObservableObject {
             liveActivityStatus = .failed(message)
             appendEvent(.error, title: "Live Activity unavailable", detail: message)
             if presentFailure { presentedError = message }
-        }
-    }
-
-    private func requestContinuedSessionIfAvailable() {
-        guard #available(iOS 26.0, *) else { return }
-        do {
-            try continuedSession.request(travelID: snapshot.travelID)
-            logger.notice("Continued-processing request submitted")
-            appendEvent(
-                .lifecycle,
-                title: "Continued session requested",
-                detail: "iOS 26 continued processing now owns the user-visible background session."
-            )
-        } catch {
-            logger.error("Continued-processing request failed: \(error.localizedDescription, privacy: .private)")
-            appendEvent(
-                .error,
-                title: "Continued processing unavailable",
-                detail: "Falling back to the standard Live Activity: \(error.localizedDescription)"
-            )
         }
     }
 
@@ -586,20 +519,4 @@ final class TravelStore: ObservableObject {
         logger.error("Travel \(operation, privacy: .public) failed: \(message, privacy: .private)")
     }
 
-    private func handleContinuedSessionExpiration() {
-        pollTask?.cancel()
-        EnrollmentStore.autoStart = false
-        requiresUserStart = true
-        liveActivityStatus = .inactive
-        let message = "iPadOS ended the background session. Open FlowSplice and tap Start to resume local mappings."
-        if !isWorking {
-            snapshot.phase = .stopped
-            snapshot.online = false
-            snapshot.activeFlows = 0
-            snapshot.relayCount = 0
-        }
-        snapshot.error = message
-        appendEvent(.lifecycle, title: "Background session ended", detail: message)
-        logger.error("iPadOS expired the continued-processing session")
-    }
 }

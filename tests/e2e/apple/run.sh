@@ -269,4 +269,4 @@ if [[ "${test_status}" -ne 0 ]] || ! grep -Fq 'FLOWSPLICE_APPLE_E2E_COMPLETE' "$
   exit 1
 fi
 test_succeeded=1
-printf '%s\n' "{\"checkpoint\":\"apple-live-activity-continued-processing-enrollment-catalog-mapping-network-screen-off-stop-restart\",\"simulator\":\"${simulator_name}\",\"background_seconds\":${background_seconds},\"sustained_seconds\":${sustained_seconds}}"
+printf '%s\n' "{\"checkpoint\":\"apple-live-activity-enrollment-catalog-mapping-network-simulator-background-stop-restart\",\"simulator\":\"${simulator_name}\",\"background_seconds\":${background_seconds},\"sustained_seconds\":${sustained_seconds}}"

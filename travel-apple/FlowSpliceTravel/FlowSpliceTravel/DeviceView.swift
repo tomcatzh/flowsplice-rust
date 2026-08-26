@@ -64,7 +64,7 @@ struct DeviceView: View {
             } header: {
                 Text("Runtime")
             } footer: {
-                Text("Starting Travel requests a user-visible continued-processing session. If iPadOS ends it, reopen FlowSplice and tap Start to resume without reinstalling mappings.")
+                Text("The Live Activity reports status only. iPadOS may suspend local mappings after the app enters the background; reopening FlowSplice restores the saved runtime and mappings.")
             }
 
             Section("Privacy") {
