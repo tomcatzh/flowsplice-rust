@@ -1,6 +1,6 @@
 import "./style.css";
+import { decodeServiceOption, encodeServiceOption, type Protocol } from "./service-option";
 
-type Protocol = "tcp" | "udp";
 type Page = "approvals" | "credentials" | "statistics";
 type CredentialStatus = "active" | "revoked" | "expired" | "all";
 type Scope =
@@ -123,9 +123,8 @@ function selectedScope(name: string, serviceSelector: string): Scope {
   const kind = document.querySelector<HTMLInputElement>(`input[name="${name}"]:checked`)?.value;
   if (kind === "global") return { kind: "global" };
   if (kind === "service") {
-    const value = (document.querySelector<HTMLSelectElement>(serviceSelector)?.value ?? "").split("\u0000");
-    if (value.length !== 2) throw new Error("请选择要授权的业务");
-    return { kind: "service", home_id: status.home_id, service_id: value[0], protocol: value[1] as Protocol };
+    const value = decodeServiceOption(document.querySelector<HTMLSelectElement>(serviceSelector)?.value ?? "");
+    return { kind: "service", home_id: status.home_id, ...value };
   }
   return { kind: "home", home_id: status.home_id };
 }
@@ -431,7 +430,7 @@ async function renderStatisticsPage(): Promise<void> {
 async function renderApprovalsPage(): Promise<void> {
   updateDocumentTitle();
   const serviceOptions = status.services.map((service) =>
-    `<option value="${escapeHtml(`${service.id}\u0000${service.protocol}`)}">${escapeHtml(service.alias)} · ${service.protocol.toUpperCase()}</option>`,
+    `<option value="${encodeServiceOption(service.id, service.protocol)}">${escapeHtml(service.alias)} · ${service.protocol.toUpperCase()}</option>`,
   ).join("");
   app.innerHTML = `${header()}
   ${pageTabs()}
