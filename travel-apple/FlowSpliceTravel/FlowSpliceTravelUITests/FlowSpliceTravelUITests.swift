@@ -60,6 +60,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
                 ?? environment["FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS"]
                 ?? "900"
         ) ?? 900
+        let liveActivityDisabled = environment["FLOWSPLICE_E2E_DISABLE_LIVE_ACTIVITY"] == "1"
         let app = XCUIApplication()
         app.launchEnvironment = [
             "FLOWSPLICE_UI_TEST_RESET": "1",
@@ -67,6 +68,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
             "FLOWSPLICE_E2E_RELAY": relay,
             "FLOWSPLICE_E2E_TRAVEL_ID": travelID,
             "FLOWSPLICE_E2E_PASSWORD": password,
+            "FLOWSPLICE_E2E_DISABLE_LIVE_ACTIVITY": liveActivityDisabled ? "1" : "0",
         ]
         app.launch()
 
@@ -81,7 +83,8 @@ final class FlowSpliceTravelUITests: XCTestCase {
         XCTAssertTrue(status.waitForExistence(timeout: 150))
         XCTAssertTrue(app.staticTexts["Online"].waitForExistence(timeout: 150))
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
-        assertLiveActivityIsVisible(in: app)
+        assertBackgroundAudioIsActive(in: app)
+        assertLiveActivityState(in: app, disabled: liveActivityDisabled)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         XCTAssertTrue(app.buttons["mapping-add"].waitForExistence(timeout: 90))
         app.buttons["mapping-add"].tap()
@@ -92,9 +95,16 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let tcpEcho = app.descendants(matching: .any)["mapping-service-tcp-echo-tcp"]
         XCTAssertTrue(tcpEcho.waitForExistence(timeout: 10))
         tcpEcho.tap()
+        let serviceSelection = app.navigationBars["Service"]
+        if serviceSelection.waitForExistence(timeout: 2) {
+            let back = serviceSelection.buttons["Add Local Mapping"]
+            XCTAssertTrue(back.waitForExistence(timeout: 5))
+            back.tap()
+        }
         let port = app.textFields["mapping-port"]
+        XCTAssertTrue(port.wait(for: \.isHittable, toEqual: true, timeout: 10))
         port.tap()
-        port.typeText("10080")
+        port.typeText("10800")
         XCTAssertTrue(app.buttons["mapping-save"].isEnabled)
         app.buttons["mapping-save"].tap()
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].waitForExistence(timeout: 30))
@@ -115,7 +125,8 @@ final class FlowSpliceTravelUITests: XCTestCase {
         app.launch()
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
         XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 90))
-        assertLiveActivityIsVisible(in: app)
+        assertBackgroundAudioIsActive(in: app)
+        assertLiveActivityState(in: app, disabled: liveActivityDisabled)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].waitForExistence(timeout: 60))
         try assertEcho("apple-after-cold-launch-restart")
@@ -161,7 +172,8 @@ final class FlowSpliceTravelUITests: XCTestCase {
         XCTAssertTrue(app.buttons["device-start"].waitForExistence(timeout: 30))
         app.buttons["device-start"].tap()
         XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 60))
-        assertLiveActivityIsVisible(in: app)
+        assertBackgroundAudioIsActive(in: app)
+        assertLiveActivityState(in: app, disabled: liveActivityDisabled)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         try assertEcho("apple-after-live-activity-stop-restart")
 
@@ -219,17 +231,32 @@ final class FlowSpliceTravelUITests: XCTestCase {
     }
 
     @MainActor
-    private func assertLiveActivityIsVisible(in app: XCUIApplication) {
-        let status = app.staticTexts["device-live-activity-status"]
+    private func assertBackgroundAudioIsActive(in app: XCUIApplication) {
+        let status = app.staticTexts["device-background-audio-status"]
         XCTAssertTrue(status.waitForExistence(timeout: 30))
-        let visible = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS[c] %@", "Visible"),
+        let active = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS[c] %@", "Active"),
             object: status
         )
         XCTAssertEqual(
-            XCTWaiter.wait(for: [visible], timeout: 60),
+            XCTWaiter.wait(for: [active], timeout: 60),
             .completed,
-            "Expected a visible Live Activity, got \(status.label)."
+            "Expected active background audio, got \(status.label)."
+        )
+    }
+
+    private func assertLiveActivityState(in app: XCUIApplication, disabled: Bool) {
+        let status = app.staticTexts["device-live-activity-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 30))
+        let expected = disabled ? "Disabled" : "Visible"
+        let state = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS[c] %@", expected),
+            object: status
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [state], timeout: 60),
+            .completed,
+            "Expected Live Activity state \(expected), got \(status.label)."
         )
     }
 
@@ -284,7 +311,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = UInt16(10_080).bigEndian
+        address.sin_port = UInt16(10_800).bigEndian
         guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
             throw URLError(.badURL)
         }

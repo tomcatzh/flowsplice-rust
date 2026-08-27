@@ -39,19 +39,6 @@ struct DeviceView: View {
             }
 
             Section {
-                LabeledContent("Live Activity", value: store.liveActivityStatus.label)
-                    .accessibilityIdentifier("device-live-activity-status")
-                Text(store.liveActivityStatus.detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("device-live-activity-detail")
-            } header: {
-                Text("System Status")
-            } footer: {
-                Text("The system activity follows the current appearance and provides a Stop action.")
-            }
-
-            Section {
                 if store.snapshot.phase == .running || store.snapshot.phase == .starting {
                     Button("Stop Travel", role: .destructive) { store.stop() }
                         .disabled(store.isWorking)
@@ -63,6 +50,25 @@ struct DeviceView: View {
                 }
             } header: {
                 Text("Runtime")
+            }
+
+            Section {
+                LabeledContent("Background Audio", value: store.backgroundAudioStatus.label)
+                    .accessibilityIdentifier("device-background-audio-status")
+                Text(store.backgroundAudioStatus.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("device-background-audio-detail")
+                LabeledContent("Live Activity", value: store.liveActivityStatus.label)
+                    .accessibilityIdentifier("device-live-activity-status")
+                Text(store.liveActivityStatus.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("device-live-activity-detail")
+            } header: {
+                Text("System Status")
+            } footer: {
+                Text("Background audio owns continuity. Live Activity is an optional status and Stop surface.")
             }
 
             Section("Privacy") {

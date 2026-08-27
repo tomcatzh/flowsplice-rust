@@ -838,12 +838,14 @@ if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" ]]; then
     "${generated_dir}/offline/test-password.txt" \
     "127.0.0.1:18446" \
     "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
-    "apple-e2e-iphone"
+    "apple-e2e-iphone" \
+    "enabled"
   "${repo_root}/tests/e2e/apple/run.sh" \
     "${generated_dir}/offline/test-password.txt" \
     "127.0.0.1:18446" \
     "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
-    "apple-e2e-ipad-mini"
+    "apple-e2e-ipad-mini" \
+    "disabled"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
 docker compose -f "${compose_file}" ps

@@ -23,11 +23,11 @@ nonisolated enum TravelLiveActivityStatus: Equatable, Sendable {
         case .checking:
             "Checking whether Live Activities are available."
         case .inactive:
-            "The Live Activity starts automatically with Travel."
+            "Optional status presentation starts automatically with Travel."
         case .active:
             "Travel is visible on the Lock Screen and supported system surfaces."
         case .disabled:
-            "Enable Live Activities for FlowSplice Travel in Settings."
+            "Optional status presentation is disabled. Travel continues independently."
         case .failed(let message):
             message
         }
@@ -36,11 +36,16 @@ nonisolated enum TravelLiveActivityStatus: Equatable, Sendable {
 
 @MainActor
 final class TravelLiveActivityController {
+    private let forceDisabled: Bool
     private var lastState: TravelActivityAttributes.ContentState?
     private var lastUpdate = Date.distantPast
 
+    init(forceDisabled: Bool = ProcessInfo.processInfo.environment["FLOWSPLICE_E2E_DISABLE_LIVE_ACTIVITY"] == "1") {
+        self.forceDisabled = forceDisabled
+    }
+
     var currentStatus: TravelLiveActivityStatus {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return .disabled }
+        guard !forceDisabled, ActivityAuthorizationInfo().areActivitiesEnabled else { return .disabled }
         return Activity<TravelActivityAttributes>.activities.isEmpty ? .inactive : .active
     }
 
@@ -49,7 +54,7 @@ final class TravelLiveActivityController {
         interfaceLabel: String,
         force: Bool = false
     ) async throws -> TravelLiveActivityStatus {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+        guard !forceDisabled, ActivityAuthorizationInfo().areActivitiesEnabled else {
             return .disabled
         }
         guard snapshot.phase == .running || snapshot.phase == .starting else {
@@ -90,7 +95,7 @@ final class TravelLiveActivityController {
     func end(snapshot: TravelSnapshot, interfaceLabel: String) async -> TravelLiveActivityStatus {
         await endAll(using: contentState(snapshot: snapshot, interfaceLabel: interfaceLabel))
         lastState = nil
-        return ActivityAuthorizationInfo().areActivitiesEnabled ? .inactive : .disabled
+        return !forceDisabled && ActivityAuthorizationInfo().areActivitiesEnabled ? .inactive : .disabled
     }
 
     private func shouldUpdate(to state: TravelActivityAttributes.ContentState, force: Bool) -> Bool {

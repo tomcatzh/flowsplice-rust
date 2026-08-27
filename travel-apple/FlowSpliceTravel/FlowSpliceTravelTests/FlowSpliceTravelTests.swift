@@ -136,4 +136,40 @@ struct FlowSpliceTravelTests {
         #expect(reconnecting.statusLabel == "Reconnecting")
         #expect(stopped.statusLabel == "Stopped")
     }
+
+    @Test("Background audio starts and stops idempotently")
+    @MainActor
+    func backgroundAudioLifecycle() throws {
+        let controller = TravelBackgroundAudioController()
+        defer { try? controller.stop() }
+
+        try controller.start()
+        #expect(controller.status == .active)
+
+        try controller.start()
+        #expect(controller.status == .active)
+
+        try controller.stop()
+        #expect(controller.status == .inactive)
+
+        try controller.stop()
+        #expect(controller.status == .inactive)
+    }
+
+    @Test("Live Activity can be disabled without affecting runtime ownership")
+    @MainActor
+    func liveActivityCanBeDisabled() async throws {
+        let controller = TravelLiveActivityController(forceDisabled: true)
+        var snapshot = TravelSnapshot()
+        snapshot.phase = .running
+        snapshot.online = true
+
+        #expect(controller.currentStatus == .disabled)
+        let status = try await controller.synchronize(
+            snapshot: snapshot,
+            interfaceLabel: "Wi-Fi",
+            force: true
+        )
+        #expect(status == .disabled)
+    }
 }

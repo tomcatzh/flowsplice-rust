@@ -48,7 +48,7 @@ struct DiagnosticsView: View {
                     Button {
                         store.prepareE2EPhase("live-activity-stop-ready")
                     } label: {
-                        Label("Prepare Live Activity Stop", systemImage: "stop.circle")
+                        Label("Prepare Background Stop", systemImage: "stop.circle")
                     }
                     .accessibilityIdentifier("diagnostics-prepare-live-activity-stop")
                 } header: {

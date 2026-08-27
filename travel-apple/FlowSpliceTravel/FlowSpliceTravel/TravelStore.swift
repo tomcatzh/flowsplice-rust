@@ -44,12 +44,14 @@ final class TravelStore: ObservableObject {
     @Published private(set) var networkAvailable = true
     @Published private(set) var interfaceLabel = "Checking…"
     @Published private(set) var liveActivityStatus: TravelLiveActivityStatus = .checking
+    @Published private(set) var backgroundAudioStatus: TravelBackgroundAudioStatus = .inactive
 
     let defaultTravelID: String
     let defaultHomeID = "home-1"
 
     private let native = NativeTravelClient()
     private let liveActivity = TravelLiveActivityController()
+    private let backgroundAudio: TravelBackgroundAudioControlling
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private let logger = Logger(subsystem: "io.zxf.flowsplice.travel", category: "lifecycle")
@@ -59,7 +61,9 @@ final class TravelStore: ObservableObject {
     private var reconciling = false
     private var runtimeStartedInProcess = false
 
-    init() {
+    init(backgroundAudio: TravelBackgroundAudioControlling? = nil) {
+        let backgroundAudio = backgroundAudio ?? TravelBackgroundAudioController()
+        self.backgroundAudio = backgroundAudio
         TravelFiles.resetForUITesting()
         let environment = ProcessInfo.processInfo.environment
         let normalizedName = TravelValidation.normalizedID(UIDevice.current.name)
@@ -76,6 +80,17 @@ final class TravelStore: ObservableObject {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
         }
         liveActivityStatus = liveActivity.currentStatus
+        backgroundAudioStatus = backgroundAudio.status
+        backgroundAudio.onStatusChange = { [weak self] status in
+            guard let self else { return }
+            backgroundAudioStatus = status
+            if status == .active {
+                TravelFiles.writeE2EPhase("background-audio-active")
+            }
+            if case .failed(let message) = status {
+                appendEvent(.error, title: "Background audio unavailable", detail: message)
+            }
+        }
     }
 
     deinit {
@@ -93,10 +108,11 @@ final class TravelStore: ObservableObject {
     func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .active:
+            backgroundAudio.reconcile()
             appendEvent(.lifecycle, title: "App active", detail: "Runtime and catalog reconciliation started.")
             Task { await reconcile(reason: "Returned to foreground") }
         case .background:
-            Task { await synchronizeLiveActivity(force: true, presentFailure: false) }
+            Task { await synchronizeLiveActivity(force: true) }
         case .inactive:
             break
         @unknown default:
@@ -196,6 +212,12 @@ final class TravelStore: ObservableObject {
         snapshot.phase = .stopping
         logger.notice("Travel stop requested")
         Task {
+            var audioError: Error?
+            do {
+                try backgroundAudio.stop()
+            } catch {
+                audioError = error
+            }
             do {
                 try await native.stop()
                 runtimeStartedInProcess = false
@@ -207,6 +229,9 @@ final class TravelStore: ObservableObject {
                 liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 appendEvent(.lifecycle, title: "Travel stopped", detail: "Mappings remain stored for the next start.")
                 logger.notice("Travel stop completed")
+                if let audioError {
+                    fail(audioError)
+                }
             } catch {
                 liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
                 failRuntime(error, operation: "stop")
@@ -345,12 +370,13 @@ final class TravelStore: ObservableObject {
         snapshot.error = nil
         let startedAt = Date()
         do {
+            try backgroundAudio.start()
             try TravelFiles.prepareRuntimeStorage()
             let status = try await native.start(config: TravelFiles.config, password: password)
             runtimeStartedInProcess = true
             apply(status)
             EnrollmentStore.autoStart = true
-            await synchronizeLiveActivity(force: true, presentFailure: userInitiated)
+            await synchronizeLiveActivity(force: true)
             await refreshStatusAndCatalog(forceCatalog: true)
             beginStatusPolling()
             let elapsed = Date().timeIntervalSince(startedAt)
@@ -360,6 +386,8 @@ final class TravelStore: ObservableObject {
             }
         } catch {
             runtimeStartedInProcess = false
+            try? await native.stop()
+            try? backgroundAudio.stop()
             failRuntime(error, operation: "start")
         }
     }
@@ -417,7 +445,7 @@ final class TravelStore: ObservableObject {
             let previousGeneration = snapshot.catalogGeneration
             let status = try await native.status()
             apply(status)
-            await synchronizeLiveActivity(force: forceCatalog, presentFailure: false)
+            await synchronizeLiveActivity(force: forceCatalog)
             if forceCatalog || status.catalogGeneration != previousGeneration || catalog.generation == 0 {
                 let next = try await native.catalog()
                 let changed = next.generation != catalog.generation
@@ -458,7 +486,7 @@ final class TravelStore: ObservableObject {
                 networkAvailable = path.status == .satisfied
                 interfaceLabel = label
                 if snapshot.phase == .running {
-                    await synchronizeLiveActivity(force: true, presentFailure: false)
+                    await synchronizeLiveActivity(force: true)
                 }
                 guard let previous, previous != signature else { return }
                 appendEvent(.network, title: "Network path changed", detail: "Current path: \(label). Reconnection requested.")
@@ -477,7 +505,7 @@ final class TravelStore: ObservableObject {
         if recoveryEvents.count > 30 { recoveryEvents.removeLast(recoveryEvents.count - 30) }
     }
 
-    private func synchronizeLiveActivity(force: Bool, presentFailure: Bool) async {
+    private func synchronizeLiveActivity(force: Bool) async {
         do {
             liveActivityStatus = try await liveActivity.synchronize(
                 snapshot: snapshot,
@@ -486,14 +514,11 @@ final class TravelStore: ObservableObject {
             )
             if liveActivityStatus == .active {
                 TravelFiles.writeE2EPhase("live-activity-active")
-            } else if liveActivityStatus == .disabled, presentFailure {
-                presentedError = "Travel is running, but Live Activities are disabled. Enable them for FlowSplice Travel in Settings to keep the session visible."
             }
         } catch {
             let message = "Live Activity could not start: \(error.localizedDescription)"
             liveActivityStatus = .failed(message)
             appendEvent(.error, title: "Live Activity unavailable", detail: message)
-            if presentFailure { presentedError = message }
         }
     }
 
