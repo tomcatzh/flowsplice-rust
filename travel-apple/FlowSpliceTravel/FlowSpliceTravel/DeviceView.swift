@@ -30,7 +30,7 @@ struct DeviceView: View {
             Section {
                 LabeledContent("Enrollment", value: store.snapshot.enrolled ? "Installed" : "Not installed")
                 LabeledContent("Configuration", value: TravelFiles.isInstalled ? "On device" : "Unavailable")
-                LabeledContent("Private Key", value: CredentialStore.load() == nil ? "Unavailable" : "Protected by Keychain")
+                LabeledContent("Private Key", value: store.credentialAvailable ? "Protected by Keychain" : "Unavailable")
                 LabeledContent("Appearance", value: colorScheme == .dark ? "System Dark" : "System Light")
             } header: {
                 Text("Installation")
@@ -59,16 +59,10 @@ struct DeviceView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("device-background-audio-detail")
-                LabeledContent("Live Activity", value: store.liveActivityStatus.label)
-                    .accessibilityIdentifier("device-live-activity-status")
-                Text(store.liveActivityStatus.detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("device-live-activity-detail")
             } header: {
                 Text("System Status")
             } footer: {
-                Text("Background audio owns continuity. Live Activity is an optional status and Stop surface.")
+                Text("The mixable playback session owns background continuity and stops with Travel.")
             }
 
             Section("Privacy") {

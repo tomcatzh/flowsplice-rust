@@ -45,12 +45,6 @@ struct DiagnosticsView: View {
                     }
                     .accessibilityIdentifier("diagnostics-prepare-screen-off")
 
-                    Button {
-                        store.prepareE2EPhase("live-activity-stop-ready")
-                    } label: {
-                        Label("Prepare Background Stop", systemImage: "stop.circle")
-                    }
-                    .accessibilityIdentifier("diagnostics-prepare-live-activity-stop")
                 } header: {
                     Text("Simulator Validation")
                 } footer: {

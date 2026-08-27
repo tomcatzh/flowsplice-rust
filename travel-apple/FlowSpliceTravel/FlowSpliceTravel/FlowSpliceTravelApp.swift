@@ -13,9 +13,6 @@ struct FlowSpliceTravelApp: App {
                 .onChange(of: scenePhase) { _, next in
                     store.handleScenePhase(next)
                 }
-                .onOpenURL { url in
-                    store.handleDeepLink(url)
-                }
         }
     }
 }

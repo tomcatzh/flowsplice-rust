@@ -114,62 +114,43 @@ struct FlowSpliceTravelTests {
         #expect(TravelSnapshot(native: status).online)
     }
 
-    @Test("Live Activity content derives stable user-facing status")
-    func liveActivityContentStatus() {
-        let online = TravelActivityAttributes.ContentState(
-            phase: "running",
-            online: true,
-            activeFlows: 2,
-            uploadedBytes: 10,
-            downloadedBytes: 20,
-            relayCount: 1,
-            mappingCount: 3,
-            interfaceLabel: "Wi-Fi",
-            updatedAt: .now
-        )
-        var reconnecting = online
-        reconnecting.online = false
-        var stopped = reconnecting
-        stopped.phase = "stopped"
-
-        #expect(online.statusLabel == "Online")
-        #expect(reconnecting.statusLabel == "Reconnecting")
-        #expect(stopped.statusLabel == "Stopped")
-    }
-
     @Test("Background audio starts and stops idempotently")
     @MainActor
-    func backgroundAudioLifecycle() throws {
+    func backgroundAudioLifecycle() async throws {
         let controller = TravelBackgroundAudioController()
-        defer { try? controller.stop() }
 
-        try controller.start()
+        try await controller.start()
         #expect(controller.status == .active)
 
-        try controller.start()
+        try await controller.start()
         #expect(controller.status == .active)
 
-        try controller.stop()
+        try await controller.stop()
         #expect(controller.status == .inactive)
 
-        try controller.stop()
+        try await controller.stop()
         #expect(controller.status == .inactive)
     }
 
-    @Test("Live Activity can be disabled without affecting runtime ownership")
-    @MainActor
-    func liveActivityCanBeDisabled() async throws {
-        let controller = TravelLiveActivityController(forceDisabled: true)
+    @Test("Native status merge preserves lifecycle and error ownership")
+    func statusMergePreservesLifecycle() throws {
+        let json = #"{"ok":true,"online":true,"travel_id":"apple-e2e","uptime_secs":12,"active_flows":1,"catalog_generation":4,"relay_directory_generation":2,"active_relays":["relay-1"],"session_uploaded_bytes":8,"session_downloaded_bytes":9,"mappings":[],"private_key_password_rotation_available":true}"#
+        let status = try JSONDecoder().decode(NativeTravelStatus.self, from: Data(json.utf8))
         var snapshot = TravelSnapshot()
-        snapshot.phase = .running
-        snapshot.online = true
+        snapshot.phase = .stopping
+        snapshot.error = "Keep this error"
 
-        #expect(controller.currentStatus == .disabled)
-        let status = try await controller.synchronize(
-            snapshot: snapshot,
-            interfaceLabel: "Wi-Fi",
-            force: true
-        )
-        #expect(status == .disabled)
+        snapshot.merge(native: status)
+
+        #expect(snapshot.phase == .stopping)
+        #expect(snapshot.error == "Keep this error")
+        #expect(snapshot.online)
+    }
+
+    @Test("Audio recovery becomes low frequency without ending")
+    func audioRecoveryBackoff() {
+        #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 1) < 1)
+        #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 8) >= 20)
+        #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 100) <= 330)
     }
 }

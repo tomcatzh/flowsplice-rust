@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +22,7 @@ static RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
         .map_err(|error| error.to_string())
 });
 static ENGINE: Mutex<Option<Arc<TravelCore>>> = Mutex::new(None);
+static ENGINE_LIFECYCLE: Mutex<()> = Mutex::new(());
 static ENROLLMENT: Mutex<Option<EnrollmentSession>> = Mutex::new(None);
 
 struct EnrollmentSession {
@@ -60,6 +62,7 @@ impl From<RemoteEnrollmentProgress> for NativeEnrollmentStatus {
 struct NativeResponse<T> {
     ok: bool,
     data: Option<T>,
+    error_code: Option<&'static str>,
     error: Option<String>,
 }
 
@@ -76,10 +79,14 @@ fn with_engine() -> Result<Arc<TravelCore>> {
 }
 
 fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> {
-    let mut slot = ENGINE
+    let _lifecycle = ENGINE_LIFECYCLE
         .lock()
         .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?;
-    if let Some(engine) = slot.as_ref() {
+    if let Some(engine) = ENGINE
+        .lock()
+        .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?
+        .clone()
+    {
         return Ok(serde_json::to_value(runtime()?.block_on(engine.status()))?);
     }
     let engine = Arc::new(
@@ -88,15 +95,21 @@ fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> 
             .context("failed to start Travel Core")?,
     );
     let status = runtime()?.block_on(engine.status());
-    *slot = Some(engine);
+    *ENGINE
+        .lock()
+        .map_err(|_| anyhow!("Travel runtime lock is poisoned"))? = Some(engine);
     Ok(serde_json::to_value(status)?)
 }
 
 fn stop_engine() -> Result<serde_json::Value> {
-    let mut slot = ENGINE
+    let _lifecycle = ENGINE_LIFECYCLE
         .lock()
         .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?;
-    let Some(engine) = slot.take() else {
+    let Some(engine) = ENGINE
+        .lock()
+        .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?
+        .take()
+    else {
         return Ok(serde_json::json!({ "running": false }));
     };
     runtime()?.block_on(engine.shutdown());
@@ -112,6 +125,20 @@ fn notify_network_changed() -> Result<serde_json::Value> {
 fn status() -> Result<serde_json::Value> {
     let engine = with_engine()?;
     Ok(serde_json::to_value(runtime()?.block_on(engine.status()))?)
+}
+
+fn wait_for_status_change(known_generation: u64, timeout_millis: u64) -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    let timeout_millis = timeout_millis.clamp(250, 30_000);
+    Ok(serde_json::to_value(runtime()?.block_on(
+        engine.wait_for_status_change(known_generation, Duration::from_millis(timeout_millis)),
+    ))?)
+}
+
+fn wake_status_waiters() -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    engine.wake_status_observers();
+    Ok(serde_json::json!({ "woken": true }))
 }
 
 fn catalog() -> Result<serde_json::Value> {
@@ -200,7 +227,7 @@ fn begin_enrollment(
             && let Ok(mut current) = task_status.lock()
         {
             "error".clone_into(&mut current.phase);
-            current.error = Some(format!("{error:#}"));
+            current.error = Some(public_error(&error).1);
         }
     });
     *slot = Some(EnrollmentSession {
@@ -254,17 +281,54 @@ fn response_json(result: Result<serde_json::Value>) -> String {
         Ok(data) => NativeResponse {
             ok: true,
             data: Some(data),
+            error_code: None,
             error: None,
         },
-        Err(error) => NativeResponse {
-            ok: false,
-            data: None,
-            error: Some(format!("{error:#}")),
-        },
+        Err(error) => {
+            let (error_code, message) = public_error(&error);
+            NativeResponse {
+                ok: false,
+                data: None,
+                error_code: Some(error_code),
+                error: Some(message),
+            }
+        }
     };
     serde_json::to_string(&response).unwrap_or_else(|error| {
         format!(r#"{{"ok":false,"data":null,"error":"JSON encoding failed: {error}"}}"#)
     })
+}
+
+fn public_error(error: &anyhow::Error) -> (&'static str, String) {
+    let detail = format!("{error:#}");
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("travel is not running") {
+        return ("not_running", "Travel is not running.".to_owned());
+    }
+    if lower.contains("tls") || lower.contains("certificate") || lower.contains("secure") {
+        return (
+            "secure_connection_failed",
+            "Could not establish a secure connection. Check the Relay address and FlowSplice versions."
+                .to_owned(),
+        );
+    }
+    if lower.contains("failed to bind") || lower.contains("address already in use") {
+        return (
+            "local_port_unavailable",
+            "The local mapping port is unavailable. Choose another port or stop the conflicting listener."
+                .to_owned(),
+        );
+    }
+    if lower.contains("invalid") || lower.contains("must be") || lower.contains("is null") {
+        return (
+            "invalid_request",
+            "The Travel request is invalid.".to_owned(),
+        );
+    }
+    (
+        "travel_core_failed",
+        "Travel Core could not complete the operation. Check Diagnostics and try again.".to_owned(),
+    )
 }
 
 fn required_string(pointer: *const c_char, name: &str) -> Result<String> {
@@ -343,6 +407,19 @@ pub extern "C" fn flowsplice_travel_status() -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn flowsplice_travel_wait_for_status_change(
+    known_generation: u64,
+    timeout_millis: u64,
+) -> *mut c_char {
+    owned_response(wait_for_status_change(known_generation, timeout_millis))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn flowsplice_travel_wake_status_waiters() -> *mut c_char {
+    owned_response(wake_status_waiters())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn flowsplice_travel_catalog() -> *mut c_char {
     owned_response(catalog())
 }
@@ -378,7 +455,11 @@ pub unsafe extern "C" fn flowsplice_travel_string_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{flowsplice_travel_stop, flowsplice_travel_string_free, stop_engine};
+    use super::{
+        flowsplice_travel_stop, flowsplice_travel_string_free, public_error, response_json,
+        stop_engine,
+    };
+    use anyhow::anyhow;
     use std::ffi::CStr;
 
     #[test]
@@ -397,5 +478,18 @@ mod tests {
         assert!(response.is_ok());
         assert!(response.is_ok_and(|json| json.contains(r#""ok":true"#)));
         unsafe { flowsplice_travel_string_free(pointer) };
+    }
+
+    #[test]
+    fn ffi_errors_do_not_expose_local_paths() {
+        let response = response_json(Err(anyhow!(
+            "failed to read /private/var/mobile/Containers/Data/Application/SECRET/config.toml"
+        )));
+        assert!(!response.contains("/private/var"));
+        assert!(response.contains(r#""error_code":"travel_core_failed""#));
+        assert_eq!(
+            public_error(&anyhow!("Travel is not running")).0,
+            "not_running"
+        );
     }
 }

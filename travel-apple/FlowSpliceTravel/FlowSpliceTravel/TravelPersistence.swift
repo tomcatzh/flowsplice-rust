@@ -16,6 +16,7 @@ enum TravelFiles {
         "enrollment_work_dir": "state/enrollment",
     ]
     private static let runtimeProtection = FileProtectionType.completeUntilFirstUserAuthentication
+    private static let runtimeProtectionMarker = ".flowsplice-protection-v1"
 
     static var installationDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -74,7 +75,18 @@ enum TravelFiles {
                 )
             }
         }
-        try applyRuntimeProtection(to: directory)
+        let protectionMarker = directory.appending(path: runtimeProtectionMarker)
+        if !FileManager.default.fileExists(atPath: protectionMarker.path) {
+            try applyRuntimeProtection(to: directory)
+            try Data("1\n".utf8).write(
+                to: protectionMarker,
+                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: protectionMarker.path
+            )
+        }
     }
 
     static func rebasedGeneratedConfig(_ source: String, installationDirectory: URL) -> String {
@@ -194,7 +206,7 @@ enum EnrollmentStore {
     }
 
     static var autoStart: Bool {
-        get { UserDefaults.standard.object(forKey: autoStartKey) as? Bool ?? true }
+        get { UserDefaults.standard.object(forKey: autoStartKey) as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: autoStartKey) }
     }
 

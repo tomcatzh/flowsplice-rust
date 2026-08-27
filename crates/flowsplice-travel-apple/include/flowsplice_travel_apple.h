@@ -1,6 +1,8 @@
 #ifndef FLOWSPLICE_TRAVEL_APPLE_H
 #define FLOWSPLICE_TRAVEL_APPLE_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,6 +19,8 @@ char *flowsplice_travel_start(const char *config_path, const char *password);
 char *flowsplice_travel_stop(void);
 char *flowsplice_travel_network_changed(void);
 char *flowsplice_travel_status(void);
+char *flowsplice_travel_wait_for_status_change(uint64_t known_generation, uint64_t timeout_millis);
+char *flowsplice_travel_wake_status_waiters(void);
 char *flowsplice_travel_catalog(void);
 char *flowsplice_travel_upsert_mapping(const char *mapping_json);
 char *flowsplice_travel_delete_mapping(

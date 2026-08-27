@@ -8,7 +8,6 @@ password_file="${1:?Apple Travel private-key password file is required}"
 relay_address="${2:-127.0.0.1:18446}"
 simulator_name="${3:-iPhone 17 Pro}"
 travel_id="${4:-apple-e2e-travel}"
-live_activity_mode="${5:-enabled}"
 background_seconds="${FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS:-120}"
 sustained_seconds="${FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS:-900}"
 longest_background_seconds="${background_seconds}"
@@ -30,19 +29,6 @@ if [[ ! -d "${DEVELOPER_DIR}" ]]; then
   echo "Xcode developer directory was not found: ${DEVELOPER_DIR}" >&2
   exit 1
 fi
-case "${live_activity_mode}" in
-  enabled)
-    live_activity_disabled=0
-    ;;
-  disabled)
-    live_activity_disabled=1
-    ;;
-  *)
-    echo "Apple Travel E2E Live Activity mode must be enabled or disabled: ${live_activity_mode}" >&2
-    exit 1
-    ;;
-esac
-
 simulator_id="$(
   xcrun simctl list devices available -j |
     python3 -c '
@@ -142,14 +128,12 @@ plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${pr
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS" -string "${sustained_seconds}" "${xctestrun_file}"
-plutil -insert "${environment_path}.FLOWSPLICE_E2E_DISABLE_LIVE_ACTIVITY" -string "${live_activity_disabled}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E" -string "1" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_RELAY" -string "${relay_address}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${private_key_password}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS" -string "${sustained_seconds}" "${xctestrun_file}"
-plutil -insert "${testing_environment_path}.FLOWSPLICE_E2E_DISABLE_LIVE_ACTIVITY" -string "${live_activity_disabled}" "${xctestrun_file}"
 test_arguments="$(
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
     '--flowsplice-apple-e2e' \
@@ -250,10 +234,6 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-wait_for_app_phase live-activity-stop-ready
-sleep 2
-xcrun simctl openurl "${simulator_id}" flowsplice://stop
-
 wait_for_app_phase screen-off-ready
 xcrun simctl io "${simulator_id}" screenConfig power off
 sleep "${screen_off_seconds}"
@@ -284,4 +264,4 @@ if [[ "${test_status}" -ne 0 ]] || ! grep -Fq 'FLOWSPLICE_APPLE_E2E_COMPLETE' "$
   exit 1
 fi
 test_succeeded=1
-printf '%s\n' "{\"checkpoint\":\"apple-background-audio-enrollment-catalog-mapping-network-simulator-background-stop-restart\",\"simulator\":\"${simulator_name}\",\"live_activity\":\"${live_activity_mode}\",\"background_seconds\":${background_seconds},\"sustained_seconds\":${sustained_seconds}}"
+printf '%s\n' "{\"checkpoint\":\"apple-background-audio-enrollment-catalog-mapping-network-simulator-background-stop-restart\",\"simulator\":\"${simulator_name}\",\"background_seconds\":${background_seconds},\"sustained_seconds\":${sustained_seconds}}"

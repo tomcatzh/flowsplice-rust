@@ -43,25 +43,39 @@ final class TravelStore: ObservableObject {
     @Published var presentedError: String?
     @Published private(set) var networkAvailable = true
     @Published private(set) var interfaceLabel = "Checking…"
-    @Published private(set) var liveActivityStatus: TravelLiveActivityStatus = .checking
     @Published private(set) var backgroundAudioStatus: TravelBackgroundAudioStatus = .inactive
+    @Published private(set) var credentialAvailable = false
 
     let defaultTravelID: String
     let defaultHomeID = "home-1"
 
-    private let native = NativeTravelClient()
-    private let liveActivity = TravelLiveActivityController()
+    private enum StartOutcome {
+        case started
+        case waitingForAudio
+        case failed
+    }
+
+    private let native: NativeTravelClient
     private let backgroundAudio: TravelBackgroundAudioControlling
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private let logger = Logger(subsystem: "io.zxf.flowsplice.travel", category: "lifecycle")
     private var lastNetworkSignature: String?
-    private var pollTask: Task<Void, Never>?
+    private var enrollmentTask: Task<Void, Never>?
+    private var statusTask: Task<Void, Never>?
+    private var lifecycleTask: Task<Void, Never>?
     private var bootstrapped = false
-    private var reconciling = false
     private var runtimeStartedInProcess = false
+    private var desiredRunning = false
+    private var currentScenePhase: ScenePhase = .active
+    private var statusGeneration: UInt64 = 0
+    private var pendingUserInitiatedStart = false
 
-    init(backgroundAudio: TravelBackgroundAudioControlling? = nil) {
+    init(
+        native: NativeTravelClient = NativeTravelClient(),
+        backgroundAudio: TravelBackgroundAudioControlling? = nil
+    ) {
+        self.native = native
         let backgroundAudio = backgroundAudio ?? TravelBackgroundAudioController()
         self.backgroundAudio = backgroundAudio
         TravelFiles.resetForUITesting()
@@ -76,16 +90,20 @@ final class TravelStore: ObservableObject {
             defaultTravelID = normalizedName.isEmpty ? "apple-travel" : normalizedName
         }
         snapshot.enrolled = TravelFiles.isInstalled
+        desiredRunning = EnrollmentStore.autoStart
+        credentialAvailable = CredentialStore.load() != nil
         if environment["FLOWSPLICE_E2E_RELAY"] != nil {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
         }
-        liveActivityStatus = liveActivity.currentStatus
         backgroundAudioStatus = backgroundAudio.status
         backgroundAudio.onStatusChange = { [weak self] status in
             guard let self else { return }
             backgroundAudioStatus = status
             if status == .active {
                 TravelFiles.writeE2EPhase("background-audio-active")
+                if desiredRunning, !runtimeStartedInProcess {
+                    requestLifecycleDrain(reason: "Background audio recovered")
+                }
             }
             if case .failed(let message) = status {
                 appendEvent(.error, title: "Background audio unavailable", detail: message)
@@ -94,7 +112,9 @@ final class TravelStore: ObservableObject {
     }
 
     deinit {
-        pollTask?.cancel()
+        enrollmentTask?.cancel()
+        statusTask?.cancel()
+        lifecycleTask?.cancel()
         networkMonitor.cancel()
     }
 
@@ -106,17 +126,13 @@ final class TravelStore: ObservableObject {
     }
 
     func handleScenePhase(_ phase: ScenePhase) {
-        switch phase {
-        case .active:
-            backgroundAudio.reconcile()
-            appendEvent(.lifecycle, title: "App active", detail: "Runtime and catalog reconciliation started.")
-            Task { await reconcile(reason: "Returned to foreground") }
-        case .background:
-            Task { await synchronizeLiveActivity(force: true) }
-        case .inactive:
-            break
-        @unknown default:
-            break
+        currentScenePhase = phase
+        Task {
+            await native.wakeStatusWaiters()
+            if phase == .active {
+                await backgroundAudio.reconcile()
+                await reconcile(reason: "Returned to foreground")
+            }
         }
     }
 
@@ -151,6 +167,7 @@ final class TravelStore: ObservableObject {
             do {
                 try TravelFiles.prepareInstallationDirectory()
                 try CredentialStore.save(password: password)
+                credentialAvailable = true
                 EnrollmentStore.lastRelay = relay
                 EnrollmentStore.pending = PendingEnrollment(
                     travelID: travelID,
@@ -175,15 +192,16 @@ final class TravelStore: ObservableObject {
 
     func cancelEnrollment() {
         isWorking = true
-        pollTask?.cancel()
+        enrollmentTask?.cancel()
         Task {
             do {
                 try await native.cancelEnrollment()
                 EnrollmentStore.pending = nil
                 CredentialStore.clear()
+                credentialAvailable = false
                 try TravelFiles.discardPendingInstallation()
                 enrollment = EnrollmentSnapshot()
-                snapshot = TravelSnapshot()
+                publish(TravelSnapshot())
                 appendEvent(.lifecycle, title: "Enrollment cancelled", detail: "Pending credentials were removed.")
             } catch {
                 fail(error)
@@ -193,66 +211,40 @@ final class TravelStore: ObservableObject {
     }
 
     func start() {
-        guard !isWorking else { return }
-        isWorking = true
-        snapshot.phase = .starting
-        snapshot.error = nil
+        desiredRunning = true
+        pendingUserInitiatedStart = true
+        EnrollmentStore.autoStart = true
+        var next = snapshot
+        next.phase = .starting
+        next.error = nil
+        publish(next)
         logger.notice("Travel start requested")
-        Task {
-            await startRuntime(userInitiated: true)
-            isWorking = false
-        }
+        requestLifecycleDrain(reason: "User Start")
     }
 
     func stop() {
-        guard !isWorking else { return }
-        isWorking = true
-        pollTask?.cancel()
+        desiredRunning = false
+        pendingUserInitiatedStart = false
         EnrollmentStore.autoStart = false
-        snapshot.phase = .stopping
+        statusTask?.cancel()
+        var next = snapshot
+        if runtimeStartedInProcess || backgroundAudioStatus != .inactive {
+            next.phase = .stopping
+        } else {
+            next.phase = .stopped
+        }
+        next.error = nil
+        publish(next)
         logger.notice("Travel stop requested")
-        Task {
-            var audioError: Error?
-            do {
-                try backgroundAudio.stop()
-            } catch {
-                audioError = error
-            }
-            do {
-                try await native.stop()
-                runtimeStartedInProcess = false
-                snapshot.phase = .stopped
-                snapshot.online = false
-                snapshot.activeFlows = 0
-                snapshot.relayCount = 0
-                snapshot.error = nil
-                liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
-                appendEvent(.lifecycle, title: "Travel stopped", detail: "Mappings remain stored for the next start.")
-                logger.notice("Travel stop completed")
-                if let audioError {
-                    fail(audioError)
-                }
-            } catch {
-                liveActivityStatus = await liveActivity.end(snapshot: snapshot, interfaceLabel: interfaceLabel)
-                failRuntime(error, operation: "stop")
-            }
-            isWorking = false
-        }
-    }
-
-    func handleDeepLink(_ url: URL) {
-        guard url.scheme?.lowercased() == "flowsplice" else { return }
-        selectedSection = .overview
-        if url.host?.lowercased() == "stop" {
-            stop()
-        }
+        Task { await native.wakeStatusWaiters() }
+        requestLifecycleDrain(reason: "User Stop")
     }
 
     func refreshCatalog() {
         Task {
             do {
                 let next = try await native.catalog()
-                catalog = next
+                if next != catalog { catalog = next }
                 appendEvent(.catalog, title: "Catalog refreshed", detail: "Generation \(next.generation), \(next.availableHomes.count) Home(s).")
             } catch {
                 fail(error)
@@ -311,14 +303,9 @@ final class TravelStore: ObservableObject {
     }
 
     private func reconcile(reason: String) async {
-        guard !reconciling else { return }
-        guard !isWorking else {
-            logger.debug("Skipped lifecycle reconciliation while an operation is running")
-            return
-        }
-        reconciling = true
-        defer { reconciling = false }
-        snapshot.enrolled = TravelFiles.isInstalled
+        var next = snapshot
+        next.enrolled = TravelFiles.isInstalled
+        publish(next)
         if let pending = EnrollmentStore.pending, !TravelFiles.isInstalled {
             guard let password = CredentialStore.load() else {
                 fail(TravelError.missingCredential)
@@ -341,65 +328,162 @@ final class TravelStore: ObservableObject {
         }
 
         guard TravelFiles.isInstalled else { return }
+        desiredRunning = EnrollmentStore.autoStart
         if runtimeStartedInProcess {
             await refreshStatusAndCatalog(forceCatalog: true)
-            if snapshot.phase == .running { beginStatusPolling() }
-        } else if EnrollmentStore.autoStart {
-            isWorking = true
-            snapshot.phase = .starting
-            await startRuntime(userInitiated: false)
-            isWorking = false
-        } else {
-            snapshot.enrolled = true
-            snapshot.phase = .stopped
+            beginStatusObservation()
         }
+        requestLifecycleDrain(reason: reason)
         appendEvent(.lifecycle, title: "State reconciled", detail: reason)
     }
 
-    private func startRuntime(userInitiated: Bool) async {
+    private func requestLifecycleDrain(reason: String) {
+        guard lifecycleTask == nil else { return }
+        lifecycleTask = Task { [weak self] in
+            guard let self else { return }
+            await drainLifecycle(reason: reason)
+        }
+    }
+
+    private func drainLifecycle(reason: String) async {
+        isWorking = true
+        defer {
+            isWorking = false
+            lifecycleTask = nil
+            let mismatch = desiredRunning != runtimeStartedInProcess
+            if mismatch, !desiredRunning || backgroundAudioStatus == .active {
+                requestLifecycleDrain(reason: "Pending desired state")
+            }
+        }
+
+        while !Task.isCancelled {
+            if desiredRunning {
+                if runtimeStartedInProcess {
+                    await backgroundAudio.reconcile()
+                    beginStatusObservation()
+                    return
+                }
+                switch await startRuntime(userInitiated: pendingUserInitiatedStart) {
+                case .started:
+                    pendingUserInitiatedStart = false
+                    if desiredRunning { return }
+                case .waitingForAudio, .failed:
+                    return
+                }
+            } else {
+                if runtimeStartedInProcess || backgroundAudioStatus != .inactive {
+                    await stopRuntime(reason: reason)
+                } else {
+                    var next = snapshot
+                    next.phase = .stopped
+                    next.online = false
+                    next.error = nil
+                    publish(next)
+                }
+                return
+            }
+        }
+    }
+
+    private func startRuntime(userInitiated: Bool) async -> StartOutcome {
         guard TravelFiles.isInstalled else {
             presentedError = "Complete remote enrollment before starting Travel."
-            return
+            desiredRunning = false
+            EnrollmentStore.autoStart = false
+            return .failed
         }
         guard let password = CredentialStore.load() else {
             fail(TravelError.missingCredential)
-            return
+            desiredRunning = false
+            EnrollmentStore.autoStart = false
+            return .failed
         }
-        snapshot.phase = .starting
-        snapshot.enrolled = true
-        snapshot.error = nil
+        var next = snapshot
+        next.phase = .starting
+        next.enrolled = true
+        next.error = nil
+        publish(next)
         let startedAt = Date()
+
         do {
-            try backgroundAudio.start()
+            try await backgroundAudio.start()
+        } catch {
+            failRuntime(error, operation: "start background keeper")
+            return desiredRunning ? .waitingForAudio : .failed
+        }
+        guard desiredRunning else {
+            try? await backgroundAudio.stop()
+            return .failed
+        }
+
+        do {
             try TravelFiles.prepareRuntimeStorage()
             let status = try await native.start(config: TravelFiles.config, password: password)
             runtimeStartedInProcess = true
-            apply(status)
+            statusGeneration = 0
+            apply(status, phase: .running, clearError: true)
             EnrollmentStore.autoStart = true
-            await synchronizeLiveActivity(force: true)
             await refreshStatusAndCatalog(forceCatalog: true)
-            beginStatusPolling()
+            beginStatusObservation()
             let elapsed = Date().timeIntervalSince(startedAt)
             logger.notice("Travel start completed in \(elapsed, format: .fixed(precision: 2)) seconds")
             if userInitiated {
                 appendEvent(.lifecycle, title: "Travel started", detail: "Runtime and local mappings are active.")
             }
+            return .started
         } catch {
             runtimeStartedInProcess = false
+            desiredRunning = false
+            EnrollmentStore.autoStart = false
             try? await native.stop()
-            try? backgroundAudio.stop()
+            try? await backgroundAudio.stop()
             failRuntime(error, operation: "start")
+            return .failed
+        }
+    }
+
+    private func stopRuntime(reason: String) async {
+        statusTask?.cancel()
+        await native.wakeStatusWaiters()
+        var audioError: Error?
+        do {
+            try await backgroundAudio.stop()
+        } catch {
+            audioError = error
+        }
+        do {
+            try await native.stop()
+            runtimeStartedInProcess = false
+            statusGeneration = 0
+            var next = snapshot
+            next.phase = .stopped
+            next.online = false
+            next.activeFlows = 0
+            next.relayCount = 0
+            next.error = nil
+            publish(next)
+            appendEvent(.lifecycle, title: "Travel stopped", detail: "Mappings remain stored for the next start.")
+            logger.notice("Travel stop completed reason=\(reason, privacy: .public)")
+            if let audioError {
+                appendEvent(
+                    .error,
+                    title: "Audio session cleanup incomplete",
+                    detail: audioError.localizedDescription
+                )
+            }
+        } catch {
+            failRuntime(error, operation: "stop")
         }
     }
 
     private func beginEnrollmentPolling() {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
+        enrollmentTask?.cancel()
+        enrollmentTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 do {
                     let next = try await native.enrollmentStatus()
-                    enrollment = next
+                    if next != enrollment { enrollment = next }
                     if let code = next.verificationCode {
                         TravelFiles.writeE2EVerificationCode(code)
                     }
@@ -407,10 +491,13 @@ final class TravelStore: ObservableObject {
                     case .installed:
                         EnrollmentStore.pending = nil
                         EnrollmentStore.autoStart = true
-                        snapshot.enrolled = true
+                        desiredRunning = true
+                        var installed = snapshot
+                        installed.enrolled = true
+                        installed.phase = .starting
+                        publish(installed)
                         appendEvent(.lifecycle, title: "Enrollment installed", detail: "Home approval and credential verification completed.")
-                        snapshot.phase = .starting
-                        await startRuntime(userInitiated: false)
+                        requestLifecycleDrain(reason: "Enrollment installed")
                         return
                     case .error:
                         if let error = next.error { fail(TravelError.native(error)) }
@@ -429,14 +516,50 @@ final class TravelStore: ObservableObject {
         }
     }
 
-    private func beginStatusPolling() {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
+    private func beginStatusObservation() {
+        guard runtimeStartedInProcess, desiredRunning, statusTask == nil else { return }
+        statusTask = Task { [weak self] in
             guard let self else { return }
-            while !Task.isCancelled {
-                await refreshStatusAndCatalog(forceCatalog: false)
-                try? await Task.sleep(for: .seconds(1))
+            defer { statusTask = nil }
+            while !Task.isCancelled, runtimeStartedInProcess, desiredRunning {
+                do {
+                    let update = try await native.waitForStatusChange(
+                        generation: statusGeneration,
+                        timeoutMillis: statusDeadlineMillis
+                    )
+                    guard !Task.isCancelled, runtimeStartedInProcess, desiredRunning else { return }
+                    statusGeneration = update.generation
+                    let previousCatalogGeneration = snapshot.catalogGeneration
+                    apply(update.status)
+                    if update.status.catalogGeneration != previousCatalogGeneration || catalog.generation == 0 {
+                        let nextCatalog = try await native.catalog()
+                        if nextCatalog != catalog {
+                            catalog = nextCatalog
+                            appendEvent(.catalog, title: "Service catalog updated", detail: "Accepted generation \(nextCatalog.generation).")
+                        }
+                    }
+                } catch {
+                    guard !Task.isCancelled, runtimeStartedInProcess, desiredRunning else { return }
+                    var next = snapshot
+                    next.online = false
+                    next.error = error.localizedDescription
+                    publish(next)
+                    return
+                }
             }
+        }
+    }
+
+    private var statusDeadlineMillis: UInt64 {
+        switch currentScenePhase {
+        case .active:
+            1_000
+        case .inactive:
+            5_000
+        case .background:
+            snapshot.activeFlows > 0 ? 5_000 : 30_000
+        @unknown default:
+            30_000
         }
     }
 
@@ -445,23 +568,36 @@ final class TravelStore: ObservableObject {
             let previousGeneration = snapshot.catalogGeneration
             let status = try await native.status()
             apply(status)
-            await synchronizeLiveActivity(force: forceCatalog)
             if forceCatalog || status.catalogGeneration != previousGeneration || catalog.generation == 0 {
                 let next = try await native.catalog()
                 let changed = next.generation != catalog.generation
-                catalog = next
+                if next != catalog { catalog = next }
                 if changed {
                     appendEvent(.catalog, title: "Service catalog updated", detail: "Accepted generation \(next.generation).")
                 }
             }
         } catch {
-            snapshot.online = false
-            snapshot.error = error.localizedDescription
+            guard runtimeStartedInProcess else { return }
+            var next = snapshot
+            next.online = false
+            next.error = error.localizedDescription
+            publish(next)
         }
     }
 
-    private func apply(_ status: NativeTravelStatus) {
-        snapshot = TravelSnapshot(native: status)
+    private func apply(
+        _ status: NativeTravelStatus,
+        phase: TravelPhase? = nil,
+        clearError: Bool = false
+    ) {
+        var next = snapshot
+        next.merge(native: status, phase: phase, clearError: clearError)
+        publish(next)
+    }
+
+    private func publish(_ next: TravelSnapshot) {
+        guard next != snapshot else { return }
+        snapshot = next
     }
 
     private func startNetworkMonitor() {
@@ -485,15 +621,13 @@ final class TravelStore: ObservableObject {
                 lastNetworkSignature = signature
                 networkAvailable = path.status == .satisfied
                 interfaceLabel = label
-                if snapshot.phase == .running {
-                    await synchronizeLiveActivity(force: true)
-                }
                 guard let previous, previous != signature else { return }
                 appendEvent(.network, title: "Network path changed", detail: "Current path: \(label). Reconnection requested.")
+                guard runtimeStartedInProcess else { return }
                 do {
                     try await native.notifyNetworkChanged()
                 } catch {
-                    if snapshot.phase == .running { fail(error) }
+                    if runtimeStartedInProcess { fail(error) }
                 }
             }
         }
@@ -505,38 +639,24 @@ final class TravelStore: ObservableObject {
         if recoveryEvents.count > 30 { recoveryEvents.removeLast(recoveryEvents.count - 30) }
     }
 
-    private func synchronizeLiveActivity(force: Bool) async {
-        do {
-            liveActivityStatus = try await liveActivity.synchronize(
-                snapshot: snapshot,
-                interfaceLabel: interfaceLabel,
-                force: force
-            )
-            if liveActivityStatus == .active {
-                TravelFiles.writeE2EPhase("live-activity-active")
-            }
-        } catch {
-            let message = "Live Activity could not start: \(error.localizedDescription)"
-            liveActivityStatus = .failed(message)
-            appendEvent(.error, title: "Live Activity unavailable", detail: message)
-        }
-    }
-
     private func fail(_ error: Error) {
         let message = error.localizedDescription
         presentedError = message
-        snapshot.error = message
+        var next = snapshot
+        next.error = message
+        publish(next)
         appendEvent(.error, title: "Needs attention", detail: message)
     }
 
     private func failRuntime(_ error: Error, operation: String) {
         let message = error.localizedDescription
-        snapshot.phase = .error
-        snapshot.online = false
-        snapshot.error = message
+        var next = snapshot
+        next.phase = .error
+        next.online = false
+        next.error = message
+        publish(next)
         presentedError = message
         appendEvent(.error, title: "Needs attention", detail: message)
         logger.error("Travel \(operation, privacy: .public) failed: \(message, privacy: .private)")
     }
-
 }

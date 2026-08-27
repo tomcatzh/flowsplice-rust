@@ -87,6 +87,11 @@ nonisolated struct NativeTravelStatus: Codable, Equatable, Sendable {
     }
 }
 
+nonisolated struct NativeTravelStatusUpdate: Codable, Equatable, Sendable {
+    var generation: UInt64
+    var status: NativeTravelStatus
+}
+
 nonisolated struct TravelSnapshot: Equatable, Sendable {
     var phase: TravelPhase = .stopped
     var online = false
@@ -115,6 +120,25 @@ nonisolated struct TravelSnapshot: Equatable, Sendable {
         relayCount = native.activeRelays.count
         catalogGeneration = native.catalogGeneration
         mappings = native.mappings
+    }
+
+    mutating func merge(
+        native: NativeTravelStatus,
+        phase nextPhase: TravelPhase? = nil,
+        clearError: Bool = false
+    ) {
+        if let nextPhase { phase = nextPhase }
+        online = native.online
+        enrolled = true
+        travelID = native.travelID
+        uptimeSeconds = native.uptimeSeconds
+        activeFlows = native.activeFlows
+        uploadedBytes = native.uploadedBytes
+        downloadedBytes = native.downloadedBytes
+        relayCount = native.activeRelays.count
+        catalogGeneration = native.catalogGeneration
+        mappings = native.mappings
+        if clearError { error = nil }
     }
 }
 
@@ -166,7 +190,15 @@ nonisolated struct TravelCatalog: Codable, Equatable, Sendable {
 nonisolated struct NativeEnvelope<Value: Decodable>: Decodable {
     var ok: Bool
     var data: Value?
+    var errorCode: String?
     var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case data
+        case errorCode = "error_code"
+        case error
+    }
 }
 
 nonisolated enum TravelError: LocalizedError, Equatable {

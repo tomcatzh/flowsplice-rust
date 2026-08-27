@@ -6,14 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		F51000010000000000000001 /* TravelActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51000110000000000000011 /* TravelActivityAttributes.swift */; };
-		F51000020000000000000002 /* TravelActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51000110000000000000011 /* TravelActivityAttributes.swift */; };
-		F51000030000000000000003 /* FlowSpliceTravelWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51000120000000000000012 /* FlowSpliceTravelWidgets.swift */; };
-		F51000040000000000000004 /* FlowSpliceTravelLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51000130000000000000013 /* FlowSpliceTravelLiveActivity.swift */; };
-		F51000050000000000000005 /* FlowSpliceTravelWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F51000150000000000000015 /* FlowSpliceTravelWidgets.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		C5EA5B9D303D406A00B33B94 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -29,38 +21,12 @@
 			remoteGlobalIDString = C5EA5B8E303D406900B33B94;
 			remoteInfo = FlowSpliceTravel;
 		};
-		F51000420000000000000042 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = C5EA5B87303D406900B33B94 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = F51000410000000000000041;
-			remoteInfo = FlowSpliceTravelWidgets;
-		};
 /* End PBXContainerItemProxy section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		F51000310000000000000031 /* Embed Foundation Extensions */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 13;
-			files = (
-				F51000050000000000000005 /* FlowSpliceTravelWidgets.appex in Embed Foundation Extensions */,
-			);
-			name = "Embed Foundation Extensions";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		C5EA5B8F303D406900B33B94 /* FlowSpliceTravel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FlowSpliceTravel.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C5EA5B9C303D406A00B33B94 /* FlowSpliceTravelTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FlowSpliceTravelTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C5EA5BA6303D406A00B33B94 /* FlowSpliceTravelUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FlowSpliceTravelUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		F51000110000000000000011 /* TravelActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TravelActivityAttributes.swift; sourceTree = "<group>"; };
-		F51000120000000000000012 /* FlowSpliceTravelWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowSpliceTravelWidgets.swift; sourceTree = "<group>"; };
-		F51000130000000000000013 /* FlowSpliceTravelLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowSpliceTravelLiveActivity.swift; sourceTree = "<group>"; };
-		F51000140000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		F51000150000000000000015 /* FlowSpliceTravelWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FlowSpliceTravelWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -116,13 +82,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		F51000320000000000000032 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -130,8 +89,6 @@
 			isa = PBXGroup;
 			children = (
 				C5EA5B91303D406900B33B94 /* FlowSpliceTravel */,
-				F51000210000000000000021 /* FlowSpliceTravelShared */,
-				F51000220000000000000022 /* FlowSpliceTravelWidgets */,
 				C5EA5B9F303D406A00B33B94 /* FlowSpliceTravelTests */,
 				C5EA5BA9303D406A00B33B94 /* FlowSpliceTravelUITests */,
 				C5EA5B90303D406900B33B94 /* Products */,
@@ -144,27 +101,8 @@
 				C5EA5B8F303D406900B33B94 /* FlowSpliceTravel.app */,
 				C5EA5B9C303D406A00B33B94 /* FlowSpliceTravelTests.xctest */,
 				C5EA5BA6303D406A00B33B94 /* FlowSpliceTravelUITests.xctest */,
-				F51000150000000000000015 /* FlowSpliceTravelWidgets.appex */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		F51000210000000000000021 /* FlowSpliceTravelShared */ = {
-			isa = PBXGroup;
-			children = (
-				F51000110000000000000011 /* TravelActivityAttributes.swift */,
-			);
-			path = FlowSpliceTravelShared;
-			sourceTree = "<group>";
-		};
-		F51000220000000000000022 /* FlowSpliceTravelWidgets */ = {
-			isa = PBXGroup;
-			children = (
-				F51000120000000000000012 /* FlowSpliceTravelWidgets.swift */,
-				F51000130000000000000013 /* FlowSpliceTravelLiveActivity.swift */,
-				F51000140000000000000014 /* Info.plist */,
-			);
-			path = FlowSpliceTravelWidgets;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -178,12 +116,10 @@
 				C5EA5B8B303D406900B33B94 /* Sources */,
 				C5EA5B8C303D406900B33B94 /* Frameworks */,
 				C5EA5B8D303D406900B33B94 /* Resources */,
-				F51000310000000000000031 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				F51000430000000000000043 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				C5EA5B91303D406900B33B94 /* FlowSpliceTravel */,
@@ -241,25 +177,6 @@
 			productReference = C5EA5BA6303D406A00B33B94 /* FlowSpliceTravelUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
-		F51000410000000000000041 /* FlowSpliceTravelWidgets */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = F51000530000000000000053 /* Build configuration list for PBXNativeTarget "FlowSpliceTravelWidgets" */;
-			buildPhases = (
-				F51000340000000000000034 /* Sources */,
-				F51000320000000000000032 /* Frameworks */,
-				F51000330000000000000033 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = FlowSpliceTravelWidgets;
-			packageProductDependencies = (
-			);
-			productName = FlowSpliceTravelWidgets;
-			productReference = F51000150000000000000015 /* FlowSpliceTravelWidgets.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -281,9 +198,6 @@
 						CreatedOnToolsVersion = 26.6;
 						TestTargetID = C5EA5B8E303D406900B33B94;
 					};
-					F51000410000000000000041 = {
-						CreatedOnToolsVersion = 26.6;
-					};
 				};
 			};
 			buildConfigurationList = C5EA5B8A303D406900B33B94 /* Build configuration list for PBXProject "FlowSpliceTravel" */;
@@ -303,7 +217,6 @@
 				C5EA5B8E303D406900B33B94 /* FlowSpliceTravel */,
 				C5EA5B9B303D406A00B33B94 /* FlowSpliceTravelTests */,
 				C5EA5BA5303D406A00B33B94 /* FlowSpliceTravelUITests */,
-				F51000410000000000000041 /* FlowSpliceTravelWidgets */,
 			);
 		};
 /* End PBXProject section */
@@ -324,13 +237,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		C5EA5BA4303D406A00B33B94 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		F51000330000000000000033 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -366,7 +272,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F51000010000000000000001 /* TravelActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -384,16 +289,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		F51000340000000000000034 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				F51000020000000000000002 /* TravelActivityAttributes.swift in Sources */,
-				F51000030000000000000003 /* FlowSpliceTravelWidgets.swift in Sources */,
-				F51000040000000000000004 /* FlowSpliceTravelLiveActivity.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -406,11 +301,6 @@
 			isa = PBXTargetDependency;
 			target = C5EA5B8E303D406900B33B94 /* FlowSpliceTravel */;
 			targetProxy = C5EA5BA7303D406A00B33B94 /* PBXContainerItemProxy */;
-		};
-		F51000430000000000000043 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = F51000410000000000000041 /* FlowSpliceTravelWidgets */;
-			targetProxy = F51000420000000000000042 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -686,62 +576,6 @@
 			};
 			name = Release;
 		};
-		F51000510000000000000051 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = FlowSpliceTravelWidgets/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				MARKETING_VERSION = 0.3.0;
-				PRODUCT_BUNDLE_IDENTIFIER = io.zxf.flowsplice.travel.widgets;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = YES;
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
-		F51000520000000000000052 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = FlowSpliceTravelWidgets/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				MARKETING_VERSION = 0.3.0;
-				PRODUCT_BUNDLE_IDENTIFIER = io.zxf.flowsplice.travel.widgets;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = YES;
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -777,15 +611,6 @@
 			buildConfigurations = (
 				C5EA5BB7303D406A00B33B94 /* Debug */,
 				C5EA5BB8303D406A00B33B94 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		F51000530000000000000053 /* Build configuration list for PBXNativeTarget "FlowSpliceTravelWidgets" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				F51000510000000000000051 /* Debug */,
-				F51000520000000000000052 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
