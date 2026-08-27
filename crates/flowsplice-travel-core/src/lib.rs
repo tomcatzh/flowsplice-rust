@@ -544,6 +544,7 @@ struct AppState {
     control_trust_state: Arc<Mutex<ControlTrustState>>,
     mappings: Arc<RwLock<Vec<Mapping>>>,
     mapping_tasks: Arc<Mutex<HashMap<String, MappingTask>>>,
+    ready_mapping_listeners: Arc<RwLock<HashMap<String, Uuid>>>,
     mapping_operation: Arc<Mutex<()>>,
 }
 
@@ -562,6 +563,23 @@ impl AppState {
         self.enrollment_outbox_generation
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
+    }
+
+    async fn set_mapping_listener_ready(&self, key: &str, token: Uuid, ready: bool) {
+        let changed = {
+            let mut listeners = self.ready_mapping_listeners.write().await;
+            if ready {
+                listeners.insert(key.to_owned(), token) != Some(token)
+            } else if listeners.get(key) == Some(&token) {
+                listeners.remove(key);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.mark_status_changed();
+        }
     }
 }
 
@@ -803,6 +821,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         control_trust_state: Arc::new(Mutex::new(control_trust_state)),
         mappings: Arc::new(RwLock::new(mappings)),
         mapping_tasks: Arc::new(Mutex::new(HashMap::new())),
+        ready_mapping_listeners: Arc::new(RwLock::new(HashMap::new())),
         mapping_operation: Arc::new(Mutex::new(())),
     })
 }
@@ -3180,26 +3199,80 @@ fn spawn_mapping_listener(
     prepared: PreparedMappingListener,
 ) -> MappingTask {
     let (shutdown, receiver) = watch::channel(false);
+    let token = Uuid::new_v4();
     let join = tokio::spawn(async move {
-        let result = match prepared {
-            PreparedMappingListener::Tcp(listener) => {
-                run_tcp_listener(state, mapping.clone(), listener, receiver).await
-            }
-            PreparedMappingListener::Udp(socket) => {
-                run_udp_listener(state, mapping.clone(), socket, receiver).await
-            }
-        };
-        if let Err(error) = result {
-            warn!(
-                home_id = %mapping.home_id,
-                service_id = %mapping.service_id,
-                address = %mapping.bind,
-                %error,
-                "local mapping listener stopped"
-            );
-        }
+        supervise_mapping_listener(state, mapping, prepared, receiver, token).await;
     });
     MappingTask { shutdown, join }
+}
+
+async fn supervise_mapping_listener(
+    state: AppState,
+    mapping: Mapping,
+    initial: PreparedMappingListener,
+    mut shutdown: watch::Receiver<bool>,
+    token: Uuid,
+) {
+    let key = mapping_key(&mapping);
+    let mut prepared = Some(initial);
+    let mut retry_delay = Duration::from_millis(100);
+    loop {
+        let listener = if let Some(listener) = prepared.take() {
+            listener
+        } else {
+            loop {
+                match prepare_mapping_listener(&mapping).await {
+                    Ok(listener) => break listener,
+                    Err(error) => {
+                        warn!(
+                            home_id = %mapping.home_id,
+                            service_id = %mapping.service_id,
+                            address = %mapping.bind,
+                            %error,
+                            retry_after_ms = retry_delay.as_millis(),
+                            "local mapping listener rebind failed"
+                        );
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                let _ = changed;
+                                return;
+                            }
+                            () = sleep(retry_delay) => {}
+                        }
+                        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        };
+
+        state.set_mapping_listener_ready(&key, token, true).await;
+        let result = match listener {
+            PreparedMappingListener::Tcp(listener) => {
+                run_tcp_listener(state.clone(), mapping.clone(), listener, shutdown.clone()).await
+            }
+            PreparedMappingListener::Udp(socket) => {
+                run_udp_listener(state.clone(), mapping.clone(), socket, shutdown.clone()).await
+            }
+        };
+        state.set_mapping_listener_ready(&key, token, false).await;
+
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                warn!(
+                    home_id = %mapping.home_id,
+                    service_id = %mapping.service_id,
+                    address = %mapping.bind,
+                    %error,
+                    "local mapping listener stopped unexpectedly; rebinding"
+                );
+            }
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+        retry_delay = Duration::from_millis(100);
+    }
 }
 
 async fn stop_mapping_task(mut task: MappingTask) {
@@ -3496,7 +3569,14 @@ async fn travel_status(state: &AppState) -> StatusResponse {
     let mut active_relays: Vec<_> = state.flow_relays.lock().await.values().cloned().collect();
     active_relays.sort();
     active_relays.dedup();
-    let online = !active_relays.is_empty() || !state.connected_relays.read().await.is_empty();
+    let mappings = state.mappings.read().await.clone();
+    let ready_mapping_listeners = state.ready_mapping_listeners.read().await;
+    let mapping_listeners_ready = mappings
+        .iter()
+        .all(|mapping| ready_mapping_listeners.contains_key(&mapping_key(mapping)));
+    let relay_connected =
+        !active_relays.is_empty() || !state.connected_relays.read().await.is_empty();
+    let online = status_is_online(mapping_listeners_ready, relay_connected);
     StatusResponse {
         ok: true,
         online,
@@ -3508,9 +3588,13 @@ async fn travel_status(state: &AppState) -> StatusResponse {
         active_relays,
         session_uploaded_bytes: state.uploaded_bytes.load(Ordering::Relaxed),
         session_downloaded_bytes: state.downloaded_bytes.load(Ordering::Relaxed),
-        mappings: state.mappings.read().await.clone(),
+        mappings,
         private_key_password_rotation_available: travel_password_rotation_is_local(&state.config),
     }
+}
+
+const fn status_is_online(mapping_listeners_ready: bool, relay_connected: bool) -> bool {
+    mapping_listeners_ready && relay_connected
 }
 
 async fn api_upsert_mapping(
@@ -4117,7 +4201,8 @@ mod tests {
         persist_runtime_mappings, remote_enrollment_capacity_available,
         remote_enrollment_outbox_expired, require_authenticated_relay_in_snapshot,
         require_control_snapshot_subject, should_persist_relay_failure,
-        signed_directory_candidates, statistics_outbox_scan_needed, trusted_home_business_pins,
+        signed_directory_candidates, statistics_outbox_scan_needed, status_is_online,
+        trusted_home_business_pins,
     };
 
     #[test]
@@ -4130,6 +4215,14 @@ mod tests {
         assert!(subcommands.contains(&"enroll-remote"));
         assert!(!subcommands.contains(&"enroll-init"));
         assert!(!subcommands.contains(&"enroll-import"));
+    }
+
+    #[test]
+    fn online_status_requires_mapping_listeners_and_a_relay() {
+        assert!(status_is_online(true, true));
+        assert!(!status_is_online(false, true));
+        assert!(!status_is_online(true, false));
+        assert!(!status_is_online(false, false));
     }
 
     #[test]
