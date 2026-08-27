@@ -35,7 +35,7 @@ struct DeviceView: View {
             } header: {
                 Text("Installation")
             } footer: {
-                Text("The app follows the iPhone or iPad appearance automatically. The private-key password is stored only in this device's Keychain.")
+                Text("The app follows the system appearance automatically. The private-key password is stored only on this device.")
             }
 
             Section {
@@ -48,7 +48,7 @@ struct DeviceView: View {
             } header: {
                 Text("System Status")
             } footer: {
-                Text("The system activity follows the current appearance and provides a Stop action. It reports the session but does not override iPadOS background limits.")
+                Text("The system activity follows the current appearance and provides a Stop action.")
             }
 
             Section {
@@ -63,8 +63,6 @@ struct DeviceView: View {
                 }
             } header: {
                 Text("Runtime")
-            } footer: {
-                Text("The Live Activity reports status only. iPadOS may suspend local mappings after the app enters the background; reopening FlowSplice restores the saved runtime and mappings.")
             }
 
             Section("Privacy") {

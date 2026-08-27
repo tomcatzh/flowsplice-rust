@@ -212,9 +212,6 @@ final class FlowSpliceTravelUITests: XCTestCase {
             return
         }
 
-        // A selectable SwiftUI List exposes the identified Label as a child of
-        // the tappable row on iPadOS. Tap its visible title when XCUI reports
-        // that child as non-hittable.
         let regularTitle = compactLabel == "Mappings" ? "Local Mappings" : compactLabel
         let sidebarTitle = app.staticTexts[regularTitle]
         XCTAssertTrue(sidebarTitle.wait(for: \.isHittable, toEqual: true, timeout: 20))

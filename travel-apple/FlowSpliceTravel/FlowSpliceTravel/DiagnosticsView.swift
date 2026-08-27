@@ -54,7 +54,7 @@ struct DiagnosticsView: View {
                 } header: {
                     Text("Simulator Validation")
                 } footer: {
-                    Text("Available only in the automated E2E environment. A real device uses the current iPadOS network path and lock state.")
+                    Text("Available only in the automated E2E environment.")
                 }
             }
 

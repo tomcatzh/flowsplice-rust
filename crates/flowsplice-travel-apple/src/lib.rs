@@ -1,8 +1,3 @@
-//! Audited C ABI boundary for the Apple Travel shell.
-//!
-//! The exported functions exchange owned UTF-8 strings and JSON. Runtime, enrollment, mapping,
-//! and transport behavior stays in the safe `flowsplice-travel-core` crate.
-
 use std::{
     ffi::{CStr, CString, c_char},
     path::{Path, PathBuf},
@@ -276,7 +271,6 @@ fn required_string(pointer: *const c_char, name: &str) -> Result<String> {
     if pointer.is_null() {
         bail!("{name} is null");
     }
-    // SAFETY: The Swift bridge passes a valid NUL-terminated pointer for the duration of this call.
     let value = unsafe { CStr::from_ptr(pointer) };
     Ok(value
         .to_str()
@@ -375,15 +369,9 @@ pub extern "C" fn flowsplice_travel_delete_mapping(
     })())
 }
 
-/// Releases a string returned by another exported function.
-///
-/// # Safety
-///
-/// `value` must either be null or a pointer returned exactly once by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flowsplice_travel_string_free(value: *mut c_char) {
     if !value.is_null() {
-        // SAFETY: The caller promises this pointer came from `CString::into_raw` in this library.
         drop(unsafe { CString::from_raw(value) });
     }
 }
@@ -403,13 +391,11 @@ mod tests {
     fn ffi_response_is_owned_utf8_json() {
         let pointer = flowsplice_travel_stop();
         assert!(!pointer.is_null());
-        // SAFETY: The pointer is live until it is released below.
         let response = unsafe { CStr::from_ptr(pointer) }
             .to_str()
             .map(str::to_owned);
         assert!(response.is_ok());
         assert!(response.is_ok_and(|json| json.contains(r#""ok":true"#)));
-        // SAFETY: The pointer was returned by this library and has not been freed yet.
         unsafe { flowsplice_travel_string_free(pointer) };
     }
 }

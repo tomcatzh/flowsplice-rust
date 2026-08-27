@@ -162,7 +162,7 @@ private struct EnrollmentStatusSection: View {
                         .font(.subheadline)
                         .foregroundStyle(.red)
                 }
-                Text(store.enrollment.phase.isActive ? "You may leave the app while approval is pending. FlowSplice resumes and reconciles when iOS returns the app to the foreground." : "Start over to change the enrollment inputs.")
+                Text(store.enrollment.phase.isActive ? "Approval remains pending until FlowSplice can reconcile again." : "Start over to change the enrollment inputs.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button(store.enrollment.phase.isActive ? "Cancel Enrollment" : "Start Over", role: .destructive) {

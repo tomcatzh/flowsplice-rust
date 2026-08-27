@@ -96,11 +96,6 @@ final class TravelStore: ObservableObject {
             appendEvent(.lifecycle, title: "App active", detail: "Runtime and catalog reconciliation started.")
             Task { await reconcile(reason: "Returned to foreground") }
         case .background:
-            appendEvent(
-                .lifecycle,
-                title: "App backgrounded",
-                detail: "Live Activity, durable enrollment, and mapping state were preserved. iPadOS may suspend the runtime."
-            )
             Task { await synchronizeLiveActivity(force: true, presentFailure: false) }
         case .inactive:
             break
