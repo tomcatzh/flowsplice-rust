@@ -398,13 +398,13 @@ export FLOWSPLICE_DOCKER_PULL=false
 公开 Home 和 Travel 包由仓库内的 `*.example.toml` 构建，只使用 IANA 保留示例域名：
 
 ```text
-flowsplice-home2-0.3.0-macos-arm64/
+flowsplice-home2-0.3.1-macos-arm64/
 ├── bin/flowsplice-homeagent
 ├── home-bootstrap.example.toml
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS
 
-flowsplice-travel-0.3.0-macos-arm64/
+flowsplice-travel-0.3.1-macos-arm64/
 ├── bin/flowsplice-travelagent
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS

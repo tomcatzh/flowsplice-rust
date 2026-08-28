@@ -7,7 +7,7 @@
 公开包只允许包含：
 
 ```text
-flowsplice-travel-0.3.0-macos-arm64/
+flowsplice-travel-0.3.1-macos-arm64/
 ├── bin/flowsplice-travelagent
 ├── QUICK_START.zh-CN.md
 └── SHA256SUMS
