@@ -22,6 +22,7 @@ char *flowsplice_travel_status(void);
 char *flowsplice_travel_wait_for_status_change(uint64_t known_generation, uint64_t timeout_millis);
 char *flowsplice_travel_wake_status_waiters(void);
 char *flowsplice_travel_catalog(void);
+char *flowsplice_travel_diagnostics(void);
 char *flowsplice_travel_upsert_mapping(const char *mapping_json);
 char *flowsplice_travel_delete_mapping(
     const char *home_id,

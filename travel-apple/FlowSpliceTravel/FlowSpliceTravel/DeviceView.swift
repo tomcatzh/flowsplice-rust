@@ -59,10 +59,17 @@ struct DeviceView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("device-background-audio-detail")
+
+                LabeledContent("Live Activity", value: store.liveActivityStatus.label)
+                    .accessibilityIdentifier("device-live-activity-status")
+                Text(store.liveActivityStatus.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("device-live-activity-detail")
             } header: {
                 Text("System Status")
             } footer: {
-                Text("The mixable playback session owns background continuity and stops with Travel.")
+                Text("Background audio owns continuity. Live Activity is optional presentation only; it never starts, stops, or keeps Travel alive.")
             }
 
             Section("Privacy") {

@@ -84,6 +84,7 @@ struct TransferState {
 
 pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<()> {
     let flow_id = Uuid::new_v4();
+    state.begin_route_flow(flow_id, &mapping).await;
     info!(
         event = "tcp_flow_started",
         %flow_id,
@@ -92,6 +93,15 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
         "travel TCP flow started"
     );
     let result = run_inner(&state, &mapping, local, flow_id).await;
+    let (uploaded_bytes, downloaded_bytes) = result.as_ref().copied().unwrap_or_default();
+    state
+        .finish_route_flow(
+            flow_id,
+            uploaded_bytes,
+            downloaded_bytes,
+            result.as_ref().err(),
+        )
+        .await;
     let relay_id = state.flow_relays.lock().await.remove(&flow_id);
     if relay_id.is_some() {
         state.mark_status_changed();
@@ -256,6 +266,9 @@ async fn run_inner(
                     reevaluate_secs = next_delay_secs;
                 }
                 None => {
+                    state
+                        .mark_route_recovering(flow_id, Some("No Relay won the carrier race"))
+                        .await;
                     warn!(
                         event = "carrier_race_retry",
                         %flow_id,
@@ -287,6 +300,9 @@ async fn run_inner(
                 .await?;
                 if closed_active {
                     active = None;
+                    state
+                        .mark_route_recovering(flow_id, Some("The active Carrier closed"))
+                        .await;
                     let generation = *state.network_generation.borrow();
                     recovery_jitter = Some(Duration::from_millis(
                         (uuid_seed(flow_id) ^ generation) % 251,
@@ -303,6 +319,13 @@ async fn run_inner(
                         "travel started immediate carrier recovery"
                     );
                 }
+                state
+                    .update_route_flow_counters(
+                        flow_id,
+                        transfer.send_offset,
+                        transfer.receive_offset,
+                    )
+                    .await;
             }
             () = sleep_until(next_reevaluation) => {}
         }
@@ -394,6 +417,9 @@ async fn perform_race(
         had_active_carrier = old_active.is_some(),
         "travel started carrier race"
     );
+    state
+        .record_route_attempt(flow_id, None, ServiceProtocol::Tcp, "started", None, None)
+        .await;
     let available_slots = state
         .config
         .max_carriers_per_flow
@@ -476,6 +502,16 @@ async fn perform_race(
                                 Some("accepted"),
                                 None,
                             );
+                            state
+                                .record_route_attempt(
+                                    flow_id,
+                                    Some(relay_id.clone()),
+                                    ServiceProtocol::Tcp,
+                                    "succeeded",
+                                    Some(latency_ms),
+                                    None,
+                                )
+                                .await;
                             record_flow_metric_sample(
                                 state,
                                 mapping,
@@ -540,6 +576,16 @@ async fn perform_race(
                                 Some("failed"),
                                 None,
                             );
+                            state
+                                .record_route_attempt(
+                                    flow_id,
+                                    Some(relay_id.clone()),
+                                    ServiceProtocol::Tcp,
+                                    "failed",
+                                    Some(latency_ms),
+                                    Some(&error.to_string()),
+                                )
+                                .await;
                             record_flow_metric_sample(
                                 state,
                                 mapping,
@@ -651,6 +697,11 @@ async fn perform_race(
             Some(race_latency_ms),
         );
         *active = Some(winner);
+        if let Some(relay_id) = winner_relay_id {
+            state
+                .select_route_relay(flow_id, relay_id, Some(race_latency_ms))
+                .await;
+        }
         retransmit(transfer, carriers, winner).await;
         Ok(Some(winner))
     } else {
@@ -670,6 +721,16 @@ async fn perform_race(
             had_active_carrier = old_active.is_some(),
             "carrier race timed out"
         );
+        state
+            .record_route_attempt(
+                flow_id,
+                old_relay_id,
+                ServiceProtocol::Tcp,
+                "failed",
+                Some(u64::try_from(race_started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                Some("Carrier race timed out"),
+            )
+            .await;
         for candidate in candidate_ids {
             close_carrier(carriers, candidate);
         }

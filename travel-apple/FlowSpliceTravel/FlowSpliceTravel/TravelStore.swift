@@ -44,6 +44,7 @@ final class TravelStore: ObservableObject {
     @Published private(set) var networkAvailable = true
     @Published private(set) var interfaceLabel = "Checking…"
     @Published private(set) var backgroundAudioStatus: TravelBackgroundAudioStatus = .inactive
+    @Published private(set) var liveActivityStatus: TravelLiveActivityStatus = .inactive
     @Published private(set) var credentialAvailable = false
 
     let defaultTravelID: String
@@ -57,6 +58,7 @@ final class TravelStore: ObservableObject {
 
     private let native: NativeTravelClient
     private let backgroundAudio: TravelBackgroundAudioControlling
+    private let liveActivity: TravelLiveActivityControlling
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private let logger = Logger(subsystem: "io.zxf.flowsplice.travel", category: "lifecycle")
@@ -64,6 +66,8 @@ final class TravelStore: ObservableObject {
     private var enrollmentTask: Task<Void, Never>?
     private var statusTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
+    private var liveActivityTask: Task<Void, Never>?
+    private var liveActivityNeedsSync = false
     private var bootstrapped = false
     private var runtimeStartedInProcess = false
     private var desiredRunning = false
@@ -73,14 +77,18 @@ final class TravelStore: ObservableObject {
 
     init(
         native: NativeTravelClient = NativeTravelClient(),
-        backgroundAudio: TravelBackgroundAudioControlling? = nil
+        backgroundAudio: TravelBackgroundAudioControlling? = nil,
+        liveActivity: TravelLiveActivityControlling? = nil
     ) {
         self.native = native
         let backgroundAudio = backgroundAudio ?? TravelBackgroundAudioController()
         self.backgroundAudio = backgroundAudio
+        let liveActivity = liveActivity ?? TravelLiveActivityController()
+        self.liveActivity = liveActivity
+        let normalizedName = TravelValidation.normalizedID(UIDevice.current.name)
+        #if DEBUG
         TravelFiles.resetForUITesting()
         let environment = ProcessInfo.processInfo.environment
-        let normalizedName = TravelValidation.normalizedID(UIDevice.current.name)
         let e2eTravelID = environment["FLOWSPLICE_E2E"] == "1"
             ? environment["FLOWSPLICE_E2E_TRAVEL_ID"].map(TravelValidation.normalizedID)
             : nil
@@ -89,18 +97,25 @@ final class TravelStore: ObservableObject {
         } else {
             defaultTravelID = normalizedName.isEmpty ? "apple-travel" : normalizedName
         }
+        #else
+        defaultTravelID = normalizedName.isEmpty ? "apple-travel" : normalizedName
+        #endif
         snapshot.enrolled = TravelFiles.isInstalled
         desiredRunning = EnrollmentStore.autoStart
         credentialAvailable = CredentialStore.load() != nil
+        #if DEBUG
         if environment["FLOWSPLICE_E2E_RELAY"] != nil {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
         }
+        #endif
         backgroundAudioStatus = backgroundAudio.status
         backgroundAudio.onStatusChange = { [weak self] status in
             guard let self else { return }
             backgroundAudioStatus = status
             if status == .active {
+                #if DEBUG
                 TravelFiles.writeE2EPhase("background-audio-active")
+                #endif
                 if desiredRunning, !runtimeStartedInProcess {
                     requestLifecycleDrain(reason: "Background audio recovered")
                 }
@@ -109,12 +124,17 @@ final class TravelStore: ObservableObject {
                 appendEvent(.error, title: "Background audio unavailable", detail: message)
             }
         }
+        liveActivityStatus = liveActivity.status
+        liveActivity.onStatusChange = { [weak self] status in
+            self?.liveActivityStatus = status
+        }
     }
 
     deinit {
         enrollmentTask?.cancel()
         statusTask?.cancel()
         lifecycleTask?.cancel()
+        liveActivityTask?.cancel()
         networkMonitor.cancel()
     }
 
@@ -122,6 +142,7 @@ final class TravelStore: ObservableObject {
         guard !bootstrapped else { return }
         bootstrapped = true
         startNetworkMonitor()
+        requestLiveActivitySync()
         Task { await reconcile(reason: "App launched") }
     }
 
@@ -132,6 +153,7 @@ final class TravelStore: ObservableObject {
             if phase == .active {
                 await backgroundAudio.reconcile()
                 await reconcile(reason: "Returned to foreground")
+                requestLiveActivitySync()
             }
         }
     }
@@ -287,6 +309,7 @@ final class TravelStore: ObservableObject {
     }
 
     func simulateNetworkChangeForTesting() {
+        #if DEBUG
         guard ProcessInfo.processInfo.environment["FLOWSPLICE_E2E"] == "1" else { return }
         Task {
             do {
@@ -296,10 +319,13 @@ final class TravelStore: ObservableObject {
                 fail(error)
             }
         }
+        #endif
     }
 
     func prepareE2EPhase(_ phase: String) {
+        #if DEBUG
         TravelFiles.writeE2EPhase(phase)
+        #endif
     }
 
     private func reconcile(reason: String) async {
@@ -598,6 +624,25 @@ final class TravelStore: ObservableObject {
     private func publish(_ next: TravelSnapshot) {
         guard next != snapshot else { return }
         snapshot = next
+        requestLiveActivitySync()
+    }
+
+    private func requestLiveActivitySync() {
+        liveActivityNeedsSync = true
+        guard liveActivityTask == nil else { return }
+        liveActivityTask = Task { [weak self] in
+            guard let self else { return }
+            while liveActivityNeedsSync, !Task.isCancelled {
+                liveActivityNeedsSync = false
+                let nextSnapshot = snapshot
+                let nextInterfaceLabel = interfaceLabel
+                await liveActivity.synchronize(
+                    snapshot: nextSnapshot,
+                    interfaceLabel: nextInterfaceLabel
+                )
+            }
+            liveActivityTask = nil
+        }
     }
 
     private func startNetworkMonitor() {
@@ -621,6 +666,7 @@ final class TravelStore: ObservableObject {
                 lastNetworkSignature = signature
                 networkAvailable = path.status == .satisfied
                 interfaceLabel = label
+                requestLiveActivitySync()
                 guard let previous, previous != signature else { return }
                 appendEvent(.network, title: "Network path changed", detail: "Current path: \(label). Reconnection requested.")
                 guard runtimeStartedInProcess else { return }

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, IsTerminal, Write},
     net::SocketAddr,
@@ -65,7 +65,7 @@ use flowsplice_storage::{
     summarize_metric_points,
 };
 use rust_embed::RustEmbed;
-use rustls_pki_types::{CertificateDer, pem::PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
@@ -425,6 +425,7 @@ const REMOTE_ENROLLMENT_VERSION: u32 = 1;
 const MAX_REMOTE_ENROLLMENT_OUTBOX_RECORDS: usize = 64;
 const REMOTE_ENROLLMENT_INSTALLED_RETENTION_SECS: u64 = 24 * 60 * 60;
 const RELAY_HISTORY_VERSION: u32 = 1;
+const MAX_ROUTE_EVENTS: usize = 256;
 const CONTROL_TRUST_STATE_OBJECT_TYPE: &str = "flowsplice.travel_control_high_water";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -529,6 +530,7 @@ struct AppState {
     permits: Arc<Semaphore>,
     carrier_permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
+    diagnostics: Arc<Mutex<DiagnosticsState>>,
     key_operation: Arc<Mutex<()>>,
     sensitive_operation: Arc<Semaphore>,
     deployment_root_public_key: Arc<String>,
@@ -581,6 +583,152 @@ impl AppState {
             self.mark_status_changed();
         }
     }
+
+    async fn begin_route_flow(&self, flow_id: Uuid, mapping: &Mapping) {
+        let now = unix_time_secs().unwrap_or_default();
+        let mut diagnostics = self.diagnostics.lock().await;
+        diagnostics.flows.insert(
+            flow_id,
+            DiagnosticFlowState {
+                mapping: mapping.clone(),
+                started_at_unix_secs: now,
+                selected_relay: None,
+                last_switch_unix_secs: None,
+                switch_count: 0,
+                uploaded_bytes: 0,
+                downloaded_bytes: 0,
+                recovering: true,
+            },
+        );
+        diagnostics.push_event(
+            now,
+            Some(flow_id),
+            None,
+            mapping.protocol,
+            "flow",
+            "started",
+            None,
+            None,
+        );
+        drop(diagnostics);
+        self.mark_status_changed();
+    }
+
+    async fn select_route_relay(&self, flow_id: Uuid, relay_id: &str, latency_ms: Option<u64>) {
+        let now = unix_time_secs().unwrap_or_default();
+        let mut diagnostics = self.diagnostics.lock().await;
+        let Some(flow) = diagnostics.flows.get_mut(&flow_id) else {
+            return;
+        };
+        let protocol = flow.mapping.protocol;
+        let previous = flow.selected_relay.replace(relay_id.to_owned());
+        let switched = previous.as_deref().is_some_and(|value| value != relay_id);
+        if switched {
+            flow.switch_count = flow.switch_count.saturating_add(1);
+            flow.last_switch_unix_secs = Some(now);
+        }
+        flow.recovering = false;
+        diagnostics.push_event(
+            now,
+            Some(flow_id),
+            Some(relay_id.to_owned()),
+            protocol,
+            "carrier",
+            if switched { "switched" } else { "selected" },
+            latency_ms,
+            None,
+        );
+        drop(diagnostics);
+        self.mark_status_changed();
+    }
+
+    async fn mark_route_recovering(&self, flow_id: Uuid, reason: Option<&str>) {
+        let now = unix_time_secs().unwrap_or_default();
+        let mut diagnostics = self.diagnostics.lock().await;
+        let Some(flow) = diagnostics.flows.get_mut(&flow_id) else {
+            return;
+        };
+        if flow.recovering {
+            return;
+        }
+        flow.recovering = true;
+        let protocol = flow.mapping.protocol;
+        let relay_id = flow.selected_relay.clone();
+        diagnostics.push_event(
+            now,
+            Some(flow_id),
+            relay_id,
+            protocol,
+            "recovery",
+            "started",
+            None,
+            reason.map(sanitized_route_reason),
+        );
+        drop(diagnostics);
+        self.mark_status_changed();
+    }
+
+    async fn update_route_flow_counters(
+        &self,
+        flow_id: Uuid,
+        uploaded_bytes: u64,
+        downloaded_bytes: u64,
+    ) {
+        if let Some(flow) = self.diagnostics.lock().await.flows.get_mut(&flow_id) {
+            flow.uploaded_bytes = uploaded_bytes;
+            flow.downloaded_bytes = downloaded_bytes;
+        }
+    }
+
+    async fn record_route_attempt(
+        &self,
+        flow_id: Uuid,
+        relay_id: Option<String>,
+        protocol: ServiceProtocol,
+        outcome: &'static str,
+        latency_ms: Option<u64>,
+        reason: Option<&str>,
+    ) {
+        let now = unix_time_secs().unwrap_or_default();
+        self.diagnostics.lock().await.push_event(
+            now,
+            Some(flow_id),
+            relay_id,
+            protocol,
+            "route_attempt",
+            outcome,
+            latency_ms,
+            reason.map(sanitized_route_reason),
+        );
+    }
+
+    async fn finish_route_flow(
+        &self,
+        flow_id: Uuid,
+        uploaded_bytes: u64,
+        downloaded_bytes: u64,
+        error: Option<&anyhow::Error>,
+    ) {
+        let now = unix_time_secs().unwrap_or_default();
+        let mut diagnostics = self.diagnostics.lock().await;
+        let Some(mut flow) = diagnostics.flows.remove(&flow_id) else {
+            return;
+        };
+        flow.uploaded_bytes = uploaded_bytes;
+        flow.downloaded_bytes = downloaded_bytes;
+        diagnostics.push_event(
+            now,
+            Some(flow_id),
+            flow.selected_relay,
+            flow.mapping.protocol,
+            "flow",
+            if error.is_some() { "failed" } else { "closed" },
+            None,
+            error.map(|value| sanitized_route_reason(&value.to_string())),
+        );
+        drop(diagnostics);
+        self.mark_status_changed();
+    }
 }
 
 struct MappingTask {
@@ -619,6 +767,118 @@ pub struct StatusResponse {
 pub struct StatusUpdate {
     pub generation: u64,
     pub status: StatusResponse,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticFlowState {
+    mapping: Mapping,
+    started_at_unix_secs: u64,
+    selected_relay: Option<String>,
+    last_switch_unix_secs: Option<u64>,
+    switch_count: u32,
+    uploaded_bytes: u64,
+    downloaded_bytes: u64,
+    recovering: bool,
+}
+
+#[derive(Default)]
+struct DiagnosticsState {
+    flows: HashMap<Uuid, DiagnosticFlowState>,
+    events: VecDeque<RouteEvent>,
+    next_event_id: u64,
+}
+
+impl DiagnosticsState {
+    #[allow(clippy::too_many_arguments)]
+    fn push_event(
+        &mut self,
+        timestamp_unix_secs: u64,
+        flow_id: Option<Uuid>,
+        relay_id: Option<String>,
+        protocol: ServiceProtocol,
+        phase: &'static str,
+        outcome: &'static str,
+        latency_ms: Option<u64>,
+        reason: Option<String>,
+    ) {
+        self.next_event_id = self.next_event_id.wrapping_add(1);
+        self.events.push_back(RouteEvent {
+            id: self.next_event_id,
+            timestamp_unix_secs,
+            flow_id: flow_id.map(|value| value.to_string()),
+            relay_id,
+            protocol,
+            phase: phase.to_owned(),
+            outcome: outcome.to_owned(),
+            latency_ms,
+            reason,
+        });
+        while self.events.len() > MAX_ROUTE_EVENTS {
+            self.events.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FlowRouteSnapshot {
+    pub flow_id: String,
+    pub home_id: String,
+    pub service_id: String,
+    pub protocol: ServiceProtocol,
+    pub local_bind: String,
+    pub selected_relay: Option<String>,
+    pub started_at_unix_secs: u64,
+    pub last_switch_unix_secs: Option<u64>,
+    pub switch_count: u32,
+    pub uploaded_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub recovering: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RelayRouteSnapshot {
+    pub relay_id: Option<String>,
+    pub redacted_endpoint: String,
+    pub current_member: bool,
+    pub observation: String,
+    pub active_flow_count: usize,
+    pub last_seen_unix_secs: Option<u64>,
+    pub last_success_unix_secs: Option<u64>,
+    pub last_failure_unix_secs: Option<u64>,
+    pub consecutive_failures: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlPlaneSnapshot {
+    pub catalog_generation: u64,
+    pub relay_directory_generation: u64,
+    pub last_accepted_unix_secs: Option<u64>,
+    pub catalog_subscription_relay: Option<String>,
+    pub connected_relays: Vec<String>,
+    pub directory_size: usize,
+    pub degraded_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RouteEvent {
+    pub id: u64,
+    pub timestamp_unix_secs: u64,
+    pub flow_id: Option<String>,
+    pub relay_id: Option<String>,
+    pub protocol: ServiceProtocol,
+    pub phase: String,
+    pub outcome: String,
+    pub latency_ms: Option<u64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DiagnosticsSnapshot {
+    pub generated_at_unix_secs: u64,
+    pub flows: Vec<FlowRouteSnapshot>,
+    pub relays: Vec<RelayRouteSnapshot>,
+    pub control_plane: ControlPlaneSnapshot,
+    pub events: Vec<RouteEvent>,
 }
 
 #[derive(Deserialize)]
@@ -723,29 +983,17 @@ pub async fn run_cli() -> Result<()> {
 }
 
 fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result<AppState> {
-    let mut config: Config = load_toml(config_path)?;
-    validate_config(&config)?;
-    let state_store = StateStore::open(&config.state_store)?;
-    let mappings = load_runtime_mappings(&config, &state_store)?;
-    apply_active_identity_directory(&mut config, &state_store)?;
-    let deployment_root_public_key = fs::read_to_string(&config.deployment_root_public_key)
-        .with_context(|| {
-            format!(
-                "failed to read deployment root public key {}",
-                config.deployment_root_public_key.display()
-            )
-        })?
-        .trim()
-        .to_owned();
+    let (config, state_store, mappings) = load_app_config(config_path)?;
+    let deployment_root_public_key = read_public_key(&config.deployment_root_public_key)?;
     let management_identity = local_certificate_identity(&config.management_cert)?;
     require_peer(&management_identity, Role::Travel, Some(&config.id), &[])?;
     let legacy_control_trust_state_path =
         enrollment_sibling(&config.management_cert, CONTROL_TRUST_STATE_FILE);
     let (control_trust_state, deployment_trust, cached_control_snapshot) =
-        load_initial_control_trust_state(
+        load_control_trust_state(
             &config,
-            &deployment_root_public_key,
             &state_store,
+            &deployment_root_public_key,
             &legacy_control_trust_state_path,
             &management_identity.spki_sha256,
         )?;
@@ -757,23 +1005,16 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
     let statistics_signer = statistics_signing_key(&management_key)?;
     let statistics_certificate_pem = fs::read_to_string(&config.management_cert)
         .context("failed to read Travel statistics signing certificate")?;
-    let statistics = LocalStatistics::new(state_store.clone());
-    let statistics_outbox_pending_at_start = !statistics.pending_reports(1)?.is_empty();
-    let enrollment_outbox_pending_at_start = !state_store
-        .scan_prefix(Table::EnrollmentOutbox, b"")?
-        .is_empty();
-    let tls = Arc::new(TlsMaterial {
-        management_connector: identity_client_connector_with_private_key(
-            &config.management_cert,
-            management_key,
-            &config.management_ca,
-        )?,
-        business_connector: identity_client_connector_with_private_key(
-            &config.business_cert,
-            business_key,
-            &config.business_ca,
-        )?,
-    });
+    let (statistics, statistics_outbox_pending_at_start, enrollment_outbox_pending_at_start) =
+        load_statistics_state(&state_store)?;
+    let tls = build_tls_material(
+        &config.management_cert,
+        management_key,
+        &config.management_ca,
+        &config.business_cert,
+        business_key,
+        &config.business_ca,
+    )?;
     let permits = Arc::new(Semaphore::new(config.max_active_flows));
     let carrier_permits = Arc::new(Semaphore::new(config.max_active_carriers));
     Ok(AppState {
@@ -804,6 +1045,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         permits,
         carrier_permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
+        diagnostics: Arc::new(Mutex::new(DiagnosticsState::default())),
         key_operation: Arc::new(Mutex::new(())),
         sensitive_operation: Arc::new(Semaphore::new(1)),
         deployment_root_public_key: Arc::new(deployment_root_public_key),
@@ -824,6 +1066,82 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         ready_mapping_listeners: Arc::new(RwLock::new(HashMap::new())),
         mapping_operation: Arc::new(Mutex::new(())),
     })
+}
+
+fn load_app_config(config_path: &Path) -> Result<(Config, StateStore, Vec<Mapping>)> {
+    let mut config: Config = load_toml(config_path)?;
+    validate_config(&config)?;
+    let state_store = StateStore::open(&config.state_store)?;
+    let mappings = load_runtime_mappings(&config, &state_store)?;
+    apply_active_identity_directory(&mut config, &state_store)?;
+    Ok((config, state_store, mappings))
+}
+
+fn read_public_key(path: &Path) -> Result<String> {
+    Ok(fs::read_to_string(path)
+        .with_context(|| {
+            format!(
+                "failed to read deployment root public key {}",
+                path.display()
+            )
+        })?
+        .trim()
+        .to_owned())
+}
+
+fn load_control_trust_state(
+    config: &Config,
+    state_store: &StateStore,
+    deployment_root_public_key: &str,
+    legacy_control_trust_state_path: &Path,
+    management_spki_sha256: &str,
+) -> Result<(
+    ControlTrustState,
+    DeploymentTrust,
+    Option<VerifiedControlSnapshot>,
+)> {
+    load_initial_control_trust_state(
+        config,
+        deployment_root_public_key,
+        state_store,
+        legacy_control_trust_state_path,
+        management_spki_sha256,
+    )
+}
+
+fn load_statistics_state(state_store: &StateStore) -> Result<(LocalStatistics, bool, bool)> {
+    let statistics = LocalStatistics::new(state_store.clone());
+    let statistics_outbox_pending_at_start = !statistics.pending_reports(1)?.is_empty();
+    let enrollment_outbox_pending_at_start = !state_store
+        .scan_prefix(Table::EnrollmentOutbox, b"")?
+        .is_empty();
+    Ok((
+        statistics,
+        statistics_outbox_pending_at_start,
+        enrollment_outbox_pending_at_start,
+    ))
+}
+
+fn build_tls_material(
+    management_cert: &Path,
+    management_key: PrivateKeyDer<'static>,
+    management_ca: &Path,
+    business_cert: &Path,
+    business_key: PrivateKeyDer<'static>,
+    business_ca: &Path,
+) -> Result<Arc<TlsMaterial>> {
+    Ok(Arc::new(TlsMaterial {
+        management_connector: identity_client_connector_with_private_key(
+            management_cert,
+            management_key,
+            management_ca,
+        )?,
+        business_connector: identity_client_connector_with_private_key(
+            business_cert,
+            business_key,
+            business_ca,
+        )?,
+    }))
 }
 
 /// A reusable, UI-independent Travel runtime.
@@ -909,6 +1227,11 @@ impl TravelCore {
     /// Returns the signed Relay directory currently accepted by the runtime.
     pub async fn relay_directory(&self) -> RelayDirectory {
         self.state.directory.read().await.clone()
+    }
+
+    /// Returns a consistent, privacy-bounded snapshot of current routes and observed Relay state.
+    pub async fn diagnostics(&self) -> DiagnosticsSnapshot {
+        diagnostics_snapshot(&self.state).await
     }
 
     /// Immediately retires connections created on the previous default network.
@@ -3050,6 +3373,7 @@ async fn record_relay_success(state: &AppState, relay_id: &str) -> Result<()> {
         record.consecutive_failures = 0;
         should_persist.then(|| record.clone())
     };
+    state.mark_status_changed();
     let Some(record) = record else {
         return Ok(());
     };
@@ -3086,6 +3410,7 @@ async fn record_relay_failure(state: &AppState, relay: &RelayCandidate) -> Resul
             should_persist_relay_failure(record.consecutive_failures, previous_failure, now);
         should_persist.then(|| record.clone())
     };
+    state.mark_status_changed();
     let Some(record) = record else {
         return Ok(());
     };
@@ -3414,35 +3739,41 @@ async fn run_udp_association(
     mapping: &Mapping,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
+    outgoing: mpsc::Receiver<Vec<u8>>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let flow_id = Uuid::new_v4();
+    state.begin_route_flow(flow_id, mapping).await;
+    let result =
+        run_udp_association_inner(state, mapping, socket, peer, outgoing, shutdown, flow_id).await;
+    let (uploaded_bytes, downloaded_bytes) = result.as_ref().copied().unwrap_or_default();
+    state
+        .finish_route_flow(
+            flow_id,
+            uploaded_bytes,
+            downloaded_bytes,
+            result.as_ref().err(),
+        )
+        .await;
+    result?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_association_inner(
+    state: &AppState,
+    mapping: &Mapping,
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
     mut outgoing: mpsc::Receiver<Vec<u8>>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+    flow_id: Uuid,
+) -> Result<(u64, u64)> {
     let config = &state.config;
-    let flow_id = Uuid::new_v4();
     let mut network_changes = state.network_generation.subscribe();
-    let mut opened = None;
-    for relay in relay_candidates(state).await {
-        let carrier_id = Uuid::new_v4();
-        match open_business_on(
-            state,
-            &relay,
-            flow_id,
-            carrier_id,
-            &mapping.service_id,
-            ServiceProtocol::Udp,
-            &mapping.home_id,
-        )
-        .await
-        {
-            Ok(carrier) => {
-                opened = Some(carrier);
-                break;
-            }
-            Err(error) => warn!(relay = relay.label(), %error, "UDP carrier attempt failed"),
-        }
-    }
-    let carrier = opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))?;
+    let carrier = open_udp_carrier_for_association(state, mapping, flow_id).await?;
     let relay_id = carrier.relay_id.clone();
+    state.select_route_relay(flow_id, &relay_id, None).await;
     let data_codec = carrier.data_codec;
     let business = carrier.stream;
     let (mut reader, mut writer) = tokio::io::split(business);
@@ -3467,6 +3798,7 @@ async fn run_udp_association(
                 let count = bytes.len() as u64;
                 uploaded_bytes = uploaded_bytes.saturating_add(count);
                 state.uploaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
                 write_data_frame(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: bytes.into() }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
@@ -3478,6 +3810,7 @@ async fn run_udp_association(
                             let count = bytes.len() as u64;
                             downloaded_bytes = downloaded_bytes.saturating_add(count);
                             state.downloaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                            state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
@@ -3503,7 +3836,61 @@ async fn run_udp_association(
         "delivered_download_datagram_bytes",
         downloaded_bytes,
     );
-    result
+    result?;
+    Ok((uploaded_bytes, downloaded_bytes))
+}
+
+async fn open_udp_carrier_for_association(
+    state: &AppState,
+    mapping: &Mapping,
+    flow_id: Uuid,
+) -> Result<BusinessCarrier> {
+    let mut opened = None;
+    for relay in relay_candidates(state).await {
+        let relay_label = relay.label().to_owned();
+        let started = Instant::now();
+        let carrier_id = Uuid::new_v4();
+        match open_business_on(
+            state,
+            &relay,
+            flow_id,
+            carrier_id,
+            &mapping.service_id,
+            ServiceProtocol::Udp,
+            &mapping.home_id,
+        )
+        .await
+        {
+            Ok(carrier) => {
+                state
+                    .record_route_attempt(
+                        flow_id,
+                        Some(carrier.relay_id.clone()),
+                        ServiceProtocol::Udp,
+                        "succeeded",
+                        Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        None,
+                    )
+                    .await;
+                opened = Some(carrier);
+                break;
+            }
+            Err(error) => {
+                state
+                    .record_route_attempt(
+                        flow_id,
+                        Some(relay_label.clone()),
+                        ServiceProtocol::Udp,
+                        "failed",
+                        Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        Some(&error.to_string()),
+                    )
+                    .await;
+                warn!(relay = %relay_label, %error, "UDP carrier attempt failed");
+            }
+        }
+    }
+    opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))
 }
 
 fn record_travel_udp_metric(
@@ -3536,6 +3923,7 @@ async fn run_ui(state: AppState) -> Result<()> {
         .route("/mappings/delete", post(api_delete_mapping))
         .route("/catalog", get(api_catalog))
         .route("/relays", get(api_relays))
+        .route("/diagnostics", get(api_diagnostics))
         .route("/statistics", get(api_statistics))
         .route(
             "/enrollment",
@@ -3708,6 +4096,253 @@ async fn api_catalog(State(state): State<AppState>) -> Json<Catalog> {
 
 async fn api_relays(State(state): State<AppState>) -> Json<RelayDirectory> {
     Json(state.directory.read().await.clone())
+}
+
+async fn api_diagnostics(State(state): State<AppState>) -> Json<DiagnosticsSnapshot> {
+    Json(diagnostics_snapshot(&state).await)
+}
+
+async fn diagnostics_snapshot(state: &AppState) -> DiagnosticsSnapshot {
+    let now = unix_time_secs().unwrap_or_default();
+    let diagnostics = state.diagnostics.lock().await;
+    let (mut flows, active_counts, events) = collect_flow_snapshot_entries(&diagnostics);
+    drop(diagnostics);
+    flows.sort_by(|left, right| {
+        left.started_at_unix_secs
+            .cmp(&right.started_at_unix_secs)
+            .then_with(|| left.flow_id.cmp(&right.flow_id))
+    });
+    let history = state.relay_history.read().await.clone();
+    let directory = state.directory.read().await.clone();
+    let catalog_generation = state.catalog.read().await.generation;
+    let connected_relays = {
+        let mut connected = state
+            .connected_relays
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        connected.sort();
+        connected
+    };
+    let mut relays = collect_relay_snapshots(
+        &history,
+        &directory,
+        &connected_relays,
+        &active_counts,
+        now,
+        &state.config.seed_relays,
+    );
+    relays.sort_by(|left, right| {
+        relay_observation_rank(&left.observation)
+            .cmp(&relay_observation_rank(&right.observation))
+            .then_with(|| left.relay_id.cmp(&right.relay_id))
+            .then_with(|| left.redacted_endpoint.cmp(&right.redacted_endpoint))
+    });
+    let last_accepted_unix_secs = history
+        .iter()
+        .filter(|record| record.current_member)
+        .map(|record| record.last_seen_unix_secs)
+        .max();
+    let has_active_tcp_flow = flows
+        .iter()
+        .any(|flow| flow.protocol == ServiceProtocol::Tcp);
+    let degraded_reason = connected_relays.is_empty().then(|| {
+        if has_active_tcp_flow {
+            "Control plane degraded; established TCP Flows continue.".to_owned()
+        } else {
+            "No active catalog subscription.".to_owned()
+        }
+    });
+    DiagnosticsSnapshot {
+        generated_at_unix_secs: now,
+        flows,
+        relays,
+        control_plane: ControlPlaneSnapshot {
+            catalog_generation,
+            relay_directory_generation: directory.generation,
+            last_accepted_unix_secs,
+            catalog_subscription_relay: connected_relays.first().cloned(),
+            connected_relays,
+            directory_size: directory.relays.len(),
+            degraded_reason,
+        },
+        events,
+    }
+}
+
+fn collect_flow_snapshot_entries(
+    diagnostics: &DiagnosticsState,
+) -> (
+    Vec<FlowRouteSnapshot>,
+    HashMap<String, usize>,
+    Vec<RouteEvent>,
+) {
+    let flows = diagnostics
+        .flows
+        .iter()
+        .map(|(flow_id, flow)| FlowRouteSnapshot {
+            flow_id: flow_id.to_string(),
+            home_id: flow.mapping.home_id.clone(),
+            service_id: flow.mapping.service_id.clone(),
+            protocol: flow.mapping.protocol,
+            local_bind: flow.mapping.bind.clone(),
+            selected_relay: flow.selected_relay.clone(),
+            started_at_unix_secs: flow.started_at_unix_secs,
+            last_switch_unix_secs: flow.last_switch_unix_secs,
+            switch_count: flow.switch_count,
+            uploaded_bytes: flow.uploaded_bytes,
+            downloaded_bytes: flow.downloaded_bytes,
+            recovering: flow.recovering,
+        })
+        .collect::<Vec<_>>();
+    let active_counts = flows
+        .iter()
+        .fold(HashMap::<String, usize>::new(), |mut counts, flow| {
+            if let Some(relay_id) = &flow.selected_relay {
+                *counts.entry(relay_id.clone()).or_default() += 1;
+            }
+            counts
+        });
+    let events = diagnostics.events.iter().rev().cloned().collect::<Vec<_>>();
+    (flows, active_counts, events)
+}
+
+fn collect_relay_snapshots(
+    history: &[RelayHistoryRecord],
+    directory: &RelayDirectory,
+    connected_relays: &[String],
+    active_counts: &HashMap<String, usize>,
+    now: u64,
+    seed_relays: &[SeedRelay],
+) -> Vec<RelayRouteSnapshot> {
+    let mut relays = Vec::new();
+    let mut known_relay_ids = HashSet::new();
+    let mut known_addresses = HashSet::new();
+    for record in history {
+        known_relay_ids.insert(record.relay_id.clone());
+        known_addresses.insert(record.management_addr.clone());
+        let active_flow_count = active_counts
+            .get(&record.relay_id)
+            .copied()
+            .unwrap_or_default();
+        relays.push(RelayRouteSnapshot {
+            relay_id: Some(record.relay_id.clone()),
+            redacted_endpoint: redact_relay_endpoint(&record.management_addr),
+            current_member: record.current_member,
+            observation: relay_observation(
+                record.current_member,
+                active_flow_count,
+                connected_relays
+                    .iter()
+                    .any(|value| value == &record.relay_id),
+                record.last_success_unix_secs,
+                record.last_failure_unix_secs,
+                now,
+            )
+            .to_owned(),
+            active_flow_count,
+            last_seen_unix_secs: Some(record.last_seen_unix_secs),
+            last_success_unix_secs: record.last_success_unix_secs,
+            last_failure_unix_secs: record.last_failure_unix_secs,
+            consecutive_failures: record.consecutive_failures,
+        });
+    }
+    for endpoint in &directory.relays {
+        if known_relay_ids.insert(endpoint.id.clone()) {
+            let active_flow_count = active_counts.get(&endpoint.id).copied().unwrap_or_default();
+            relays.push(RelayRouteSnapshot {
+                relay_id: Some(endpoint.id.clone()),
+                redacted_endpoint: redact_relay_endpoint(&endpoint.management_addr),
+                current_member: true,
+                observation: relay_observation(
+                    true,
+                    active_flow_count,
+                    connected_relays.iter().any(|value| value == &endpoint.id),
+                    None,
+                    None,
+                    now,
+                )
+                .to_owned(),
+                active_flow_count,
+                last_seen_unix_secs: None,
+                last_success_unix_secs: None,
+                last_failure_unix_secs: None,
+                consecutive_failures: 0,
+            });
+        }
+        known_addresses.insert(endpoint.management_addr.clone());
+    }
+    for seed in seed_relays {
+        if known_addresses.insert(seed.management_addr.clone()) {
+            relays.push(RelayRouteSnapshot {
+                relay_id: None,
+                redacted_endpoint: redact_relay_endpoint(&seed.management_addr),
+                current_member: false,
+                observation: "bootstrap_only".to_owned(),
+                active_flow_count: 0,
+                last_seen_unix_secs: None,
+                last_success_unix_secs: None,
+                last_failure_unix_secs: None,
+                consecutive_failures: 0,
+            });
+        }
+    }
+    relays
+}
+
+fn relay_observation(
+    current_member: bool,
+    active_flow_count: usize,
+    connected: bool,
+    last_success: Option<u64>,
+    last_failure: Option<u64>,
+    now: u64,
+) -> &'static str {
+    if active_flow_count > 0 {
+        return "in_use";
+    }
+    if !current_member {
+        return "removed";
+    }
+    if last_failure.is_some_and(|failure| last_success.is_none_or(|success| failure >= success)) {
+        return "recent_failure";
+    }
+    if connected || last_success.is_some_and(|success| now.saturating_sub(success) <= 15 * 60) {
+        return "recently_reachable";
+    }
+    "eligible_unverified"
+}
+
+fn relay_observation_rank(value: &str) -> u8 {
+    match value {
+        "in_use" => 0,
+        "recently_reachable" => 1,
+        "eligible_unverified" => 2,
+        "recent_failure" => 3,
+        "bootstrap_only" => 4,
+        _ => 5,
+    }
+}
+
+fn redact_relay_endpoint(value: &str) -> String {
+    value
+        .rsplit_once(':')
+        .map_or_else(|| "•••".to_owned(), |(_, port)| format!("•••:{port}"))
+}
+
+fn sanitized_route_reason(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "Route attempt timed out.".to_owned()
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("secure") {
+        "Secure route setup failed.".to_owned()
+    } else if lower.contains("invalid") {
+        "Relay returned an invalid route response.".to_owned()
+    } else {
+        "Relay route attempt failed.".to_owned()
+    }
 }
 
 #[derive(Deserialize)]
@@ -4194,15 +4829,15 @@ mod tests {
     use flowsplice_storage::{StateStore, Table, WriteBatch};
 
     use super::{
-        Cli, ConfiguredHome, ControlTrustState, Mapping, RELAY_HISTORY_VERSION,
-        RelayAddressOverride, RelayHistoryRecord, SeedRelay, TRAVEL_MAPPINGS_KEY,
-        bootstrap_candidate_pool, configured_home_ids, configured_homes_are_trusted,
-        enrollment_outbox_scan_needed, load_relay_history, local_ui_request_allowed,
-        persist_runtime_mappings, remote_enrollment_capacity_available,
-        remote_enrollment_outbox_expired, require_authenticated_relay_in_snapshot,
-        require_control_snapshot_subject, should_persist_relay_failure,
-        signed_directory_candidates, statistics_outbox_scan_needed, status_is_online,
-        trusted_home_business_pins,
+        Cli, ConfiguredHome, ControlTrustState, DiagnosticsState, MAX_ROUTE_EVENTS, Mapping,
+        RELAY_HISTORY_VERSION, RelayAddressOverride, RelayHistoryRecord, SeedRelay,
+        TRAVEL_MAPPINGS_KEY, bootstrap_candidate_pool, configured_home_ids,
+        configured_homes_are_trusted, enrollment_outbox_scan_needed, load_relay_history,
+        local_ui_request_allowed, persist_runtime_mappings, redact_relay_endpoint,
+        relay_observation, remote_enrollment_capacity_available, remote_enrollment_outbox_expired,
+        require_authenticated_relay_in_snapshot, require_control_snapshot_subject,
+        sanitized_route_reason, should_persist_relay_failure, signed_directory_candidates,
+        statistics_outbox_scan_needed, status_is_online, trusted_home_business_pins,
     };
 
     #[test]
@@ -4637,5 +5272,59 @@ mod tests {
         assert!(should_persist_relay_failure(4, Some(102), 103));
         assert!(!should_persist_relay_failure(5, Some(103), 104));
         assert!(should_persist_relay_failure(5, Some(100), 160));
+    }
+
+    #[test]
+    fn diagnostics_distinguish_directory_membership_from_observed_reachability() {
+        assert_eq!(
+            relay_observation(true, 1, false, None, Some(100), 200),
+            "in_use"
+        );
+        assert_eq!(
+            relay_observation(true, 0, true, None, None, 200),
+            "recently_reachable"
+        );
+        assert_eq!(
+            relay_observation(true, 0, false, None, None, 200),
+            "eligible_unverified"
+        );
+        assert_eq!(
+            relay_observation(true, 0, false, Some(100), Some(150), 200),
+            "recent_failure"
+        );
+        assert_eq!(
+            relay_observation(false, 0, false, Some(190), None, 200),
+            "removed"
+        );
+    }
+
+    #[test]
+    fn diagnostics_redact_endpoints_and_failure_details() {
+        assert_eq!(redact_relay_endpoint("relay.example:8443"), "•••:8443");
+        assert_eq!(redact_relay_endpoint("not-an-endpoint"), "•••");
+        let reason = sanitized_route_reason(
+            "failed to read /Users/example/secret/config.toml after TLS timeout",
+        );
+        assert_eq!(reason, "Route attempt timed out.");
+        assert!(!reason.contains("/Users"));
+    }
+
+    #[test]
+    fn diagnostics_event_timeline_is_bounded() {
+        let mut diagnostics = DiagnosticsState::default();
+        for index in 0..(MAX_ROUTE_EVENTS + 4) {
+            diagnostics.push_event(
+                u64::try_from(index).unwrap_or_default(),
+                None,
+                None,
+                ServiceProtocol::Tcp,
+                "flow",
+                "started",
+                None,
+                None,
+            );
+        }
+        assert_eq!(diagnostics.events.len(), MAX_ROUTE_EVENTS);
+        assert_eq!(diagnostics.events.front().map(|event| event.id), Some(5));
     }
 }

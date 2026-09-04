@@ -146,6 +146,13 @@ fn catalog() -> Result<serde_json::Value> {
     Ok(serde_json::to_value(runtime()?.block_on(engine.catalog()))?)
 }
 
+fn diagnostics() -> Result<serde_json::Value> {
+    let engine = with_engine()?;
+    Ok(serde_json::to_value(
+        runtime()?.block_on(engine.diagnostics()),
+    )?)
+}
+
 fn idle_enrollment() -> serde_json::Value {
     serde_json::json!({
         "phase": "idle",
@@ -425,6 +432,11 @@ pub extern "C" fn flowsplice_travel_catalog() -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn flowsplice_travel_diagnostics() -> *mut c_char {
+    owned_response(diagnostics())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn flowsplice_travel_upsert_mapping(mapping_json: *const c_char) -> *mut c_char {
     owned_response((|| {
         upsert_mapping(&required_string(mapping_json, "mapping JSON")?)
@@ -447,6 +459,12 @@ pub extern "C" fn flowsplice_travel_delete_mapping(
 }
 
 #[unsafe(no_mangle)]
+/// Releases a C string previously returned from one of this crate's public FFI functions.
+///
+/// # Safety
+/// The caller must ensure `value` is either null or a pointer returned by this library's
+/// `flowsplice_travel_*` functions that allocate response strings. Each pointer may only be
+/// freed once, and must not be used after this function returns.
 pub unsafe extern "C" fn flowsplice_travel_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });

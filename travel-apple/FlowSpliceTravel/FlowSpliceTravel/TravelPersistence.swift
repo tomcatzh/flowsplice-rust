@@ -140,6 +140,7 @@ enum TravelFiles {
     }
 
     static func writeE2EVerificationCode(_ code: String) {
+        #if DEBUG
         guard ProcessInfo.processInfo.environment["FLOWSPLICE_E2E"] == "1" else { return }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         try? code.write(
@@ -147,9 +148,11 @@ enum TravelFiles {
             atomically: true,
             encoding: .utf8
         )
+        #endif
     }
 
     static func writeE2EPhase(_ phase: String) {
+        #if DEBUG
         guard ProcessInfo.processInfo.environment["FLOWSPLICE_E2E"] == "1" else { return }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let safePhase = TravelValidation.normalizedID(phase)
@@ -158,9 +161,11 @@ enum TravelFiles {
             atomically: true,
             encoding: .utf8
         )
+        #endif
     }
 
     static func resetForUITesting() {
+        #if DEBUG
         guard ProcessInfo.processInfo.environment["FLOWSPLICE_UI_TEST_RESET"] == "1" else { return }
         try? FileManager.default.removeItem(at: installationDirectory)
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -172,6 +177,7 @@ enum TravelFiles {
         }
         EnrollmentStore.reset()
         CredentialStore.clear()
+        #endif
     }
 }
 

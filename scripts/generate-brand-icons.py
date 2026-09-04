@@ -101,6 +101,25 @@ def export_apple() -> None:
     )
 
 
+def export_macos() -> None:
+    app_icon = ROOT / "travel-macos/FlowSpliceMac/FlowSpliceMac/Assets.xcassets/AppIcon.appiconset"
+    app_icon.mkdir(parents=True, exist_ok=True)
+    exports = {
+        "AppIcon-16.png": 16,
+        "AppIcon-16@2x.png": 32,
+        "AppIcon-32.png": 32,
+        "AppIcon-32@2x.png": 64,
+        "AppIcon-128.png": 128,
+        "AppIcon-128@2x.png": 256,
+        "AppIcon-256.png": 256,
+        "AppIcon-256@2x.png": 512,
+        "AppIcon-512.png": 512,
+        "AppIcon-512@2x.png": 1024,
+    }
+    for filename, size in exports.items():
+        render(size).save(app_icon / filename, format="PNG", optimize=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -114,6 +133,7 @@ def main() -> None:
             export_web(ROOT / app / "web/public")
         export_android_legacy()
     export_apple()
+    export_macos()
 
 
 if __name__ == "__main__":

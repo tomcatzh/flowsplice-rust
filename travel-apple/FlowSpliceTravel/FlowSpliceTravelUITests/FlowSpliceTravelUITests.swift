@@ -82,6 +82,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Online"].waitForExistence(timeout: 150))
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
         assertBackgroundAudioIsActive(in: app)
+        assertLiveActivityIsVisible(in: app)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         XCTAssertTrue(app.buttons["mapping-add"].waitForExistence(timeout: 90))
         app.buttons["mapping-add"].tap()
@@ -123,6 +124,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
         navigate(in: app, compactLabel: "Device", regularIdentifier: "nav-device")
         XCTAssertTrue(app.buttons["device-stop"].waitForExistence(timeout: 90))
         assertBackgroundAudioIsActive(in: app)
+        assertLiveActivityIsVisible(in: app)
         navigate(in: app, compactLabel: "Mappings", regularIdentifier: "nav-mappings")
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].waitForExistence(timeout: 60))
         try assertEcho("apple-after-cold-launch-restart")
@@ -216,6 +218,21 @@ final class FlowSpliceTravelUITests: XCTestCase {
             XCTWaiter.wait(for: [active], timeout: 60),
             .completed,
             "Expected active background audio, got \(status.label)."
+        )
+    }
+
+    @MainActor
+    private func assertLiveActivityIsVisible(in app: XCUIApplication) {
+        let status = app.staticTexts["device-live-activity-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 30))
+        let visible = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS[c] %@", "Visible"),
+            object: status
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [visible], timeout: 60),
+            .completed,
+            "Expected a visible Live Activity, got \(status.label)."
         )
     }
 

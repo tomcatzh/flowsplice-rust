@@ -3,9 +3,11 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var store: TravelStore
 
+    #if DEBUG
     private var e2eEnabled: Bool {
         ProcessInfo.processInfo.environment["FLOWSPLICE_E2E"] == "1"
     }
+    #endif
 
     var body: some View {
         List {
@@ -21,6 +23,7 @@ struct DiagnosticsView: View {
                 LabeledContent("Active Relays", value: "\(store.snapshot.relayCount)")
             }
 
+            #if DEBUG
             if e2eEnabled {
                 Section {
                     Button {
@@ -51,6 +54,7 @@ struct DiagnosticsView: View {
                     Text("Available only in the automated E2E environment.")
                 }
             }
+            #endif
 
             Section("Recovery Timeline") {
                 if store.recoveryEvents.isEmpty {

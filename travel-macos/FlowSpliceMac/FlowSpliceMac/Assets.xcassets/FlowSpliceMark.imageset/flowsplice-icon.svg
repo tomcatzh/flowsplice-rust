@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" role="img" aria-labelledby="title">
+  <title id="title">FlowSplice</title>
+  <rect width="108" height="108" fill="#07110F"/>
+  <path d="M81 30H51C36 30 27 36 27 46C27 55 35 59 48 59H60C73 59 81 63 81 72C81 81 72 82 57 82H27"
+        fill="none" stroke="#70D8B6" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

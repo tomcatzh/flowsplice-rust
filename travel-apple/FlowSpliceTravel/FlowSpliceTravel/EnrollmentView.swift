@@ -92,12 +92,14 @@ struct EnrollmentView: View {
             if travelID.isEmpty { travelID = store.defaultTravelID }
             if homeID.isEmpty { homeID = store.defaultHomeID }
             if relay.isEmpty { relay = EnrollmentStore.lastRelay }
+            #if DEBUG
             let environment = ProcessInfo.processInfo.environment
             if environment["FLOWSPLICE_E2E"] == "1",
                let e2ePassword = environment["FLOWSPLICE_E2E_PASSWORD"] {
                 if password.isEmpty { password = e2ePassword }
                 if confirmation.isEmpty { confirmation = e2ePassword }
             }
+            #endif
         }
     }
 

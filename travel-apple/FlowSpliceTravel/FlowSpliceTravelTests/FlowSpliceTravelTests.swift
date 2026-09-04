@@ -153,4 +153,64 @@ struct FlowSpliceTravelTests {
         #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 8) >= 20)
         #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 100) <= 330)
     }
+
+    @Test("Live Activity is presentation for a running runtime only")
+    func liveActivityVisibilityPolicy() {
+        var snapshot = TravelSnapshot()
+        snapshot.phase = .starting
+        #expect(!TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Wi‑Fi").shouldBeVisible)
+
+        snapshot.phase = .running
+        #expect(TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Wi‑Fi").shouldBeVisible)
+
+        snapshot.phase = .stopping
+        #expect(!TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Wi‑Fi").shouldBeVisible)
+    }
+
+    @Test("Live Activity updates state immediately but rate-limits traffic-only changes")
+    func liveActivityUpdatePolicy() {
+        var snapshot = TravelSnapshot()
+        snapshot.phase = .running
+        snapshot.online = true
+        let previous = TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Wi‑Fi")
+        let lastUpdated = Date(timeIntervalSince1970: 1_000)
+
+        snapshot.downloadedBytes = 4_096
+        let trafficOnly = TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Wi‑Fi")
+        #expect(!trafficOnly.requiresUpdate(
+            comparedWith: previous,
+            lastUpdated: lastUpdated,
+            now: lastUpdated.addingTimeInterval(1),
+            telemetryInterval: 60
+        ))
+        #expect(trafficOnly.requiresUpdate(
+            comparedWith: previous,
+            lastUpdated: lastUpdated,
+            now: lastUpdated.addingTimeInterval(60),
+            telemetryInterval: 60
+        ))
+
+        snapshot.online = false
+        let connectivityChange = TravelLiveActivityPresentation(snapshot: snapshot, interfaceLabel: "Cellular")
+        #expect(connectivityChange.requiresUpdate(
+            comparedWith: trafficOnly,
+            lastUpdated: lastUpdated,
+            now: lastUpdated.addingTimeInterval(1),
+            telemetryInterval: 60
+        ))
+    }
+
+    @Test("Disabled Live Activities stay optional for running Travel state")
+    @MainActor
+    func disabledLiveActivityIsOptional() async {
+        let controller = TravelLiveActivityController(forceDisabled: true)
+        var snapshot = TravelSnapshot()
+        snapshot.phase = .running
+        snapshot.online = true
+
+        await controller.synchronize(snapshot: snapshot, interfaceLabel: "Wi‑Fi")
+
+        #expect(controller.status == .disabled)
+        #expect(controller.status.detail.contains("continues independently"))
+    }
 }
