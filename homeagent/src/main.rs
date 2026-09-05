@@ -73,7 +73,7 @@ use flowsplice_enrollment::{
     parse_enrollment_request, prepare_enrollment_approval,
 };
 use flowsplice_storage::{
-    LocalStatistics, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
+    LocalStatistics, MetricBatch, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
     summarize_metric_points,
 };
 use rust_embed::RustEmbed;
@@ -81,7 +81,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpStream, UdpSocket},
     sync::{Mutex, Semaphore, mpsc, oneshot, watch},
-    time::{interval, sleep, timeout},
+    time::{MissedTickBehavior, interval, sleep, timeout},
 };
 use tokio_rustls::{
     TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
@@ -2237,29 +2237,55 @@ async fn serve_udp(
     let mut send_sequence = 0_u64;
     let mut receive_sequence = 0_u64;
     let mut buffer = vec![0_u8; 65_507];
-    let mut downloaded_bytes = 0_u64;
-    let mut uploaded_bytes = 0_u64;
-    let result: Result<()> = async {
+    let dimensions = home_udp_metric_dimensions(&travel_id, service, &relay_id);
+    let mut observed_datagram_bytes = MetricBatch::new(
+        statistics.as_ref().clone(),
+        "home_flow_download_observed_datagram_bytes".to_owned(),
+        dimensions.clone(),
+    );
+    let mut delivered_datagram_bytes = MetricBatch::new(
+        statistics.as_ref().clone(),
+        "delivered_upload_datagram_bytes".to_owned(),
+        dimensions,
+    );
+    let mut statistics_tick = interval(Duration::from_secs(5));
+    statistics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    statistics_tick.tick().await;
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
     loop {
         tokio::select! {
-            response = timeout(Duration::from_secs(idle_secs), socket.recv(&mut buffer)) => {
-                let count = response.context("UDP association idle timeout")??;
-                downloaded_bytes = downloaded_bytes.saturating_add(count as u64);
+            count = socket.recv(&mut buffer) => {
+                let count = count?;
+                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
+                if count > 0 && let Ok(now) = unix_time_secs() {
+                    observed_datagram_bytes.record(now, count as u64);
+                }
                 write_data_frame(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: Bytes::copy_from_slice(&buffer[..count]) }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(idle_secs), tls_reader.read()) => {
-                match frame.context("UDP association idle timeout")?? {
+            frame = tls_reader.read() => {
+                let frame = frame?;
+                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
+                match frame {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
-                            socket.send(&bytes).await?;
-                            uploaded_bytes = uploaded_bytes.saturating_add(bytes.len() as u64);
+                            let delivered = socket.send(&bytes).await?;
+                            if delivered > 0 && let Ok(now) = unix_time_secs() {
+                                delivered_datagram_bytes.record(now, delivered as u64);
+                            }
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
                     DataFrame::Close { flow_id: id, .. } if id == flow_id => return Ok(()),
                     _ => bail!("invalid UDP flow frame"),
                 }
+            }
+            _ = statistics_tick.tick() => {
+                observed_datagram_bytes.flush();
+                delivered_datagram_bytes.flush();
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                bail!("UDP association idle timeout");
             }
             changed = authorization_rx.changed() => {
                 changed.map_err(|_| anyhow::anyhow!("Travel authorization publisher closed"))?;
@@ -2270,25 +2296,19 @@ async fn serve_udp(
             }
         }
     }
-    }
-    .await;
-    record_home_udp_metric(
-        &statistics,
-        &travel_id,
-        service,
-        &relay_id,
-        "home_flow_download_observed_datagram_bytes",
-        downloaded_bytes,
-    );
-    record_home_udp_metric(
-        &statistics,
-        &travel_id,
-        service,
-        &relay_id,
-        "delivered_upload_datagram_bytes",
-        uploaded_bytes,
-    );
-    result
+}
+
+fn home_udp_metric_dimensions(
+    travel_id: &str,
+    service: &Service,
+    relay_id: &str,
+) -> BTreeMap<String, String> {
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert("travel_id".to_owned(), travel_id.to_owned());
+    dimensions.insert("service_id".to_owned(), service.id.clone());
+    dimensions.insert("protocol".to_owned(), "udp".to_owned());
+    dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
+    dimensions
 }
 
 fn record_home_udp_metric(
@@ -2316,11 +2336,7 @@ fn record_home_udp_metric_sample(
     value: u64,
     histogram_sample: Option<u64>,
 ) {
-    let mut dimensions = BTreeMap::new();
-    dimensions.insert("travel_id".to_owned(), travel_id.to_owned());
-    dimensions.insert("service_id".to_owned(), service.id.clone());
-    dimensions.insert("protocol".to_owned(), "udp".to_owned());
-    dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
+    let dimensions = home_udp_metric_dimensions(travel_id, service, relay_id);
     if let Ok(now) = unix_time_secs() {
         statistics.record(now, family, dimensions, value, histogram_sample);
     }

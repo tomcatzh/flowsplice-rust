@@ -78,7 +78,11 @@ fn with_engine() -> Result<Arc<TravelCore>> {
         .ok_or_else(|| anyhow!("Travel is not running"))
 }
 
-fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> {
+fn start_engine(
+    config_path: &str,
+    password: &str,
+    trusted_root: &str,
+) -> Result<serde_json::Value> {
     let _lifecycle = ENGINE_LIFECYCLE
         .lock()
         .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?;
@@ -91,7 +95,11 @@ fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> 
     }
     let engine = Arc::new(
         runtime()?
-            .block_on(TravelCore::start(Path::new(config_path), password))
+            .block_on(TravelCore::start_with_trusted_root(
+                Path::new(config_path),
+                password,
+                trusted_root,
+            ))
             .context("failed to start Travel Core")?,
     );
     let status = runtime()?.block_on(engine.status());
@@ -186,6 +194,7 @@ fn begin_enrollment(
     home_id: &str,
     selected_relay: &str,
     password: &str,
+    trusted_root: &str,
 ) -> Result<serde_json::Value> {
     let mut slot = ENROLLMENT
         .lock()
@@ -217,6 +226,7 @@ fn begin_enrollment(
         home_id: home_id.to_owned(),
         install_dir: PathBuf::from(install_dir),
         bootstrap_config: None,
+        trusted_deployment_root_public_key: Some(trusted_root.to_owned()),
         selected_relay: (!selected_relay.is_empty()).then(|| selected_relay.to_owned()),
         ui_listen: None,
         private_key_password: password.to_owned(),
@@ -309,6 +319,12 @@ fn response_json(result: Result<serde_json::Value>) -> String {
 fn public_error(error: &anyhow::Error) -> (&'static str, String) {
     let detail = format!("{error:#}");
     let lower = detail.to_ascii_lowercase();
+    if lower.contains("deployment trust mismatch")
+        || lower.contains("trusted deployment public key")
+        || lower.contains("outside the trusted deployment")
+    {
+        return ("deployment_trust_mismatch", "The deployment does not match this app package. Use the package for your deployment; the installed identity has been preserved.".to_owned());
+    }
     if lower.contains("travel is not running") {
         return ("not_running", "Travel is not running.".to_owned());
     }
@@ -363,6 +379,7 @@ pub extern "C" fn flowsplice_travel_begin_enrollment(
     home_id: *const c_char,
     selected_relay: *const c_char,
     password: *const c_char,
+    trusted_root: *const c_char,
 ) -> *mut c_char {
     owned_response((|| {
         begin_enrollment(
@@ -371,6 +388,7 @@ pub extern "C" fn flowsplice_travel_begin_enrollment(
             &required_string(home_id, "Home id")?,
             &required_string(selected_relay, "Relay")?,
             &required_string(password, "private-key password")?,
+            &required_string(trusted_root, "trusted deployment public key")?,
         )
     })())
 }
@@ -389,11 +407,13 @@ pub extern "C" fn flowsplice_travel_cancel_enrollment() -> *mut c_char {
 pub extern "C" fn flowsplice_travel_start(
     config_path: *const c_char,
     password: *const c_char,
+    trusted_root: *const c_char,
 ) -> *mut c_char {
     owned_response((|| {
         start_engine(
             &required_string(config_path, "config path")?,
             &required_string(password, "private-key password")?,
+            &required_string(trusted_root, "trusted deployment public key")?,
         )
     })())
 }

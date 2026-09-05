@@ -11,10 +11,15 @@ object NativeTravel {
         homeId: String,
         selectedRelay: String,
         privateKeyPassword: String,
+        trustedDeploymentRootPublicKey: String,
     ): String
     external fun enrollmentStatus(): String
     external fun cancelEnrollment(): String
-    external fun start(configPath: String, privateKeyPassword: String): String
+    external fun start(
+        configPath: String,
+        privateKeyPassword: String,
+        trustedDeploymentRootPublicKey: String,
+    ): String
     external fun stop(): String
     external fun networkChanged(): String
     external fun status(): String

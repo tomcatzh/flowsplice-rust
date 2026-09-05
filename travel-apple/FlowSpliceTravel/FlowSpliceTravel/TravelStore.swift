@@ -6,6 +6,54 @@ import SwiftUI
 import UIKit
 
 @MainActor
+protocol TravelRuntimeControlling: AnyObject {
+    func beginEnrollment(
+        installDirectory: URL,
+        travelID: String,
+        homeID: String,
+        relay: String,
+        password: String
+    ) async throws -> EnrollmentSnapshot
+    func enrollmentStatus() async throws -> EnrollmentSnapshot
+    func cancelEnrollment() async throws
+    func start(config: URL, password: String) async throws -> NativeTravelStatus
+    func stop() async throws
+    func notifyNetworkChanged() async throws
+    func status() async throws -> NativeTravelStatus
+    func waitForStatusChange(
+        generation: UInt64,
+        timeoutMillis: UInt64
+    ) async throws -> NativeTravelStatusUpdate
+    func wakeStatusWaiters() async
+    func catalog() async throws -> TravelCatalog
+    func upsert(mapping: TravelMapping) async throws -> TravelMapping
+    func delete(mapping: TravelMapping) async throws -> TravelMapping
+}
+
+extension NativeTravelClient: TravelRuntimeControlling {}
+
+@MainActor
+struct TravelFileAccess {
+    let installationDirectory: () -> URL
+    let config: () -> URL
+    let isInstalled: () -> Bool
+    let prepareInstallationDirectory: () throws -> Void
+    let prepareRuntimeStorage: () throws -> Void
+    let discardPendingInstallation: () throws -> Void
+    let removeInstallationForReenrollment: () throws -> Void
+
+    static let live = Self(
+        installationDirectory: { TravelFiles.installationDirectory },
+        config: { TravelFiles.config },
+        isInstalled: { TravelFiles.isInstalled },
+        prepareInstallationDirectory: { try TravelFiles.prepareInstallationDirectory() },
+        prepareRuntimeStorage: { try TravelFiles.prepareRuntimeStorage() },
+        discardPendingInstallation: { try TravelFiles.discardPendingInstallation() },
+        removeInstallationForReenrollment: { try TravelFiles.removeInstallationForReenrollment() }
+    )
+}
+
+@MainActor
 final class TravelStore: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
         case overview
@@ -43,9 +91,14 @@ final class TravelStore: ObservableObject {
     @Published var presentedError: String?
     @Published private(set) var networkAvailable = true
     @Published private(set) var interfaceLabel = "Checking…"
-    @Published private(set) var backgroundAudioStatus: TravelBackgroundAudioStatus = .inactive
+    @Published private(set) var backgroundAudioStatus: TravelBackgroundAudioStatus = .inactive {
+        didSet { refreshCanStop() }
+    }
     @Published private(set) var liveActivityStatus: TravelLiveActivityStatus = .inactive
     @Published private(set) var credentialAvailable = false
+    @Published private(set) var credentialAvailability: CredentialAvailability = .missing
+    @Published private(set) var canStop = false
+    @Published private(set) var isReenrolling = false
 
     let defaultTravelID: String
     let defaultHomeID = "home-1"
@@ -54,11 +107,16 @@ final class TravelStore: ObservableObject {
         case started
         case waitingForAudio
         case failed
+        case stopped
     }
 
-    private let native: NativeTravelClient
+    private let native: any TravelRuntimeControlling
     private let backgroundAudio: TravelBackgroundAudioControlling
     private let liveActivity: TravelLiveActivityControlling
+    private let files: TravelFileAccess
+    private let credentialLookup: () -> CredentialLookupResult
+    private let credentialSave: (String) throws -> Void
+    private let credentialClear: () -> Void
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "io.zxf.flowsplice.travel.network")
     private let logger = Logger(subsystem: "io.zxf.flowsplice.travel", category: "lifecycle")
@@ -69,22 +127,38 @@ final class TravelStore: ObservableObject {
     private var liveActivityTask: Task<Void, Never>?
     private var liveActivityNeedsSync = false
     private var bootstrapped = false
-    private var runtimeStartedInProcess = false
-    private var desiredRunning = false
+    private var lifecycleIsDraining = false {
+        didSet { refreshCanStop() }
+    }
+    private var lifecycleRequestGeneration: UInt64 = 0
+    private var runtimeStartedInProcess = false {
+        didSet { refreshCanStop() }
+    }
+    private var desiredRunning = false {
+        didSet { refreshCanStop() }
+    }
     private var currentScenePhase: ScenePhase = .active
     private var statusGeneration: UInt64 = 0
     private var pendingUserInitiatedStart = false
 
     init(
-        native: NativeTravelClient = NativeTravelClient(),
+        native: any TravelRuntimeControlling = NativeTravelClient(),
         backgroundAudio: TravelBackgroundAudioControlling? = nil,
-        liveActivity: TravelLiveActivityControlling? = nil
+        liveActivity: TravelLiveActivityControlling? = nil,
+        files: TravelFileAccess = .live,
+        credentialLookup: @escaping () -> CredentialLookupResult = CredentialStore.lookup,
+        credentialSave: @escaping (String) throws -> Void = CredentialStore.save,
+        credentialClear: @escaping () -> Void = CredentialStore.clear
     ) {
         self.native = native
         let backgroundAudio = backgroundAudio ?? TravelBackgroundAudioController()
         self.backgroundAudio = backgroundAudio
         let liveActivity = liveActivity ?? TravelLiveActivityController()
         self.liveActivity = liveActivity
+        self.files = files
+        self.credentialLookup = credentialLookup
+        self.credentialSave = credentialSave
+        self.credentialClear = credentialClear
         let normalizedName = TravelValidation.normalizedID(UIDevice.current.name)
         #if DEBUG
         TravelFiles.resetForUITesting()
@@ -100,9 +174,9 @@ final class TravelStore: ObservableObject {
         #else
         defaultTravelID = normalizedName.isEmpty ? "apple-travel" : normalizedName
         #endif
-        snapshot.enrolled = TravelFiles.isInstalled
+        snapshot.enrolled = files.isInstalled()
         desiredRunning = EnrollmentStore.autoStart
-        credentialAvailable = CredentialStore.load() != nil
+        applyCredentialLookup(credentialLookup())
         #if DEBUG
         if environment["FLOWSPLICE_E2E_RELAY"] != nil {
             EnrollmentStore.lastRelay = environment["FLOWSPLICE_E2E_RELAY"] ?? ""
@@ -128,6 +202,7 @@ final class TravelStore: ObservableObject {
         liveActivity.onStatusChange = { [weak self] status in
             self?.liveActivityStatus = status
         }
+        refreshCanStop()
     }
 
     deinit {
@@ -187,9 +262,10 @@ final class TravelStore: ObservableObject {
         isWorking = true
         Task {
             do {
-                try TravelFiles.prepareInstallationDirectory()
-                try CredentialStore.save(password: password)
+                try files.prepareInstallationDirectory()
+                try credentialSave(password)
                 credentialAvailable = true
+                credentialAvailability = .available
                 EnrollmentStore.lastRelay = relay
                 EnrollmentStore.pending = PendingEnrollment(
                     travelID: travelID,
@@ -197,7 +273,7 @@ final class TravelStore: ObservableObject {
                     relay: relay.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
                 enrollment = try await native.beginEnrollment(
-                    installDirectory: TravelFiles.installationDirectory,
+                    installDirectory: files.installationDirectory(),
                     travelID: travelID,
                     homeID: homeID,
                     relay: relay,
@@ -219,9 +295,10 @@ final class TravelStore: ObservableObject {
             do {
                 try await native.cancelEnrollment()
                 EnrollmentStore.pending = nil
-                CredentialStore.clear()
+                credentialClear()
                 credentialAvailable = false
-                try TravelFiles.discardPendingInstallation()
+                credentialAvailability = .missing
+                try files.discardPendingInstallation()
                 enrollment = EnrollmentSnapshot()
                 publish(TravelSnapshot())
                 appendEvent(.lifecycle, title: "Enrollment cancelled", detail: "Pending credentials were removed.")
@@ -260,6 +337,55 @@ final class TravelStore: ObservableObject {
         logger.notice("Travel stop requested")
         Task { await native.wakeStatusWaiters() }
         requestLifecycleDrain(reason: "User Stop")
+    }
+
+    var needsReenrollmentOnThisDevice: Bool {
+        snapshot.enrolled && credentialAvailability == .missing
+    }
+
+    func reenrollOnThisDevice() {
+        guard !isReenrolling else { return }
+        let credential = credentialLookup()
+        applyCredentialLookup(credential)
+        guard snapshot.enrolled, credential.availability == .missing else { return }
+        isReenrolling = true
+        stop()
+        Task { [weak self] in
+            guard let self else { return }
+            defer { isReenrolling = false }
+            await waitForRuntimeCleanup()
+            guard !runtimeStartedInProcess, backgroundAudioStatus == .inactive else {
+                fail(TravelError.native("Travel could not finish stopping. Try again before re-enrolling this device."))
+                return
+            }
+            do {
+                enrollmentTask?.cancel()
+                try await native.cancelEnrollment()
+                let currentCredential = credentialLookup()
+                applyCredentialLookup(currentCredential)
+                guard snapshot.enrolled, currentCredential.availability == .missing else { return }
+                try files.removeInstallationForReenrollment()
+                credentialClear()
+                EnrollmentStore.pending = nil
+                EnrollmentStore.autoStart = false
+                desiredRunning = false
+                pendingUserInitiatedStart = false
+                credentialAvailable = false
+                credentialAvailability = .missing
+                enrollment = EnrollmentSnapshot()
+                catalog = TravelCatalog()
+                statusGeneration = 0
+                presentedError = nil
+                publish(TravelSnapshot())
+                appendEvent(
+                    .lifecycle,
+                    title: "Device enrollment removed",
+                    detail: "This device is ready to enroll again."
+                )
+            } catch {
+                fail(error)
+            }
+        }
     }
 
     func refreshCatalog() {
@@ -330,17 +456,16 @@ final class TravelStore: ObservableObject {
 
     private func reconcile(reason: String) async {
         var next = snapshot
-        next.enrolled = TravelFiles.isInstalled
+        next.enrolled = files.isInstalled()
         publish(next)
-        if let pending = EnrollmentStore.pending, !TravelFiles.isInstalled {
-            guard let password = CredentialStore.load() else {
-                fail(TravelError.missingCredential)
+        if let pending = EnrollmentStore.pending, !files.isInstalled() {
+            guard let password = credentialPassword() else {
                 return
             }
             do {
-                try TravelFiles.prepareInstallationDirectory()
+                try files.prepareInstallationDirectory()
                 enrollment = try await native.beginEnrollment(
-                    installDirectory: TravelFiles.installationDirectory,
+                    installDirectory: files.installationDirectory(),
                     travelID: pending.travelID,
                     homeID: pending.homeID,
                     relay: pending.relay,
@@ -353,7 +478,14 @@ final class TravelStore: ObservableObject {
             return
         }
 
-        guard TravelFiles.isInstalled else { return }
+        guard files.isInstalled() else { return }
+        do {
+            try files.prepareInstallationDirectory()
+        } catch {
+            fail(error)
+            return
+        }
+        applyCredentialLookup(credentialLookup())
         desiredRunning = EnrollmentStore.autoStart
         if runtimeStartedInProcess {
             await refreshStatusAndCatalog(forceCatalog: true)
@@ -364,7 +496,9 @@ final class TravelStore: ObservableObject {
     }
 
     private func requestLifecycleDrain(reason: String) {
+        lifecycleRequestGeneration &+= 1
         guard lifecycleTask == nil else { return }
+        lifecycleIsDraining = true
         lifecycleTask = Task { [weak self] in
             guard let self else { return }
             await drainLifecycle(reason: reason)
@@ -372,13 +506,14 @@ final class TravelStore: ObservableObject {
     }
 
     private func drainLifecycle(reason: String) async {
+        let requestGeneration = lifecycleRequestGeneration
         isWorking = true
         defer {
             isWorking = false
             lifecycleTask = nil
-            let mismatch = desiredRunning != runtimeStartedInProcess
-            if mismatch, !desiredRunning || backgroundAudioStatus == .active {
-                requestLifecycleDrain(reason: "Pending desired state")
+            lifecycleIsDraining = false
+            if lifecycleRequestGeneration != requestGeneration, lifecycleNeedsWork {
+                requestLifecycleDrain(reason: "Newer lifecycle request")
             }
         }
 
@@ -393,6 +528,8 @@ final class TravelStore: ObservableObject {
                 case .started:
                     pendingUserInitiatedStart = false
                     if desiredRunning { return }
+                case .stopped:
+                    continue
                 case .waitingForAudio, .failed:
                     return
                 }
@@ -412,16 +549,17 @@ final class TravelStore: ObservableObject {
     }
 
     private func startRuntime(userInitiated: Bool) async -> StartOutcome {
-        guard TravelFiles.isInstalled else {
+        guard files.isInstalled() else {
             presentedError = "Complete remote enrollment before starting Travel."
             desiredRunning = false
             EnrollmentStore.autoStart = false
             return .failed
         }
-        guard let password = CredentialStore.load() else {
-            fail(TravelError.missingCredential)
-            desiredRunning = false
-            EnrollmentStore.autoStart = false
+        guard let password = credentialPassword() else {
+            if credentialAvailability == .missing {
+                desiredRunning = false
+                EnrollmentStore.autoStart = false
+            }
             return .failed
         }
         var next = snapshot
@@ -435,18 +573,24 @@ final class TravelStore: ObservableObject {
             try await backgroundAudio.start()
         } catch {
             failRuntime(error, operation: "start background keeper")
-            return desiredRunning ? .waitingForAudio : .failed
+            if desiredRunning { return .waitingForAudio }
+            try? await backgroundAudio.stop()
+            return .stopped
         }
         guard desiredRunning else {
             try? await backgroundAudio.stop()
-            return .failed
+            return .stopped
         }
 
         do {
-            try TravelFiles.prepareRuntimeStorage()
-            let status = try await native.start(config: TravelFiles.config, password: password)
+            try files.prepareRuntimeStorage()
+            let status = try await native.start(config: files.config(), password: password)
             runtimeStartedInProcess = true
             statusGeneration = 0
+            guard desiredRunning else {
+                await stopRuntime(reason: "Start superseded by user Stop")
+                return .stopped
+            }
             apply(status, phase: .running, clearError: true)
             EnrollmentStore.autoStart = true
             await refreshStatusAndCatalog(forceCatalog: true)
@@ -459,10 +603,11 @@ final class TravelStore: ObservableObject {
             return .started
         } catch {
             runtimeStartedInProcess = false
-            desiredRunning = false
-            EnrollmentStore.autoStart = false
             try? await native.stop()
             try? await backgroundAudio.stop()
+            guard desiredRunning else { return .stopped }
+            desiredRunning = false
+            EnrollmentStore.autoStart = false
             failRuntime(error, operation: "start")
             return .failed
         }
@@ -502,6 +647,12 @@ final class TravelStore: ObservableObject {
         }
     }
 
+    private func waitForRuntimeCleanup() async {
+        while let lifecycleTask {
+            await lifecycleTask.value
+        }
+    }
+
     private func beginEnrollmentPolling() {
         enrollmentTask?.cancel()
         enrollmentTask = Task { [weak self] in
@@ -509,6 +660,7 @@ final class TravelStore: ObservableObject {
             while !Task.isCancelled {
                 do {
                     let next = try await native.enrollmentStatus()
+                    guard !Task.isCancelled else { return }
                     if next != enrollment { enrollment = next }
                     if let code = next.verificationCode {
                         TravelFiles.writeE2EVerificationCode(code)
@@ -621,10 +773,32 @@ final class TravelStore: ObservableObject {
         publish(next)
     }
 
+    private func applyCredentialLookup(_ result: CredentialLookupResult) {
+        credentialAvailability = result.availability
+        credentialAvailable = credentialAvailability == .available
+    }
+
+    private func credentialPassword() -> String? {
+        let result = credentialLookup()
+        applyCredentialLookup(result)
+        switch result {
+        case .available(let password):
+            return password
+        case .missing:
+            fail(TravelError.missingCredential)
+            return nil
+        case .unavailable:
+            fail(TravelError.native("Keychain is temporarily unavailable. Unlock this device and try again."))
+            return nil
+        }
+    }
+
     private func publish(_ next: TravelSnapshot) {
-        guard next != snapshot else { return }
-        snapshot = next
-        requestLiveActivitySync()
+        if next != snapshot {
+            snapshot = next
+            requestLiveActivitySync()
+        }
+        refreshCanStop()
     }
 
     private func requestLiveActivitySync() {
@@ -683,6 +857,19 @@ final class TravelStore: ObservableObject {
     private func appendEvent(_ kind: RecoveryEvent.Kind, title: String, detail: String) {
         recoveryEvents.insert(RecoveryEvent(date: .now, kind: kind, title: title, detail: detail), at: 0)
         if recoveryEvents.count > 30 { recoveryEvents.removeLast(recoveryEvents.count - 30) }
+    }
+
+    private func refreshCanStop() {
+        let next = desiredRunning || lifecycleIsDraining || runtimeStartedInProcess ||
+            backgroundAudioStatus != .inactive
+        if canStop != next { canStop = next }
+    }
+
+    private var lifecycleNeedsWork: Bool {
+        if desiredRunning {
+            return !runtimeStartedInProcess
+        }
+        return runtimeStartedInProcess || backgroundAudioStatus != .inactive
     }
 
     private func fail(_ error: Error) {

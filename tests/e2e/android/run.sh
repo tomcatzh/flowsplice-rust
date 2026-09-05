@@ -28,9 +28,43 @@ if [[ "$("${adb}" get-state 2>/dev/null)" != "device" ]]; then
   exit 1
 fi
 
+stage="$(mktemp -d "${TMPDIR:-/private/tmp}/flowsplice-android-e2e.XXXXXX")"
+instrumentation_output="${stage}/instrumentation.log"
+instrumentation_pid=''
+cleanup() {
+  if [[ -n "${instrumentation_pid}" ]] && kill -0 "${instrumentation_pid}" 2>/dev/null; then
+    kill "${instrumentation_pid}" 2>/dev/null || true
+    wait "${instrumentation_pid}" 2>/dev/null || true
+  fi
+  rm -rf -- "${stage}"
+}
+trap cleanup EXIT
+
+# Only the Docker E2E fixture has a repository-local default. Explicit inputs
+# must be external, just like private release inputs.
+test_root="${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-${repo_root}/tests/e2e/generated/certs/deployment-root.pub}"
+if [[ ! -s "${test_root}" ]]; then
+  echo 'Android Travel E2E deployment-root fixture is missing' >&2
+  exit 1
+fi
+if [[ -n "${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-}" ]]; then
+  python3 "${repo_root}/scripts/private-travel-trust.py" check-path --path "${test_root}"
+fi
+python3 "${repo_root}/tests/e2e/stage-source.py" "${repo_root}" "${stage}/source"
+cp -- "${test_root}" "${stage}/deployment-root.pub"
+android_root="${stage}/source/travel-android"
+python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
+  --source "${stage}/deployment-root.pub" \
+  --destination "${android_root}/app/src/debug/assets/bootstrap/deployment-root.pub"
+mkdir -p "${stage}/tmp"
+export ANDROID_SDK_ROOT="${sdk_root}"
+export CARGO_TARGET_DIR="${stage}/cargo-target"
+export GRADLE_USER_HOME="${stage}/gradle-home"
+export TMPDIR="${stage}/tmp"
 (
   cd "${android_root}"
-  ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
+  ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
+    :app:assembleDebug :app:assembleDebugAndroidTest
 )
 
 app_id='io.zxf.flowsplice.travel'
@@ -40,15 +74,6 @@ app_id='io.zxf.flowsplice.travel'
 "${adb}" shell pm grant "${app_id}" android.permission.POST_NOTIFICATIONS
 
 private_key_password="$(tr -d '\r\n' <"${password_file}")"
-instrumentation_output="$(mktemp -t flowsplice-android-e2e.XXXXXX)"
-instrumentation_pid=''
-cleanup() {
-  if [[ -n "${instrumentation_pid}" ]] && kill -0 "${instrumentation_pid}" 2>/dev/null; then
-    kill "${instrumentation_pid}" 2>/dev/null || true
-  fi
-  rm -f "${instrumentation_output}"
-}
-trap cleanup EXIT
 "${adb}" shell am instrument -w -r \
   -e class io.zxf.flowsplice.travel.TravelCoreDockerE2ETest \
   -e relay_address "${relay_address}" \

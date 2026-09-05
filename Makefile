@@ -1,4 +1,4 @@
-.PHONY: web fmt check test e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
+.PHONY: web fmt check test review-regressions e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
 
 web:
 	cd travelagent/web && npm ci && npm run build
@@ -14,6 +14,9 @@ check: web openwrt-check policy-check
 
 test: web openwrt-check policy-check
 	cargo test --workspace --all-targets
+
+review-regressions:
+	CARGO_TARGET_DIR="$(CURDIR)/target" bash ./tests/check-travel-review-regressions.sh
 
 e2e:
 	./tests/e2e/run.sh
@@ -41,6 +44,7 @@ policy-check:
 	bash ./tests/check-release-feature-gates.sh
 	bash ./tests/check-runtime-configuration-boundary.sh
 	python3 ./tests/test_package_privacy.py
+	python3 ./tests/test_private_travel_trust.py
 
 openwrt-ipk:
 	python3 scripts/build-openwrt-ipk.py \

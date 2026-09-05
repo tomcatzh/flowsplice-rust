@@ -94,18 +94,12 @@ private struct ConnectionStatusCard: View {
 
     @ViewBuilder
     private var actionButton: some View {
-        switch store.snapshot.phase {
-        case .running, .starting:
+        if store.canStop {
             Button("Stop") { store.stop() }
                 .buttonStyle(.bordered)
                 .tint(colorScheme == .dark ? Color("FlowMint") : Color("AccentColor"))
-                .disabled(store.isWorking)
                 .accessibilityIdentifier("travel-stop")
-        case .stopping:
-            Button("Stopping…") {}
-                .buttonStyle(.borderedProminent)
-                .disabled(true)
-        default:
+        } else {
             Button("Start") { store.start() }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isWorking)

@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 apple_root="${repo_root}/travel-apple/FlowSpliceTravel"
 compose_file="${repo_root}/tests/e2e/compose.yaml"
+deployment_root_input="${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-${repo_root}/tests/e2e/generated/certs/deployment-root.pub}"
 password_file="${1:?Apple Travel private-key password file is required}"
 relay_address="${2:-127.0.0.1:18446}"
 simulator_name="${3:-iPhone 17 Pro}"
@@ -27,6 +28,10 @@ if [[ ! -s "${password_file}" ]]; then
 fi
 if [[ ! -d "${DEVELOPER_DIR}" ]]; then
   echo "Xcode developer directory was not found: ${DEVELOPER_DIR}" >&2
+  exit 1
+fi
+if [[ ! -f "${deployment_root_input}" || ! -r "${deployment_root_input}" || ! -s "${deployment_root_input}" ]]; then
+  echo 'Apple Travel E2E deployment-root test input is missing or unreadable' >&2
   exit 1
 fi
 simulator_id="$(
@@ -91,13 +96,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+trust_directory="${derived_data}/trust"
+staged_deployment_root="${trust_directory}/deployment-root-input.pub"
+frozen_deployment_root="${trust_directory}/deployment-root.pub"
+trust_input_list="${trust_directory}/trust-inputs.xcfilelist"
+mkdir -p "${trust_directory}"
+cp "${deployment_root_input}" "${staged_deployment_root}"
+chmod 600 "${staged_deployment_root}"
+python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
+  --source "${staged_deployment_root}" --destination "${frozen_deployment_root}"
+printf '%s\n' "${frozen_deployment_root}" >"${trust_input_list}"
+
 xcodebuild \
   -project "${apple_root}/FlowSpliceTravel.xcodeproj" \
   -scheme FlowSpliceTravel \
   -destination "platform=iOS Simulator,id=${simulator_id}" \
   -derivedDataPath "${derived_data}" \
   -parallel-testing-enabled NO \
+  "FLOWSPLICE_PRIVATE_TRUST_FILE=${frozen_deployment_root}" \
+  "FLOWSPLICE_TRUST_INPUT_LIST=${trust_input_list}" \
   build-for-testing >"${test_output}" 2>&1
+apple_bundle="$(find "${derived_data}/Build/Products" -type d -name 'FlowSpliceTravel.app' -print -quit)"
+if [[ -z "${apple_bundle}" ]]; then
+  echo 'Xcode did not produce the Apple Travel app bundle for deployment-root verification' >&2
+  exit 1
+fi
+python3 "${repo_root}/scripts/private-travel-trust.py" verify-root \
+  --source "${frozen_deployment_root}" \
+  --artifact-resource "${apple_bundle}/bootstrap/deployment-root.pub"
 xctestrun_file="$(find "${derived_data}/Build/Products" -maxdepth 1 -name '*.xctestrun' -print -quit)"
 if [[ -z "${xctestrun_file}" ]]; then
   echo 'Xcode did not produce an xctestrun file' >&2

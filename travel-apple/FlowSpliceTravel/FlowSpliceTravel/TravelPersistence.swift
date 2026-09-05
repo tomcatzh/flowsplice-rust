@@ -35,7 +35,7 @@ enum TravelFiles {
         try prepareInstallationDirectory(at: installationDirectory)
     }
 
-    private static func prepareInstallationDirectory(at directory: URL) throws {
+    static func prepareInstallationDirectory(at directory: URL) throws {
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,
@@ -44,6 +44,7 @@ enum TravelFiles {
                 .protectionKey: runtimeProtection,
             ]
         )
+        try excludeFromBackup(directory)
     }
 
     static func prepareRuntimeStorage() throws {
@@ -87,6 +88,7 @@ enum TravelFiles {
                 ofItemAtPath: protectionMarker.path
             )
         }
+        try excludeFromBackup(directory)
     }
 
     static func rebasedGeneratedConfig(_ source: String, installationDirectory: URL) -> String {
@@ -132,11 +134,27 @@ enum TravelFiles {
         }
     }
 
+    private static func excludeFromBackup(_ directory: URL) throws {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableDirectory = directory
+        try mutableDirectory.setResourceValues(values)
+    }
+
     static func discardPendingInstallation() throws {
         guard !isInstalled, FileManager.default.fileExists(atPath: installationDirectory.path) else {
             return
         }
         try FileManager.default.removeItem(at: installationDirectory)
+    }
+
+    static func removeInstallationForReenrollment() throws {
+        try removeInstallationForReenrollment(at: installationDirectory)
+    }
+
+    static func removeInstallationForReenrollment(at directory: URL) throws {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return }
+        try FileManager.default.removeItem(at: directory)
     }
 
     static func writeE2EVerificationCode(_ code: String) {
@@ -223,6 +241,26 @@ enum EnrollmentStore {
     }
 }
 
+enum CredentialAvailability: Equatable, Sendable {
+    case available
+    case missing
+    case unavailable
+}
+
+enum CredentialLookupResult: Equatable, Sendable {
+    case available(String)
+    case missing
+    case unavailable(OSStatus)
+
+    var availability: CredentialAvailability {
+        switch self {
+        case .available: .available
+        case .missing: .missing
+        case .unavailable: .unavailable
+        }
+    }
+}
+
 enum CredentialStore {
     private static let service = "io.zxf.flowsplice.travel"
     private static let account = "private-key-password"
@@ -243,7 +281,7 @@ enum CredentialStore {
         }
     }
 
-    static func load() -> String? {
+    static func lookup() -> CredentialLookupResult {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -252,11 +290,22 @@ enum CredentialStore {
             kSecMatchLimit: kSecMatchLimitOne,
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else {
-            return nil
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return classifyLookup(status: status, data: result as? Data)
+    }
+
+    static func classifyLookup(status: OSStatus, data: Data?) -> CredentialLookupResult {
+        switch status {
+        case errSecSuccess:
+            guard let data, let password = String(data: data, encoding: .utf8) else {
+                return .unavailable(errSecDecode)
+            }
+            return .available(password)
+        case errSecItemNotFound:
+            return .missing
+        default:
+            return .unavailable(status)
         }
-        return String(data: data, encoding: .utf8)
     }
 
     static func clear() {

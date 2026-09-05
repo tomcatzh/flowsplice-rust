@@ -254,7 +254,11 @@ fn decode_data_frame(payload: &[u8], codec: DataFrameCodec) -> io::Result<DataFr
 ///
 /// # Errors
 ///
-/// Returns an I/O error when serialization fails, the result exceeds `limit`, or writing fails.
+/// Returns `TimedOut` if the complete write exceeds the default 10-second deadline, or an I/O
+/// error when serialization fails, the result exceeds `limit`, or writing fails.
+///
+/// A write error or timeout can leave a partial frame on `writer`; callers must discard the
+/// transport after an error rather than write another frame.
 pub async fn write_json<W, T>(writer: &mut W, value: &T, limit: usize) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -299,8 +303,24 @@ where
 ///
 /// # Errors
 ///
-/// Returns an I/O error when encoding exceeds a bound or the destination write fails.
+/// Returns `TimedOut` if the complete write exceeds the default 10-second deadline, or an I/O
+/// error when encoding exceeds a bound or the destination write fails.
+///
+/// A write error or timeout can leave a partial frame on `writer`; callers must discard the
+/// transport after an error rather than write another frame.
 pub async fn write_data_frame<W>(
+    writer: &mut W,
+    value: &DataFrame,
+    limit: usize,
+    codec: DataFrameCodec,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_data_frame_with_timeout(writer, value, limit, codec, DEFAULT_WRITE_TIMEOUT).await
+}
+
+async fn write_data_frame_inner<W>(
     writer: &mut W,
     value: &DataFrame,
     limit: usize,
@@ -365,6 +385,8 @@ fn encode_binary_payload(
 /// # Errors
 ///
 /// Returns `TimedOut` on deadline expiry or the underlying serialization/write error.
+/// A write error or timeout can leave a partial frame on `writer`; callers must discard the
+/// transport after an error rather than write another frame.
 pub async fn write_json_with_timeout<W, T>(
     writer: &mut W,
     value: &T,
@@ -380,25 +402,117 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "JSON frame write timed out"))?
 }
 
+/// Writes one business-data frame and fails when the complete write exceeds `deadline`.
+///
+/// # Errors
+///
+/// Returns `TimedOut` on deadline expiry or the underlying encoding/write error.
+/// A write error or timeout can leave a partial frame on `writer`; callers must discard the
+/// transport after an error rather than write another frame.
+pub async fn write_data_frame_with_timeout<W>(
+    writer: &mut W,
+    value: &DataFrame,
+    limit: usize,
+    codec: DataFrameCodec,
+    deadline: Duration,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(
+        deadline,
+        write_data_frame_inner(writer, value, limit, codec),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "data frame write timed out"))?
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::protocol::DataFrame;
     use bytes::Bytes;
     use serde::{Deserialize, Serialize};
-    use std::time::Duration;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use tokio::{io::duplex, time::timeout};
+    use tokio::{
+        io::{AsyncWrite, duplex},
+        time::timeout,
+    };
 
     use super::{
         DataFrameCodec, DataFrameReader, JsonFrameReader, encode_binary_payload, write_data_frame,
-        write_json,
+        write_data_frame_with_timeout, write_json,
     };
     use uuid::Uuid;
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
     struct Message {
         value: String,
+    }
+
+    #[derive(Default)]
+    struct PartialThenStallWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for PartialThenStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if this.bytes.is_empty() {
+                this.bytes.push(buf[0]);
+                Poll::Ready(Ok(1))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushStallWriter {
+        bytes: Vec<u8>,
+        flush_called: bool,
+    }
+
+    impl AsyncWrite for FlushStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().flush_called = true;
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[tokio::test]
@@ -460,6 +574,55 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn data_frame_write_deadline_rejects_backpressure_for_json_and_binary_v1() {
+        let frame = DataFrame::Data {
+            flow_id: Uuid::new_v4(),
+            offset: 42,
+            bytes: Bytes::from_static(b"backpressure"),
+        };
+
+        for codec in [DataFrameCodec::Json, DataFrameCodec::BinaryV1] {
+            let mut writer = PartialThenStallWriter::default();
+            let error = write_data_frame_with_timeout(
+                &mut writer,
+                &frame,
+                1024,
+                codec,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(writer.bytes.len(), 1, "{codec:?} should partially write");
+        }
+    }
+
+    #[tokio::test]
+    async fn data_frame_write_deadline_includes_flush() {
+        let frame = DataFrame::Data {
+            flow_id: Uuid::new_v4(),
+            offset: 7,
+            bytes: Bytes::from_static(b"flush"),
+        };
+        let mut writer = FlushStallWriter::default();
+
+        let error = write_data_frame_with_timeout(
+            &mut writer,
+            &frame,
+            1024,
+            DataFrameCodec::BinaryV1,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(writer.flush_called);
+        assert!(!writer.bytes.is_empty());
     }
 
     #[tokio::test]

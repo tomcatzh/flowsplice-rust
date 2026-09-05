@@ -319,6 +319,12 @@ class TravelService : Service() {
         )
         startForegroundNow(enrollmentNotification(initial))
         markSessionActive()
+        val trustedDeploymentRoot = runCatching {
+            DeploymentRootAsset.load(this@TravelService)
+        }.getOrElse { error ->
+            failEnrollment(error.message ?: "Required deployment root asset is unavailable", startId)
+            return
+        }
         val password = CredentialStore.load(this@TravelService)
         if (password.isNullOrEmpty()) {
             failEnrollment("The private-key password is unavailable", startId)
@@ -332,6 +338,7 @@ class TravelService : Service() {
                     inputs.homeId,
                     inputs.relay,
                     password,
+                    trustedDeploymentRoot,
                 ),
             )
         }.getOrElse { error ->
@@ -395,6 +402,12 @@ class TravelService : Service() {
             failAndStop("Complete remote enrollment before starting", startId)
             return
         }
+        val trustedDeploymentRoot = runCatching {
+            DeploymentRootAsset.load(this@TravelService)
+        }.getOrElse { error ->
+            failAndStop(error.message ?: "Required deployment root asset is unavailable", startId)
+            return
+        }
         val password = CredentialStore.load(this@TravelService)
         if (password.isNullOrEmpty()) {
             failAndStop("The private-key password is unavailable", startId)
@@ -403,7 +416,11 @@ class TravelService : Service() {
         stopPolling()
         val snapshot = runCatching {
             TravelSnapshot.fromNative(
-                NativeTravel.start(TravelInstallation.config(this@TravelService).absolutePath, password),
+                NativeTravel.start(
+                    TravelInstallation.config(this@TravelService).absolutePath,
+                    password,
+                    trustedDeploymentRoot,
+                ),
                 enrolled = true,
             )
         }.getOrElse { error ->

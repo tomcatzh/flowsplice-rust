@@ -8,7 +8,10 @@ notary_profile="${FLOWSPLICE_NOTARY_PROFILE:-flowsplice-notary}"
 ios_device_selector="${FLOWSPLICE_IOS_DEVICE:-iPad}"
 developer_dir="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 release_parent="${repo_root}/dist/apple"
-release_dir="${release_parent}/${version}"
+release_dir="${FLOWSPLICE_APPLE_OUTPUT_DIR:-${release_parent}/${version}}"
+release_parent="$(dirname -- "${release_dir}")"
+private_trust_file="${FLOWSPLICE_PRIVATE_TRUST_FILE:-}"
+private_stage_parent="${FLOWSPLICE_APPLE_STAGE_PARENT:-${TMPDIR:-/tmp}}"
 stage_root=''
 
 fail() {
@@ -22,6 +25,13 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ -n "${private_trust_file}" ]]; then
+  python3 "${repo_root}/scripts/private-travel-trust.py" check-path --path "${release_dir}"
+  python3 "${repo_root}/scripts/private-travel-trust.py" check-path --path "${private_stage_parent}"
+fi
 
 [[ -n "${version}" ]] || fail 'workspace version is unavailable'
 [[ -d "${developer_dir}" ]] || fail "Xcode developer directory is missing: ${developer_dir}"
@@ -54,11 +64,21 @@ xcrun notarytool history \
   --keychain-profile "${notary_profile}" \
   --output-format json >/dev/null
 
-stage_root="$(mktemp -d "${TMPDIR:-/tmp}/flowsplice-apple-release.XXXXXX")"
+stage_root="$(mktemp -d "${private_stage_parent}/flowsplice-apple-release.XXXXXX")"
+chmod 700 "${stage_root}"
 publication_dir="${stage_root}/publication"
 cargo_target_dir="${stage_root}/cargo-target"
 mkdir -p "${publication_dir}" "${cargo_target_dir}"
 export CARGO_TARGET_DIR="${cargo_target_dir}"
+trust_xcode_args=("FLOWSPLICE_PRIVATE_TRUST_FILE=")
+if [[ -n "${private_trust_file}" ]]; then
+  frozen_trust="${stage_root}/trust/deployment-root.pub"
+  python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
+    --source "${private_trust_file}" --destination "${frozen_trust}"
+  export FLOWSPLICE_PRIVATE_TRUST_FILE="${frozen_trust}"
+  printf '%s\n' "${frozen_trust}" >"${stage_root}/trust-inputs.xcfilelist"
+  trust_xcode_args+=("FLOWSPLICE_PRIVATE_TRUST_FILE=${frozen_trust}" "FLOWSPLICE_TRUST_INPUT_LIST=${stage_root}/trust-inputs.xcfilelist")
+fi
 
 device_json="${stage_root}/devices.json"
 xcrun devicectl list devices --json-output "${device_json}" --quiet
@@ -219,12 +239,17 @@ xcodebuild \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "${mac_derived}" \
   CODE_SIGNING_ALLOWED=NO \
+  "${trust_xcode_args[@]}" \
   "LIBRARY_SEARCH_PATHS=${cargo_target_dir}/aarch64-apple-darwin/release" \
   build
 mac_built_app="${mac_derived}/Build/Products/Release/FlowSpliceMac.app"
 [[ -d "${mac_built_app}" ]] || fail 'Xcode did not produce FlowSpliceMac.app'
 mac_stage_app="${stage_root}/FlowSplice.app"
 ditto "${mac_built_app}" "${mac_stage_app}"
+if [[ -n "${private_trust_file}" ]]; then
+  python3 "${repo_root}/scripts/private-travel-trust.py" verify-root \
+    --source "${frozen_trust}" --artifact-resource "${mac_stage_app}/Contents/Resources/bootstrap/deployment-root.pub"
+fi
 xattr -cr "${mac_stage_app}"
 codesign \
   --force \
@@ -283,6 +308,8 @@ xcodebuild \
   -configuration Release \
   -destination 'generic/platform=iOS' \
   -archivePath "${ios_archive}" \
+  -derivedDataPath "${stage_root}/ios-derived" \
+  "${trust_xcode_args[@]}" \
   -allowProvisioningUpdates \
   -allowProvisioningDeviceRegistration \
   DEVELOPMENT_TEAM="${team_id}" \

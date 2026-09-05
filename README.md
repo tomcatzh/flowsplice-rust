@@ -173,9 +173,10 @@ private keys, bearer tokens, or route/work secrets.
 ## Travel Quick Start
 
 The public Travel package contains a deployment-neutral binary and no deployment address or trust
-material. A fresh device needs only a reachable Relay management address; it does not need a
-generated runtime TOML, certificate directory, root public key, or signed trust file before this
-command:
+material. A fresh CLI installation needs a reachable Relay management address and a deployment root
+public key obtained independently from the deployment operator. It does not need a generated runtime
+TOML or client certificate directory. Private native packages include this root as a signed resource
+without an extra user verification step; see [private packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -183,14 +184,15 @@ mkdir -m 700 ./my-travel
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel \
-  --relay relay.example:8443
+  --relay relay.example:8443 \
+  --deployment-root-public-key /outside-git/deployment-root.pub
 ```
 
 `enroll-remote` is the Travel identity-enrollment command.
 
 Enter and confirm a new Travel private-key password of at least 12 characters. Travel creates the
 two encrypted private keys locally, retrieves public first-contact material from the selected Relay,
-verifies the root-signed deployment trust, reconnects with the verified Management CA, and prints a
+verifies deployment trust against the supplied root and authenticates the discovery certificate, reconnects with the verified Management CA, and prints a
 short Home verification code. The command remains running while it retries and waits for attended
 Home approval.
 

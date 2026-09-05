@@ -100,6 +100,16 @@ verify_developer_id_container() {
   [[ "${details}" == *'Timestamp='* ]] || fail "secure timestamp is missing: ${artifact}"
 }
 
+verify_deployment_resource() {
+  local resource="$1"
+  if [[ -n "${FLOWSPLICE_PRIVATE_TRUST_FILE:-}" ]]; then
+    python3 "${repo_root}/scripts/private-travel-trust.py" verify-root \
+      --source "${FLOWSPLICE_PRIVATE_TRUST_FILE}" --artifact-resource "${resource}"
+  elif [[ -e "${resource}" ]]; then
+    fail 'deployment-neutral packages must not contain a deployment trust key'
+  fi
+}
+
 ditto -x -k "${release_dir}/${cli_name}.zip" "${audit_root}/cli"
 cli_root="${audit_root}/cli/${cli_name}"
 [[ -d "${cli_root}" ]] || fail 'command-line archive root is missing'
@@ -133,6 +143,7 @@ mac_app="${mac_mount}/FlowSplice.app"
 [[ -L "${mac_mount}/Applications" ]] || fail 'macOS DMG does not contain the Applications shortcut'
 [[ "$(readlink "${mac_mount}/Applications")" == '/Applications' ]] || fail 'macOS DMG Applications shortcut has the wrong destination'
 verify_developer_id "${mac_app}"
+verify_deployment_resource "${mac_app}/Contents/Resources/bootstrap/deployment-root.pub"
 [[ "$(lipo -archs "${mac_app}/Contents/MacOS/FlowSpliceMac")" == 'arm64' ]] || fail 'macOS app is not thin arm64'
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "${mac_app}/Contents/Info.plist")" == 'io.zxf.flowsplice.travel.macos' ]] || fail 'macOS bundle identifier is incorrect'
 [[ "$(plutil -extract LSMinimumSystemVersion raw -o - "${mac_app}/Contents/Info.plist")" == '26.0' ]] || fail 'macOS minimum version is not 26.0'
@@ -151,6 +162,7 @@ ios_app="$(find "${audit_root}/ios/Payload" -maxdepth 1 -type d -name '*.app' -p
 [[ -n "${ios_app}" ]] || fail 'IPA application bundle is missing'
 ios_executable="${ios_app}/$(plutil -extract CFBundleExecutable raw -o - "${ios_app}/Info.plist")"
 codesign --verify --strict --verbose=2 "${ios_app}"
+verify_deployment_resource "${ios_app}/bootstrap/deployment-root.pub"
 ios_details="$(codesign -dvvv "${ios_app}" 2>&1)"
 [[ "${ios_details}" == *'Authority=Apple Distribution:'* ]] || fail 'IPA does not use Apple Distribution signing'
 [[ "${ios_details}" == *"TeamIdentifier=${team_id}"* ]] || fail 'IPA team mismatch'

@@ -83,7 +83,11 @@ fn with_engine() -> Result<Arc<TravelCore>> {
         .ok_or_else(|| anyhow!("Travel is not running"))
 }
 
-fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> {
+fn start_engine(
+    config_path: &str,
+    password: &str,
+    trusted_deployment_root_public_key: &str,
+) -> Result<serde_json::Value> {
     let mut slot = ENGINE
         .lock()
         .map_err(|_| anyhow!("Travel runtime lock is poisoned"))?;
@@ -92,7 +96,11 @@ fn start_engine(config_path: &str, password: &str) -> Result<serde_json::Value> 
     }
     let engine = Arc::new(
         runtime()?
-            .block_on(TravelCore::start(Path::new(config_path), password))
+            .block_on(TravelCore::start_with_trusted_root(
+                Path::new(config_path),
+                password,
+                trusted_deployment_root_public_key,
+            ))
             .context("failed to start Travel Core")?,
     );
     let status = runtime()?.block_on(engine.status());
@@ -175,6 +183,7 @@ fn begin_enrollment(
     home_id: &str,
     selected_relay: &str,
     password: &str,
+    trusted_deployment_root_public_key: &str,
 ) -> Result<serde_json::Value> {
     let mut slot = ENROLLMENT
         .lock()
@@ -206,6 +215,7 @@ fn begin_enrollment(
         home_id: home_id.to_owned(),
         install_dir: PathBuf::from(install_dir),
         bootstrap_config: None,
+        trusted_deployment_root_public_key: Some(trusted_deployment_root_public_key.to_owned()),
         selected_relay: (!selected_relay.is_empty()).then(|| selected_relay.to_owned()),
         ui_listen: None,
         private_key_password: password.to_owned(),
@@ -324,6 +334,7 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_beginEnrollmen
     home_id: JString<'caller>,
     selected_relay: JString<'caller>,
     password: JString<'caller>,
+    trusted_deployment_root_public_key: JString<'caller>,
 ) -> JString<'caller> {
     jni_string(&mut unowned_env, |env| {
         response_json((|| {
@@ -332,12 +343,18 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_beginEnrollmen
             let home_id = required_string(env, &home_id, "Home id")?;
             let selected_relay = required_string(env, &selected_relay, "Relay")?;
             let password = required_string(env, &password, "private-key password")?;
+            let trusted_deployment_root_public_key = required_string(
+                env,
+                &trusted_deployment_root_public_key,
+                "trusted deployment root",
+            )?;
             begin_enrollment(
                 &install_dir,
                 &travel_id,
                 &home_id,
                 &selected_relay,
                 &password,
+                &trusted_deployment_root_public_key,
             )
         })())
     })
@@ -365,12 +382,18 @@ pub extern "system" fn Java_io_zxf_flowsplice_travel_NativeTravel_start<'caller>
     _class: JClass<'caller>,
     config_path: JString<'caller>,
     password: JString<'caller>,
+    trusted_deployment_root_public_key: JString<'caller>,
 ) -> JString<'caller> {
     jni_string(&mut unowned_env, |env| {
         response_json((|| {
             let config_path = required_string(env, &config_path, "config path")?;
             let password = required_string(env, &password, "private-key password")?;
-            start_engine(&config_path, &password)
+            let trusted_deployment_root_public_key = required_string(
+                env,
+                &trusted_deployment_root_public_key,
+                "trusted deployment root",
+            )?;
+            start_engine(&config_path, &password, &trusted_deployment_root_public_key)
         })())
     })
 }

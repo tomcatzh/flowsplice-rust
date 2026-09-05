@@ -19,12 +19,22 @@ case "${test_mode}" in
     ;;
 esac
 
+deployment_root_input=''
+if [[ "${test_mode}" == 'remote' ]]; then
+  deployment_root_input="${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-${repo_root}/tests/e2e/generated/certs/deployment-root.pub}"
+fi
+
 if [[ ! -s "${password_file}" ]]; then
   echo 'macOS Travel E2E password input is missing' >&2
   exit 1
 fi
 if [[ ! -d "${DEVELOPER_DIR}" ]]; then
   echo "Xcode developer directory was not found: ${DEVELOPER_DIR}" >&2
+  exit 1
+fi
+if [[ "${test_mode}" == 'remote' ]] && \
+   [[ ! -f "${deployment_root_input}" || ! -r "${deployment_root_input}" || ! -s "${deployment_root_input}" ]]; then
+  echo 'macOS Travel E2E deployment-root test input is missing or unreadable' >&2
   exit 1
 fi
 
@@ -98,6 +108,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+trust_xcode_args=(
+  'FLOWSPLICE_PRIVATE_TRUST_FILE='
+  "FLOWSPLICE_TRUST_INPUT_LIST=${repo_root}/scripts/empty-trust-inputs.xcfilelist"
+)
+frozen_deployment_root=''
+if [[ "${test_mode}" == 'remote' ]]; then
+  trust_directory="${derived_data}/trust"
+  staged_deployment_root="${trust_directory}/deployment-root-input.pub"
+  frozen_deployment_root="${trust_directory}/deployment-root.pub"
+  trust_input_list="${trust_directory}/trust-inputs.xcfilelist"
+  mkdir -p "${trust_directory}"
+  cp "${deployment_root_input}" "${staged_deployment_root}"
+  chmod 600 "${staged_deployment_root}"
+  python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
+    --source "${staged_deployment_root}" --destination "${frozen_deployment_root}"
+  printf '%s\n' "${frozen_deployment_root}" >"${trust_input_list}"
+  trust_xcode_args=(
+    "FLOWSPLICE_PRIVATE_TRUST_FILE=${frozen_deployment_root}"
+    "FLOWSPLICE_TRUST_INPUT_LIST=${trust_input_list}"
+  )
+else
+  unset FLOWSPLICE_PRIVATE_TRUST_FILE FLOWSPLICE_TRUST_INPUT_LIST
+fi
+
 capture_keychain_state >"${keychain_state_before}"
 security create-keychain -p "${ui_keychain_password}" "${ui_keychain_path}" >/dev/null
 security unlock-keychain -p "${ui_keychain_password}" "${ui_keychain_path}" >/dev/null
@@ -108,7 +142,22 @@ xcodebuild \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "${derived_data}" \
   -parallel-testing-enabled NO \
+  "${trust_xcode_args[@]}" \
   build-for-testing >"${test_output}" 2>&1
+
+mac_bundle="$(find "${derived_data}/Build/Products" -type d -name 'FlowSpliceMac.app' -print -quit)"
+if [[ -z "${mac_bundle}" ]]; then
+  echo 'Xcode did not produce the macOS Travel app bundle for deployment-root verification' >&2
+  exit 1
+fi
+if [[ "${test_mode}" == 'remote' ]]; then
+  python3 "${repo_root}/scripts/private-travel-trust.py" verify-root \
+    --source "${frozen_deployment_root}" \
+    --artifact-resource "${mac_bundle}/Contents/Resources/bootstrap/deployment-root.pub"
+elif [[ -e "${mac_bundle}/Contents/Resources/bootstrap/deployment-root.pub" ]]; then
+  echo 'macOS local E2E unexpectedly bundled a deployment root' >&2
+  exit 1
+fi
 
 xctestrun_file="$(find "${derived_data}/Build/Products" -maxdepth 1 -name '*.xctestrun' -print -quit)"
 if [[ -z "${xctestrun_file}" ]]; then

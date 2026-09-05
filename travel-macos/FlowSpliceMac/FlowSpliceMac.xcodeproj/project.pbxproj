@@ -103,6 +103,7 @@
 				C59F5C3730452DDA00973323 /* Sources */,
 				C59F5C3830452DDA00973323 /* Frameworks */,
 				C59F5C3930452DDA00973323 /* Resources */,
+				F50100010000000000000001 /* Copy Deployment Trust */,
 			);
 			buildRules = (
 			);
@@ -252,6 +253,20 @@
 			shellPath = /bin/sh;
 			shellScript = "\"${SRCROOT}/scripts/build-rust-macos.sh\"\n";
 		};
+		F50100010000000000000001 /* Copy Deployment Trust */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputFileListPaths = ("$(FLOWSPLICE_TRUST_INPUT_LIST)");
+			inputPaths = ("$(SRCROOT)/../../scripts/copy-travel-trust-resource.sh", "$(SRCROOT)/../../scripts/private-travel-trust.py");
+			name = "Copy Deployment Trust";
+			outputFileListPaths = ();
+			outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/bootstrap/deployment-root.pub");
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "bash \"${SRCROOT}/../../scripts/copy-travel-trust-resource.sh\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -330,6 +345,7 @@
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FLOWSPLICE_TRUST_INPUT_LIST = "$(SRCROOT)/../../scripts/empty-trust-inputs.xcfilelist";
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -395,6 +411,7 @@
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FLOWSPLICE_TRUST_INPUT_LIST = "$(SRCROOT)/../../scripts/empty-trust-inputs.xcfilelist";
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -425,6 +442,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FLOWSPLICE_TRUST_INPUT_LIST = "$(SRCROOT)/../../scripts/empty-trust-inputs.xcfilelist";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = FlowSplice;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -467,6 +485,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FLOWSPLICE_TRUST_INPUT_LIST = "$(SRCROOT)/../../scripts/empty-trust-inputs.xcfilelist";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = FlowSplice;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";

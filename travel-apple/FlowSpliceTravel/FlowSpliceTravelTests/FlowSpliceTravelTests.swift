@@ -1,7 +1,9 @@
 import Foundation
+import Security
 import Testing
 @testable import FlowSpliceTravel
 
+@Suite(.serialized)
 struct FlowSpliceTravelTests {
     @Test("IDs are normalized for generated device identities")
     func normalizedIDs() {
@@ -65,6 +67,169 @@ struct FlowSpliceTravelTests {
         #expect(fileManager.fileExists(atPath: directory.appending(path: "state").path))
         let configAttributes = try fileManager.attributesOfItem(atPath: config.path)
         #expect((configAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let backupValues = try directory.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        #expect(backupValues.isExcludedFromBackup == true)
+    }
+
+    @Test("Runtime storage excludes a newly created installation directory from backup")
+    func runtimeStorageCreationExcludesBackup() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appending(path: "flowsplice-new-storage-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? fileManager.removeItem(at: directory) }
+
+        try TravelFiles.prepareRuntimeStorage(at: directory)
+
+        let backupValues = try directory.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        #expect(backupValues.isExcludedFromBackup == true)
+    }
+
+    @Test("Credential lookup only treats an absent Keychain item as missing")
+    func credentialLookupClassification() {
+        #expect(CredentialStore.classifyLookup(status: errSecItemNotFound, data: nil) == .missing)
+        #expect(
+            CredentialStore.classifyLookup(status: errSecInteractionNotAllowed, data: nil) ==
+                .unavailable(errSecInteractionNotAllowed)
+        )
+        #expect(
+            CredentialStore.classifyLookup(status: errSecSuccess, data: Data("test-password".utf8)) ==
+                .available("test-password")
+        )
+    }
+
+    @Test("Re-enrollment removes only this device installation and its credential")
+    @MainActor
+    func reenrollmentRemovesOnlyDeviceData() async throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appending(path: "flowsplice-reenrollment-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let config = directory.appending(path: "travelagent.toml", directoryHint: .notDirectory)
+        try TravelFiles.prepareInstallationDirectory(at: directory)
+        try Data("test".utf8).write(to: config)
+        defer { try? fileManager.removeItem(at: directory) }
+
+        let oldPending = EnrollmentStore.pending
+        let oldAutoStart = EnrollmentStore.autoStart
+        let oldRelay = EnrollmentStore.lastRelay
+        defer {
+            EnrollmentStore.pending = oldPending
+            EnrollmentStore.autoStart = oldAutoStart
+            EnrollmentStore.lastRelay = oldRelay
+        }
+        EnrollmentStore.pending = PendingEnrollment(
+            travelID: "travel-1",
+            homeID: "home-1",
+            relay: "relay.example:443"
+        )
+        EnrollmentStore.autoStart = true
+        EnrollmentStore.lastRelay = "keep-this-setting"
+
+        var credentialClearCalls = 0
+        let files = TravelFileAccess(
+            installationDirectory: { directory },
+            config: { config },
+            isInstalled: { fileManager.fileExists(atPath: config.path) },
+            prepareInstallationDirectory: {},
+            prepareRuntimeStorage: {},
+            discardPendingInstallation: {},
+            removeInstallationForReenrollment: {
+                try TravelFiles.removeInstallationForReenrollment(at: directory)
+            }
+        )
+        let native = TravelStoreTestNative(delaysCancelEnrollment: true)
+        let store = TravelStore(
+            native: native,
+            backgroundAudio: TravelStoreTestAudio(mode: .immediate),
+            liveActivity: TravelStoreTestLiveActivity(),
+            files: files,
+            credentialLookup: { .missing },
+            credentialSave: { _ in },
+            credentialClear: { credentialClearCalls += 1 }
+        )
+
+        #expect(store.needsReenrollmentOnThisDevice)
+        store.reenrollOnThisDevice()
+
+        #expect(await waitForCondition { native.cancelEnrollmentCalls == 1 })
+        #expect(fileManager.fileExists(atPath: directory.path))
+        #expect(credentialClearCalls == 0)
+        native.completeCancelEnrollment()
+        #expect(await waitForCondition {
+            !fileManager.fileExists(atPath: directory.path) && credentialClearCalls == 1
+        })
+        #expect(EnrollmentStore.pending == nil)
+        #expect(!EnrollmentStore.autoStart)
+        #expect(EnrollmentStore.lastRelay == "keep-this-setting")
+        #expect(!store.snapshot.enrolled)
+    }
+
+    @Test("Re-enrollment rechecks a stale missing Keychain result before removing data")
+    @MainActor
+    func reenrollmentRechecksCredentialBeforeDestructiveReset() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let directory = URL(fileURLWithPath: "/tmp/flowsplice-stale-reenrollment", isDirectory: true)
+        var credential = CredentialLookupResult.missing
+        var removedInstallationCalls = 0
+        var credentialClearCalls = 0
+        let files = TravelFileAccess(
+            installationDirectory: { directory },
+            config: { directory.appending(path: "travelagent.toml") },
+            isInstalled: { true },
+            prepareInstallationDirectory: {},
+            prepareRuntimeStorage: {},
+            discardPendingInstallation: {},
+            removeInstallationForReenrollment: { removedInstallationCalls += 1 }
+        )
+        let native = TravelStoreTestNative()
+        let store = testStore(
+            native: native,
+            audio: TravelStoreTestAudio(mode: .immediate),
+            files: files,
+            credentialLookup: { credential },
+            credentialClear: { credentialClearCalls += 1 }
+        )
+
+        #expect(store.needsReenrollmentOnThisDevice)
+        credential = .unavailable(errSecInteractionNotAllowed)
+        store.reenrollOnThisDevice()
+        for _ in 0..<20 { await Task.yield() }
+
+        #expect(store.credentialAvailability == .unavailable)
+        #expect(native.cancelEnrollmentCalls == 0)
+        #expect(removedInstallationCalls == 0)
+        #expect(credentialClearCalls == 0)
+    }
+
+    @Test("Reconciliation applies installation backup protection without auto-starting")
+    @MainActor
+    func reconciliationProtectsInstalledDirectoryWithoutStartingRuntime() async {
+        let oldAutoStart = EnrollmentStore.autoStart
+        defer { EnrollmentStore.autoStart = oldAutoStart }
+        EnrollmentStore.autoStart = false
+        var preparedInstallationCalls = 0
+        let directory = URL(fileURLWithPath: "/tmp/flowsplice-reconcile-storage", isDirectory: true)
+        let files = TravelFileAccess(
+            installationDirectory: { directory },
+            config: { directory.appending(path: "travelagent.toml") },
+            isInstalled: { true },
+            prepareInstallationDirectory: { preparedInstallationCalls += 1 },
+            prepareRuntimeStorage: {},
+            discardPendingInstallation: {},
+            removeInstallationForReenrollment: {}
+        )
+        let native = TravelStoreTestNative()
+        let store = testStore(
+            native: native,
+            audio: TravelStoreTestAudio(mode: .immediate),
+            files: files,
+            credentialLookup: { .missing }
+        )
+
+        store.bootstrap()
+
+        #expect(await waitForCondition { preparedInstallationCalls == 1 })
+        #expect(native.startCalls == 0)
     }
 
     @Test("Relay addresses require an explicit valid port")
@@ -154,6 +319,141 @@ struct FlowSpliceTravelTests {
         #expect(TravelBackgroundAudioRecoveryPolicy.delay(attempt: 100) <= 330)
     }
 
+    @Test("Stop cancels a recovering audio start before it can restart Travel")
+    @MainActor
+    func stopCancelsRecoveringAudioStart() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let native = TravelStoreTestNative()
+        let audio = TravelStoreTestAudio(mode: .failsAndRecovers)
+        let store = testStore(native: native, audio: audio)
+
+        store.start()
+        #expect(await waitForCondition { audio.startCalls == 1 && store.canStop })
+
+        store.stop()
+        #expect(await waitForCondition { audio.stopCalls == 1 && !store.canStop })
+        #expect(native.startCalls == 0)
+        #expect(!EnrollmentStore.autoStart)
+
+        audio.recover()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(native.startCalls == 0)
+        #expect(!EnrollmentStore.autoStart)
+    }
+
+    @Test("Stop wins while background audio startup is delayed")
+    @MainActor
+    func stopWinsDuringDelayedAudioStart() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let native = TravelStoreTestNative()
+        let audio = TravelStoreTestAudio(mode: .delayed)
+        let store = testStore(native: native, audio: audio)
+
+        store.start()
+        #expect(await waitForCondition { audio.startCalls == 1 && store.canStop })
+
+        store.stop()
+        #expect(store.canStop)
+        audio.completeStart()
+
+        #expect(await waitForCondition { audio.stopCalls == 1 && !store.canStop })
+        #expect(native.startCalls == 0)
+        #expect(!EnrollmentStore.autoStart)
+    }
+
+    @Test("Stop wins when native startup completes after the user stops")
+    @MainActor
+    func stopWinsAfterDelayedNativeStart() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let native = TravelStoreTestNative(delaysStart: true)
+        let audio = TravelStoreTestAudio(mode: .immediate)
+        let store = testStore(native: native, audio: audio)
+
+        store.start()
+        #expect(await waitForCondition { native.startCalls == 1 && store.canStop })
+
+        store.stop()
+        #expect(!EnrollmentStore.autoStart)
+        native.completeStart()
+
+        #expect(await waitForCondition { native.stopCalls == 1 && !store.canStop })
+        #expect(native.startCalls == 1)
+        #expect(!EnrollmentStore.autoStart)
+    }
+
+    @Test("Failed stop operations wait for a new lifecycle request before retrying")
+    @MainActor
+    func failedStopDoesNotSpinLifecycleDrain() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let native = TravelStoreTestNative(failsStop: true)
+        let audio = TravelStoreTestAudio(mode: .immediate, failsStop: true)
+        let store = testStore(native: native, audio: audio)
+
+        store.start()
+        #expect(await waitForCondition { native.startCalls == 1 })
+
+        store.stop()
+        #expect(await waitForCondition { native.stopCalls == 1 && audio.stopCalls == 1 })
+        for _ in 0..<50 { await Task.yield() }
+
+        #expect(native.stopCalls == 1)
+        #expect(audio.stopCalls == 1)
+        #expect(store.canStop)
+    }
+
+    @Test("Temporary Keychain unavailability does not immediately retry an active-audio start")
+    @MainActor
+    func temporaryKeychainFailureDoesNotSpinStart() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        var lookupCalls = 0
+        let native = TravelStoreTestNative()
+        let audio = TravelStoreTestAudio(mode: .immediate, initialStatus: .active)
+        let store = testStore(
+            native: native,
+            audio: audio,
+            credentialLookup: {
+                lookupCalls += 1
+                return .unavailable(errSecInteractionNotAllowed)
+            }
+        )
+        let initialLookupCalls = lookupCalls
+
+        store.start()
+        #expect(await waitForCondition { store.presentedError != nil })
+        for _ in 0..<50 { await Task.yield() }
+
+        #expect(lookupCalls == initialLookupCalls + 1)
+        #expect(native.startCalls == 0)
+        #expect(audio.startCalls == 0)
+        #expect(store.canStop)
+    }
+
+    @Test("A Start arriving during an awaited Stop runs after cleanup")
+    @MainActor
+    func startDuringAwaitedStopRunsAfterCleanup() async {
+        EnrollmentStore.autoStart = false
+        defer { EnrollmentStore.autoStart = false }
+        let native = TravelStoreTestNative(delaysStop: true)
+        let audio = TravelStoreTestAudio(mode: .immediate)
+        let store = testStore(native: native, audio: audio)
+
+        store.start()
+        #expect(await waitForCondition { native.startCalls == 1 && store.snapshot.phase == .running })
+
+        store.stop()
+        #expect(await waitForCondition { native.stopCalls == 1 })
+        store.start()
+        native.completeStop()
+
+        #expect(await waitForCondition { native.startCalls == 2 && store.snapshot.phase == .running })
+        #expect(EnrollmentStore.autoStart)
+    }
+
     @Test("Live Activity is presentation for a running runtime only")
     func liveActivityVisibilityPolicy() {
         var snapshot = TravelSnapshot()
@@ -212,5 +512,260 @@ struct FlowSpliceTravelTests {
 
         #expect(controller.status == .disabled)
         #expect(controller.status.detail.contains("continues independently"))
+    }
+
+    @MainActor
+    private func testStore(
+        native: TravelStoreTestNative,
+        audio: TravelStoreTestAudio,
+        files: TravelFileAccess? = nil,
+        credentialLookup: @escaping () -> CredentialLookupResult = { .available("test-password") },
+        credentialClear: @escaping () -> Void = {}
+    ) -> TravelStore {
+        let directory = URL(fileURLWithPath: "/tmp/flowsplice-travel-store-tests", isDirectory: true)
+        let defaultFiles = TravelFileAccess(
+            installationDirectory: { directory },
+            config: { directory.appending(path: "travelagent.toml") },
+            isInstalled: { true },
+            prepareInstallationDirectory: {},
+            prepareRuntimeStorage: {},
+            discardPendingInstallation: {},
+            removeInstallationForReenrollment: {}
+        )
+        return TravelStore(
+            native: native,
+            backgroundAudio: audio,
+            liveActivity: TravelStoreTestLiveActivity(),
+            files: files ?? defaultFiles,
+            credentialLookup: credentialLookup,
+            credentialSave: { _ in },
+            credentialClear: credentialClear
+        )
+    }
+
+    @MainActor
+    private func waitForCondition(_ condition: @escaping () -> Bool) async -> Bool {
+        for _ in 0..<200 {
+            if condition() { return true }
+            await Task.yield()
+        }
+        return condition()
+    }
+}
+
+@MainActor
+private final class TravelStoreTestAudio: TravelBackgroundAudioControlling {
+    enum Mode {
+        case immediate
+        case delayed
+        case failsAndRecovers
+    }
+
+    private let mode: Mode
+    private let failsStop: Bool
+    private var startContinuation: CheckedContinuation<Void, Error>?
+    private(set) var startCalls = 0
+    private(set) var stopCalls = 0
+    private(set) var status: TravelBackgroundAudioStatus = .inactive {
+        didSet { onStatusChange?(status) }
+    }
+    var onStatusChange: ((TravelBackgroundAudioStatus) -> Void)?
+
+    init(
+        mode: Mode,
+        initialStatus: TravelBackgroundAudioStatus = .inactive,
+        failsStop: Bool = false
+    ) {
+        self.mode = mode
+        self.failsStop = failsStop
+        status = initialStatus
+    }
+
+    func start() async throws {
+        startCalls += 1
+        status = .starting
+        switch mode {
+        case .immediate:
+            status = .active
+        case .delayed:
+            try await withCheckedThrowingContinuation { continuation in
+                startContinuation = continuation
+            }
+            status = .active
+        case .failsAndRecovers:
+            status = .recovering
+            throw TravelStoreTestError.audioUnavailable
+        }
+    }
+
+    func stop() async throws {
+        stopCalls += 1
+        if failsStop { throw TravelStoreTestError.audioStopUnavailable }
+        status = .inactive
+    }
+
+    func reconcile() async {}
+
+    func completeStart() {
+        startContinuation?.resume()
+        startContinuation = nil
+    }
+
+    func recover() {
+        status = .active
+    }
+}
+
+@MainActor
+private final class TravelStoreTestNative: TravelRuntimeControlling {
+    private let delaysStart: Bool
+    private let delaysStop: Bool
+    private let delaysCancelEnrollment: Bool
+    private let failsStop: Bool
+    private var startContinuation: CheckedContinuation<NativeTravelStatus, Error>?
+    private var stopContinuation: CheckedContinuation<Void, Error>?
+    private var cancelEnrollmentContinuation: CheckedContinuation<Void, Error>?
+    private(set) var startCalls = 0
+    private(set) var stopCalls = 0
+    private(set) var cancelEnrollmentCalls = 0
+
+    init(
+        delaysStart: Bool = false,
+        delaysStop: Bool = false,
+        delaysCancelEnrollment: Bool = false,
+        failsStop: Bool = false
+    ) {
+        self.delaysStart = delaysStart
+        self.delaysStop = delaysStop
+        self.delaysCancelEnrollment = delaysCancelEnrollment
+        self.failsStop = failsStop
+    }
+
+    func beginEnrollment(
+        installDirectory: URL,
+        travelID: String,
+        homeID: String,
+        relay: String,
+        password: String
+    ) async throws -> EnrollmentSnapshot {
+        EnrollmentSnapshot()
+    }
+
+    func enrollmentStatus() async throws -> EnrollmentSnapshot {
+        EnrollmentSnapshot()
+    }
+
+    func cancelEnrollment() async throws {
+        cancelEnrollmentCalls += 1
+        if delaysCancelEnrollment {
+            try await withCheckedThrowingContinuation { continuation in
+                cancelEnrollmentContinuation = continuation
+            }
+        }
+    }
+
+    func start(config: URL, password: String) async throws -> NativeTravelStatus {
+        startCalls += 1
+        if delaysStart {
+            return try await withCheckedThrowingContinuation { continuation in
+                startContinuation = continuation
+            }
+        }
+        return runningStatus
+    }
+
+    func stop() async throws {
+        stopCalls += 1
+        if failsStop { throw TravelStoreTestError.nativeStopUnavailable }
+        if delaysStop {
+            try await withCheckedThrowingContinuation { continuation in
+                stopContinuation = continuation
+            }
+        }
+    }
+
+    func notifyNetworkChanged() async throws {}
+
+    func status() async throws -> NativeTravelStatus {
+        runningStatus
+    }
+
+    func waitForStatusChange(
+        generation: UInt64,
+        timeoutMillis: UInt64
+    ) async throws -> NativeTravelStatusUpdate {
+        try await Task.sleep(for: .milliseconds(1))
+        return NativeTravelStatusUpdate(generation: generation + 1, status: runningStatus)
+    }
+
+    func wakeStatusWaiters() async {}
+
+    func catalog() async throws -> TravelCatalog {
+        TravelCatalog()
+    }
+
+    func upsert(mapping: TravelMapping) async throws -> TravelMapping {
+        mapping
+    }
+
+    func delete(mapping: TravelMapping) async throws -> TravelMapping {
+        mapping
+    }
+
+    func completeStart() {
+        startContinuation?.resume(returning: runningStatus)
+        startContinuation = nil
+    }
+
+    func completeStop() {
+        stopContinuation?.resume()
+        stopContinuation = nil
+    }
+
+    func completeCancelEnrollment() {
+        cancelEnrollmentContinuation?.resume()
+        cancelEnrollmentContinuation = nil
+    }
+
+    private var runningStatus: NativeTravelStatus {
+        NativeTravelStatus(
+            ok: true,
+            online: true,
+            travelID: "test-travel",
+            uptimeSeconds: 1,
+            activeFlows: 0,
+            catalogGeneration: 1,
+            relayDirectoryGeneration: 1,
+            activeRelays: ["relay-1"],
+            uploadedBytes: 0,
+            downloadedBytes: 0,
+            mappings: [],
+            privateKeyPasswordRotationAvailable: false
+        )
+    }
+}
+
+@MainActor
+private final class TravelStoreTestLiveActivity: TravelLiveActivityControlling {
+    var status: TravelLiveActivityStatus = .inactive
+    var onStatusChange: ((TravelLiveActivityStatus) -> Void)?
+
+    func synchronize(snapshot: TravelSnapshot, interfaceLabel: String) async {}
+}
+
+private enum TravelStoreTestError: LocalizedError {
+    case audioUnavailable
+    case audioStopUnavailable
+    case nativeStopUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .audioUnavailable:
+            "Audio unavailable for test"
+        case .audioStopUnavailable:
+            "Audio stop unavailable for test"
+        case .nativeStopUnavailable:
+            "Native stop unavailable for test"
+        }
     }
 }

@@ -549,6 +549,7 @@ docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
   --home-id "${dynamic_global_home_id}" \
   --install-dir /dynamic-travel \
   --relay relay2:8443 \
+  --deployment-root-public-key /certs/deployment-root.pub \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
   --test-password-file /dynamic-travel/test-password.txt \
@@ -596,6 +597,7 @@ docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
   --home-id home-1 \
   --install-dir /first-travel \
   --relay relay2:8443 \
+  --deployment-root-public-key /certs/deployment-root.pub \
   --test-allow-remote-listen \
   --test-admin-token flowsplice-e2e-first-remote-administrator-token \
   --test-password-file /first-travel/test-password.txt \
@@ -720,6 +722,7 @@ docker compose -f "${compose_file}" run --no-deps --rm travelagent \
   --home-id home-1 \
   --install-dir /travel \
   --relay relay2:8443 \
+  --deployment-root-public-key /certs/deployment-root.pub \
   --test-password-file /travel/test-password.txt \
   --wait-timeout-secs 180 \
   >"${generated_dir}/travel/enroll.log" 2>&1 &

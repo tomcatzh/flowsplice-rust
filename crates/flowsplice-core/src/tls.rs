@@ -545,9 +545,9 @@ pub fn identity_server_auth_connector_from_ca_pem(ca_pem: &str) -> Result<TlsCon
 
 /// Builds the narrowly scoped connector used to retrieve public first-contact material.
 ///
-/// The server certificate is not yet anchored during this one request. The caller must parse a
-/// Relay identity, verify the returned signed deployment document, reconnect with the discovered
-/// management CA, and require human verification at Home before accepting an identity.
+/// The server certificate is not yet anchored during this one request. The caller must verify the
+/// deployment document against an independently trusted root, authenticate this connection with
+/// `verify_discovery_certificate`, then reconnect using that document's management CA.
 #[must_use]
 pub fn bootstrap_discovery_connector() -> TlsConnector {
     let signature_algorithms =
@@ -560,6 +560,34 @@ pub fn bootstrap_discovery_connector() -> TlsConnector {
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+/// Authenticates discovery metadata after its signed trust document has established the CA.
+///
+/// # Errors
+/// Returns an error if the discovery peer's certificate chain is not issued by the trusted CA.
+pub fn verify_discovery_certificate(
+    certificates: Option<&[CertificateDer<'_>]>,
+    trusted_ca_pem: &str,
+) -> Result<()> {
+    let (leaf, intermediates) = certificates
+        .and_then(|chain| chain.split_first())
+        .ok_or_else(|| anyhow!("discovery peer did not supply a certificate"))?;
+    let verifier = CertificateChainVerifier {
+        roots: roots_from_pem(trusted_ca_pem, "trusted deployment management CA")?,
+        signature_algorithms: rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms,
+    };
+    verifier
+        .verify_server_cert(
+            leaf,
+            intermediates,
+            &identity_server_name()?,
+            &[],
+            UnixTime::now(),
+        )
+        .context("discovery peer is outside the trusted deployment")?;
+    Ok(())
 }
 
 /// Builds an mTLS client connector that validates the certificate chain while `FlowSplice` checks

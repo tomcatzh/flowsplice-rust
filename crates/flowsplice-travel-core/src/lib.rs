@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -46,7 +46,7 @@ use flowsplice_core::{
     tls::{
         bootstrap_discovery_connector, identity_client_connector_with_private_key,
         identity_from_certificate_pem, identity_server_auth_connector_from_ca_pem,
-        identity_server_name, peer_identity, require_peer,
+        identity_server_name, peer_identity, require_peer, verify_discovery_certificate,
     },
 };
 use flowsplice_enrollment::{
@@ -61,7 +61,7 @@ use flowsplice_enrollment::{
     load_json, validate_enrollment_response,
 };
 use flowsplice_storage::{
-    LocalStatistics, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
+    LocalStatistics, MetricBatch, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
     summarize_metric_points,
 };
 use rust_embed::RustEmbed;
@@ -79,6 +79,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod tcp_flow;
+
+#[cfg(test)]
+mod review_regressions;
 
 #[derive(RustEmbed)]
 #[folder = "../../travelagent/web/dist/"]
@@ -126,6 +129,14 @@ struct EnrollRemoteArgs {
     /// Legacy private bootstrap file accepted for compatibility with existing automation.
     #[arg(long, conflicts_with = "relay")]
     bootstrap_config: Option<PathBuf>,
+    /// Trusted deployment public key supplied separately from the Relay (CLI discovery).
+    #[arg(
+        long,
+        required_unless_present = "bootstrap_config",
+        requires = "relay",
+        conflicts_with = "bootstrap_config"
+    )]
+    deployment_root_public_key: Option<PathBuf>,
     #[arg(long, default_value_t = 900)]
     wait_timeout_secs: u64,
     #[cfg(feature = "e2e-remote-ui")]
@@ -218,6 +229,8 @@ pub struct RemoteEnrollmentOptions {
     pub home_id: String,
     pub install_dir: PathBuf,
     pub bootstrap_config: Option<PathBuf>,
+    /// Pretrusted key from a signed native resource or a private CLI input. Never from discovery.
+    pub trusted_deployment_root_public_key: Option<String>,
     pub selected_relay: Option<String>,
     /// Listener written to a generated CLI config. Native clients may leave this unset.
     pub ui_listen: Option<String>,
@@ -261,6 +274,9 @@ struct RelayAddressOverride {
     id: String,
     management_addr: String,
     data_addr: String,
+    /// Discovery addresses are fallback hints; only explicit operator overrides outrank updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    bootstrap_hint: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,7 +555,6 @@ struct AppState {
     state_store: Arc<StateStore>,
     enrollment_outbox_generation: Arc<std::sync::atomic::AtomicU64>,
     statistics: Arc<LocalStatistics>,
-    statistics_outbox_pending_at_start: bool,
     statistics_signer: Arc<EcdsaKeyPair>,
     statistics_certificate_pem: Arc<String>,
     relay_history: Arc<RwLock<Vec<RelayHistoryRecord>>>,
@@ -548,9 +563,31 @@ struct AppState {
     mapping_tasks: Arc<Mutex<HashMap<String, MappingTask>>>,
     ready_mapping_listeners: Arc<RwLock<HashMap<String, Uuid>>>,
     mapping_operation: Arc<Mutex<()>>,
+    blocking_operations: watch::Sender<usize>,
+}
+
+struct BlockingOperation(watch::Sender<usize>);
+
+impl Drop for BlockingOperation {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
 }
 
 impl AppState {
+    fn spawn_blocking<F, R>(&self, work: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.blocking_operations.send_modify(|count| *count += 1);
+        let operation = BlockingOperation(self.blocking_operations.clone());
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            work()
+        })
+    }
+
     fn mark_status_changed(&self) {
         self.status_generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1005,8 +1042,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
     let statistics_signer = statistics_signing_key(&management_key)?;
     let statistics_certificate_pem = fs::read_to_string(&config.management_cert)
         .context("failed to read Travel statistics signing certificate")?;
-    let (statistics, statistics_outbox_pending_at_start, enrollment_outbox_pending_at_start) =
-        load_statistics_state(&state_store)?;
+    let (statistics, enrollment_outbox_pending_at_start) = load_statistics_state(&state_store)?;
     let tls = build_tls_material(
         &config.management_cert,
         management_key,
@@ -1056,7 +1092,6 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
             enrollment_outbox_pending_at_start,
         ))),
         statistics: Arc::new(statistics),
-        statistics_outbox_pending_at_start,
         statistics_signer: Arc::new(statistics_signer),
         statistics_certificate_pem: Arc::new(statistics_certificate_pem),
         relay_history: Arc::new(RwLock::new(relay_history)),
@@ -1065,6 +1100,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         mapping_tasks: Arc::new(Mutex::new(HashMap::new())),
         ready_mapping_listeners: Arc::new(RwLock::new(HashMap::new())),
         mapping_operation: Arc::new(Mutex::new(())),
+        blocking_operations: watch::channel(0).0,
     })
 }
 
@@ -1078,15 +1114,17 @@ fn load_app_config(config_path: &Path) -> Result<(Config, StateStore, Vec<Mappin
 }
 
 fn read_public_key(path: &Path) -> Result<String> {
-    Ok(fs::read_to_string(path)
-        .with_context(|| {
-            format!(
-                "failed to read deployment root public key {}",
-                path.display()
-            )
-        })?
-        .trim()
-        .to_owned())
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .context("failed to open deployment root public key")?
+        .take(257)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 256 {
+        bail!("deployment root public key is too large");
+    }
+    normalized_trusted_root(
+        std::str::from_utf8(&bytes).context("invalid deployment root public key encoding")?,
+    )
 }
 
 fn load_control_trust_state(
@@ -1109,17 +1147,12 @@ fn load_control_trust_state(
     )
 }
 
-fn load_statistics_state(state_store: &StateStore) -> Result<(LocalStatistics, bool, bool)> {
+fn load_statistics_state(state_store: &StateStore) -> Result<(LocalStatistics, bool)> {
     let statistics = LocalStatistics::new(state_store.clone());
-    let statistics_outbox_pending_at_start = !statistics.pending_reports(1)?.is_empty();
     let enrollment_outbox_pending_at_start = !state_store
         .scan_prefix(Table::EnrollmentOutbox, b"")?
         .is_empty();
-    Ok((
-        statistics,
-        statistics_outbox_pending_at_start,
-        enrollment_outbox_pending_at_start,
-    ))
+    Ok((statistics, enrollment_outbox_pending_at_start))
 }
 
 fn build_tls_material(
@@ -1152,6 +1185,8 @@ fn build_tls_material(
 pub struct TravelCore {
     state: AppState,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    shutdown_lock: Mutex<()>,
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl TravelCore {
@@ -1161,10 +1196,35 @@ impl TravelCore {
     ///
     /// Returns an error if configuration, state, credentials, or initial mapping listeners fail.
     pub async fn start(config_path: &Path, private_key_password: &str) -> Result<Self> {
+        Self::start_inner(config_path, private_key_password, None).await
+    }
+
+    /// Starts a native runtime only if the installed identity belongs to the packaged deployment.
+    ///
+    /// # Errors
+    /// Returns an error without changing the identity when the trust root differs or is invalid.
+    pub async fn start_with_trusted_root(
+        config_path: &Path,
+        private_key_password: &str,
+        trusted_root: &str,
+    ) -> Result<Self> {
+        let root = normalized_trusted_root(trusted_root)?;
+        Self::start_inner(config_path, private_key_password, Some(root)).await
+    }
+
+    async fn start_inner(
+        config_path: &Path,
+        private_key_password: &str,
+        trusted_root: Option<String>,
+    ) -> Result<Self> {
         init_crypto();
         let config_path = config_path.to_path_buf();
         let private_key_password = Zeroizing::new(private_key_password.to_owned());
         let state = tokio::task::spawn_blocking(move || {
+            if let Some(root) = trusted_root {
+                let config: Config = load_toml(&config_path)?;
+                require_trusted_root(&read_public_key(&config.deployment_root_public_key)?, &root)?;
+            }
             load_app_state(&config_path, Some(private_key_password.as_str()))
         })
         .await
@@ -1185,6 +1245,8 @@ impl TravelCore {
         Ok(Self {
             state,
             tasks: Mutex::new(vec![catalog, trust]),
+            shutdown_lock: Mutex::new(()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1252,6 +1314,10 @@ impl TravelCore {
     ///
     /// Returns an error if the mapping is invalid, cannot bind, or cannot be persisted.
     pub async fn upsert_mapping(&self, mapping: Mapping) -> Result<Mapping> {
+        let _lifecycle = self.shutdown_lock.lock().await;
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("Travel runtime is stopped");
+        }
         upsert_mapping(&self.state, mapping).await
     }
 
@@ -1266,11 +1332,19 @@ impl TravelCore {
         service_id: String,
         protocol: ServiceProtocol,
     ) -> Result<Mapping> {
+        let _lifecycle = self.shutdown_lock.lock().await;
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("Travel runtime is stopped");
+        }
         delete_mapping(&self.state, home_id, service_id, protocol).await
     }
 
     /// Stops background subscriptions and all local mapping listeners.
     pub async fn shutdown(&self) {
+        let _lifecycle = self.shutdown_lock.lock().await;
+        if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         self.state.mark_status_changed();
         let tasks = {
             let mut tasks = self.tasks.lock().await;
@@ -1288,6 +1362,16 @@ impl TravelCore {
         };
         for task in mappings {
             stop_mapping_task(task).await;
+        }
+        let mut blocking = self.state.blocking_operations.subscribe();
+        let _ = blocking.wait_for(|count| *count == 0).await;
+        self.state.connected_relays.write().await.clear();
+        self.state.flow_relays.lock().await.clear();
+        self.state.diagnostics.lock().await.flows.clear();
+        self.state.mark_status_changed();
+        // Persist the final deltas even when the control connection is offline.
+        if let Err(error) = flush_travel_statistics(&self.state).await {
+            warn!(%error, "Travel statistics final flush failed");
         }
     }
 }
@@ -1408,6 +1492,11 @@ async fn run_remote_enrollment_cli(args: EnrollRemoteArgs) -> Result<()> {
         home_id: args.home_id,
         install_dir: args.install_dir,
         bootstrap_config: args.bootstrap_config,
+        trusted_deployment_root_public_key: args
+            .deployment_root_public_key
+            .as_deref()
+            .map(read_public_key)
+            .transpose()?,
         selected_relay: args.relay,
         ui_listen,
         private_key_password: password.to_string(),
@@ -1493,12 +1582,22 @@ where
         bail!("invalid selected Relay address {relay}");
     }
     let bootstrap = if let Some(config) = options.bootstrap_config.as_deref() {
-        load_travel_bootstrap(config)?
+        let bootstrap = load_travel_bootstrap(config)?;
+        if let Some(root) = options.trusted_deployment_root_public_key.as_deref() {
+            require_trusted_root(&bootstrap.deployment_root_public_key, root)?;
+        }
+        bootstrap
     } else {
         let relay = selected_relay
             .as_deref()
             .ok_or_else(|| anyhow!("remote enrollment requires a Relay address"))?;
-        discover_bootstrap_relay(relay).await?
+        let root = options
+            .trusted_deployment_root_public_key
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow!("a trusted deployment public key is required before Relay discovery")
+            })?;
+        discover_bootstrap_relay(relay, root).await?
     };
     let root_public_key = bootstrap.deployment_root_public_key.as_str();
     let management_ca = &bootstrap.trust.management_ca_certificate_pem;
@@ -1776,7 +1875,28 @@ fn write_or_verify_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap> {
+fn normalized_trusted_root(root: &str) -> Result<String> {
+    let root = root.trim();
+    if root.len() != 130 || !root.starts_with("04") || !root.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("invalid trusted deployment public key; expected a P-256 public point");
+    }
+    Ok(root.to_ascii_lowercase())
+}
+
+fn require_trusted_root(received: &str, trusted: &str) -> Result<String> {
+    let trusted = normalized_trusted_root(trusted)?;
+    if normalized_trusted_root(received)? != trusted {
+        bail!("deployment trust mismatch; use the app package for this deployment");
+    }
+    Ok(trusted)
+}
+
+async fn discover_bootstrap_relay(
+    relay: &str,
+    trusted_root: &str,
+) -> Result<VerifiedTravelBootstrap> {
+    let trusted_root = normalized_trusted_root(trusted_root)?;
     let socket = timeout(Duration::from_secs(10), TcpStream::connect(relay))
         .await
         .context("Relay discovery TCP connection timed out")??;
@@ -1815,10 +1935,15 @@ async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap
     if protocol_version != CONTROL_PROTOCOL_VERSION {
         bail!("Relay returned an unsupported discovery protocol version");
     }
-    let deployment_root_public_key = deployment_root_public_key.trim().to_owned();
+    let deployment_root_public_key =
+        require_trusted_root(&deployment_root_public_key, &trusted_root)?;
     let signed_trust: SignedDeploymentTrust = serde_json::from_slice(&deployment_trust_json)
         .context("Relay discovery returned invalid deployment trust")?;
     let trust = signed_trust.verify(&deployment_root_public_key, unix_time_secs()?)?;
+    verify_discovery_certificate(
+        stream.get_ref().1.peer_certificates(),
+        &trust.management_ca_certificate_pem,
+    )?;
     if trust.home_endpoints.is_empty() {
         bail!("discovered deployment trust has no Home");
     }
@@ -1834,6 +1959,7 @@ async fn discover_bootstrap_relay(relay: &str) -> Result<VerifiedTravelBootstrap
             id: identity.id,
             management_addr: relay.to_owned(),
             data_addr: relay_data_addr,
+            bootstrap_hint: true,
         }],
         ui_listen: "127.0.0.1:0".to_owned(),
     })
@@ -2521,7 +2647,8 @@ async fn run_catalog_session(
     let mut enrollment_inflight = None::<(Uuid, Instant)>;
     let mut enrollment_generation_checked = 0_u64;
     let mut enrollment_pending = state.has_enrollment_outbox_work();
-    let mut statistics_pending = state.statistics_outbox_pending_at_start;
+    // Each connection gets one fresh outbox scan, including ACK loss in an earlier session.
+    let mut statistics_pending = true;
     let mut nonce = 0_u64;
     let mut last_received = Instant::now();
     loop {
@@ -2545,7 +2672,7 @@ async fn run_catalog_session(
                             if let Some(key) = report_keys.remove(&digest_sha256) {
                                 let statistics = Arc::clone(&state.statistics);
                                 let digest = digest_sha256.clone();
-                                tokio::task::spawn_blocking(move || statistics.acknowledge_report(&key, &digest))
+                                state.spawn_blocking(move || statistics.acknowledge_report(&key, &digest))
                                     .await
                                     .context("Travel statistics acknowledgement task failed")??;
                             }
@@ -2662,77 +2789,78 @@ async fn next_remote_enrollment_message(state: &AppState) -> Result<EnrollmentOu
     let travel_id = state.config.id.clone();
     let travel_session_id = state.session_id;
     let management_spki_sha256 = Arc::clone(&state.management_spki_sha256);
-    tokio::task::spawn_blocking(move || {
-        let now = unix_time_secs()?;
-        let mut batch = WriteBatch::new();
-        let mut pending = false;
-        let mut selected = None;
-        for (key, value) in store.scan_prefix(Table::EnrollmentOutbox, b"")? {
-            let Ok(mut record) = serde_json::from_slice::<RemoteEnrollmentOutboxRecord>(&value)
-            else {
-                warn!(?key, "ignored malformed remote enrollment outbox record");
-                continue;
-            };
-            if remote_enrollment_outbox_expired(
-                record.created_at_unix_secs,
-                record.installed_at_unix_secs,
-                now,
-            ) {
-                batch = batch.delete(Table::EnrollmentOutbox, key);
-                continue;
-            }
-            if record.version != REMOTE_ENROLLMENT_VERSION {
-                continue;
-            }
-            let request_id = record.request.request_id;
-            let message = if let (Some(response), Some(credential_id)) =
-                (record.response.as_ref(), record.installed_credential_id)
-            {
-                let installed_identity =
-                    identity_from_certificate_pem(&response.management_certificate_pem)?;
-                if installed_identity.spki_sha256 != *management_spki_sha256 {
+    state
+        .spawn_blocking(move || {
+            let now = unix_time_secs()?;
+            let mut batch = WriteBatch::new();
+            let mut pending = false;
+            let mut selected = None;
+            for (key, value) in store.scan_prefix(Table::EnrollmentOutbox, b"")? {
+                let Ok(mut record) = serde_json::from_slice::<RemoteEnrollmentOutboxRecord>(&value)
+                else {
+                    warn!(?key, "ignored malformed remote enrollment outbox record");
+                    continue;
+                };
+                if remote_enrollment_outbox_expired(
+                    record.created_at_unix_secs,
+                    record.installed_at_unix_secs,
+                    now,
+                ) {
+                    batch = batch.delete(Table::EnrollmentOutbox, key);
                     continue;
                 }
-                ControlMessage::RemoteEnrollmentInstalled {
-                    request_id,
-                    travel_id: travel_id.clone(),
-                    travel_session_id,
-                    credential_id,
-                    home_id: record.home_id.clone(),
+                if record.version != REMOTE_ENROLLMENT_VERSION {
+                    continue;
                 }
-            } else if record.response.is_none() && !record.restart_required {
-                ControlMessage::TravelEnrollmentSubmit {
-                    request_id,
-                    travel_id: travel_id.clone(),
-                    travel_session_id,
-                    home_id: record.home_id.clone(),
-                    request_json: serde_json::to_vec(&record.request)?,
+                let request_id = record.request.request_id;
+                let message = if let (Some(response), Some(credential_id)) =
+                    (record.response.as_ref(), record.installed_credential_id)
+                {
+                    let installed_identity =
+                        identity_from_certificate_pem(&response.management_certificate_pem)?;
+                    if installed_identity.spki_sha256 != *management_spki_sha256 {
+                        continue;
+                    }
+                    ControlMessage::RemoteEnrollmentInstalled {
+                        request_id,
+                        travel_id: travel_id.clone(),
+                        travel_session_id,
+                        credential_id,
+                        home_id: record.home_id.clone(),
+                    }
+                } else if record.response.is_none() && !record.restart_required {
+                    ControlMessage::TravelEnrollmentSubmit {
+                        request_id,
+                        travel_id: travel_id.clone(),
+                        travel_session_id,
+                        home_id: record.home_id.clone(),
+                        request_json: serde_json::to_vec(&record.request)?,
+                    }
+                } else {
+                    continue;
+                };
+                pending = true;
+                if selected.is_some()
+                    || record
+                        .last_attempt_unix_secs
+                        .is_some_and(|attempt| now.saturating_sub(attempt) < 10)
+                {
+                    continue;
                 }
-            } else {
-                continue;
-            };
-            pending = true;
-            if selected.is_some()
-                || record
-                    .last_attempt_unix_secs
-                    .is_some_and(|attempt| now.saturating_sub(attempt) < 10)
-            {
-                continue;
+                record.last_attempt_unix_secs = Some(now);
+                batch = batch.put_json(Table::EnrollmentOutbox, key, &record)?;
+                selected = Some((request_id, message));
             }
-            record.last_attempt_unix_secs = Some(now);
-            batch = batch.put_json(Table::EnrollmentOutbox, key, &record)?;
-            selected = Some((request_id, message));
-        }
-        if !batch.is_empty() {
-            store.apply_immediate(batch)?;
-        }
-        Ok(EnrollmentOutboxPoll {
-            message: selected,
-            pending,
+            if !batch.is_empty() {
+                store.apply_immediate(batch)?;
+            }
+            Ok(EnrollmentOutboxPoll {
+                message: selected,
+                pending,
+            })
         })
-    })
-    .await
-    .context("Travel enrollment outbox query task failed")?
+        .await
+        .context("Travel enrollment outbox query task failed")?
 }
 
 fn prune_remote_enrollment_outbox(store: &StateStore, now: u64) -> Result<()> {
@@ -2772,22 +2900,23 @@ fn remote_enrollment_outbox_expired(
 
 async fn acknowledge_remote_enrollment_install(state: &AppState, request_id: Uuid) -> Result<()> {
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || {
-        let record = store
-            .get_json::<RemoteEnrollmentOutboxRecord>(
-                Table::EnrollmentOutbox,
-                request_id.as_bytes(),
-            )?
-            .ok_or_else(|| anyhow!("unknown remote enrollment install acknowledgement"))?;
-        if record.installed_credential_id.is_none() {
-            bail!("remote enrollment was not installed");
-        }
-        store.apply_immediate(
-            WriteBatch::new().delete(Table::EnrollmentOutbox, request_id.as_bytes().to_vec()),
-        )
-    })
-    .await
-    .context("Travel enrollment install acknowledgement task failed")??;
+    state
+        .spawn_blocking(move || {
+            let record = store
+                .get_json::<RemoteEnrollmentOutboxRecord>(
+                    Table::EnrollmentOutbox,
+                    request_id.as_bytes(),
+                )?
+                .ok_or_else(|| anyhow!("unknown remote enrollment install acknowledgement"))?;
+            if record.installed_credential_id.is_none() {
+                bail!("remote enrollment was not installed");
+            }
+            store.apply_immediate(
+                WriteBatch::new().delete(Table::EnrollmentOutbox, request_id.as_bytes().to_vec()),
+            )
+        })
+        .await
+        .context("Travel enrollment install acknowledgement task failed")??;
     state.mark_enrollment_outbox_changed();
     info!(%request_id, "Home acknowledged installed remote enrollment");
     Ok(())
@@ -2819,34 +2948,56 @@ async fn apply_remote_enrollment_result(
         unix_time_secs()?,
     )?;
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || {
-        let mut record = store
-            .get_json::<RemoteEnrollmentOutboxRecord>(
-                Table::EnrollmentOutbox,
-                request_id.as_bytes(),
-            )?
-            .ok_or_else(|| anyhow!("remote enrollment response has no local request"))?;
-        if record.request != response.approval.request {
-            bail!("remote enrollment response does not match the local request");
-        }
-        if let Some(existing) = record.response.as_ref() {
-            if existing == &response {
-                return Ok(());
+    state
+        .spawn_blocking(move || {
+            let mut record = store
+                .get_json::<RemoteEnrollmentOutboxRecord>(
+                    Table::EnrollmentOutbox,
+                    request_id.as_bytes(),
+                )?
+                .ok_or_else(|| anyhow!("remote enrollment response has no local request"))?;
+            if record.request != response.approval.request {
+                bail!("remote enrollment response does not match the local request");
             }
-            bail!("conflicting remote enrollment response for the same request");
-        }
-        record.response = Some(response);
-        store.apply_immediate(WriteBatch::new().put_json(
-            Table::EnrollmentOutbox,
-            request_id.as_bytes().to_vec(),
-            &record,
-        )?)
-    })
-    .await
-    .context("Travel enrollment response commit task failed")??;
+            if let Some(existing) = record.response.as_ref() {
+                if existing == &response {
+                    return Ok(());
+                }
+                bail!("conflicting remote enrollment response for the same request");
+            }
+            record.response = Some(response);
+            store.apply_immediate(WriteBatch::new().put_json(
+                Table::EnrollmentOutbox,
+                request_id.as_bytes().to_vec(),
+                &record,
+            )?)
+        })
+        .await
+        .context("Travel enrollment response commit task failed")??;
     state.mark_enrollment_outbox_changed();
     info!(%request_id, "received and verified remote enrollment response");
     Ok(())
+}
+
+async fn flush_travel_statistics(state: &AppState) -> Result<usize> {
+    let statistics = Arc::clone(&state.statistics);
+    let deployment_id = state.deployment_trust.read().await.deployment_id.clone();
+    let reporter_id = state.config.id.clone();
+    let certificate_pem = Arc::clone(&state.statistics_certificate_pem);
+    let signer = Arc::clone(&state.statistics_signer);
+    let staged = state
+        .spawn_blocking(move || {
+            statistics.flush_and_stage(
+                &deployment_id,
+                Role::Travel,
+                &reporter_id,
+                &certificate_pem,
+                &signer,
+            )
+        })
+        .await
+        .context("Travel statistics flush task failed")??;
+    Ok(staged)
 }
 
 async fn flush_and_send_travel_statistics<W: tokio::io::AsyncWrite + Unpin>(
@@ -2855,27 +3006,13 @@ async fn flush_and_send_travel_statistics<W: tokio::io::AsyncWrite + Unpin>(
     report_keys: &mut HashMap<String, Vec<u8>>,
     known_pending: &mut bool,
 ) -> Result<()> {
-    let statistics = Arc::clone(&state.statistics);
-    let deployment_id = state.deployment_trust.read().await.deployment_id.clone();
-    let reporter_id = state.config.id.clone();
-    let certificate_pem = Arc::clone(&state.statistics_certificate_pem);
-    let signer = Arc::clone(&state.statistics_signer);
-    let staged = tokio::task::spawn_blocking(move || {
-        statistics.flush_and_stage(
-            &deployment_id,
-            Role::Travel,
-            &reporter_id,
-            &certificate_pem,
-            &signer,
-        )
-    })
-    .await
-    .context("Travel statistics flush task failed")??;
+    let staged = flush_travel_statistics(state).await?;
     if !statistics_outbox_scan_needed(staged, *known_pending, !report_keys.is_empty()) {
         return Ok(());
     }
     let statistics = Arc::clone(&state.statistics);
-    let reports = tokio::task::spawn_blocking(move || statistics.pending_reports(16))
+    let reports = state
+        .spawn_blocking(move || statistics.pending_reports(16))
         .await
         .context("Travel statistics outbox task failed")??;
     *known_pending = !reports.is_empty();
@@ -3065,20 +3202,27 @@ async fn open_business_on(
         trusted_home_business_pins(&trust, &home.id, endpoint_credential, unix_time_secs()?)?
     };
     let (grant, relay_id) = request_route(state, relay, home_id).await?;
-    let data_addr = state
-        .config
-        .relay_address_overrides
-        .iter()
-        .find(|candidate| candidate.id == relay_id)
-        .map_or(grant.data_addr.as_str(), |candidate| {
-            candidate.data_addr.as_str()
-        });
-    let mut socket = timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
-        TcpStream::connect(data_addr),
-    )
-    .await
-    .context("relay data connection timed out")??;
+    let addresses =
+        relay_data_addresses(&relay_id, &grant.data_addr, &config.relay_address_overrides);
+    let mut connected = None;
+    let mut last_error = None;
+    for address in addresses {
+        match timeout(
+            Duration::from_secs(config.handshake_timeout_secs),
+            TcpStream::connect(address),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => {
+                connected = Some(socket);
+                break;
+            }
+            Ok(Err(error)) => last_error = Some(anyhow!(error)),
+            Err(_) => last_error = Some(anyhow!("relay data connection timed out")),
+        }
+    }
+    let mut socket =
+        connected.ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("no Relay data address")))?;
     socket.set_nodelay(true)?;
     timeout(
         Duration::from_secs(config.handshake_timeout_secs),
@@ -3149,20 +3293,61 @@ fn signed_directory_candidates(
     directory
         .relays
         .into_iter()
-        .map(|relay| {
-            let management_addr = overrides
-                .iter()
-                .find(|candidate| candidate.id == relay.id)
-                .map_or(relay.management_addr, |candidate| {
-                    candidate.management_addr.clone()
-                });
-            RelayCandidate {
-                expected_id: Some(relay.id),
-                management_addr,
-                management_spki_sha256: Some(relay.management_spki_sha256),
-            }
+        .flat_map(|relay| {
+            relay_management_candidates(
+                relay.id,
+                relay.management_addr,
+                relay.management_spki_sha256,
+                overrides,
+            )
         })
         .collect()
+}
+
+fn relay_data_addresses<'a>(
+    relay_id: &str,
+    signed: &'a str,
+    overrides: &'a [RelayAddressOverride],
+) -> Vec<&'a str> {
+    let Some(address) = overrides.iter().find(|entry| entry.id == relay_id) else {
+        return vec![signed];
+    };
+    if address.data_addr == signed {
+        return vec![signed];
+    }
+    if address.bootstrap_hint {
+        vec![signed, &address.data_addr]
+    } else {
+        vec![&address.data_addr, signed]
+    }
+}
+
+fn relay_management_candidates(
+    id: String,
+    signed: String,
+    pin: String,
+    overrides: &[RelayAddressOverride],
+) -> Vec<RelayCandidate> {
+    let address = overrides.iter().find(|entry| entry.id == id);
+    let signed_candidate = RelayCandidate {
+        expected_id: Some(id),
+        management_addr: signed,
+        management_spki_sha256: Some(pin),
+    };
+    let Some(address) =
+        address.filter(|entry| entry.management_addr != signed_candidate.management_addr)
+    else {
+        return vec![signed_candidate];
+    };
+    let override_candidate = RelayCandidate {
+        management_addr: address.management_addr.clone(),
+        ..signed_candidate.clone()
+    };
+    if address.bootstrap_hint {
+        vec![signed_candidate, override_candidate]
+    } else {
+        vec![override_candidate, signed_candidate]
+    }
 }
 
 async fn bootstrap_candidates(state: &AppState) -> Vec<RelayCandidate> {
@@ -3196,39 +3381,27 @@ fn bootstrap_candidate_pool(
             })
             .then_with(|| right.last_seen_unix_secs.cmp(&left.last_seen_unix_secs))
     });
-    let mut source = directory
+    let current_ids: HashSet<_> = directory
         .relays
-        .into_iter()
-        .map(|relay| {
-            let management_addr = overrides
-                .iter()
-                .find(|candidate| candidate.id == relay.id)
-                .map_or(relay.management_addr, |candidate| {
-                    candidate.management_addr.clone()
-                });
-            RelayCandidate {
-                expected_id: Some(relay.id),
-                management_addr,
-                management_spki_sha256: Some(relay.management_spki_sha256),
-            }
-        })
-        .collect::<Vec<_>>();
+        .iter()
+        .map(|relay| relay.id.clone())
+        .collect();
+    let mut source = signed_directory_candidates(directory, overrides);
     source.extend(
         history
             .into_iter()
-            .filter(|relay| relay.deployment_id == deployment_id && !relay.operator_disabled)
-            .map(|relay| {
-                let management_addr = overrides
-                    .iter()
-                    .find(|candidate| candidate.id == relay.relay_id)
-                    .map_or(relay.management_addr, |candidate| {
-                        candidate.management_addr.clone()
-                    });
-                RelayCandidate {
-                    expected_id: Some(relay.relay_id),
-                    management_addr,
-                    management_spki_sha256: Some(relay.management_spki_sha256),
-                }
+            .filter(|relay| {
+                relay.deployment_id == deployment_id
+                    && !relay.operator_disabled
+                    && !current_ids.contains(&relay.relay_id)
+            })
+            .flat_map(|relay| {
+                relay_management_candidates(
+                    relay.relay_id,
+                    relay.management_addr,
+                    relay.management_spki_sha256,
+                    overrides,
+                )
             }),
     );
     source.extend(seeds.iter().map(|relay| RelayCandidate {
@@ -3239,14 +3412,7 @@ fn bootstrap_candidate_pool(
     let mut seen = HashSet::new();
     source
         .into_iter()
-        .filter(|relay| {
-            seen.insert(
-                relay
-                    .expected_id
-                    .clone()
-                    .unwrap_or_else(|| relay.management_addr.clone()),
-            )
-        })
+        .filter(|relay| seen.insert((relay.expected_id.clone(), relay.management_addr.clone())))
         .collect()
 }
 
@@ -3324,7 +3490,8 @@ async fn apply_control_snapshot(
             )?;
         }
         let store = Arc::clone(&state.state_store);
-        tokio::task::spawn_blocking(move || store.apply_immediate(batch))
+        state
+            .spawn_blocking(move || store.apply_immediate(batch))
             .await
             .context("Travel redb commit task failed")??;
         *acceptance = proposed;
@@ -3383,7 +3550,8 @@ async fn record_relay_success(state: &AppState, relay_id: &str) -> Result<()> {
         &record,
     )?;
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || store.apply_immediate(batch))
+    state
+        .spawn_blocking(move || store.apply_immediate(batch))
         .await
         .context("Relay success history commit task failed")??;
     Ok(())
@@ -3420,7 +3588,8 @@ async fn record_relay_failure(state: &AppState, relay: &RelayCandidate) -> Resul
         &record,
     )?;
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || store.apply_immediate(batch))
+    state
+        .spawn_blocking(move || store.apply_immediate(batch))
         .await
         .context("Relay failure history commit task failed")??;
     Ok(())
@@ -3600,23 +3769,23 @@ async fn supervise_mapping_listener(
     }
 }
 
-async fn stop_mapping_task(mut task: MappingTask) {
+async fn stop_mapping_task(task: MappingTask) {
     let _ = task.shutdown.send(true);
-    if timeout(Duration::from_secs(2), &mut task.join)
-        .await
-        .is_err()
-    {
-        task.join.abort();
-        let _ = task.join.await;
-    }
+    let _ = task.join.await;
 }
 
 async fn start_initial_mapping_listeners(state: &AppState) -> Result<()> {
+    // Bind the whole set before publishing any task that can retain the database or accept flows.
+    let mut prepared_listeners = Vec::new();
     for mapping in state.mappings.read().await.clone() {
         let prepared = prepare_mapping_listener(&mapping).await?;
+        prepared_listeners.push((mapping, prepared));
+    }
+    let mut tasks = state.mapping_tasks.lock().await;
+    for (mapping, prepared) in prepared_listeners {
         let key = mapping_key(&mapping);
         let task = spawn_mapping_listener(state.clone(), mapping, prepared);
-        state.mapping_tasks.lock().await.insert(key, task);
+        tasks.insert(key, task);
     }
     Ok(())
 }
@@ -3628,35 +3797,43 @@ async fn run_tcp_listener(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     info!(home_id = %mapping.home_id, service_id = %mapping.service_id, address = %mapping.bind, "local TCP mapping ready");
-    loop {
-        let (local, peer) = tokio::select! {
-            changed = shutdown.changed() => {
-                let _ = changed;
-                return Ok(());
-            }
-            accepted = listener.accept() => accepted?,
-        };
-        let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
-            warn!(%peer, "travel active-flow limit reached");
-            continue;
-        };
-        let state = state.clone();
-        let mapping = mapping.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _guard = FlowGuard::new(
-                Arc::clone(&state.active_flows),
-                state.status_generation.clone(),
-            );
-            if let Err(error) = run_tcp_flow(&state, &mapping, local).await {
-                warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "TCP flow closed");
-            }
-        });
+    let mut flows = JoinSet::new();
+    let (flow_stop, flow_shutdown) = watch::channel(false);
+    let result = async {
+        loop {
+            let (local, peer) = tokio::select! {
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return Ok(());
+                }
+                _ = flows.join_next(), if !flows.is_empty() => continue,
+                accepted = listener.accept() => accepted?,
+            };
+            let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
+                warn!(%peer, "travel active-flow limit reached");
+                continue;
+            };
+            let state = state.clone();
+            let mapping = mapping.clone();
+            let flow_shutdown = flow_shutdown.clone();
+            flows.spawn(async move {
+                let _permit = permit;
+                let _guard = FlowGuard::new(
+                    Arc::clone(&state.active_flows),
+                    state.status_generation.clone(),
+                );
+                if let Err(error) = tcp_flow::run(state, mapping, local, flow_shutdown).await {
+                    warn!(%peer, %error, "TCP flow closed");
+                }
+            });
+        }
     }
-}
-
-async fn run_tcp_flow(state: &AppState, mapping: &Mapping, local: TcpStream) -> Result<()> {
-    tcp_flow::run(state.clone(), mapping.clone(), local).await
+    .await;
+    // A listener error also ends its flow lifetime. Each flow drains its own child tasks.
+    drop(listener);
+    let _ = flow_stop.send(true);
+    while flows.join_next().await.is_some() {}
+    result
 }
 
 async fn run_udp_listener(
@@ -3670,6 +3847,8 @@ async fn run_udp_listener(
     let associations: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut buffer = vec![0_u8; 65_507];
+    let mut flows = JoinSet::new();
+    let result = async {
     loop {
         let (count, peer) = tokio::select! {
             changed = shutdown.changed() => {
@@ -3677,6 +3856,7 @@ async fn run_udp_listener(
                 return Ok(());
             }
             received = socket.recv_from(&mut buffer) => received?,
+            _ = flows.join_next(), if !flows.is_empty() => continue,
         };
         let mut bytes = buffer[..count].to_vec();
         let existing = associations.lock().await.get(&peer).cloned();
@@ -3712,7 +3892,7 @@ async fn run_udp_listener(
         let state = state.clone();
         let mapping = mapping.clone();
         let association_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        flows.spawn(async move {
             let _permit = permit;
             let _guard = FlowGuard::new(
                 Arc::clone(&state.active_flows),
@@ -3732,6 +3912,10 @@ async fn run_udp_listener(
             }
         });
     }
+    }.await;
+    // Cancelling drops the association's sockets and flushes its small metric batches.
+    flows.shutdown().await;
+    result
 }
 
 async fn run_udp_association(
@@ -3782,6 +3966,20 @@ async fn run_udp_association_inner(
     let mut receive_sequence = 0_u64;
     let mut uploaded_bytes = 0_u64;
     let mut downloaded_bytes = 0_u64;
+    let dimensions = travel_udp_metric_dimensions(mapping, &relay_id);
+    let mut upload_metrics = MetricBatch::new(
+        (*state.statistics).clone(),
+        "travel_flow_upload_observed_bytes".to_owned(),
+        dimensions.clone(),
+    );
+    let mut download_metrics = MetricBatch::new(
+        (*state.statistics).clone(),
+        "delivered_download_datagram_bytes".to_owned(),
+        dimensions,
+    );
+    let mut metrics_tick = interval(Duration::from_secs(5));
+    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_activity = tokio::time::Instant::now();
     let result: Result<()> = async {
     loop {
         tokio::select! {
@@ -3793,22 +3991,28 @@ async fn run_udp_association_inner(
                 let _ = changed;
                 return Ok(());
             }
-            datagram = timeout(Duration::from_secs(config.udp_idle_secs), outgoing.recv()) => {
-                let Some(bytes) = datagram.context("UDP association idle timeout")? else { return Ok(()); };
+            _ = metrics_tick.tick() => { upload_metrics.flush(); download_metrics.flush(); }
+            () = tokio::time::sleep_until(last_activity + Duration::from_secs(config.udp_idle_secs)) => bail!("UDP association idle timeout"),
+            datagram = outgoing.recv() => {
+                let Some(bytes) = datagram else { return Ok(()); };
+                last_activity = tokio::time::Instant::now();
                 let count = bytes.len() as u64;
                 uploaded_bytes = uploaded_bytes.saturating_add(count);
+                upload_metrics.record(unix_time_secs()?, count);
                 state.uploaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
                 state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
                 write_data_frame(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: bytes.into() }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
-            frame = timeout(Duration::from_secs(config.udp_idle_secs), reader.read()) => {
-                match frame.context("UDP association idle timeout")?? {
+            frame = reader.read() => {
+                last_activity = tokio::time::Instant::now();
+                match frame? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
                             socket.send_to(&bytes, peer).await?;
                             let count = bytes.len() as u64;
                             downloaded_bytes = downloaded_bytes.saturating_add(count);
+                            download_metrics.record(unix_time_secs()?, count);
                             state.downloaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
                             state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
                             receive_sequence = receive_sequence.wrapping_add(1);
@@ -3822,20 +4026,6 @@ async fn run_udp_association_inner(
     }
     }
     .await;
-    record_travel_udp_metric(
-        state,
-        mapping,
-        &relay_id,
-        "travel_flow_upload_observed_bytes",
-        uploaded_bytes,
-    );
-    record_travel_udp_metric(
-        state,
-        mapping,
-        &relay_id,
-        "delivered_download_datagram_bytes",
-        downloaded_bytes,
-    );
     result?;
     Ok((uploaded_bytes, downloaded_bytes))
 }
@@ -3893,27 +4083,14 @@ async fn open_udp_carrier_for_association(
     opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))
 }
 
-fn record_travel_udp_metric(
-    state: &AppState,
-    mapping: &Mapping,
-    relay_id: &str,
-    family: &str,
-    value: u64,
-) {
-    if value == 0 {
-        return;
-    }
+fn travel_udp_metric_dimensions(mapping: &Mapping, relay_id: &str) -> BTreeMap<String, String> {
     let mut dimensions = BTreeMap::new();
     dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
     dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
     dimensions.insert("protocol".to_owned(), "udp".to_owned());
     dimensions.insert("mapping".to_owned(), mapping.bind.clone());
     dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
-    if let Ok(now) = unix_time_secs() {
-        state
-            .statistics
-            .record(now, family, dimensions, value, None);
-    }
+    dimensions
 }
 
 async fn run_ui(state: AppState) -> Result<()> {
@@ -4023,7 +4200,8 @@ async fn upsert_mapping(state: &AppState, mapping: Mapping) -> Result<Mapping> {
     let prepared = prepare_mapping_listener(&mapping).await?;
     let store = Arc::clone(&state.state_store);
     let durable = next.clone();
-    tokio::task::spawn_blocking(move || persist_runtime_mappings(&store, &durable))
+    state
+        .spawn_blocking(move || persist_runtime_mappings(&store, &durable))
         .await
         .context("Travel mapping persistence task failed")??;
 
@@ -4078,7 +4256,8 @@ async fn delete_mapping(
         .collect::<Vec<_>>();
     let store = Arc::clone(&state.state_store);
     let durable = next.clone();
-    tokio::task::spawn_blocking(move || persist_runtime_mappings(&store, &durable))
+    state
+        .spawn_blocking(move || persist_runtime_mappings(&store, &durable))
         .await
         .context("Travel mapping persistence task failed")??;
     let old = state.mapping_tasks.lock().await.remove(&key);
@@ -4395,7 +4574,8 @@ async fn api_statistics(
     };
     let from = now.saturating_sub(duration);
     let statistics = Arc::clone(&state.statistics);
-    let points = tokio::task::spawn_blocking(move || statistics.query(from, now))
+    let points = state
+        .spawn_blocking(move || statistics.query(from, now))
         .await
         .ok()
         .and_then(Result::ok)
@@ -4457,30 +4637,31 @@ async fn api_remote_enrollments(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<RemoteEnrollmentStatus>> {
     let store = Arc::clone(&state.state_store);
-    tokio::task::spawn_blocking(move || {
-        let mut statuses = store
-            .scan_prefix(Table::EnrollmentOutbox, b"")?
-            .into_iter()
-            .map(|(_, value)| {
-                let record: RemoteEnrollmentOutboxRecord = serde_json::from_slice(&value)
-                    .context("Travel enrollment outbox contains an invalid record")?;
-                Ok(RemoteEnrollmentStatus {
-                    request_id: record.request.request_id,
-                    home_id: record.home_id,
-                    created_at_unix_secs: record.created_at_unix_secs,
-                    response_received: record.response.is_some(),
-                    restart_required: record.restart_required,
+    state
+        .spawn_blocking(move || {
+            let mut statuses = store
+                .scan_prefix(Table::EnrollmentOutbox, b"")?
+                .into_iter()
+                .map(|(_, value)| {
+                    let record: RemoteEnrollmentOutboxRecord = serde_json::from_slice(&value)
+                        .context("Travel enrollment outbox contains an invalid record")?;
+                    Ok(RemoteEnrollmentStatus {
+                        request_id: record.request.request_id,
+                        home_id: record.home_id,
+                        created_at_unix_secs: record.created_at_unix_secs,
+                        response_received: record.response.is_some(),
+                        restart_required: record.restart_required,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        statuses.sort_by_key(|status| status.created_at_unix_secs);
-        Ok(statuses)
-    })
-    .await
-    .context("Travel enrollment outbox query task failed")
-    .and_then(|result| result)
-    .map(Json)
-    .map_err(api_error)
+                .collect::<Result<Vec<_>>>()?;
+            statuses.sort_by_key(|status| status.created_at_unix_secs);
+            Ok(statuses)
+        })
+        .await
+        .context("Travel enrollment outbox query task failed")
+        .and_then(|result| result)
+        .map(Json)
+        .map_err(api_error)
 }
 
 async fn api_create_remote_enrollment(
@@ -4518,7 +4699,7 @@ async fn create_remote_enrollment(
     let travel_id = state.config.id.clone();
     let home_id = request.home_id;
     let store = Arc::clone(&state.state_store);
-    let status = tokio::task::spawn_blocking(move || {
+    let status = state.spawn_blocking(move || {
         let now = unix_time_secs()?;
         prune_remote_enrollment_outbox(&store, now)?;
         let queued = store.scan_prefix(Table::EnrollmentOutbox, b"")?.len();
@@ -4607,8 +4788,8 @@ async fn install_remote_enrollment(
     let request_id = request.request_id;
     let store = Arc::clone(&state.state_store);
     let root_public_key = Arc::clone(&state.deployment_root_public_key);
-    let response =
-        tokio::task::spawn_blocking(move || -> Result<InstallRemoteEnrollmentResponse> {
+    let response = state
+        .spawn_blocking(move || -> Result<InstallRemoteEnrollmentResponse> {
             let mut record = store
                 .get_json::<RemoteEnrollmentOutboxRecord>(
                     Table::EnrollmentOutbox,
@@ -4689,15 +4870,16 @@ async fn rotate_travel_private_key_password(
     }
     let config = Arc::clone(&state.config);
     let key_operation = state.key_operation.lock().await;
-    tokio::task::spawn_blocking(move || {
-        rotate_private_key_passwords(
-            &travel_key_targets(&config),
-            current_password.as_str(),
-            new_password.as_str(),
-        )
-    })
-    .await
-    .context("Travel private-key password rotation task failed")??;
+    state
+        .spawn_blocking(move || {
+            rotate_private_key_passwords(
+                &travel_key_targets(&config),
+                current_password.as_str(),
+                new_password.as_str(),
+            )
+        })
+        .await
+        .context("Travel private-key password rotation task failed")??;
     drop(key_operation);
     info!(rotated_keys = 2, "rotated Travel private-key password");
     Ok(RotatePrivateKeyPasswordResponse { rotated_keys: 2 })
@@ -4861,7 +5043,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_enrollment_cli_accepts_a_relay_without_bootstrap_files() {
+    fn remote_enrollment_cli_accepts_a_relay_with_a_trusted_public_key() {
         let parsed = Cli::try_parse_from([
             "flowsplice-travelagent",
             "enroll-remote",
@@ -4873,6 +5055,8 @@ mod tests {
             "/tmp/travel-1",
             "--relay",
             "relay.example:8443",
+            "--deployment-root-public-key",
+            "/external/deployment-root.pub",
         ]);
         assert!(parsed.is_ok());
     }
@@ -5243,6 +5427,7 @@ mod tests {
             id: "relay-1".to_owned(),
             management_addr: "10.0.2.2:18443".to_owned(),
             data_addr: "10.0.2.2:18444".to_owned(),
+            bootstrap_hint: false,
         }];
         let candidates = signed_directory_candidates(directory.clone(), &overrides);
         assert_eq!(candidates[0].expected_id.as_deref(), Some("relay-1"));
@@ -5258,10 +5443,11 @@ mod tests {
             }],
             &overrides,
         );
-        assert_eq!(bootstrap.len(), 2);
+        assert_eq!(bootstrap.len(), 3);
         assert_eq!(bootstrap[0].expected_id.as_deref(), Some("relay-1"));
         assert_eq!(bootstrap[0].management_addr, "10.0.2.2:18443");
-        assert_eq!(bootstrap[1].expected_id, None);
+        assert_eq!(bootstrap[1].management_addr, "relay.example:8443");
+        assert_eq!(bootstrap[2].expected_id, None);
     }
 
     #[test]

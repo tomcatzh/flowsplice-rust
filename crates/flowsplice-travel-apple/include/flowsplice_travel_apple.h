@@ -11,11 +11,12 @@ char *flowsplice_travel_begin_enrollment(
     const char *travel_id,
     const char *home_id,
     const char *selected_relay,
-    const char *password
+    const char *password,
+    const char *trusted_root
 );
 char *flowsplice_travel_enrollment_status(void);
 char *flowsplice_travel_cancel_enrollment(void);
-char *flowsplice_travel_start(const char *config_path, const char *password);
+char *flowsplice_travel_start(const char *config_path, const char *password, const char *trusted_root);
 char *flowsplice_travel_stop(void);
 char *flowsplice_travel_network_changed(void);
 char *flowsplice_travel_status(void);

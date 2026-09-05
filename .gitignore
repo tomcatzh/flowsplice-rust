@@ -16,3 +16,14 @@ __pycache__/
 **/xcuserdata/
 *.xcuserstate
 DerivedData/
+
+# Deployment trust is injected from an external private packaging profile.
+*.pub
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+/private-packaging/

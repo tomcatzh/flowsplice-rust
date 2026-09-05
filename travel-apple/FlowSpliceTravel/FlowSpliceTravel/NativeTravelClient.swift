@@ -13,7 +13,9 @@ nonisolated final class NativeTravelClient: @unchecked Sendable {
         password: String
     ) async throws -> EnrollmentSnapshot {
         try await perform(on: operationQueue) {
-            let pointer = installDirectory.path.withCString { installDirectoryPointer in
+            let trustedRoot = try Self.packagedDeploymentRoot()
+            let pointer = trustedRoot.withCString { rootPointer in
+            installDirectory.path.withCString { installDirectoryPointer in
                 travelID.withCString { travelIDPointer in
                     homeID.withCString { homeIDPointer in
                         relay.withCString { relayPointer in
@@ -23,12 +25,14 @@ nonisolated final class NativeTravelClient: @unchecked Sendable {
                                     travelIDPointer,
                                     homeIDPointer,
                                     relayPointer,
-                                    passwordPointer
+                                    passwordPointer,
+                                    rootPointer
                                 )
                             }
                         }
                     }
                 }
+            }
             }
             return try Self.decode(pointer, as: EnrollmentSnapshot.self)
         }
@@ -48,10 +52,13 @@ nonisolated final class NativeTravelClient: @unchecked Sendable {
 
     func start(config: URL, password: String) async throws -> NativeTravelStatus {
         try await perform(on: operationQueue) {
-            let pointer = config.path.withCString { configPointer in
+            let trustedRoot = try Self.packagedDeploymentRoot()
+            let pointer = trustedRoot.withCString { rootPointer in
+            config.path.withCString { configPointer in
                 password.withCString { passwordPointer in
-                    flowsplice_travel_start(configPointer, passwordPointer)
+                    flowsplice_travel_start(configPointer, passwordPointer, rootPointer)
                 }
+            }
             }
             return try Self.decode(pointer, as: NativeTravelStatus.self)
         }
@@ -123,6 +130,19 @@ nonisolated final class NativeTravelClient: @unchecked Sendable {
             }
             return try Self.decode(pointer, as: TravelMapping.self)
         }
+    }
+
+    private static func packagedDeploymentRoot() throws -> String {
+        guard let url = Bundle.main.url(forResource: "deployment-root", withExtension: "pub", subdirectory: "bootstrap") else {
+            throw TravelError.native("This app package has no deployment trust key. Install the private package for your deployment.")
+        }
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        guard let bytes = try file.read(upToCount: 257), bytes.count <= 256,
+              let root = String(data: bytes, encoding: .utf8) else {
+            throw TravelError.native("This app package contains an invalid deployment trust key.")
+        }
+        return root.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func perform<Value: Sendable>(

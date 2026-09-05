@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 output_root="${1:?Rust JNI output directory is required}"
+cargo_target_root="${CARGO_TARGET_DIR:-${repo_root}/target}"
 android_sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-${HOME}/Library/Android/sdk}}"
 android_ndk_root="${ANDROID_NDK_HOME:-${android_sdk_root}/ndk/29.0.14206865}"
 toolchain_bin="${android_ndk_root}/toolchains/llvm/prebuilt/darwin-x86_64/bin"
@@ -39,7 +40,7 @@ build_abi() {
 
   mkdir -p "${output_root}/${android_abi}"
   cp \
-    "${repo_root}/target/${rust_target}/android-release/libflowsplice_travel_android.so" \
+    "${cargo_target_root}/${rust_target}/android-release/libflowsplice_travel_android.so" \
     "${output_root}/${android_abi}/libflowsplice_travel_android.so"
 }
 

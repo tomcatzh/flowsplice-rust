@@ -402,6 +402,92 @@ pub struct LocalStatistics {
     injected_flush_failures: Arc<AtomicU64>,
 }
 
+/// Aggregates counter samples for one fixed metric identity before transferring them to local
+/// statistics staging.
+///
+/// `record` updates an active bucket without locking or allocating. On a bucket change, `flush`
+/// only merges its in-memory delta into the shared `LocalStatistics` accumulator; it does not
+/// perform durable I/O. Any pending delta is flushed when the batch is dropped.
+pub struct MetricBatch {
+    statistics: LocalStatistics,
+    identity: MetricIdentity,
+    bucket_start_unix_secs: Option<u64>,
+    delta: MetricDelta,
+}
+
+impl MetricBatch {
+    /// Creates a batch for one fixed metric family and set of dimensions.
+    #[must_use]
+    pub fn new(
+        statistics: LocalStatistics,
+        family: String,
+        dimensions: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            statistics,
+            identity: MetricIdentity {
+                metric_family: family,
+                dimensions,
+            },
+            bucket_start_unix_secs: None,
+            delta: MetricDelta::default(),
+        }
+    }
+
+    /// Records one counter sample in the timestamp's five-minute bucket.
+    ///
+    /// If a sample crosses into a new bucket, the previous bucket is flushed before this sample is
+    /// accumulated.
+    pub fn record(&mut self, now: u64, value: u64) {
+        let bucket_start = five_minute_bucket_start(now);
+        if self.bucket_start_unix_secs != Some(bucket_start) {
+            self.flush();
+            self.bucket_start_unix_secs = Some(bucket_start);
+        }
+        self.delta.count = self.delta.count.saturating_add(1);
+        self.delta.sum = self.delta.sum.saturating_add(value);
+        if self.delta.count == 1 {
+            self.delta.min = value;
+            self.delta.max = value;
+        } else {
+            self.delta.min = self.delta.min.min(value);
+            self.delta.max = self.delta.max.max(value);
+        }
+    }
+
+    /// Merges the pending delta into the local in-memory statistics accumulator.
+    ///
+    /// This waits briefly for the shared accumulator mutex instead of dropping samples when a
+    /// concurrent statistics flush owns it. It performs no database I/O.
+    pub fn flush(&mut self) {
+        let Some(bucket_start) = self.bucket_start_unix_secs else {
+            return;
+        };
+        if self.delta.count == 0 {
+            self.bucket_start_unix_secs = None;
+            return;
+        }
+
+        let identity = self.identity.clone();
+        let mut accumulator = match self.statistics.accumulator.lock() {
+            Ok(accumulator) => accumulator,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let delta = std::mem::take(&mut self.delta);
+        merge_pending_delta(
+            accumulator.entry((bucket_start, identity)).or_default(),
+            delta,
+        );
+        self.bucket_start_unix_secs = None;
+    }
+}
+
+impl Drop for MetricBatch {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedReport {
@@ -962,6 +1048,121 @@ mod tests {
     fn bucket_and_ordered_keys_are_stable() -> Result<()> {
         assert_eq!(five_minute_bucket_start(599), 300);
         assert!(ordered_key(&["relay-1"], 300)? < ordered_key(&["relay-1"], 600)?);
+        Ok(())
+    }
+
+    #[test]
+    fn metric_batch_preserves_samples_across_a_bucket_boundary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = StateStore::open(directory.path().join("state.redb"))?;
+        let statistics = LocalStatistics::new(store);
+        let dimensions = BTreeMap::from([("home_id".to_owned(), "home-1".to_owned())]);
+        let identity = MetricIdentity {
+            metric_family: "home_flow_download_observed_datagram_bytes".to_owned(),
+            dimensions: dimensions.clone(),
+        };
+        let mut batch = MetricBatch::new(
+            statistics.clone(),
+            identity.metric_family.clone(),
+            dimensions,
+        );
+
+        batch.record(299, 2);
+        batch.record(299, 7);
+        batch.record(300, 3);
+
+        {
+            let accumulator = statistics
+                .accumulator
+                .lock()
+                .map_err(|_| anyhow!("statistics accumulator lock is poisoned"))?;
+            let old_bucket = accumulator
+                .get(&(0, identity.clone()))
+                .ok_or_else(|| anyhow!("old bucket should flush before new accumulation"))?;
+            assert_eq!(old_bucket.count, 2);
+            assert_eq!(old_bucket.sum, 9);
+            assert_eq!(old_bucket.min, 2);
+            assert_eq!(old_bucket.max, 7);
+            assert!(!accumulator.contains_key(&(300, identity.clone())));
+        }
+
+        batch.record(300, 11);
+        batch.flush();
+
+        let accumulator = statistics
+            .accumulator
+            .lock()
+            .map_err(|_| anyhow!("statistics accumulator lock is poisoned"))?;
+        let new_bucket = accumulator
+            .get(&(300, identity))
+            .ok_or_else(|| anyhow!("new bucket should flush on request"))?;
+        assert_eq!(new_bucket.count, 2);
+        assert_eq!(new_bucket.sum, 14);
+        assert_eq!(new_bucket.min, 3);
+        assert_eq!(new_bucket.max, 11);
+        Ok(())
+    }
+
+    #[test]
+    fn metric_batch_periodic_flush_and_drop_do_not_double_count() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = StateStore::open(directory.path().join("state.redb"))?;
+        let statistics = LocalStatistics::new(store);
+        let dimensions = BTreeMap::from([("home_id".to_owned(), "home-1".to_owned())]);
+        let identity = MetricIdentity {
+            metric_family: "home_flow_download_observed_datagram_bytes".to_owned(),
+            dimensions: dimensions.clone(),
+        };
+
+        {
+            let mut batch = MetricBatch::new(
+                statistics.clone(),
+                identity.metric_family.clone(),
+                dimensions,
+            );
+            batch.record(1, 2);
+            batch.record(2, 5);
+            batch.flush();
+            batch.flush();
+            batch.record(3, 7);
+        }
+
+        let accumulator = statistics
+            .accumulator
+            .lock()
+            .map_err(|_| anyhow!("statistics accumulator lock is poisoned"))?;
+        let delta = accumulator
+            .get(&(0, identity))
+            .ok_or_else(|| anyhow!("periodic and drop flushes should merge"))?;
+        assert_eq!(delta.count, 3);
+        assert_eq!(delta.sum, 14);
+        assert_eq!(delta.min, 2);
+        assert_eq!(delta.max, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn metric_batch_empty_flush_is_a_noop() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = StateStore::open(directory.path().join("state.redb"))?;
+        let statistics = LocalStatistics::new(store);
+        let mut batch = MetricBatch::new(
+            statistics.clone(),
+            "home_flow_download_observed_datagram_bytes".to_owned(),
+            BTreeMap::from([("home_id".to_owned(), "home-1".to_owned())]),
+        );
+
+        batch.flush();
+        drop(batch);
+
+        assert!(
+            statistics
+                .accumulator
+                .lock()
+                .map_err(|_| anyhow!("statistics accumulator lock is poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(statistics.dropped_events(), 0);
         Ok(())
     }
 

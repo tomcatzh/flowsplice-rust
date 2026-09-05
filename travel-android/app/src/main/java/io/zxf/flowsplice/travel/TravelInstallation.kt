@@ -8,6 +8,9 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.core.content.edit
 import java.io.File
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.io.InputStream
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -26,6 +29,39 @@ object TravelInstallation {
 
     fun discardPending(context: Context) {
         if (!isInstalled(context)) directory(context).deleteRecursively()
+    }
+}
+
+object DeploymentRootAsset {
+    const val PATH = "bootstrap/deployment-root.pub"
+    const val MAX_BYTES = 256
+
+    fun load(context: Context): String = try {
+        context.assets.open(PATH).use(::read)
+    } catch (_: FileNotFoundException) {
+        throw IllegalStateException("Required deployment root asset is missing")
+    } catch (_: IOException) {
+        throw IllegalStateException("Could not read the required deployment root asset")
+    } catch (_: SecurityException) {
+        throw IllegalStateException("Could not access the required deployment root asset")
+    }
+
+    internal fun read(input: InputStream): String {
+        val bytes = ByteArray(MAX_BYTES + 1)
+        var size = 0
+        while (size < bytes.size) {
+            val count = input.read(bytes, size, bytes.size - size)
+            if (count < 0) break
+            if (count == 0) throw IOException("No forward progress reading deployment root asset")
+            size += count
+        }
+        check(size <= MAX_BYTES) {
+            "Required deployment root asset exceeds $MAX_BYTES bytes"
+        }
+        check(size > 0) {
+            "Required deployment root asset is empty"
+        }
+        return bytes.copyOf(size).toString(Charsets.UTF_8)
     }
 }
 

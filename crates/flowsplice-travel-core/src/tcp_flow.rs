@@ -59,13 +59,12 @@ enum FlowEvent {
     },
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
+type OpenResult = (
+    String,
+    OwnedSemaphorePermit,
+    Result<BusinessCarrier>,
+    Duration,
+);
 
 struct TransferState {
     flow_id: Uuid,
@@ -80,9 +79,17 @@ struct TransferState {
     local_fin_acked: bool,
     remote_eof: bool,
     io_timeout: Duration,
+    uploaded_total: Arc<std::sync::atomic::AtomicU64>,
+    downloaded_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
-pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<()> {
+pub async fn run(
+    state: AppState,
+    mapping: Mapping,
+    local: TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    local.set_nodelay(true)?;
     let flow_id = Uuid::new_v4();
     state.begin_route_flow(flow_id, &mapping).await;
     info!(
@@ -92,8 +99,43 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
         service_id = %mapping.service_id,
         "travel TCP flow started"
     );
-    let result = run_inner(&state, &mapping, local, flow_id).await;
-    let (uploaded_bytes, downloaded_bytes) = result.as_ref().copied().unwrap_or_default();
+    let mut io_tasks = JoinSet::new();
+    let mut opens = JoinSet::new();
+    let (local_reader, local_writer) = local.into_split();
+    let (events_tx, mut events) = mpsc::channel(32);
+    let send_credit = Arc::new(Semaphore::new(state.config.max_unacked_bytes));
+    spawn_local_reader(&mut io_tasks, local_reader, events_tx.clone(), send_credit);
+
+    let mut transfer = TransferState {
+        flow_id,
+        local_writer,
+        send_offset: 0,
+        send_acked: 0,
+        receive_offset: 0,
+        unacked: VecDeque::new(),
+        unacked_bytes: 0,
+        max_unacked_bytes: state.config.max_unacked_bytes,
+        local_eof: false,
+        local_fin_acked: false,
+        remote_eof: false,
+        io_timeout: Duration::from_secs(state.config.carrier_timeout_secs),
+        uploaded_total: Arc::clone(&state.uploaded_bytes),
+        downloaded_total: Arc::clone(&state.downloaded_bytes),
+    };
+    let result = if *shutdown.borrow() {
+        Err(anyhow!("mapping stopped"))
+    } else {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => Err(anyhow!("mapping stopped")),
+            result = run_inner(&state, &mapping, flow_id, &events_tx, &mut events, &mut transfer, &mut io_tasks, &mut opens) => result,
+        }
+    };
+    // Own and drain all readers, carriers, and in-progress opens before releasing the flow.
+    opens.shutdown().await;
+    io_tasks.shutdown().await;
+    let (uploaded_bytes, downloaded_bytes) = (transfer.send_offset, transfer.receive_offset);
+    drop(transfer);
     state
         .finish_route_flow(
             flow_id,
@@ -106,21 +148,21 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
     if relay_id.is_some() {
         state.mark_status_changed();
     }
-    if let Ok((upload_bytes, download_bytes)) = result.as_ref() {
-        record_flow_metric(
-            &state,
-            &mapping,
-            relay_id.as_deref(),
-            "travel_flow_upload_observed_bytes",
-            *upload_bytes,
-        );
-        record_flow_metric(
-            &state,
-            &mapping,
-            relay_id.as_deref(),
-            "delivered_download_bytes",
-            *download_bytes,
-        );
+    record_flow_metric(
+        &state,
+        &mapping,
+        relay_id.as_deref(),
+        "travel_flow_upload_observed_bytes",
+        uploaded_bytes,
+    );
+    record_flow_metric(
+        &state,
+        &mapping,
+        relay_id.as_deref(),
+        "delivered_download_bytes",
+        downloaded_bytes,
+    );
+    if result.is_ok() {
         record_flow_metric(
             &state,
             &mapping,
@@ -138,40 +180,20 @@ pub async fn run(state: AppState, mapping: Mapping, local: TcpStream) -> Result<
             1,
         );
     }
-    result.map(|_| ())
+    result
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_inner(
     state: &AppState,
     mapping: &Mapping,
-    local: TcpStream,
     flow_id: Uuid,
-) -> Result<(u64, u64)> {
-    local.set_nodelay(true)?;
-    let (local_reader, local_writer) = local.into_split();
-    let (events_tx, mut events) = mpsc::channel(32);
-    let send_credit = Arc::new(Semaphore::new(state.config.max_unacked_bytes));
-    let _local_reader = AbortOnDrop(spawn_local_reader(
-        local_reader,
-        events_tx.clone(),
-        send_credit,
-    ));
-
-    let mut transfer = TransferState {
-        flow_id,
-        local_writer,
-        send_offset: 0,
-        send_acked: 0,
-        receive_offset: 0,
-        unacked: VecDeque::new(),
-        unacked_bytes: 0,
-        max_unacked_bytes: state.config.max_unacked_bytes,
-        local_eof: false,
-        local_fin_acked: false,
-        remote_eof: false,
-        io_timeout: Duration::from_secs(state.config.carrier_timeout_secs),
-    };
+    events_tx: &mpsc::Sender<FlowEvent>,
+    events: &mut mpsc::Receiver<FlowEvent>,
+    transfer: &mut TransferState,
+    io_tasks: &mut JoinSet<()>,
+    opens: &mut JoinSet<OpenResult>,
+) -> Result<()> {
     let mut carriers = HashMap::<Uuid, CarrierHandle>::new();
     let mut active = None;
     let mut recovery_started = Instant::now();
@@ -181,12 +203,13 @@ async fn run_inner(
     let mut next_reevaluation = Instant::now();
 
     loop {
+        while io_tasks.try_join_next().is_some() {}
         if transfer.local_eof
             && transfer.remote_eof
             && transfer.local_fin_acked
             && transfer.unacked.is_empty()
         {
-            return Ok((transfer.send_offset, transfer.receive_offset));
+            return Ok(());
         }
 
         if active.is_none() || Instant::now() >= next_reevaluation {
@@ -206,11 +229,13 @@ async fn run_inner(
                 state,
                 mapping,
                 flow_id,
-                &events_tx,
-                &mut events,
+                events_tx,
+                events,
                 &mut carriers,
                 &mut active,
-                &mut transfer,
+                transfer,
+                io_tasks,
+                opens,
             )
             .await?
             {
@@ -292,7 +317,7 @@ async fn run_inner(
                 let Some(event) = event else { bail!("flow event channel closed"); };
                 let closed_active = handle_event(
                     event,
-                    &mut transfer,
+                    transfer,
                     &mut carriers,
                     active,
                     None,
@@ -339,6 +364,9 @@ fn record_flow_metric(
     family: &str,
     value: u64,
 ) {
+    if value == 0 {
+        return;
+    }
     record_flow_metric_sample(state, mapping, relay_id, family, value, None, None);
 }
 
@@ -351,17 +379,6 @@ fn record_flow_metric_sample(
     result: Option<&str>,
     histogram_sample: Option<u64>,
 ) {
-    use std::sync::atomic::Ordering;
-
-    match family {
-        "travel_flow_upload_observed_bytes" => {
-            state.uploaded_bytes.fetch_add(value, Ordering::Relaxed);
-        }
-        "delivered_download_bytes" => {
-            state.downloaded_bytes.fetch_add(value, Ordering::Relaxed);
-        }
-        _ => {}
-    }
     let mut dimensions = BTreeMap::new();
     dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
     dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
@@ -390,6 +407,8 @@ async fn perform_race(
     carriers: &mut HashMap<Uuid, CarrierHandle>,
     active: &mut Option<Uuid>,
     transfer: &mut TransferState,
+    io_tasks: &mut JoinSet<()>,
+    opens: &mut JoinSet<OpenResult>,
 ) -> Result<Option<Uuid>> {
     let race_id = Uuid::new_v4();
     let race_started = Instant::now();
@@ -400,7 +419,6 @@ async fn perform_race(
         .and_then(|carrier_id| carriers.get(&carrier_id))
         .map(|carrier| carrier.relay_id.clone());
     let mut candidate_ids = HashSet::new();
-    let mut opens = JoinSet::new();
     let candidates = relay_candidates(state).await;
     let relay_ids: Vec<_> = candidates
         .iter()
@@ -544,6 +562,7 @@ async fn perform_race(
                                 "carrier candidate completed OPEN"
                             );
                             let handle = spawn_carrier(
+                                io_tasks,
                                 flow_id,
                                 carrier,
                                 events_tx.clone(),
@@ -647,7 +666,7 @@ async fn perform_race(
             () = sleep_until(race_deadline) => break None,
         }
     };
-    opens.abort_all();
+    opens.shutdown().await;
 
     if let Some(winner) = winner {
         if !carriers.contains_key(&winner) {
@@ -765,6 +784,10 @@ async fn handle_event(
             transfer.send_offset = transfer
                 .send_offset
                 .saturating_add(segment.bytes.len() as u64);
+            transfer.uploaded_total.fetch_add(
+                segment.bytes.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             transfer.unacked_bytes += segment.bytes.len();
             debug!(
                 event = "tcp_data_buffered",
@@ -835,10 +858,25 @@ async fn handle_event(
             } if flow_id == transfer.flow_id && bytes.len() <= MAX_DATA_PAYLOAD => {
                 let end = offset.saturating_add(bytes.len() as u64);
                 if offset == transfer.receive_offset {
-                    timeout(transfer.io_timeout, transfer.local_writer.write_all(&bytes))
+                    let deadline = Instant::now() + transfer.io_timeout;
+                    let mut delivered = 0;
+                    while delivered < bytes.len() {
+                        let count = tokio::time::timeout_at(
+                            deadline,
+                            transfer.local_writer.write(&bytes[delivered..]),
+                        )
                         .await
                         .map_err(|_| anyhow!("local TCP write timed out"))??;
-                    transfer.receive_offset = end;
+                        if count == 0 {
+                            bail!("local TCP write returned zero");
+                        }
+                        delivered += count;
+                        transfer.receive_offset =
+                            transfer.receive_offset.saturating_add(count as u64);
+                        transfer
+                            .downloaded_total
+                            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     debug!(event = "tcp_data_accepted", flow_id = %transfer.flow_id, %carrier_id, offset, next_offset = transfer.receive_offset, bytes = bytes.len(), "accepted Home-to-Travel TCP data");
                     send_to(
                         carriers,
@@ -926,11 +964,12 @@ async fn handle_event(
 }
 
 fn spawn_local_reader(
+    tasks: &mut JoinSet<()>,
     mut reader: OwnedReadHalf,
     events: mpsc::Sender<FlowEvent>,
     send_credit: Arc<Semaphore>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) {
+    tasks.spawn(async move {
         let mut buffer = vec![0_u8; MAX_DATA_PAYLOAD];
         loop {
             match reader.read(&mut buffer).await {
@@ -966,10 +1005,12 @@ fn spawn_local_reader(
                 }
             }
         }
-    })
+    });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_carrier(
+    tasks: &mut JoinSet<()>,
     flow_id: Uuid,
     carrier: BusinessCarrier,
     events: mpsc::Sender<FlowEvent>,
@@ -989,7 +1030,7 @@ fn spawn_carrier(
     let handle_relay_id = relay_id.clone();
     let (tx, mut outgoing) = mpsc::channel(128);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _carrier_permit = carrier_permit;
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, data_codec);
@@ -1155,5 +1196,119 @@ mod tests {
     #[test]
     fn unstable_carrier_result_resets_reevaluation() {
         assert_eq!(advance_reevaluation(480, 60, 900, false), (60, 120));
+    }
+}
+
+#[cfg(test)]
+mod live_counter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_payload_counts_once_and_survives_error_close() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut peer = TcpStream::connect(listener.local_addr()?).await?;
+        let (local, _) = listener.accept().await?;
+        let (_reader, writer) = local.into_split();
+        let upload = Arc::new(AtomicU64::new(0));
+        let download = Arc::new(AtomicU64::new(0));
+        let flow_id = Uuid::new_v4();
+        let mut transfer = TransferState {
+            flow_id,
+            local_writer: writer,
+            send_offset: 0,
+            send_acked: 0,
+            receive_offset: 0,
+            unacked: VecDeque::new(),
+            unacked_bytes: 0,
+            max_unacked_bytes: 65536,
+            local_eof: false,
+            local_fin_acked: false,
+            remote_eof: false,
+            io_timeout: Duration::from_secs(1),
+            uploaded_total: Arc::clone(&upload),
+            downloaded_total: Arc::clone(&download),
+        };
+        let mut carriers = HashMap::new();
+        let credit = Arc::new(Semaphore::new(4)).acquire_many_owned(4).await?;
+        handle_event(
+            FlowEvent::LocalData {
+                bytes: Bytes::from_static(b"sent"),
+                credit,
+            },
+            &mut transfer,
+            &mut carriers,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(upload.load(Ordering::Relaxed), 4);
+        let carrier_id = Uuid::new_v4();
+        for _ in 0..2 {
+            handle_event(
+                FlowEvent::CarrierFrame {
+                    carrier_id,
+                    frame: DataFrame::Data {
+                        flow_id,
+                        offset: 0,
+                        bytes: Bytes::from_static(b"recv"),
+                    },
+                },
+                &mut transfer,
+                &mut carriers,
+                None,
+                None,
+            )
+            .await?;
+        }
+        let mut received = [0; 4];
+        peer.read_exact(&mut received).await?;
+        assert_eq!(&received, b"recv");
+        assert_eq!(
+            download.load(Ordering::Relaxed),
+            4,
+            "duplicate carrier payload must not count again"
+        );
+        handle_event(
+            FlowEvent::CarrierFrame {
+                carrier_id,
+                frame: DataFrame::Ack {
+                    flow_id,
+                    next_offset: 4,
+                },
+            },
+            &mut transfer,
+            &mut carriers,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            upload.load(Ordering::Relaxed),
+            4,
+            "ACK must not count upload again"
+        );
+        assert!(
+            handle_event(
+                FlowEvent::LocalError("fixture failure".to_owned()),
+                &mut transfer,
+                &mut carriers,
+                None,
+                None
+            )
+            .await
+            .is_err()
+        );
+        drop(transfer);
+        assert_eq!(
+            (
+                upload.load(Ordering::Relaxed),
+                download.load(Ordering::Relaxed)
+            ),
+            (4, 4)
+        );
+        Ok(())
     }
 }

@@ -1,10 +1,12 @@
 package io.zxf.flowsplice.travel
 
+import java.io.ByteArrayInputStream
 import org.junit.Test
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 
 class TravelUnitTest {
     @Test
@@ -38,6 +40,24 @@ class TravelUnitTest {
                 "Relay management port and that the Relay is running the same 0.3 build as this app.",
             EnrollmentSnapshot.friendlyEnrollmentError(raw),
         )
+    }
+
+    @Test
+    fun deploymentRootAssetRejectsOversizedFakeInput() {
+        assertEquals(
+            "trusted-root",
+            DeploymentRootAsset.read(ByteArrayInputStream("trusted-root".toByteArray())),
+        )
+        val oversized = ByteArray(DeploymentRootAsset.MAX_BYTES + 1) { 'a'.code.toByte() }
+        try {
+            DeploymentRootAsset.read(ByteArrayInputStream(oversized))
+            fail("Expected an oversized deployment root to fail")
+        } catch (error: IllegalStateException) {
+            assertEquals(
+                "Required deployment root asset exceeds ${DeploymentRootAsset.MAX_BYTES} bytes",
+                error.message,
+            )
+        }
     }
 
     @Test

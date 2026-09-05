@@ -29,7 +29,7 @@ codesign --verify --strict --verbose=2 ./bin/flowsplice-travelagent
 
 Travel 使用 `enroll-remote` 完成身份注册。
 
-选择一个全新的 Travel ID、要申请的 Home ID、一个空安装目录，以及任意可达 Relay 的 Management 地址：
+选择一个全新的 Travel ID、要申请的 Home ID、一个空安装目录，以及可达 Relay 的 Management 地址。CLI 还需由部署管理员独立提供根公钥文件，保存在 Git 目录之外。私有 Android、iOS 和 macOS 安装包会在签名之前嵌入此公钥，使用者无需增加确认步骤。
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -37,13 +37,14 @@ mkdir -m 700 ./my-travel
   --travel-id travel-laptop \
   --home-id home-1 \
   --install-dir ./my-travel \
-  --relay relay.example:8443
+  --relay relay.example:8443 \
+  --deployment-root-public-key /outside-git/deployment-root.pub
 ```
 
 命令会要求输入并再次确认一个至少 12 个字符的 Travel 私钥密码。然后它会：
 
 1. 在 Travel 本机生成两把独立、加密保存的 Management/Business 私钥；
-2. 从指定 Relay 取得公开的首次联系材料，验证根签名 trust，再使用已验证的 Management CA 重新连接；
+2. 从指定 Relay 取得公开的首次联系材料，用独立提供的根公钥验证 trust 和 Relay 证书，再使用已验证的 Management CA 重新连接；
 3. 把只有公钥和 proof-of-possession 的 enrollment 请求送到指定 Home；
 4. 在终端显示 `Home verification code`；
 5. 保持运行并重试，等待 Home 上的人工批准。
