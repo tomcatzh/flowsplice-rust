@@ -171,8 +171,8 @@ notarize_archive() {
 }
 
 printf 'Building signed macOS command-line bundle...\n'
-(cd "${repo_root}/travelagent/web" && npm run build)
-(cd "${repo_root}/homeagent/web" && npm run build)
+(cd "${repo_root}/travelagent/web" && npm ci && npm run build)
+(cd "${repo_root}/homeagent/web" && npm ci && npm run build)
 (cd "${repo_root}" && cargo build --locked --release \
   -p flowsplice-server \
   -p flowsplice-relay \
