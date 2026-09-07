@@ -7,3 +7,5 @@ Use `scripts/build-private.py --root /external/deployment-root.pub --descriptor 
 For release, add `--release` and supply durable external signing through FLOWSPLICE_PTY_KEYSTORE, FLOWSPLICE_PTY_KEY_ALIAS, FLOWSPLICE_PTY_STORE_PASSWORD and FLOWSPLICE_PTY_KEY_PASSWORD in the environment. Never place deployment resources or signing keys in this source tree.
 
 The WebView loads only bundled assets under `https://appassets.androidplatform.net/assets/pty/`; every other request is blocked. Polling runs at 25ms only while foreground and page-ready. Leaving the activity requests disconnect; returning never reconnects automatically. Enrollment passwords are persisted with a distinct Android Keystore AES-GCM key only after the installed event.
+
+The PTY family uses the shared [terminal ribbon icon](../assets/brand/pty/README.md). Generated platform assets are checked in; regenerate them with `python3 scripts/export-pty-icons.py` after an artwork update.
