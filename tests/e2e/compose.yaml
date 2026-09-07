@@ -167,7 +167,7 @@ services:
     networks: [flowsplice]
 
   travelagent:
-    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
+    image: "${FLOWSPLICE_E2E_TRAVEL_IMAGE:-${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/config/travelagent.toml"]
     environment:
@@ -195,7 +195,7 @@ services:
     networks: [flowsplice]
 
   firsttravel:
-    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
+    image: "${FLOWSPLICE_E2E_TRAVEL_IMAGE:-${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/first-travel/travelagent.toml"]
     environment:
@@ -212,7 +212,7 @@ services:
     networks: [flowsplice]
 
   dynamictravel:
-    image: "${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}"
+    image: "${FLOWSPLICE_E2E_TRAVEL_IMAGE:-${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e:local}}"
     user: "${FLOWSPLICE_E2E_UID:-0}:${FLOWSPLICE_E2E_GID:-0}"
     command: ["/usr/local/bin/flowsplice-travelagent", "--config", "/dynamic-travel/travelagent.toml"]
     environment:

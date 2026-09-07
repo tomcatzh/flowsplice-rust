@@ -3,6 +3,54 @@ import Testing
 @testable import FlowSpliceMac
 
 struct FlowSpliceMacTests {
+    #if DEBUG
+    @Test @MainActor func enrollmentUITestPreferencesNeverChangeStandardPreferences() throws {
+        let environmentKey = "FLOWSPLICE_UI_TESTING"
+        let previousEnvironment = ProcessInfo.processInfo.environment[environmentKey]
+        let suite = try #require(UserDefaults(suiteName: EnrollmentStore.uiTestSuiteName))
+        let previousTestDomain = suite.persistentDomain(forName: EnrollmentStore.uiTestSuiteName)
+        let keys = [
+            "flowsplice.macos.pending-enrollment",
+            "flowsplice.macos.last-relay",
+            "flowsplice.macos.auto-start",
+        ]
+        let standardBefore = keys.map { UserDefaults.standard.object(forKey: $0) as? NSObject }
+        defer {
+            if let previousTestDomain {
+                suite.setPersistentDomain(previousTestDomain, forName: EnrollmentStore.uiTestSuiteName)
+            } else {
+                suite.removePersistentDomain(forName: EnrollmentStore.uiTestSuiteName)
+            }
+            if let previousEnvironment {
+                setenv(environmentKey, previousEnvironment, 1)
+            } else {
+                unsetenv(environmentKey)
+            }
+        }
+        try #require(setenv(environmentKey, "1", 1) == 0)
+        EnrollmentStore.reset()
+        let pending = PendingEnrollment(travelID: "test-travel", homeID: "test-home", relay: "127.0.0.1:8443")
+        EnrollmentStore.pending = pending
+        EnrollmentStore.lastRelay = " 127.0.0.1:8443 "
+        EnrollmentStore.autoStart = true
+        #expect(EnrollmentStore.pending == pending)
+        #expect(EnrollmentStore.lastRelay == "127.0.0.1:8443")
+        #expect(EnrollmentStore.autoStart)
+        let unchangedAfterSave = keys.enumerated().allSatisfy { index, key in
+            (UserDefaults.standard.object(forKey: key) as? NSObject) == standardBefore[index]
+        }
+        #expect(unchangedAfterSave)
+        EnrollmentStore.reset()
+        #expect(EnrollmentStore.pending == nil)
+        #expect(EnrollmentStore.lastRelay.isEmpty)
+        #expect(!EnrollmentStore.autoStart)
+        let unchangedAfterReset = keys.enumerated().allSatisfy { index, key in
+            (UserDefaults.standard.object(forKey: key) as? NSObject) == standardBefore[index]
+        }
+        #expect(unchangedAfterReset)
+    }
+    #endif
+
     @Test func normalizesIdentifiersWithoutInventingCharacters() {
         #expect(TravelValidation.normalizedID("  Tomcat’s Mac / Studio  ") == "Tomcat-s-Mac-Studio")
         #expect(TravelValidation.normalizedID("...---") == "")

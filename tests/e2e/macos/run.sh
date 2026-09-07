@@ -73,18 +73,19 @@ capture_keychain_state() {
 }
 
 cleanup() {
-  if [[ -f "${keychain_state_before}" ]]; then
-    rm -f "${keychain_state_before}"
-  fi
-  if [[ -f "${keychain_state_after}" ]]; then
-    rm -f "${keychain_state_after}"
-  fi
-  if [[ -f "${keychain_state_diff}" ]]; then
-    rm -f "${keychain_state_diff}"
-  fi
+  local status=$?
   if [[ -e "${ui_keychain_path}" ]]; then
     security delete-keychain "${ui_keychain_path}" >/dev/null 2>&1 || true
   fi
+  if [[ -s "${keychain_state_before}" ]]; then
+    capture_keychain_state >"${keychain_state_after}"
+    if ! diff -u "${keychain_state_before}" "${keychain_state_after}" >"${keychain_state_diff}"; then
+      echo 'macOS keychain state changed after test cleanup.' >&2
+      cat "${keychain_state_diff}" >&2
+      status=1
+    fi
+  fi
+  rm -f "${keychain_state_before}" "${keychain_state_after}" "${keychain_state_diff}"
   if [[ -n "${test_pid}" ]] && kill -0 "${test_pid}" 2>/dev/null; then
     kill "${test_pid}" 2>/dev/null || true
     wait "${test_pid}" 2>/dev/null || true
@@ -104,7 +105,13 @@ cleanup() {
     rm -f "${test_output}"
     rm -f "${runtime_log}"
   fi
-  rm -rf -- "${derived_data}" "${keychain_dir}" "${marker_dir}"
+  if [[ "${test_succeeded}" == "1" ]]; then
+    rm -rf -- "${derived_data}"
+  else
+    echo "macOS failure results retained: ${derived_data}/Logs/Test" >&2
+  fi
+  rm -rf -- "${keychain_dir}" "${marker_dir}"
+  exit "${status}"
 }
 trap cleanup EXIT
 

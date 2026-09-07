@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-flowsplice-travel-core.workspace = true
+flowsplice-travel-core = { workspace = true, default-features = false }
 flowsplice-core.workspace = true
 jni = "0.22.4"
 serde.workspace = true

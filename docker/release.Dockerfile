@@ -63,13 +63,18 @@ RUN --mount=type=cache,id=flowsplice-release-cargo-registry-${TARGETARCH},target
       -p flowsplice-relay \
       -p flowsplice-homeagent \
       -p flowsplice-travelagent \
-      -p flowsplice-foobar && \
+      -p flowsplice-foobar \
+      -p flowsplice-pty-home && \
+    cargo build --locked --release --target "${RUST_TARGET}" \
+      -p flowsplice-enrollment --bin flowsplice-trust && \
     mkdir /out && \
     cp "target/${RUST_TARGET}/release/flowsplice-server" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-relay" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-homeagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-travelagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-foobar" /out/ && \
+    cp "target/${RUST_TARGET}/release/flowsplice-pty-home" /out/ && \
+    cp "target/${RUST_TARGET}/release/flowsplice-trust" /out/ && \
     file /out/*
 
 FROM scratch

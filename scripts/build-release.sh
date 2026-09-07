@@ -22,13 +22,13 @@ mkdir -p "${dist_dir}/macos-arm64"
 (cd "${repo_root}/homeagent/web" && npm ci && npm run build)
 (cd "${repo_root}" && cargo build --locked --release \
   -p flowsplice-server -p flowsplice-relay -p flowsplice-homeagent -p flowsplice-travelagent \
-  -p flowsplice-foobar)
+  -p flowsplice-foobar -p flowsplice-pty-home)
 (cd "${repo_root}" && cargo build --locked --release \
   -p flowsplice-enrollment --bin flowsplice-trust)
 bash "${repo_root}/tests/check-release-feature-gates.sh" \
   --home "${repo_root}/target/release/flowsplice-homeagent" \
   --travel "${repo_root}/target/release/flowsplice-travelagent"
-for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar flowsplice-trust; do
+for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar flowsplice-trust flowsplice-pty-home; do
   cp "${repo_root}/target/release/${binary}" "${dist_dir}/macos-arm64/${binary}"
 done
 
@@ -36,7 +36,7 @@ if ! command -v codesign >/dev/null 2>&1; then
   printf 'codesign is required to produce the macOS release artifacts.\n' >&2
   exit 1
 fi
-for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar flowsplice-trust; do
+for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent flowsplice-foobar flowsplice-trust flowsplice-pty-home; do
   identifier="io.zxf.flowsplice.${binary#flowsplice-}"
   artifact="${dist_dir}/macos-arm64/${binary}"
   codesign \

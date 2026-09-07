@@ -10,10 +10,18 @@ plane and never binds a business-data listener.
 > configuration, protocols, persisted state, and deployment artifacts may change without backward
 > compatibility.
 
-Version 0.3.1 includes native Travel clients for Android, iOS/iPadOS, and macOS, alongside the
-command-line applications. The [public 0.3.1 release](docs/releases/0.3.1.md) contains source and
-release notes only, with no binary attachments. Native installers are built privately for each
-deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
+The current code version is 0.4.0, under development; this is not a release or deployment
+announcement. Final native end-to-end and production acceptance are not claimed here.
+Generic native Travel clients for Android, iOS/iPadOS, and macOS remain available alongside the
+command-line applications. The historical [public 0.3.1 release](docs/releases/0.3.1.md) contains
+source and release notes only, with no binary attachments. Native installers are built privately
+for each deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
+
+Version 0.4.0 extracts the [shared encrypted socket runtimes](docs/socket-runtime.md) used by
+both generic Home/Travel applications and embedded businesses. The separate
+[private PTY applications](docs/pty.md) target Android, iOS/iPadOS, and macOS, with a tmux backend
+for Linux arm64/amd64 and macOS arm64. PTY clients use in-process connections without local
+forwarding listeners; connecting opens the session list.
 
 ## How it works
 
@@ -21,7 +29,7 @@ deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
 
 [中文图示](docs/flowsplice-how-it-works.svg)
 
-A local Travel mapping selects one logical business:
+A generic Travel application's local mapping selects one logical business:
 
 ```text
 (home_id, service_id, protocol) -> local TCP/UDP listener
@@ -42,7 +50,11 @@ not interchangeable failover replicas.
 | `flowsplice-homeagent` | Publishes services, terminates business TLS, connects authorized Flows to local targets, and optionally hosts the local issuer/revocation UI. |
 | `flowsplice-travelagent` | Creates local mappings, verifies signed discovery state, races Relays, and originates end-to-end business TLS. |
 | Native Travel clients | Android, iOS/iPadOS, and macOS interfaces for enrollment, local mappings, and runtime status. |
-| `flowsplice-travel-core` | Provides the shared Travel runtime and application-facing enrollment, mapping, and status operations. |
+| `flowsplice-home-core` | Provides shared Home identity, authorization synchronization, encrypted serving, and flow recovery. |
+| `flowsplice-travel-core` | Provides shared Travel enrollment, trusted discovery, encrypted socket connections, mapping, and status operations. |
+| `flowsplice-transport` | Defines application I/O and bounded in-process Home listeners. |
+| `flowsplice-pty-home` | Serves private tmux sessions through the shared Home runtime. |
+| Private PTY clients | Separate Android, iOS/iPadOS, and macOS apps sharing the PTY client engine and bundled terminal UI. |
 | `flowsplice-travel-android` | Connects the Android Kotlin client to Travel Core through JNI. |
 | `flowsplice-travel-apple` | Connects the Apple native clients to Travel Core through the Apple adapter. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
@@ -367,6 +379,11 @@ The script uses the lockfile and produces:
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
+Each directory contains `flowsplice-server`, `flowsplice-relay`, `flowsplice-homeagent`,
+`flowsplice-travelagent`, `flowsplice-foobar`, `flowsplice-trust`, and `flowsplice-pty-home`.
+The PTY backend requires an installed tmux executable; private native PTY installers use the
+separate packaging paths in [the PTY guide](docs/pty.md).
+
 `make home2-macos-package` and `make travel-macos-package` build and verify deployment-neutral
 macOS CLI bundles suitable for public distribution; they do not build the native desktop app. Each bundle contains one generic binary, a Chinese Quick Start, an
 deployment-neutral Quick Start, and internal SHA-256 checksums. The
@@ -421,6 +438,9 @@ travelagent/  CLI Travel Agent and local Web UI
 travel-android/ Android native Travel client
 travel-apple/ iOS/iPadOS native Travel client
 travel-macos/ macOS native Travel client
+pty-web/      bundled terminal UI for private PTY apps
+pty-android/  private Android PTY host and packaging
+pty-apple/    private iOS/iPadOS and macOS PTY host and packaging
 foobar/       continuity target and probe
 openwrt/      UCI, procd, LuCI, and IPK sources
 tests/        fixtures and Docker E2E suite

@@ -454,7 +454,19 @@ enroll_dynamic_home() {
     --password-file "${generated_dir}/offline/test-password.txt" \
     --profile "${profile}" \
     --valid-days 365 >/dev/null
-  wait "${dynamic_home_init_pid}"
+  local installation_deadline=$((SECONDS + 120))
+  while kill -0 "${dynamic_home_init_pid}" 2>/dev/null; do
+    if (( SECONDS >= installation_deadline )); then
+      printf '%s init did not finish within 120 seconds after approval; log: %s\n' \
+        "${service}" "${log_path}" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  if ! wait "${dynamic_home_init_pid}"; then
+    printf '%s init failed after approval; log: %s\n' "${service}" "${log_path}" >&2
+    exit 1
+  fi
   dynamic_home_init_pid=""
   for required in \
     homeagent.toml \
@@ -795,6 +807,8 @@ configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
   home-1 target-failure tcp 0.0.0.0:10084
 configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
   home-2 target-failure tcp 0.0.0.0:10085
+bash "${repo_root}/tests/e2e/check-socket-api.sh"
+python3 -u "${repo_root}/tests/e2e/check-business.py"
 python3 -u "${repo_root}/tests/e2e/assert_e2e.py"
 docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 for event in \

@@ -62,6 +62,7 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
       -p flowsplice-relay \
       -p flowsplice-homeagent \
       -p flowsplice-travelagent \
+      -p flowsplice-pty-home \
       -p flowsplice-echo && \
     mkdir /out && \
     cp target/release/flowsplice-server /out/ && \
@@ -69,14 +70,23 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
     cp target/release/flowsplice-homeagent /out/ && \
     cp target/release/flowsplice-travelagent /out/ && \
     cp target/release/flowsplice-echo /out/ && \
+    cp target/release/socket-probe /out/ && \
+    cp target/release/business-probe /out/ && \
+    cp target/release/pty-probe /out/ && \
+    cp target/release/flowsplice-pty-home /out/ && \
     cp target/release/travel-login-probe /out/
 
 FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+RUN apk add --no-cache tmux
 RUN addgroup -S flowsplice && adduser -S -G flowsplice flowsplice
 COPY --from=build /out/flowsplice-server /usr/local/bin/
 COPY --from=build /out/flowsplice-relay /usr/local/bin/
 COPY --from=build /out/flowsplice-homeagent /usr/local/bin/
 COPY --from=build /out/flowsplice-travelagent /usr/local/bin/
 COPY --from=build /out/flowsplice-echo /usr/local/bin/
+COPY --from=build /out/socket-probe /usr/local/bin/flowsplice-socket-probe
+COPY --from=build /out/business-probe /usr/local/bin/flowsplice-business-probe
+COPY --from=build /out/pty-probe /usr/local/bin/flowsplice-pty-probe
+COPY --from=build /out/flowsplice-pty-home /usr/local/bin/flowsplice-pty-home
 COPY --from=build /out/travel-login-probe /usr/local/bin/flowsplice-travel-login-probe
 USER flowsplice

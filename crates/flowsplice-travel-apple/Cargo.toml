@@ -11,7 +11,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 anyhow.workspace = true
 flowsplice-core.workspace = true
-flowsplice-travel-core.workspace = true
+flowsplice-travel-core = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

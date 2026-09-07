@@ -1,21 +1,20 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     io::{self, IsTerminal},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use aws_lc_rs::{
     digest,
     rand::{SecureRandom, SystemRandom},
-    signature::EcdsaKeyPair,
 };
 use axum::{
     Json, Router,
@@ -25,45 +24,48 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
+use flowsplice_core::business::{
+    BUSINESS_VERSION, BusinessDescriptor, BusinessService, VerifiedBusinessDescriptor,
+    validate_services as validate_business_services,
+};
 use flowsplice_core::{
-    CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    CONTROL_FRAME_LIMIT,
     authorization::{
-        AuthorizationCache, SignedTravelCredential, TravelAuthorizationSnapshot,
-        TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization,
-        initialize_authorization_cache, load_initialized_authorization_cache, load_json,
-        store_json_atomic, unix_time_secs,
+        TravelCredentialScope, TrustedTravelAuthority, initialize_authorization_cache, load_json,
+        unix_time_secs,
     },
     config::{load_toml, resolve_path},
     deployment::{
         DeploymentTrust, SignedDeploymentTrust, SignedHomeEndpointCredential,
         load_verified_deployment_trust,
     },
-    frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
+    frame::{JsonFrameReader, write_json},
     init_crypto,
     protocol::{
-        CONTROL_PROTOCOL_VERSION, ControlMessage, DataFrame, HomeCatalog, Role, Service,
-        ServiceProtocol, bootstrap_verification_code,
+        CONTROL_PROTOCOL_VERSION, ControlMessage, Role, Service, bootstrap_verification_code,
     },
-    route::{RouteSide, write_preface},
-    statistics::{statistics_dashboard_html, statistics_signing_key},
+    statistics::statistics_dashboard_html,
     tls::{
-        client_connector, identity_server_auth_connector_from_ca_pem, identity_server_name,
-        load_private_key as load_management_private_key, peer_identity, require_peer,
-        server_acceptor, server_name, validate_spki_pins,
+        identity_server_auth_connector_from_ca_pem, identity_server_name, peer_identity,
+        require_peer, server_name, validate_spki_pins,
     },
+};
+use flowsplice_enrollment::business::{
+    BUSINESS_HOME_REQUEST_TYPE, BusinessHomeRequest, HOME_SERVICE_GRANT_FILE, HomeRequestEnvelope,
+    HomeResponseEnvelope, TravelRequestEnvelope, TravelResponseEnvelope, issue_business_home,
+    issue_business_travel,
 };
 use flowsplice_enrollment::home::{
     HOME_BUSINESS_CERT_FILE, HOME_BUSINESS_KEY_FILE, HOME_ENDPOINT_CREDENTIAL_FILE,
     HOME_MANAGEMENT_CERT_FILE, HOME_MANAGEMENT_KEY_FILE, HOME_REQUEST_FILE, HomeEnrollmentProfile,
     HomeEnrollmentRequest, HomeEnrollmentResponse, HomeIssuerMaterial,
     create_home_enrollment_request, install_home_enrollment_response, issue_home_enrollment,
-    parse_home_enrollment_request, prepare_home_enrollment_approval,
+    prepare_home_enrollment_approval,
 };
 use flowsplice_enrollment::{
-    DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentRequest, TravelEnrollmentResponse,
+    DEFAULT_VALID_DAYS, MAX_VALID_DAYS, TravelEnrollmentResponse,
     issuer::{IssuerMaterial, ProtectedKey, issue_enrollment},
     key::{
         MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget,
@@ -73,30 +75,29 @@ use flowsplice_enrollment::{
     parse_enrollment_request, prepare_enrollment_approval,
 };
 use flowsplice_storage::{
-    LocalStatistics, MetricBatch, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
-    summarize_metric_points,
+    MetricPoint, MetricRollup, StateStore, Table, WriteBatch, summarize_metric_points,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    net::{TcpStream, UdpSocket},
-    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
-    time::{MissedTickBehavior, interval, sleep, timeout},
+    net::TcpStream,
+    sync::{Mutex, Semaphore, mpsc, oneshot},
+    time::{sleep, timeout},
 };
-use tokio_rustls::{
-    TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
-    server::TlsStream as ServerTlsStream,
-};
-use tracing::{info, warn};
+use tokio_rustls::TlsConnector;
+use tracing::info;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-mod tcp_flow;
+mod targets;
 
 mod issuance_ledger;
 
+use flowsplice_home_core::{
+    HomeControlHooks, HomeRuntime, HomeRuntimeConfig, HomeStatistics, IssuerControlRequest,
+    TravelAuthorizationState,
+};
 use issuance_ledger::{IssuanceLedger, IssuanceRecord, ledger_path};
-use tcp_flow::{IncomingCarrier, TcpFlowRegistry};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -124,6 +125,12 @@ enum Command {
         server: IpAddr,
         #[arg(long, default_value = "home-bootstrap.toml")]
         bootstrap_config: PathBuf,
+        /// Request only these business services (JSON array), with no issuer material.
+        #[arg(long, requires = "install_dir")]
+        business_services: Option<PathBuf>,
+        /// Use an explicit installation directory, required for a business Home.
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
     },
     /// Validate bootstrap configuration without connecting or writing local state.
     CheckBootstrapConfig {
@@ -146,6 +153,8 @@ struct HomeBootstrapState {
     request_id: Uuid,
     home_id: String,
     retrieval_token_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    business_services: Option<Vec<BusinessService>>,
 }
 
 #[derive(Deserialize)]
@@ -185,10 +194,13 @@ struct InstalledHomeConfig {
     deployment_root_public_key: PathBuf,
     deployment_trust: PathBuf,
     endpoint_credential: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_service_grant: Option<PathBuf>,
     server_spki_pins: Vec<String>,
     travel_authorization_cache: PathBuf,
     state_store: PathBuf,
-    ui_listen: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ui_listen: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issuer: Option<InstalledIssuerConfig>,
     services: Vec<Service>,
@@ -328,43 +340,6 @@ const fn default_max_unacked_bytes() -> usize {
 }
 
 #[derive(Clone)]
-struct TlsMaterial {
-    management_connector: TlsConnector,
-    business_acceptor: TlsAcceptor,
-}
-
-struct TravelAuthorizationState {
-    tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
-    cache: Mutex<AuthorizationCache>,
-    trust: Arc<DeploymentTrust>,
-    deployment_id: Arc<String>,
-}
-
-impl TravelAuthorizationState {
-    fn new(cache: AuthorizationCache, trust: DeploymentTrust) -> Arc<Self> {
-        let (tx, _) = watch::channel(None);
-        Arc::new(Self {
-            tx,
-            cache: Mutex::new(cache),
-            deployment_id: Arc::new(trust.deployment_id.clone()),
-            trust: Arc::new(trust),
-        })
-    }
-}
-
-enum IssuerControlRequest {
-    Publish {
-        credential: SignedTravelCredential,
-        response: oneshot::Sender<std::result::Result<u64, String>>,
-    },
-    Revoke {
-        credential_id: Uuid,
-        reason: String,
-        response: oneshot::Sender<std::result::Result<u64, String>>,
-    },
-}
-
-#[derive(Clone)]
 struct IssuerAppState {
     config: Arc<Config>,
     issuer: Arc<IssuerConfig>,
@@ -377,15 +352,8 @@ struct IssuerAppState {
     statistics: HomeStatistics,
 }
 
-#[derive(Clone)]
-struct HomeStatistics {
-    store: Arc<StateStore>,
-    local: Arc<LocalStatistics>,
-    signer: Arc<EcdsaKeyPair>,
-    certificate_pem: Arc<String>,
-    deployment_id: Arc<String>,
-    reporter_id: Arc<String>,
-}
+#[cfg(feature = "e2e-remote-ui")]
+use flowsplice_enrollment::TravelEnrollmentRequest;
 
 #[cfg(feature = "e2e-remote-ui")]
 #[derive(Deserialize)]
@@ -401,7 +369,7 @@ struct IssueRequest {
 #[derive(Serialize)]
 struct IssueResponse {
     generation: u64,
-    enrollment: TravelEnrollmentResponse,
+    enrollment: TravelResponseEnvelope,
     reused: bool,
 }
 
@@ -425,8 +393,8 @@ struct RemoteEnrollmentInboxRecord {
     travel_id: String,
     home_id: String,
     received_at_unix_secs: u64,
-    request: TravelEnrollmentRequest,
-    response: Option<TravelEnrollmentResponse>,
+    request: TravelRequestEnvelope,
+    response: Option<TravelResponseEnvelope>,
     #[serde(default)]
     bootstrap_token_sha256: Option<String>,
     #[serde(default)]
@@ -453,8 +421,8 @@ struct HomeEnrollmentInboxRecord {
     version: u32,
     home_id: String,
     received_at_unix_secs: u64,
-    request: HomeEnrollmentRequest,
-    response: Option<HomeEnrollmentResponse>,
+    request: HomeRequestEnvelope,
+    response: Option<HomeResponseEnvelope>,
     retrieval_token_sha256: String,
     verification_code: String,
 }
@@ -466,6 +434,7 @@ struct ApproveHomeEnrollmentRequest {
     profile: HomeEnrollmentProfile,
     valid_days: Option<u32>,
     password: String,
+    services: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -476,6 +445,8 @@ struct HomeEnrollmentStatus {
     approved: bool,
     verification_code: String,
     profile: Option<HomeEnrollmentProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_services: Option<Vec<BusinessService>>,
 }
 
 #[derive(Serialize)]
@@ -571,7 +542,17 @@ async fn main() -> Result<()> {
         Some(Command::Init {
             server,
             bootstrap_config,
-        }) => run_home_init(server, &bootstrap_config).await,
+            business_services,
+            install_dir,
+        }) => {
+            run_home_init(
+                server,
+                &bootstrap_config,
+                business_services.as_deref(),
+                install_dir,
+            )
+            .await
+        }
         Some(Command::CheckBootstrapConfig { config }) => {
             let bootstrap = load_home_bootstrap(&config)?;
             println!(
@@ -612,84 +593,51 @@ async fn run_home_agent(config_path: PathBuf) -> Result<()> {
     let config: Config = load_toml(&config_path)?;
     validate_home_ui_config(&config)?;
     validate_services(&config.services)?;
-    validate_spki_pins(&config.server_spki_pins, "server")?;
-    let (_, deployment_trust) = load_home_trust(&config)?;
-    let endpoint_credential = if let Some(path) = config.endpoint_credential.as_deref() {
-        let signed: SignedHomeEndpointCredential = load_json(path)?;
-        let endpoint = signed.verify(&deployment_trust, unix_time_secs()?)?;
-        if endpoint.home_id != config.id {
-            bail!("Home endpoint credential belongs to a different Home");
-        }
-        Some((signed, endpoint.not_after_unix_secs))
-    } else {
-        None
-    };
+    let runtime = HomeRuntime::load(
+        HomeRuntimeConfig {
+            id: config.id.clone(),
+            alias: config.alias.clone(),
+            server_control_addr: config.server_control_addr.clone(),
+            server_name: config.server_name.clone(),
+            server_id: config.server_id.clone(),
+            management_cert: config.management_cert.clone(),
+            management_key: config.management_key.clone(),
+            management_ca: config.management_ca.clone(),
+            business_cert: config.business_cert.clone(),
+            business_key: config.business_key.clone(),
+            business_ca: config.business_ca.clone(),
+            deployment_root_public_key: config.deployment_root_public_key.clone(),
+            deployment_trust: config.deployment_trust.clone(),
+            endpoint_credential: config.endpoint_credential.clone(),
+            business_service_grant: None,
+            server_spki_pins: config.server_spki_pins.clone(),
+            travel_authorization_cache: config.travel_authorization_cache.clone(),
+            state_store: config.state_store.clone(),
+            services: config.services.clone(),
+            handshake_timeout_secs: config.handshake_timeout_secs,
+            udp_idle_secs: config.udp_idle_secs,
+            max_active_flows: config.max_active_flows,
+            max_active_carriers: config.max_active_carriers,
+            max_carriers_per_flow: config.max_carriers_per_flow,
+            carrier_heartbeat_secs: config.carrier_heartbeat_secs,
+            carrier_timeout_secs: config.carrier_timeout_secs,
+            flow_detach_timeout_secs: config.flow_detach_timeout_secs,
+            max_unacked_bytes: config.max_unacked_bytes,
+        },
+        Arc::new(targets::NetworkTargets),
+    )?;
+    let statistics = runtime.statistics();
+    let authorization = runtime.authorization();
+    let endpoint_credential = runtime.endpoint_credential();
     if let Some(issuer) = &config.issuer {
-        validate_issuer_config(
-            &config,
-            issuer,
-            endpoint_credential.as_ref().map(|(signed, _)| signed),
-        )?;
+        validate_issuer_config(&config, issuer, endpoint_credential)?;
         if !issuer.allow_unencrypted_test_keys
             && recover_private_key_password_rotation(&issuer_key_targets(issuer))?
         {
             info!("completed interrupted Home issuer private-key password rotation");
         }
     }
-    if config.carrier_heartbeat_secs == 0
-        || config.carrier_timeout_secs <= config.carrier_heartbeat_secs
-        || config.flow_detach_timeout_secs <= config.carrier_timeout_secs
-        || config.max_unacked_bytes < MAX_DATA_PAYLOAD
-        || config.max_unacked_bytes > u32::MAX as usize
-        || config.max_active_flows == 0
-        || config.max_active_carriers == 0
-        || config.max_carriers_per_flow == 0
-        || config.max_carriers_per_flow > config.max_active_carriers
-    {
-        bail!("carrier/flow timeout or unacknowledged-data limits are invalid");
-    }
-    let state_store = Arc::new(StateStore::open(&config.state_store)?);
-    let statistics = HomeStatistics {
-        store: Arc::clone(&state_store),
-        local: Arc::new(LocalStatistics::new(state_store.as_ref().clone())),
-        signer: Arc::new(statistics_signing_key(&load_management_private_key(
-            &config.management_key,
-        )?)?),
-        certificate_pem: Arc::new(
-            std::fs::read_to_string(&config.management_cert)
-                .context("failed to read Home statistics signing certificate")?,
-        ),
-        deployment_id: Arc::new(deployment_trust.deployment_id.clone()),
-        reporter_id: Arc::new(config.id.clone()),
-    };
-    let tls = Arc::new(TlsMaterial {
-        management_connector: client_connector(
-            &config.management_cert,
-            &config.management_key,
-            &config.management_ca,
-        )?,
-        business_acceptor: server_acceptor(
-            &config.business_cert,
-            &config.business_key,
-            &config.business_ca,
-        )?,
-    });
     let config = Arc::new(config);
-    let authorization_cache =
-        load_initialized_authorization_cache(&config.travel_authorization_cache)?;
-    let authorization =
-        TravelAuthorizationState::new(authorization_cache, deployment_trust.clone());
-    let permits = Arc::new(Semaphore::new(config.max_active_flows));
-    let tcp_flows = TcpFlowRegistry::new(
-        Arc::clone(&permits),
-        Duration::from_secs(config.carrier_heartbeat_secs),
-        Duration::from_secs(config.carrier_timeout_secs),
-        Duration::from_secs(config.flow_detach_timeout_secs),
-        config.max_unacked_bytes,
-        config.max_active_carriers,
-        config.max_carriers_per_flow,
-        Arc::clone(&statistics.local),
-    );
     let (issuer_state, issuer_control_rx) = if let Some(issuer) = &config.issuer {
         let (issuer_control_tx, issuer_control_rx) = mpsc::channel(32);
         let issuance_ledger = IssuanceLedger::load(ledger_path(&issuer.management_ca_key)?)?;
@@ -697,9 +645,7 @@ async fn run_home_agent(config_path: PathBuf) -> Result<()> {
             Some(IssuerAppState {
                 config: Arc::clone(&config),
                 issuer: Arc::new(issuer.clone()),
-                endpoint_credential: endpoint_credential
-                    .as_ref()
-                    .map(|(signed, _)| Arc::new(signed.clone())),
+                endpoint_credential: endpoint_credential.map(|signed| Arc::new(signed.clone())),
                 authorization: Arc::clone(&authorization),
                 control_tx: issuer_control_tx,
                 key_operation: Arc::new(Mutex::new(())),
@@ -712,29 +658,19 @@ async fn run_home_agent(config_path: PathBuf) -> Result<()> {
     } else {
         (None, None)
     };
-    let control = run_control_loop(
-        Arc::clone(&config),
-        Arc::clone(&permits),
-        Arc::clone(&tls),
-        Arc::clone(&tcp_flows),
-        Arc::clone(&authorization),
+    let control = runtime.run(
         issuer_control_rx,
-        statistics.clone(),
-    );
-    let trust_expiry = monitor_trust_expiry(
-        endpoint_credential
-            .as_ref()
-            .map_or(deployment_trust.not_after_unix_secs, |(_, not_after)| {
-                deployment_trust.not_after_unix_secs.min(*not_after)
-            }),
+        Arc::new(LegacyHomeControlHooks {
+            config: Arc::clone(&config),
+            statistics: statistics.clone(),
+        }),
     );
     if let Some(issuer_state) = issuer_state {
-        tokio::try_join!(control, run_issuer_ui(issuer_state), trust_expiry)?;
+        tokio::try_join!(control, run_issuer_ui(issuer_state))?;
     } else {
         tokio::try_join!(
             control,
-            run_statistics_only_ui(Arc::clone(&config), statistics),
-            trust_expiry
+            run_statistics_only_ui(Arc::clone(&config), statistics)
         )?;
     }
     Ok(())
@@ -816,12 +752,25 @@ fn default_home_install_root() -> Result<PathBuf> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<()> {
+async fn run_home_init(
+    server: IpAddr,
+    bootstrap_config_path: &Path,
+    services_path: Option<&Path>,
+    install_dir: Option<PathBuf>,
+) -> Result<()> {
+    let business_services: Option<Vec<BusinessService>> =
+        services_path.map(load_json).transpose()?;
+    if let Some(services) = &business_services {
+        validate_business_services(services)?;
+        if install_dir.is_none() {
+            bail!("business Home setup requires an explicit installation directory");
+        }
+    }
     let bootstrap = load_home_bootstrap(bootstrap_config_path)?;
     let deployment_root_public_key = bootstrap.deployment_root_public_key.as_str();
     let management_ca = &bootstrap.trust.management_ca_certificate_pem;
     let server_address = SocketAddr::new(server, bootstrap.server_control_port);
-    let install_root = default_home_install_root()?;
+    let install_root = install_dir.map_or_else(default_home_install_root, Ok)?;
     if install_root.exists() && !install_root.is_dir() {
         bail!(
             "Home install path is not a directory: {}",
@@ -837,8 +786,23 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
     let install_root = install_root.canonicalize()?;
     let enrollment_directory = install_root.join("cert");
     let bootstrap_state_path = install_root.join("home-bootstrap.json");
-    let config_path = install_root.join("homeagent.toml");
+    let config_path = install_root.join(if business_services.is_some() {
+        "home-runtime.toml"
+    } else {
+        "homeagent.toml"
+    });
     if config_path.exists() {
+        if business_services.is_some() {
+            let installed: HomeRuntimeConfig = load_toml(&config_path)?;
+            if installed.server_control_addr != server_address.to_string() {
+                bail!("business Home is already initialized for a different Server");
+            }
+            println!(
+                "Business Home is already initialized: {}",
+                config_path.display()
+            );
+            return Ok(());
+        }
         #[cfg(target_os = "macos")]
         {
             let installed: Config = load_toml(&config_path)?;
@@ -867,6 +831,9 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         let state: HomeBootstrapState = load_json(&bootstrap_state_path)?;
         if state.version != HOME_BOOTSTRAP_STATE_VERSION {
             bail!("existing Home bootstrap state has an unsupported version");
+        }
+        if state.business_services != business_services {
+            bail!("resumed Home setup must use exactly its original business services");
         }
         let request: HomeEnrollmentRequest =
             load_json(&enrollment_directory.join(HOME_REQUEST_FILE))?;
@@ -901,9 +868,19 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
                 request_id: request.request_id,
                 home_id: request.home_id.clone(),
                 retrieval_token_hex: hex::encode(&token),
+                business_services: business_services.clone(),
             },
         )?;
         (request, token)
+    };
+    let request = match business_services {
+        Some(services) => HomeRequestEnvelope::Business(Box::new(BusinessHomeRequest {
+            version: BUSINESS_VERSION,
+            object_type: BUSINESS_HOME_REQUEST_TYPE.to_owned(),
+            request,
+            services,
+        })),
+        None => HomeRequestEnvelope::Legacy(request),
     };
     let request_json = serde_json::to_vec(&request)?;
     let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
@@ -938,11 +915,10 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         }
         sleep(Duration::from_secs(2)).await;
     };
-    let (endpoint, _) = flowsplice_enrollment::home::validate_home_enrollment_response(
-        &response,
-        deployment_root_public_key,
-        unix_time_secs()?,
-    )?;
+    response.validate(deployment_root_public_key, unix_time_secs()?)?;
+    if response.request_envelope() != request {
+        bail!("Home response changed the requested business enrollment");
+    }
     let response_trust = response
         .deployment_trust
         .verify(deployment_root_public_key, unix_time_secs()?)?;
@@ -952,6 +928,9 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         &response.deployment_trust,
         &response_trust,
     )?;
+    let endpoint = response
+        .signed_endpoint_credential
+        .verify(&response_trust, unix_time_secs()?)?;
     if endpoint.home_id != request.home_id {
         bail!("approved Home identity changed during enrollment");
     }
@@ -966,6 +945,56 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         format!("{}\n", deployment_root_public_key.trim()).as_bytes(),
     )?;
     let issuer = installed_issuer_config(&install_root, &response);
+    let (business_service_grant, services) = match &response {
+        HomeResponseEnvelope::Business(business) => {
+            let grant = business.grant.verify(
+                &response_trust,
+                &business.response.signed_endpoint_credential,
+                unix_time_secs()?,
+            )?;
+            let path = enrollment_directory.join(HOME_SERVICE_GRANT_FILE);
+            write_or_verify_private(&path, &serde_json::to_vec_pretty(&business.grant)?)?;
+            let approver = response_trust
+                .home_enrollment_authority(&grant.authority_id, grant.authority_epoch)?;
+            for service in &grant.services {
+                let descriptor = BusinessDescriptor {
+                    version: BUSINESS_VERSION,
+                    approving_home_id: approver.issuer_home_id.clone(),
+                    endpoint: business.response.signed_endpoint_credential.clone(),
+                    grant: business.grant.clone(),
+                    service_id: service.service_id.clone(),
+                };
+                descriptor.verify(&response_trust, unix_time_secs()?)?;
+                let descriptor_path = install_root.join(format!(
+                    "business-{}.json",
+                    hex::encode(service.service_id.as_bytes())
+                ));
+                write_or_verify_private(
+                    &descriptor_path,
+                    &serde_json::to_vec_pretty(&descriptor)?,
+                )?;
+                println!(
+                    "Private descriptor for {}: {}",
+                    service.service_id,
+                    descriptor_path.display()
+                );
+            }
+            (
+                Some(path),
+                grant
+                    .services
+                    .iter()
+                    .map(|service| Service {
+                        id: service.service_id.clone(),
+                        alias: service.service_id.clone(),
+                        protocol: service.protocol,
+                        target: "in-process".to_owned(),
+                    })
+                    .collect(),
+            )
+        }
+        HomeResponseEnvelope::Legacy(_) => (None, Vec::new()),
+    };
     let suffix = request
         .home_id
         .strip_prefix("home-")
@@ -985,31 +1014,39 @@ async fn run_home_init(server: IpAddr, bootstrap_config_path: &Path) -> Result<(
         deployment_root_public_key: enrollment_directory.join("deployment-root.pub"),
         deployment_trust: enrollment_directory.join(flowsplice_enrollment::DEPLOYMENT_TRUST_FILE),
         endpoint_credential: enrollment_directory.join(HOME_ENDPOINT_CREDENTIAL_FILE),
+        business_service_grant,
         server_spki_pins: vec![server_spki_pin],
         travel_authorization_cache: install_root.join("state/travel-authorization-cache.json"),
         state_store: install_root.join("state/home-state.redb"),
-        ui_listen: bootstrap.ui_listen,
+        ui_listen: matches!(response, HomeResponseEnvelope::Legacy(_))
+            .then_some(bootstrap.ui_listen),
         issuer,
-        services: Vec::new(),
+        services,
     };
     let encoded = toml::to_string_pretty(&generated).context("failed to encode Home TOML")?;
     initialize_authorization_cache(&generated.travel_authorization_cache)?;
     let _ = StateStore::open(&generated.state_store)?;
     write_new_private(&config_path, encoded.as_bytes())?;
     #[cfg(target_os = "macos")]
-    install_and_start_macos_home(&install_root, &config_path, &request.home_id)?;
+    if matches!(response, HomeResponseEnvelope::Legacy(_)) {
+        install_and_start_macos_home(&install_root, &config_path, &request.home_id)?;
+    }
     fs::remove_file(&bootstrap_state_path)?;
     println!(
         "Home enrollment installed with profile {:?}",
         response.approval.profile
     );
     println!("configuration: {}", config_path.display());
-    println!("Home page: http://{}/", generated.ui_listen);
+    if let Some(ui_listen) = generated.ui_listen {
+        println!("Home page: http://{ui_listen}/");
+    }
     #[cfg(not(target_os = "macos"))]
-    println!(
-        "start: flowsplice-homeagent --config {}",
-        config_path.display()
-    );
+    if matches!(response, HomeResponseEnvelope::Legacy(_)) {
+        println!(
+            "start: flowsplice-homeagent --config {}",
+            config_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1020,7 +1057,7 @@ async fn poll_home_bootstrap_server(
     retrieval_token: &[u8],
     request_json: &[u8],
     server_id: &str,
-) -> Result<Option<(HomeEnrollmentResponse, String)>> {
+) -> Result<Option<(HomeResponseEnvelope, String)>> {
     let socket = timeout(Duration::from_secs(10), TcpStream::connect(address))
         .await
         .context("Server bootstrap TCP connection timed out")??;
@@ -1200,42 +1237,6 @@ fn install_and_start_macos_home(
     Ok(())
 }
 
-async fn monitor_trust_expiry(not_after_unix_secs: u64) -> Result<()> {
-    loop {
-        if unix_time_secs()? >= not_after_unix_secs {
-            bail!("deployment trust expired; refusing to continue");
-        }
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    }
-}
-
-async fn run_control_loop(
-    config: Arc<Config>,
-    permits: Arc<Semaphore>,
-    tls: Arc<TlsMaterial>,
-    tcp_flows: Arc<TcpFlowRegistry>,
-    authorization: Arc<TravelAuthorizationState>,
-    mut issuer_control_rx: Option<mpsc::Receiver<IssuerControlRequest>>,
-    statistics: HomeStatistics,
-) -> Result<()> {
-    loop {
-        if let Err(error) = run_control(
-            Arc::clone(&config),
-            Arc::clone(&permits),
-            Arc::clone(&tls),
-            Arc::clone(&tcp_flows),
-            Arc::clone(&authorization),
-            &mut issuer_control_rx,
-            statistics.clone(),
-        )
-        .await
-        {
-            warn!(%error, "server control disconnected; reconnecting");
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
 fn validate_issuer_config(
     config: &Config,
     issuer: &IssuerConfig,
@@ -1401,372 +1402,149 @@ fn validate_services(services: &[Service]) -> Result<()> {
     Ok(())
 }
 
-async fn run_control(
+struct LegacyHomeControlHooks {
     config: Arc<Config>,
-    permits: Arc<Semaphore>,
-    tls: Arc<TlsMaterial>,
-    tcp_flows: Arc<TcpFlowRegistry>,
-    authorization: Arc<TravelAuthorizationState>,
-    issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
     statistics: HomeStatistics,
-) -> Result<()> {
-    let socket = TcpStream::connect(&config.server_control_addr).await?;
-    let stream = timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
-        tls.management_connector
-            .connect(server_name(&config.server_name)?, socket),
-    )
-    .await
-    .context("server TLS handshake timed out")??;
-    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(
-        &identity,
-        Role::Server,
-        Some(&config.server_id),
-        &config.server_spki_pins,
-    )?;
-    run_control_session(
-        stream,
-        config,
-        permits,
-        tls,
-        tcp_flows,
-        authorization,
-        issuer_control_rx,
-        statistics,
-    )
-    .await
 }
-
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
-async fn run_control_session(
-    stream: ClientTlsStream<TcpStream>,
-    config: Arc<Config>,
-    permits: Arc<Semaphore>,
-    tls: Arc<TlsMaterial>,
-    tcp_flows: Arc<TcpFlowRegistry>,
-    authorization: Arc<TravelAuthorizationState>,
-    issuer_control_rx: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
-    statistics: HomeStatistics,
-) -> Result<()> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = JsonFrameReader::new(reader, CONTROL_FRAME_LIMIT);
-    write_json(
-        &mut writer,
-        &ControlMessage::Hello {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            role: Role::Home,
-            id: config.id.clone(),
-        },
-        CONTROL_FRAME_LIMIT,
-    )
-    .await?;
-    match reader
-        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
-        .await?
-    {
-        ControlMessage::Hello {
-            protocol_version,
-            role,
-            id,
-        } if protocol_version == CONTROL_PROTOCOL_VERSION
-            && role == Role::Server
-            && id == config.server_id => {}
-        _ => bail!("server sent an invalid HELLO"),
-    }
-    write_json(
-        &mut writer,
-        &ControlMessage::HomeRegister {
-            home: HomeCatalog {
-                home_id: config.id.clone(),
-                home_alias: config.alias.clone(),
-                endpoint_credential: config
-                    .endpoint_credential
-                    .as_deref()
-                    .map(load_json)
-                    .transpose()?,
-                services: config.services.clone(),
-            },
-        },
-        CONTROL_FRAME_LIMIT,
-    )
-    .await?;
-    let ControlMessage::TravelAuthorizationSnapshot {
-        snapshot: initial_snapshot,
-    } = reader
-        .read_with_timeout::<ControlMessage>(Duration::from_secs(config.handshake_timeout_secs))
-        .await?
-    else {
-        bail!("Server did not send initial Travel authorization state");
-    };
-    let generation =
-        apply_authorization_snapshot(&authorization, &tcp_flows, &config, initial_snapshot).await?;
-    write_json(
-        &mut writer,
-        &ControlMessage::TravelAuthorizationAck { generation },
-        CONTROL_FRAME_LIMIT,
-    )
-    .await?;
-    info!(server = %config.server_control_addr, "home agent registered");
-
-    let mut heartbeat = interval(Duration::from_secs(10));
-    let mut statistics_tick = interval(Duration::from_secs(5));
-    let mut report_keys = HashMap::<String, Vec<u8>>::new();
-    let mut last_enrollment_prune = Instant::now();
-    let mut nonce = 0_u64;
-    let mut last_received = Instant::now();
-    let mut pending_issuer =
-        HashMap::<Uuid, oneshot::Sender<std::result::Result<u64, String>>>::new();
-    loop {
-        tokio::select! {
-            command = receive_issuer_command(issuer_control_rx) => {
-                let Some(command) = command else { bail!("Home issuer control channel closed"); };
-                let request_id = Uuid::new_v4();
-                let (message, response) = match command {
-                    IssuerControlRequest::Publish { credential, response } => (
-                        ControlMessage::PublishTravelCredential { request_id, credential },
-                        response,
-                    ),
-                    IssuerControlRequest::Revoke { credential_id, reason, response } => (
-                        ControlMessage::RevokeTravelCredential { request_id, credential_id, reason },
-                        response,
-                    ),
-                };
-                write_json(&mut writer, &message, CONTROL_FRAME_LIMIT).await?;
-                pending_issuer.insert(request_id, response);
-            }
-            message = reader.read::<ControlMessage>() => {
-                last_received = Instant::now();
-                match message? {
-                    ControlMessage::TravelAuthorizationSnapshot { snapshot } => {
-                        let generation = apply_authorization_snapshot(
-                            &authorization,
-                            &tcp_flows,
-                            &config,
-                            snapshot,
-                        )
-                        .await?;
-                        write_json(
-                            &mut writer,
-                            &ControlMessage::TravelAuthorizationAck { generation },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
-                    ControlMessage::OpenRelayWork {
-                        work_id,
-                        work_secret,
-                        credential_id,
-                        relay_id,
-                        relay_data_addr,
-                        expires_at_unix_secs,
-                    } => {
-                        ensure_credential_active(&authorization.tx.subscribe(), credential_id)?;
-                        let config = Arc::clone(&config);
-                        let tls = Arc::clone(&tls);
-                        let permits = Arc::clone(&permits);
-                        let tcp_flows = Arc::clone(&tcp_flows);
-                        let authorization_rx = authorization.tx.subscribe();
-                        tokio::spawn(async move {
-                            if let Err(error) = run_work(config, tls, permits, tcp_flows, authorization_rx, credential_id, work_id, work_secret, relay_id.clone(), relay_data_addr, expires_at_unix_secs).await {
-                                warn!(%work_id, %relay_id, %error, "home direct Relay work failed");
-                            }
-                        });
-                    }
-                    ControlMessage::RemoteEnrollmentSubmit {
+impl HomeControlHooks for LegacyHomeControlHooks {
+    fn handle(
+        &self,
+        message: ControlMessage,
+    ) -> flowsplice_transport::IoFuture<'_, ControlMessage> {
+        Box::pin(async move {
+            let config = &self.config;
+            let statistics = &self.statistics;
+            match message {
+                ControlMessage::RemoteEnrollmentSubmit {
+                    request_id,
+                    travel_id,
+                    home_id,
+                    request_json,
+                    ..
+                } => {
+                    let result = persist_remote_enrollment_request(
+                        statistics,
+                        config,
                         request_id,
                         travel_id,
                         home_id,
                         request_json,
-                        ..
-                    } => {
-                        let result = persist_remote_enrollment_request(
-                            &statistics,
-                            &config,
+                        None,
+                    )
+                    .await;
+                    Ok(encode_enrollment_result(result)?.remote(request_id))
+                }
+                ControlMessage::BootstrapEnrollmentSubmit {
+                    protocol_version,
+                    request_id,
+                    travel_id,
+                    home_id,
+                    retrieval_token,
+                    request_json,
+                } => {
+                    let result = if protocol_version == CONTROL_PROTOCOL_VERSION {
+                        persist_remote_enrollment_request(
+                            statistics,
+                            config,
                             request_id,
                             travel_id,
                             home_id,
                             request_json,
-                            None,
+                            Some(retrieval_token),
                         )
-                        .await;
-                        let (accepted, response_json, error) = match result {
-                            Ok(response) => (
-                                true,
-                                response
-                                    .map(|response| serde_json::to_vec(&response))
-                                    .transpose()?,
-                                None,
-                            ),
-                            Err(error) => (false, None, Some(error.to_string())),
-                        };
-                        write_json(
-                            &mut writer,
-                            &ControlMessage::RemoteEnrollmentResult {
-                                request_id,
-                                accepted,
-                                response_json,
-                                error,
-                            },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
-                    ControlMessage::BootstrapEnrollmentSubmit {
-                        protocol_version,
-                        request_id,
-                        travel_id,
-                        home_id,
-                        retrieval_token,
-                        request_json,
-                    } => {
-                        let result = if protocol_version == CONTROL_PROTOCOL_VERSION {
-                            persist_remote_enrollment_request(
-                                &statistics,
-                                &config,
-                                request_id,
-                                travel_id,
-                                home_id,
-                                request_json,
-                                Some(retrieval_token),
-                            )
-                            .await
-                        } else {
-                            Err(anyhow::anyhow!("unsupported bootstrap protocol version"))
-                        };
-                        let (accepted, response_json, error) = match result {
-                            Ok(response) => (
-                                true,
-                                response
-                                    .map(|response| serde_json::to_vec(&response))
-                                    .transpose()?,
-                                None,
-                            ),
-                            Err(error) => (false, None, Some(error.to_string())),
-                        };
-                        write_json(
-                            &mut writer,
-                            &ControlMessage::RemoteEnrollmentResult {
-                                request_id,
-                                accepted,
-                                response_json,
-                                error,
-                            },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
-                    ControlMessage::HomeEnrollmentSubmit {
+                        .await
+                    } else {
+                        Err(anyhow::anyhow!("unsupported bootstrap protocol version"))
+                    };
+                    Ok(encode_enrollment_result(result)?.remote(request_id))
+                }
+                ControlMessage::HomeEnrollmentSubmit {
+                    request_id,
+                    home_id,
+                    retrieval_token,
+                    request_json,
+                } => {
+                    let result = persist_home_enrollment_request(
+                        statistics,
                         request_id,
                         home_id,
                         retrieval_token,
                         request_json,
-                    } => {
-                        let result = persist_home_enrollment_request(
-                            &statistics,
-                            request_id,
-                            home_id,
-                            retrieval_token,
-                            request_json,
-                        )
-                        .await;
-                        let (accepted, response_json, error) = match result {
-                            Ok(response) => (
-                                true,
-                                response
-                                    .map(|response| serde_json::to_vec(&response))
-                                    .transpose()?,
-                                None,
-                            ),
-                            Err(error) => (false, None, Some(error.to_string())),
-                        };
-                        write_json(
-                            &mut writer,
-                            &ControlMessage::HomeEnrollmentResult {
-                                request_id,
-                                accepted,
-                                response_json,
-                                error,
-                            },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
-                    ControlMessage::RemoteEnrollmentInstalled {
+                    )
+                    .await;
+                    Ok(encode_enrollment_result(result)?.home(request_id))
+                }
+                ControlMessage::RemoteEnrollmentInstalled {
+                    request_id,
+                    travel_id,
+                    credential_id,
+                    home_id,
+                    ..
+                } => {
+                    let result = acknowledge_remote_enrollment_installed(
+                        statistics,
+                        config,
                         request_id,
-                        travel_id,
+                        &travel_id,
                         credential_id,
-                        home_id,
-                        ..
-                    } => {
-                        let result = acknowledge_remote_enrollment_installed(
-                            &statistics,
-                            &config,
-                            request_id,
-                            &travel_id,
-                            credential_id,
-                            &home_id,
-                        )
-                        .await;
-                        write_json(
-                            &mut writer,
-                            &ControlMessage::RemoteEnrollmentInstalledAck {
-                                request_id,
-                                accepted: result.is_ok(),
-                                error: result.err().map(|error| error.to_string()),
-                            },
-                            CONTROL_FRAME_LIMIT,
-                        )
-                        .await?;
-                    }
-                    ControlMessage::Heartbeat { nonce } => {
-                        write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
-                    }
-                    ControlMessage::HeartbeatAck { .. } => {}
-                    ControlMessage::PublishTravelCredentialResult { request_id, accepted, generation, error }
-                    | ControlMessage::RevokeTravelCredentialResult { request_id, accepted, generation, error } => {
-                        if let Some(response) = pending_issuer.remove(&request_id) {
-                            let result = if accepted {
-                                Ok(generation)
-                            } else {
-                                Err(error.unwrap_or_else(|| "Server rejected the request".to_owned()))
-                            };
-                            let _ = response.send(result);
-                        }
-                    }
-                    ControlMessage::StatisticsReportAck { digest_sha256, accepted, error } => {
-                        if accepted {
-                            if let Some(key) = report_keys.remove(&digest_sha256) {
-                                let local = Arc::clone(&statistics.local);
-                                let digest = digest_sha256.clone();
-                                tokio::task::spawn_blocking(move || local.acknowledge_report(&key, &digest))
-                                    .await
-                                    .context("Home statistics acknowledgement task failed")??;
-                            }
-                        } else {
-                            warn!(?error, %digest_sha256, "Server rejected Home statistics report");
-                        }
-                    }
-                    _ => bail!("unexpected message from server"),
+                        &home_id,
+                    )
+                    .await;
+                    Ok(ControlMessage::RemoteEnrollmentInstalledAck {
+                        request_id,
+                        accepted: result.is_ok(),
+                        error: result.err().map(|error| error.to_string()),
+                    })
                 }
+                _ => bail!("unexpected message for Home enrollment adapter"),
             }
-            _ = heartbeat.tick() => {
-                if last_received.elapsed() > Duration::from_secs(30) {
-                    bail!("server control heartbeat timed out");
-                }
-                nonce = nonce.wrapping_add(1);
-                write_json(&mut writer, &ControlMessage::Heartbeat { nonce }, CONTROL_FRAME_LIMIT).await?;
-            }
-            _ = statistics_tick.tick() => {
-                flush_and_send_home_statistics(&statistics, &mut writer, &mut report_keys).await?;
-                if last_enrollment_prune.elapsed() >= Duration::from_secs(60) {
-                    prune_remote_enrollment_inbox(&statistics).await?;
-                    last_enrollment_prune = Instant::now();
-                }
-            }
+        })
+    }
+    fn tick(&self) -> flowsplice_transport::IoFuture<'_, ()> {
+        Box::pin(prune_remote_enrollment_inbox(&self.statistics))
+    }
+}
+
+struct EnrollmentWireResult {
+    accepted: bool,
+    response_json: Option<Vec<u8>>,
+    error: Option<String>,
+}
+impl EnrollmentWireResult {
+    fn remote(self, request_id: Uuid) -> ControlMessage {
+        ControlMessage::RemoteEnrollmentResult {
+            request_id,
+            accepted: self.accepted,
+            response_json: self.response_json,
+            error: self.error,
         }
     }
+    fn home(self, request_id: Uuid) -> ControlMessage {
+        ControlMessage::HomeEnrollmentResult {
+            request_id,
+            accepted: self.accepted,
+            response_json: self.response_json,
+            error: self.error,
+        }
+    }
+}
+fn encode_enrollment_result<T: Serialize>(
+    result: Result<Option<T>>,
+) -> Result<EnrollmentWireResult> {
+    Ok(match result {
+        Ok(response) => EnrollmentWireResult {
+            accepted: true,
+            response_json: response
+                .map(|response| serde_json::to_vec(&response))
+                .transpose()?,
+            error: None,
+        },
+        Err(error) => EnrollmentWireResult {
+            accepted: false,
+            response_json: None,
+            error: Some(error.to_string()),
+        },
+    })
 }
 
 async fn persist_remote_enrollment_request(
@@ -1777,14 +1555,14 @@ async fn persist_remote_enrollment_request(
     home_id: String,
     request_json: Vec<u8>,
     bootstrap_token: Option<Vec<u8>>,
-) -> Result<Option<TravelEnrollmentResponse>> {
+) -> Result<Option<TravelResponseEnvelope>> {
     if request_id.is_nil() || request_json.is_empty() || request_json.len() > 512 * 1024 {
         bail!("remote enrollment request is missing or oversized");
     }
     if home_id != config.id {
         bail!("remote enrollment request targets a different Home");
     }
-    let request: TravelEnrollmentRequest =
+    let request: TravelRequestEnvelope =
         serde_json::from_slice(&request_json).context("remote enrollment request is invalid")?;
     if request.request_id != request_id || request.travel_id != travel_id {
         bail!("remote enrollment request does not match authenticated transport identity");
@@ -1795,7 +1573,22 @@ async fn persist_remote_enrollment_request(
     {
         bail!("first enrollment retrieval token has an invalid length");
     }
-    parse_enrollment_request(&request, unix_time_secs()?)?;
+    match &request {
+        TravelRequestEnvelope::Business(request) => {
+            let (_, trust) = load_home_trust(config)?;
+            request.validate(&trust, &config.id, unix_time_secs()?)?;
+            if config
+                .issuer
+                .as_ref()
+                .is_none_or(|issuer| issuer.global_authority.is_none())
+            {
+                bail!("directed business enrollment requires a global Home issuer");
+            }
+        }
+        TravelRequestEnvelope::Legacy(request) => {
+            parse_enrollment_request(request, unix_time_secs()?)?;
+        }
+    }
     let bootstrap_token_sha256 = bootstrap_token
         .as_ref()
         .map(|token| hex::encode(digest::digest(&digest::SHA256, token).as_ref()));
@@ -1857,7 +1650,7 @@ async fn persist_home_enrollment_request(
     home_id: String,
     retrieval_token: Vec<u8>,
     request_json: Vec<u8>,
-) -> Result<Option<HomeEnrollmentResponse>> {
+) -> Result<Option<HomeResponseEnvelope>> {
     if request_id.is_nil()
         || home_id.is_empty()
         || retrieval_token.len() != 32
@@ -1866,12 +1659,12 @@ async fn persist_home_enrollment_request(
     {
         bail!("Home enrollment request is invalid or oversized");
     }
-    let request: HomeEnrollmentRequest =
+    let request: HomeRequestEnvelope =
         serde_json::from_slice(&request_json).context("Home enrollment request is invalid")?;
     if request.request_id != request_id || request.home_id != home_id {
         bail!("Home enrollment transport identity does not match its request");
     }
-    parse_home_enrollment_request(&request, unix_time_secs()?)?;
+    request.validate(unix_time_secs()?)?;
     let retrieval_token_sha256 =
         hex::encode(digest::digest(&digest::SHA256, &retrieval_token).as_ref());
     let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
@@ -1963,7 +1756,10 @@ async fn acknowledge_remote_enrollment_installed(
         )?)
     })
     .await
-    .context("Home enrollment acknowledgement task failed")?
+    .context("Home enrollment acknowledgement task failed")??;
+    info!(event = "remote_enrollment_installation_confirmed", %request_id, %credential_id,
+        home_id = %config.id, "Travel installation acknowledgement is durable");
+    Ok(())
 }
 
 async fn prune_remote_enrollment_inbox(statistics: &HomeStatistics) -> Result<()> {
@@ -2026,391 +1822,6 @@ fn remote_enrollment_inbox_expired(
 
 fn remote_enrollment_capacity_available(current: usize, maximum: usize) -> bool {
     current < maximum
-}
-
-async fn flush_and_send_home_statistics<W: tokio::io::AsyncWrite + Unpin>(
-    statistics: &HomeStatistics,
-    writer: &mut W,
-    report_keys: &mut HashMap<String, Vec<u8>>,
-) -> Result<()> {
-    let local = Arc::clone(&statistics.local);
-    let deployment_id = Arc::clone(&statistics.deployment_id);
-    let reporter_id = Arc::clone(&statistics.reporter_id);
-    let certificate_pem = Arc::clone(&statistics.certificate_pem);
-    let signer = Arc::clone(&statistics.signer);
-    let flush_result = tokio::task::spawn_blocking(move || {
-        local.flush_and_stage(
-            &deployment_id,
-            Role::Home,
-            &reporter_id,
-            &certificate_pem,
-            &signer,
-        )
-    })
-    .await
-    .context("Home statistics flush task failed")?;
-    if let Err(error) = flush_result {
-        warn!(%error, "Home statistics write failed; business processing remains active and pending deltas were retained");
-    }
-    let local = Arc::clone(&statistics.local);
-    let reports = tokio::task::spawn_blocking(move || local.pending_reports(16))
-        .await
-        .context("Home statistics outbox task failed")??;
-    for (key, report) in reports {
-        let digest = report.digest_sha256()?;
-        report_keys.insert(digest, key);
-        write_json(
-            writer,
-            &ControlMessage::StatisticsReport { report },
-            CONTROL_FRAME_LIMIT,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn receive_issuer_command(
-    receiver: &mut Option<mpsc::Receiver<IssuerControlRequest>>,
-) -> Option<IssuerControlRequest> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_work(
-    config: Arc<Config>,
-    tls: Arc<TlsMaterial>,
-    permits: Arc<Semaphore>,
-    tcp_flows: Arc<TcpFlowRegistry>,
-    authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
-    expected_credential_id: Uuid,
-    work_id: Uuid,
-    work_secret: Vec<u8>,
-    relay_id: String,
-    relay_data_addr: String,
-    expires_at_unix_secs: u64,
-) -> Result<()> {
-    if unix_time_secs()? >= expires_at_unix_secs {
-        bail!("direct Relay work expired before Home connection");
-    }
-    let socket = timeout(Duration::from_secs(config.handshake_timeout_secs), async {
-        let mut socket = TcpStream::connect(&relay_data_addr).await?;
-        write_preface(&mut socket, RouteSide::Home, work_id, &work_secret).await?;
-        Ok::<_, anyhow::Error>(socket)
-    })
-    .await
-    .with_context(|| format!("Relay {relay_id} direct work setup timed out"))??;
-    let mut stream = timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
-        tls.business_acceptor.accept(socket),
-    )
-    .await
-    .context("business TLS handshake timed out")??;
-    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Travel, None, &[])?;
-    let credential =
-        authorize_business_identity(&identity, &authorization_rx, expected_credential_id)?;
-    let credential_id = credential.credential_id;
-    let not_after_unix_secs = credential
-        .not_after_unix_secs
-        .min(identity.not_after_unix_secs);
-
-    let open = JsonFrameReader::new(&mut stream, DATA_FRAME_LIMIT)
-        .read_with_timeout::<DataFrame>(Duration::from_secs(config.handshake_timeout_secs))
-        .await?;
-    let DataFrame::Open {
-        flow_id,
-        carrier_id,
-        service_id,
-        protocol,
-        data_protocol_version,
-    } = open
-    else {
-        bail!("first business frame must be OPEN");
-    };
-    let data_codec = DataFrameCodec::negotiate(data_protocol_version);
-    let service = config
-        .services
-        .iter()
-        .find(|candidate| candidate.id == service_id && candidate.protocol == protocol)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("unknown or mismatched service"))?;
-    if !credential.allows_service(&config.id, &service.id, service.protocol) {
-        bail!("Travel credential is not authorized for this logical service");
-    }
-
-    match protocol {
-        ServiceProtocol::Tcp => {
-            tcp_flows
-                .attach(
-                    credential_id,
-                    identity.id,
-                    flow_id,
-                    service,
-                    IncomingCarrier {
-                        carrier_id,
-                        relay_id,
-                        stream,
-                        global_permit: None,
-                        flow_permit: None,
-                        data_codec,
-                    },
-                    not_after_unix_secs,
-                )
-                .await
-        }
-        ServiceProtocol::Udp => {
-            let _permit = permits
-                .try_acquire_owned()
-                .map_err(|_| anyhow::anyhow!("home active-flow limit reached"))?;
-            serve_udp(
-                stream,
-                flow_id,
-                carrier_id,
-                &service,
-                config.udp_idle_secs,
-                authorization_rx,
-                credential_id,
-                not_after_unix_secs,
-                tcp_flows.statistics(),
-                identity.id,
-                relay_id,
-                data_codec,
-            )
-            .await
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn serve_udp(
-    stream: ServerTlsStream<TcpStream>,
-    flow_id: Uuid,
-    carrier_id: Uuid,
-    service: &Service,
-    idle_secs: u64,
-    mut authorization_rx: watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
-    credential_id: Uuid,
-    not_after_unix_secs: u64,
-    statistics: Arc<LocalStatistics>,
-    travel_id: String,
-    relay_id: String,
-    data_codec: DataFrameCodec,
-) -> Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let target_started = Instant::now();
-    socket.connect(&service.target).await?;
-    let target_latency_ms = u64::try_from(target_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    record_home_udp_metric_sample(
-        &statistics,
-        &travel_id,
-        service,
-        &relay_id,
-        "target_connection_latency_ms",
-        target_latency_ms,
-        Some(target_latency_ms),
-    );
-    record_home_udp_metric(
-        &statistics,
-        &travel_id,
-        service,
-        &relay_id,
-        "home_flow_accepted",
-        1,
-    );
-    let (mut tls_reader, mut tls_writer) = tokio::io::split(stream);
-    let mut tls_reader = DataFrameReader::new(&mut tls_reader, DATA_FRAME_LIMIT, data_codec);
-    write_json(
-        &mut tls_writer,
-        &DataFrame::OpenOk {
-            flow_id,
-            carrier_id,
-            receive_offset: 0,
-            send_offset: 0,
-            data_protocol_version: data_codec.version(),
-        },
-        DATA_FRAME_LIMIT,
-    )
-    .await?;
-    let mut send_sequence = 0_u64;
-    let mut receive_sequence = 0_u64;
-    let mut buffer = vec![0_u8; 65_507];
-    let dimensions = home_udp_metric_dimensions(&travel_id, service, &relay_id);
-    let mut observed_datagram_bytes = MetricBatch::new(
-        statistics.as_ref().clone(),
-        "home_flow_download_observed_datagram_bytes".to_owned(),
-        dimensions.clone(),
-    );
-    let mut delivered_datagram_bytes = MetricBatch::new(
-        statistics.as_ref().clone(),
-        "delivered_upload_datagram_bytes".to_owned(),
-        dimensions,
-    );
-    let mut statistics_tick = interval(Duration::from_secs(5));
-    statistics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    statistics_tick.tick().await;
-    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
-    loop {
-        tokio::select! {
-            count = socket.recv(&mut buffer) => {
-                let count = count?;
-                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
-                if count > 0 && let Ok(now) = unix_time_secs() {
-                    observed_datagram_bytes.record(now, count as u64);
-                }
-                write_data_frame(&mut tls_writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: Bytes::copy_from_slice(&buffer[..count]) }, DATA_FRAME_LIMIT, data_codec).await?;
-                send_sequence = send_sequence.wrapping_add(1);
-            }
-            frame = tls_reader.read() => {
-                let frame = frame?;
-                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
-                match frame {
-                    DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
-                        if sequence == receive_sequence {
-                            let delivered = socket.send(&bytes).await?;
-                            if delivered > 0 && let Ok(now) = unix_time_secs() {
-                                delivered_datagram_bytes.record(now, delivered as u64);
-                            }
-                            receive_sequence = receive_sequence.wrapping_add(1);
-                        }
-                    }
-                    DataFrame::Close { flow_id: id, .. } if id == flow_id => return Ok(()),
-                    _ => bail!("invalid UDP flow frame"),
-                }
-            }
-            _ = statistics_tick.tick() => {
-                observed_datagram_bytes.flush();
-                delivered_datagram_bytes.flush();
-            }
-            () = tokio::time::sleep_until(idle_deadline) => {
-                bail!("UDP association idle timeout");
-            }
-            changed = authorization_rx.changed() => {
-                changed.map_err(|_| anyhow::anyhow!("Travel authorization publisher closed"))?;
-                ensure_credential_active(&authorization_rx, credential_id)?;
-            }
-            () = sleep_until_unix(not_after_unix_secs) => {
-                bail!("Travel credential expired");
-            }
-        }
-    }
-}
-
-fn home_udp_metric_dimensions(
-    travel_id: &str,
-    service: &Service,
-    relay_id: &str,
-) -> BTreeMap<String, String> {
-    let mut dimensions = BTreeMap::new();
-    dimensions.insert("travel_id".to_owned(), travel_id.to_owned());
-    dimensions.insert("service_id".to_owned(), service.id.clone());
-    dimensions.insert("protocol".to_owned(), "udp".to_owned());
-    dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
-    dimensions
-}
-
-fn record_home_udp_metric(
-    statistics: &LocalStatistics,
-    travel_id: &str,
-    service: &Service,
-    relay_id: &str,
-    family: &str,
-    value: u64,
-) {
-    if value == 0 {
-        return;
-    }
-    record_home_udp_metric_sample(
-        statistics, travel_id, service, relay_id, family, value, None,
-    );
-}
-
-fn record_home_udp_metric_sample(
-    statistics: &LocalStatistics,
-    travel_id: &str,
-    service: &Service,
-    relay_id: &str,
-    family: &str,
-    value: u64,
-    histogram_sample: Option<u64>,
-) {
-    let dimensions = home_udp_metric_dimensions(travel_id, service, relay_id);
-    if let Ok(now) = unix_time_secs() {
-        statistics.record(now, family, dimensions, value, histogram_sample);
-    }
-}
-
-fn authorize_business_identity(
-    identity: &flowsplice_core::tls::PeerIdentity,
-    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
-    credential_id: Uuid,
-) -> Result<flowsplice_core::authorization::TravelCredential> {
-    let now = unix_time_secs()?;
-    let authorization = authorization_rx
-        .borrow()
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("Travel authorization has not synchronized from Server"))?;
-    Ok(authorization
-        .authorize_business_credential(identity, credential_id, now)?
-        .clone())
-}
-
-fn ensure_credential_active(
-    authorization_rx: &watch::Receiver<Option<Arc<VerifiedAuthorization>>>,
-    credential_id: Uuid,
-) -> Result<u64> {
-    let now = unix_time_secs()?;
-    let authorization = authorization_rx
-        .borrow()
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("Travel authorization has not synchronized from Server"))?;
-    if !authorization.is_active(credential_id, now) {
-        bail!("Travel credential is revoked, expired, or not yet valid");
-    }
-    authorization
-        .credential(credential_id)
-        .map(|credential| credential.not_after_unix_secs)
-        .ok_or_else(|| anyhow::anyhow!("unknown Travel credential"))
-}
-
-async fn sleep_until_unix(not_after_unix_secs: u64) {
-    let now = unix_time_secs().unwrap_or(not_after_unix_secs);
-    tokio::time::sleep(Duration::from_secs(not_after_unix_secs.saturating_sub(now))).await;
-}
-
-async fn apply_authorization_snapshot(
-    state: &TravelAuthorizationState,
-    tcp_flows: &TcpFlowRegistry,
-    config: &Config,
-    snapshot: TravelAuthorizationSnapshot,
-) -> Result<u64> {
-    let authorities = state.trust.travel_authorities_with_home_delegations(
-        &snapshot.home_endpoint_credentials,
-        unix_time_secs()?,
-    )?;
-    let authorization =
-        VerifiedAuthorization::verify(&snapshot, &authorities, &state.deployment_id)?;
-    let mut cache = state.cache.lock().await;
-    let proposed_cache = cache.accept(&authorization)?;
-    if proposed_cache != *cache {
-        store_json_atomic(&config.travel_authorization_cache, &proposed_cache)?;
-        *cache = proposed_cache;
-    }
-    drop(cache);
-    let now = unix_time_secs()?;
-    tcp_flows.revoke_inactive(&authorization, now).await;
-    let generation = authorization.generation();
-    state.tx.send_replace(Some(Arc::new(authorization)));
-    info!(
-        event = "travel_authorization_applied",
-        generation,
-        revoked = snapshot.revocations.len(),
-        credentials = snapshot.credentials.len(),
-        "Home applied Travel authorization state without restart"
-    );
-    Ok(generation)
 }
 
 async fn run_issuer_ui(state: IssuerAppState) -> Result<()> {
@@ -2602,6 +2013,8 @@ struct RemoteEnrollmentStatus {
     approved: bool,
     bootstrap: bool,
     verification_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business: Option<VerifiedBusinessDescriptor>,
 }
 
 fn pagination_values(page: Option<usize>, page_size: Option<usize>) -> Result<(usize, usize)> {
@@ -2636,6 +2049,7 @@ async fn api_pending_remote_enrollments(
 ) -> ApiResult<PagedResponse<RemoteEnrollmentStatus>> {
     let (page, page_size) = pagination_values(query.page, query.page_size).map_err(api_error)?;
     let store = Arc::clone(&state.statistics.store);
+    let (_, trust) = load_home_trust(&state.config).map_err(api_error)?;
     tokio::task::spawn_blocking(move || {
         let mut records = store
             .scan_prefix(Table::EnrollmentInbox, b"")?
@@ -2657,6 +2071,13 @@ async fn api_pending_remote_enrollments(
                 approved: false,
                 bootstrap: record.bootstrap_token_sha256.is_some(),
                 verification_code: record.verification_code,
+                business: match &record.request {
+                    TravelRequestEnvelope::Business(request) => request
+                        .descriptor
+                        .verify(&trust, unix_time_secs().unwrap_or_default())
+                        .ok(),
+                    TravelRequestEnvelope::Legacy(_) => None,
+                },
             })
             .collect();
         Ok(paginate(pending, page, page_size))
@@ -2708,6 +2129,10 @@ async fn api_pending_home_enrollments(
                 approved: false,
                 verification_code: record.verification_code,
                 profile: None,
+                requested_services: match record.request {
+                    HomeRequestEnvelope::Business(request) => Some(request.services),
+                    HomeRequestEnvelope::Legacy(_) => None,
+                },
             })
             .collect();
         Ok(paginate(pending, page, page_size))
@@ -2728,6 +2153,7 @@ async fn api_approve_home_enrollment(
     result.map(Json).map_err(api_error)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn approve_home_enrollment(
     state: &IssuerAppState,
     request: ApproveHomeEnrollmentRequest,
@@ -2737,6 +2163,7 @@ async fn approve_home_enrollment(
         profile,
         valid_days,
         password,
+        services,
     } = request;
     let password = Zeroizing::new(password);
     if state.issuer.global_authority.is_none() {
@@ -2758,9 +2185,55 @@ async fn approve_home_enrollment(
     })
     .await
     .context("Home enrollment inbox read task failed")??;
+    let approved_services = match &record.request {
+        HomeRequestEnvelope::Business(request) => {
+            if profile != HomeEnrollmentProfile::ServingOnly {
+                bail!("business Home must use the serving-only profile");
+            }
+            let selected = services.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("select the requested business services to approve")
+            })?;
+            let mut unique = std::collections::HashSet::new();
+            if selected.is_empty() || selected.iter().any(|id| !unique.insert(id)) {
+                bail!("select one or more unique business services");
+            }
+            Some(
+                selected
+                    .iter()
+                    .map(|id| {
+                        request
+                            .services
+                            .iter()
+                            .find(|service| &service.service_id == id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("cannot approve an unrequested business service")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        HomeRequestEnvelope::Legacy(_) => {
+            if services.is_some() {
+                bail!("legacy Home request has no business service selection");
+            }
+            None
+        }
+    };
     if let Some(existing) = &record.response {
         if existing.approval.profile != profile {
             bail!("Home enrollment was already approved with a different profile");
+        }
+        if let HomeResponseEnvelope::Business(existing) = existing {
+            let (_, trust) = load_home_trust(&state.config)?;
+            let grant = existing.grant.verify(
+                &trust,
+                &existing.response.signed_endpoint_credential,
+                unix_time_secs()?,
+            )?;
+            if approved_services.as_ref() != Some(&grant.services) {
+                bail!("Home enrollment was already approved with different services");
+            }
         }
         return Ok(ApproveHomeEnrollmentResponse {
             request_id,
@@ -2776,7 +2249,7 @@ async fn approve_home_enrollment(
         bail!("issuer password must not be empty");
     }
     let approval = prepare_home_enrollment_approval(
-        record.request.clone(),
+        (*record.request).clone(),
         u64::from(valid_days) * 86_400,
         enrollment_authority.id.clone(),
         profile,
@@ -2804,7 +2277,22 @@ async fn approve_home_enrollment(
         .map_err(|_| anyhow::anyhow!("another sensitive issuer operation is already running"))?;
     let key_operation = state.key_operation.lock().await;
     recover_private_key_password_rotation(&issuer_key_targets(&state.issuer))?;
-    let response = issue_home_enrollment(approval, &material, unix_time_secs()?)?;
+    let response = match &record.request {
+        HomeRequestEnvelope::Business(request) => {
+            HomeResponseEnvelope::Business(Box::new(issue_business_home(
+                (**request).clone(),
+                approval,
+                approved_services.unwrap_or_default(),
+                &material,
+                unix_time_secs()?,
+            )?))
+        }
+        HomeRequestEnvelope::Legacy(_) => HomeResponseEnvelope::from(issue_home_enrollment(
+            approval,
+            &material,
+            unix_time_secs()?,
+        )?),
+    };
     drop(key_operation);
     record.response = Some(response);
     let home_id = record.home_id.clone();
@@ -2906,7 +2394,7 @@ async fn api_issued_credentials(
     .into_iter()
     .flatten()
     .collect::<std::collections::HashSet<_>>();
-    let Some(authorization) = state.authorization.tx.borrow().clone() else {
+    let Some(authorization) = state.authorization.current() else {
         return Ok(Json(paginate(Vec::new(), page, page_size)));
     };
     let mut credentials = authorization
@@ -2988,7 +2476,7 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
     } = request;
     issue_from_home_with_password(
         state,
-        request,
+        TravelRequestEnvelope::Legacy(request),
         valid_days,
         valid_minutes,
         scope,
@@ -2997,9 +2485,10 @@ async fn issue_from_home(state: &IssuerAppState, request: IssueRequest) -> Resul
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn issue_from_home_with_password(
     state: &IssuerAppState,
-    request: TravelEnrollmentRequest,
+    request: TravelRequestEnvelope,
     valid_days: Option<u32>,
     valid_minutes: Option<u32>,
     scope: TravelCredentialScope,
@@ -3007,20 +2496,44 @@ async fn issue_from_home_with_password(
 ) -> Result<IssueResponse> {
     let valid_for_secs =
         requested_validity_secs(valid_days, valid_minutes, state.issuer.default_valid_days)?;
-    validate_requested_scope(&state.config, &state.issuer, &scope)?;
-    let authority = match &scope {
-        TravelCredentialScope::Global => state
-            .issuer
-            .global_authority
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("global super authorization is not configured"))?,
-        TravelCredentialScope::Home { .. } | TravelCredentialScope::Service { .. } => {
-            &state.issuer.home_authority
-        }
-    };
+    let authority =
+        match &request {
+            TravelRequestEnvelope::Business(request) => {
+                let (_, trust) = load_home_trust(&state.config)?;
+                request.validate(&trust, &state.config.id, unix_time_secs()?)?;
+                let target = request.descriptor.verify(&trust, unix_time_secs()?)?;
+                if scope
+                    != (TravelCredentialScope::Service {
+                        home_id: target.home_id,
+                        service_id: target.service.service_id,
+                        protocol: target.service.protocol,
+                    })
+                {
+                    bail!("directed enrollment must approve exactly the requested business");
+                }
+                state.issuer.global_authority.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("directed enrollment requires the global issuer")
+                })?
+            }
+            TravelRequestEnvelope::Legacy(_) => {
+                validate_requested_scope(&state.config, &state.issuer, &scope)?;
+                match &scope {
+                    TravelCredentialScope::Global => {
+                        state.issuer.global_authority.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("global super authorization is not configured")
+                        })?
+                    }
+                    TravelCredentialScope::Home { .. } | TravelCredentialScope::Service { .. } => {
+                        &state.issuer.home_authority
+                    }
+                }
+            }
+        };
     let mut ledger = state.issuance_ledger.lock().await;
     if let Some(record) = ledger.find(&request)? {
-        if !record.matches_intent(&authority.id, &scope, valid_for_secs) {
+        if !record.matches_intent(&authority.id, &scope, valid_for_secs)
+            || !record.matches_request_envelope(&request)
+        {
             bail!(
                 "this enrollment request was already used for a different authorization; create a new enrollment request"
             );
@@ -3047,7 +2560,7 @@ async fn issue_from_home_with_password(
         bail!("private-key password must not be empty");
     }
     let approval = prepare_enrollment_approval(
-        request.clone(),
+        (*request).clone(),
         valid_for_secs,
         authority.id.clone(),
         scope.clone(),
@@ -3074,7 +2587,14 @@ async fn issue_from_home_with_password(
     };
     let key_operation = state.key_operation.lock().await;
     recover_private_key_password_rotation(&issuer_key_targets(&state.issuer))?;
-    let enrollment = issue_enrollment(approval, &material, unix_time_secs()?)?;
+    let enrollment = match &request {
+        TravelRequestEnvelope::Business(request) => TravelResponseEnvelope::Business(Box::new(
+            issue_business_travel((**request).clone(), approval, &material, unix_time_secs()?)?,
+        )),
+        TravelRequestEnvelope::Legacy(_) => {
+            TravelResponseEnvelope::from(issue_enrollment(approval, &material, unix_time_secs()?)?)
+        }
+    };
     drop(key_operation);
     let record =
         ledger.insert_pending(&request, &authority.id, &scope, valid_for_secs, enrollment)?;
@@ -3088,7 +2608,7 @@ async fn issue_from_home_with_password(
 }
 
 fn ensure_record_not_revoked(state: &IssuerAppState, record: &IssuanceRecord) -> Result<()> {
-    let Some(authorization) = state.authorization.tx.borrow().clone() else {
+    let Some(authorization) = state.authorization.current() else {
         return Ok(());
     };
     if authorization.credential(record.credential_id()).is_some()
@@ -3260,10 +2780,10 @@ async fn revoke_from_home(
             "issuer password must not be empty"
         )));
     }
-    let authorization =
-        state.authorization.tx.borrow().clone().ok_or_else(|| {
-            api_error(anyhow::anyhow!("Travel authorization has not synchronized"))
-        })?;
+    let authorization = state
+        .authorization
+        .current()
+        .ok_or_else(|| api_error(anyhow::anyhow!("Travel authorization has not synchronized")))?;
     let credential = authorization
         .credential(request.credential_id)
         .ok_or_else(|| api_error(anyhow::anyhow!("unknown Travel credential")))?;

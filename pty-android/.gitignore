@@ -1,0 +1,7 @@
+.gradle/
+**/build/
+local.properties
+app/src/main/assets/bootstrap/
+app/src/main/assets/pty/
+app/src/main/jniLibs/
+**/__pycache__/

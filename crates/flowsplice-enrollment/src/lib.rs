@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+pub mod business;
 pub mod home;
 pub mod issuer;
 pub mod key;

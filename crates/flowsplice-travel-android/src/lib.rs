@@ -210,6 +210,8 @@ fn begin_enrollment(
     };
     let status = Arc::new(Mutex::new(initial.clone()));
     let task_status = Arc::clone(&status);
+    // Workspace feature unification may add test-only fields; keep native defaults disabled.
+    #[allow(clippy::needless_update)]
     let options = RemoteEnrollmentOptions {
         travel_id: travel_id.to_owned(),
         home_id: home_id.to_owned(),
@@ -220,6 +222,7 @@ fn begin_enrollment(
         ui_listen: None,
         private_key_password: password.to_owned(),
         wait_timeout_secs: 900,
+        ..RemoteEnrollmentOptions::default()
     };
     let task = runtime()?.spawn(async move {
         let progress_status = Arc::clone(&task_status);

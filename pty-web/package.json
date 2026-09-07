@@ -1,0 +1,1 @@
+{"name":"flowsplice-pty-web","private":true,"version":"0.4.0","type":"module","scripts":{"build":"tsc --noEmit && vite build --base=./","test":"vitest run --environment jsdom"},"dependencies":{"@xterm/xterm":"6.0.0","@xterm/addon-fit":"0.11.0"},"devDependencies":{"typescript":"^5.9.2","vite":"^7.1.3","vitest":"^3.2.4","jsdom":"^26.1.0"}}

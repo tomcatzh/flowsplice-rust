@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flowsplice_core::authorization::{
@@ -7,6 +11,7 @@ use flowsplice_core::authorization::{
     validate_trusted_authorities,
 };
 use flowsplice_core::deployment::{DeploymentTrust, SignedHomeEndpointCredential};
+use flowsplice_core::{business::SignedHomeServiceGrant, protocol::Service};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,6 +21,8 @@ struct PersistentAuthorizationState {
     version: u32,
     snapshot: TravelAuthorizationSnapshot,
     used_enrollment_requests: HashSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    business_home_grants: BTreeMap<String, SignedHomeServiceGrant>,
 }
 
 impl Default for PersistentAuthorizationState {
@@ -29,6 +36,7 @@ impl Default for PersistentAuthorizationState {
                 revocations: Vec::new(),
             },
             used_enrollment_requests: HashSet::new(),
+            business_home_grants: BTreeMap::new(),
         }
     }
 }
@@ -38,6 +46,10 @@ const MAX_CREDENTIALS: usize = 2_048;
 const MAX_REVOCATIONS: usize = 2_048;
 const MAX_STATE_BYTES: usize = 900 * 1_024;
 
+#[cfg(test)]
+#[path = "authorization_business_tests.rs"]
+mod business_tests;
+
 pub struct ServerAuthorization {
     deployment_id: String,
     authorities: Vec<TrustedTravelAuthority>,
@@ -45,6 +57,7 @@ pub struct ServerAuthorization {
     snapshot: TravelAuthorizationSnapshot,
     verified: VerifiedAuthorization,
     used_enrollment_requests: HashSet<String>,
+    business_home_grants: BTreeMap<String, SignedHomeServiceGrant>,
 }
 
 impl ServerAuthorization {
@@ -59,6 +72,7 @@ impl ServerAuthorization {
 
     pub fn validate_with_trust(trust: DeploymentTrust, state_path: PathBuf) -> Result<()> {
         let state = load_state(&state_path)?;
+        validate_business_grants(&trust, &state)?;
         let authorities = trust.travel_authorities_with_home_delegations(
             &state.snapshot.home_endpoint_credentials,
             unix_time_secs()?,
@@ -68,6 +82,7 @@ impl ServerAuthorization {
 
     pub fn load_with_trust(trust: DeploymentTrust, state_path: PathBuf) -> Result<Self> {
         let (mut state, legacy_snapshot_encoding) = load_state_with_format(&state_path)?;
+        validate_business_grants(&trust, &state)?;
         migrate_legacy_snapshot_generation(&mut state, legacy_snapshot_encoding)?;
         let authorities = trust.travel_authorities_with_home_delegations(
             &state.snapshot.home_endpoint_credentials,
@@ -125,6 +140,7 @@ impl ServerAuthorization {
             snapshot,
             verified,
             used_enrollment_requests: state.used_enrollment_requests,
+            business_home_grants: state.business_home_grants,
         })
     }
 
@@ -134,6 +150,33 @@ impl ServerAuthorization {
 
     pub const fn verified(&self) -> &VerifiedAuthorization {
         &self.verified
+    }
+
+    pub fn validate_install_acknowledgement(
+        &self,
+        credential_id: Uuid,
+        request_id: Uuid,
+        approving_home_id: &str,
+    ) -> Result<()> {
+        let credential = self
+            .verified
+            .credential(credential_id)
+            .ok_or_else(|| anyhow!("installed Travel credential is unavailable"))?;
+        if request_id.is_nil() || credential.enrollment_request_id != request_id {
+            bail!("installed credential does not belong to this enrollment request");
+        }
+        let authority = self
+            .authorities
+            .iter()
+            .find(|authority| {
+                authority.id() == credential.authority_id
+                    && authority.epoch() == credential.authority_epoch
+            })
+            .ok_or_else(|| anyhow!("installed credential authority is unavailable"))?;
+        if authority.home_id() != Some(approving_home_id) {
+            bail!("installation acknowledgement must target the credential's issuing Home");
+        }
+        Ok(())
     }
 
     pub fn global_issuer_home_ids(&self) -> HashSet<String> {
@@ -171,6 +214,10 @@ impl ServerAuthorization {
     ) -> Result<bool> {
         let now = unix_time_secs()?;
         let endpoint = signed.verify(trust, now)?;
+        if let Some(grant) = self.business_home_grants.get(&endpoint.home_id) {
+            // A legacy import may retry the same endpoint, but cannot strip its service policy.
+            grant.verify_binding(trust, &signed)?;
+        }
         if let Some(existing) = self
             .snapshot
             .home_endpoint_credentials
@@ -203,6 +250,84 @@ impl ServerAuthorization {
         self.authorities = authorities;
         self.verified = verified;
         Ok(true)
+    }
+
+    pub fn import_business_home(
+        &mut self,
+        trust: &DeploymentTrust,
+        endpoint: SignedHomeEndpointCredential,
+        grant: SignedHomeServiceGrant,
+    ) -> Result<bool> {
+        let now = unix_time_secs()?;
+        let approved = grant.verify(trust, &endpoint, now)?;
+        if let Some(existing) = self.business_home_grants.get(&approved.home_id) {
+            if existing != &grant {
+                bail!("business Home already has a different signed service grant");
+            }
+            if !self.snapshot.home_endpoint_credentials.contains(&endpoint) {
+                bail!("business Home retry changed its signed endpoint credential");
+            }
+            return Ok(false);
+        }
+        // Build and persist a complete proposed state before publishing either object in memory.
+        let mut proposed = self.snapshot.clone();
+        if proposed
+            .home_endpoint_credentials
+            .iter()
+            .any(|existing| existing == &endpoint)
+        {
+            bail!(
+                "an existing generic Home cannot acquire a business restriction by enrollment retry"
+            );
+        }
+        for existing in &proposed.home_endpoint_credentials {
+            if existing
+                .verify(trust, now)
+                .is_ok_and(|value| value.home_id == approved.home_id)
+            {
+                bail!("Home already has different endpoint authorization");
+            }
+        }
+        if trust
+            .home_endpoints
+            .iter()
+            .any(|home| home.home_id == approved.home_id)
+        {
+            bail!("business enrollment cannot replace a statically trusted Home");
+        }
+        proposed.generation = proposed
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Travel authorization generation exhausted"))?;
+        proposed.home_endpoint_credentials.push(endpoint);
+        let authorities = trust
+            .travel_authorities_with_home_delegations(&proposed.home_endpoint_credentials, now)?;
+        let verified = VerifiedAuthorization::verify(&proposed, &authorities, &self.deployment_id)?;
+        let mut grants = self.business_home_grants.clone();
+        grants.insert(approved.home_id, grant);
+        self.persist_with_grants(&proposed, &self.used_enrollment_requests, &grants)?;
+        self.snapshot = proposed;
+        self.authorities = authorities;
+        self.verified = verified;
+        self.business_home_grants = grants;
+        Ok(true)
+    }
+
+    pub fn validate_home_services(
+        &self,
+        trust: &DeploymentTrust,
+        home_id: &str,
+        endpoint: Option<&SignedHomeEndpointCredential>,
+        services: &[Service],
+    ) -> Result<()> {
+        if let Some(grant) = self.business_home_grants.get(home_id) {
+            let endpoint = endpoint
+                .ok_or_else(|| anyhow!("business Home is missing its endpoint credential"))?;
+            grant
+                .verify(trust, endpoint, unix_time_secs()?)?
+                .validate_catalog_services(services)?;
+        }
+        Ok(())
     }
 
     pub fn revoke_from_home(
@@ -313,14 +438,49 @@ impl ServerAuthorization {
         snapshot: &TravelAuthorizationSnapshot,
         used_enrollment_requests: &HashSet<String>,
     ) -> Result<()> {
+        self.persist_with_grants(
+            snapshot,
+            used_enrollment_requests,
+            &self.business_home_grants,
+        )
+    }
+
+    fn persist_with_grants(
+        &self,
+        snapshot: &TravelAuthorizationSnapshot,
+        used_enrollment_requests: &HashSet<String>,
+        business_home_grants: &BTreeMap<String, SignedHomeServiceGrant>,
+    ) -> Result<()> {
         let state = PersistentAuthorizationState {
             version: AUTHORIZATION_STATE_VERSION,
             snapshot: snapshot.clone(),
             used_enrollment_requests: used_enrollment_requests.clone(),
+            business_home_grants: business_home_grants.clone(),
         };
         validate_state_size(&state)?;
         store_json_atomic(&self.state_path, &state)
     }
+}
+
+fn validate_business_grants(
+    trust: &DeploymentTrust,
+    state: &PersistentAuthorizationState,
+) -> Result<()> {
+    for (home_id, grant) in &state.business_home_grants {
+        if !state
+            .snapshot
+            .home_endpoint_credentials
+            .iter()
+            .any(|endpoint| {
+                grant
+                    .verify_binding(trust, endpoint)
+                    .is_ok_and(|verified| verified.home_id == *home_id)
+            })
+        {
+            bail!("persisted business Home grant has no matching trusted endpoint");
+        }
+    }
+    Ok(())
 }
 
 fn validate_state_size(state: &PersistentAuthorizationState) -> Result<()> {
@@ -469,6 +629,7 @@ mod tests {
                     revocations: Vec::new(),
                 },
                 used_enrollment_requests,
+                business_home_grants: BTreeMap::new(),
             },
         )
     }

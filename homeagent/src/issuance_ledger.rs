@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use aws_lc_rs::digest;
 use flowsplice_core::authorization::TravelCredentialScope;
-use flowsplice_enrollment::{TravelEnrollmentRequest, TravelEnrollmentResponse};
+use flowsplice_enrollment::{
+    TravelEnrollmentRequest,
+    business::{TravelRequestEnvelope, TravelResponseEnvelope},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -24,13 +27,13 @@ pub struct IssuanceRecord {
     authority_id: String,
     scope: TravelCredentialScope,
     valid_for_secs: u64,
-    enrollment: TravelEnrollmentResponse,
+    enrollment: TravelResponseEnvelope,
     published_generation: Option<u64>,
 }
 
 impl IssuanceRecord {
     #[must_use]
-    pub const fn enrollment(&self) -> &TravelEnrollmentResponse {
+    pub const fn enrollment(&self) -> &TravelResponseEnvelope {
         &self.enrollment
     }
 
@@ -40,8 +43,22 @@ impl IssuanceRecord {
     }
 
     #[must_use]
-    pub const fn credential_id(&self) -> Uuid {
+    pub fn credential_id(&self) -> Uuid {
         self.enrollment.approval.credential_id
+    }
+
+    #[must_use]
+    pub fn matches_request_envelope(&self, request: &TravelRequestEnvelope) -> bool {
+        match (&self.enrollment, request) {
+            (TravelResponseEnvelope::Legacy(response), TravelRequestEnvelope::Legacy(request)) => {
+                &response.approval.request == request
+            }
+            (
+                TravelResponseEnvelope::Business(response),
+                TravelRequestEnvelope::Business(request),
+            ) => &response.request == request.as_ref(),
+            _ => false,
+        }
     }
 
     #[must_use]
@@ -108,7 +125,7 @@ impl IssuanceLedger {
         authority_id: &str,
         scope: &TravelCredentialScope,
         valid_for_secs: u64,
-        enrollment: TravelEnrollmentResponse,
+        enrollment: TravelResponseEnvelope,
     ) -> Result<IssuanceRecord> {
         if self.find(request)?.is_some() {
             bail!("issuance ledger already contains this enrollment request");
@@ -191,6 +208,11 @@ fn validate_state(state: &LedgerState) -> Result<()> {
 }
 
 fn validate_record(record: &IssuanceRecord) -> Result<()> {
+    if let TravelResponseEnvelope::Business(response) = &record.enrollment
+        && response.request.request != response.response.approval.request
+    {
+        bail!("issuance ledger contains an inconsistent business enrollment request");
+    }
     let approval = &record.enrollment.approval;
     if record.request_id.is_nil()
         || record.request_sha256.len() != 64
@@ -246,7 +268,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use flowsplice_core::authorization::SignedTravelCredential;
-    use flowsplice_enrollment::{ENROLLMENT_VERSION, TravelEnrollmentApproval};
+    use flowsplice_enrollment::{
+        ENROLLMENT_VERSION, TravelEnrollmentApproval, TravelEnrollmentResponse,
+    };
 
     fn request(request_id: Uuid) -> TravelEnrollmentRequest {
         TravelEnrollmentRequest {
@@ -300,7 +324,13 @@ mod tests {
         let global = TravelCredentialScope::Global;
         let enrollment = response(request.clone(), "global-authority", global.clone());
         let credential_id = enrollment.approval.credential_id;
-        ledger.insert_pending(&request, "global-authority", &global, 3_600, enrollment)?;
+        ledger.insert_pending(
+            &request,
+            "global-authority",
+            &global,
+            3_600,
+            TravelResponseEnvelope::from(enrollment),
+        )?;
         drop(ledger);
 
         let mut recovered = IssuanceLedger::load(path.clone())?;
@@ -339,11 +369,87 @@ mod tests {
             "global-authority",
             &scope,
             3_600,
-            response(original.clone(), "global-authority", scope.clone()),
+            TravelResponseEnvelope::from(response(
+                original.clone(),
+                "global-authority",
+                scope.clone(),
+            )),
         )?;
         let mut changed = original;
         changed.travel_id = "different-travel".to_owned();
         assert!(ledger.find(&changed).is_err());
+        Ok(())
+    }
+    #[test]
+    fn legacy_json_shape_and_envelope_matching_are_preserved() -> Result<()> {
+        let original = request(Uuid::new_v4());
+        let enrollment = response(
+            original.clone(),
+            "global-authority",
+            TravelCredentialScope::Global,
+        );
+        let legacy_json = serde_json::json!({
+            "version": LEDGER_VERSION,
+            "records": [{
+                "request_id": original.request_id,
+                "request_sha256": request_fingerprint(&original)?,
+                "authority_id": "global-authority",
+                "scope": TravelCredentialScope::Global,
+                "valid_for_secs": 3600,
+                "enrollment": enrollment,
+                "published_generation": null
+            }]
+        });
+        let state: LedgerState = serde_json::from_value(legacy_json.clone())?;
+        validate_state(&state)?;
+        assert_eq!(serde_json::to_value(&state)?, legacy_json);
+        let record = &state.records[0];
+        assert!(record.matches_request_envelope(&TravelRequestEnvelope::Legacy(original.clone())));
+        let signed = serde_json::json!({
+            "authority_id": "home-authority", "payload_hex": "payload", "signature_hex": "signature"
+        });
+        let business_request = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "object_type": "flowsplice.business_travel_request",
+            "request": original,
+            "descriptor": {
+                "version": 1, "approving_home_id": "home-1", "endpoint": signed,
+                "grant": signed, "service_id": "terminal"
+            }
+        }))?;
+        let business_envelope = TravelRequestEnvelope::Business(Box::new(business_request));
+        assert!(!record.matches_request_envelope(&business_envelope));
+        let TravelRequestEnvelope::Business(business_request) = business_envelope else {
+            bail!("expected business request fixture");
+        };
+        let mut business_record = record.clone();
+        business_record.enrollment = TravelResponseEnvelope::Business(Box::new(
+            flowsplice_enrollment::business::BusinessTravelResponse {
+                version: 1,
+                object_type: "flowsplice.business_travel_response".to_owned(),
+                request: (*business_request).clone(),
+                response: enrollment,
+                approval: serde_json::from_value(signed)?,
+            },
+        ));
+        validate_record(&business_record)?;
+        assert!(
+            !business_record.matches_request_envelope(&TravelRequestEnvelope::Legacy(original))
+        );
+        assert!(
+            business_record.matches_request_envelope(&TravelRequestEnvelope::Business(
+                business_request.clone()
+            ))
+        );
+        let mut changed = business_request;
+        changed.descriptor.service_id = "other-service".to_owned();
+        assert!(
+            !business_record.matches_request_envelope(&TravelRequestEnvelope::Business(changed))
+        );
+        if let TravelResponseEnvelope::Business(response) = &mut business_record.enrollment {
+            response.request.request.travel_id = "different-travel".to_owned();
+        }
+        assert!(validate_record(&business_record).is_err());
         Ok(())
     }
 }

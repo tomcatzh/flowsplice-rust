@@ -753,3 +753,162 @@ async fn r06_unacknowledged_statistics_are_sent_again_once_after_a_new_session()
     join_catalog_after_peer_disconnect(restarted_catalog, "restarted").await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "run tests/check-travel-review-regressions.sh"]
+async fn r09_in_process_identity_checks_and_legacy_mappings_never_listen() -> Result<()> {
+    let fixture = Fixture::load("legit")?;
+    let rogue = Fixture::load("rogue")?;
+    let temporary = tempfile::tempdir()?;
+    let identity = install_fixture_identity(temporary.path(), &fixture, "review-travel")?;
+    let reservation = TcpListener::bind("127.0.0.1:0").await?;
+    let bind = reservation.local_addr()?.to_string();
+    drop(reservation);
+    let mapping = Mapping {
+        home_id: "home-1".to_owned(),
+        service_id: "legacy".to_owned(),
+        protocol: ServiceProtocol::Tcp,
+        bind: bind.clone(),
+    };
+    let (config, state_path) = write_runtime_config(
+        temporary.path(),
+        &fixture,
+        &identity,
+        std::slice::from_ref(&mapping),
+    )?;
+    assert!(
+        TravelCore::start_in_process(&config, PRIVATE_KEY_PASSWORD, &rogue.deployment_root()?)
+            .await
+            .is_err()
+    );
+    assert!(
+        TravelCore::start_in_process(&config, "incorrect-password", &fixture.deployment_root()?)
+            .await
+            .is_err()
+    );
+    let core =
+        TravelCore::start_in_process(&config, PRIVATE_KEY_PASSWORD, &fixture.deployment_root()?)
+            .await?;
+    let listener = TcpListener::bind(&bind)
+        .await
+        .context("in-process runtime bound a legacy mapping")?;
+    assert!(core.state.ready_mapping_listeners.read().await.is_empty());
+    assert!(core.state.mapping_tasks.lock().await.is_empty());
+    assert!(core.upsert_mapping(mapping).await.is_err());
+    shutdown_with_timeout(&core, "r09 in-process runtime").await?;
+    drop(core);
+    drop(listener);
+    drop(StateStore::open(state_path)?);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "run tests/check-travel-review-regressions.sh"]
+async fn r10_in_process_invalid_bindings_allocate_no_flows() -> Result<()> {
+    let fixture = Fixture::load("legit")?;
+    let temporary = tempfile::tempdir()?;
+    let identity = install_fixture_identity(temporary.path(), &fixture, "review-travel")?;
+    let (config, _) = write_runtime_config(temporary.path(), &fixture, &identity, &[])?;
+    let core =
+        TravelCore::start_in_process(&config, PRIVATE_KEY_PASSWORD, &fixture.deployment_root()?)
+            .await?;
+    for protocol in [ServiceProtocol::Tcp, ServiceProtocol::Udp] {
+        let unknown = super::ServiceBinding {
+            home_id: "unknown-home".to_owned(),
+            service_id: "service".to_owned(),
+            protocol,
+        };
+        assert!(core.connect_tcp(&unknown).await.is_err());
+        assert!(core.connect_udp(&unknown).await.is_err());
+        let known = super::ServiceBinding {
+            home_id: "home-1".to_owned(),
+            ..unknown
+        };
+        match protocol {
+            ServiceProtocol::Tcp => assert!(core.connect_udp(&known).await.is_err()),
+            ServiceProtocol::Udp => assert!(core.connect_tcp(&known).await.is_err()),
+        }
+        let empty = super::ServiceBinding {
+            service_id: String::new(),
+            ..known
+        };
+        assert!(core.connect_tcp(&empty).await.is_err());
+        assert!(core.connect_udp(&empty).await.is_err());
+    }
+    assert_eq!(core.status().await.active_flows, 0);
+    assert_eq!(
+        core.state.permits.available_permits(),
+        core.state.config.max_active_flows
+    );
+    assert!(core.socket_tasks.tasks.lock().await.is_empty());
+    shutdown_with_timeout(&core, "r10 in-process runtime").await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "run tests/check-travel-review-regressions.sh"]
+async fn r11_cancel_pending_in_process_connect_releases_runtime_resources() -> Result<()> {
+    let fixture = Fixture::load("legit")?;
+    for protocol in [ServiceProtocol::Tcp, ServiceProtocol::Udp] {
+        let temporary = tempfile::tempdir()?;
+        let identity = install_fixture_identity(temporary.path(), &fixture, "review-travel")?;
+        let (config, state_path) =
+            write_runtime_config(temporary.path(), &fixture, &identity, &[])?;
+        // A test-owned listener deliberately never completes Relay TLS. This verifies pending
+        // connection cancellation only; it does not simulate authenticated acceptance.
+        let unavailable = TcpListener::bind("127.0.0.1:0").await?;
+        let address = unavailable.local_addr()?.to_string();
+        let mut settings: toml::Value = toml::from_str(&fs::read_to_string(&config)?)?;
+        settings["seed_relays"][0]["management_addr"] = toml::Value::String(address.clone());
+        fs::write(&config, toml::to_string_pretty(&settings)?)?;
+        let core = TravelCore::start_in_process(
+            &config,
+            PRIVATE_KEY_PASSWORD,
+            &fixture.deployment_root()?,
+        )
+        .await?;
+        core.state.directory.write().await.relays =
+            vec![flowsplice_core::protocol::RelayEndpoint {
+                id: "relay-1".to_owned(),
+                management_addr: address.clone(),
+                data_public_addr: address,
+                management_spki_sha256: "00".repeat(32),
+            }];
+        let binding = super::ServiceBinding {
+            home_id: "home-1".to_owned(),
+            service_id: "pending".to_owned(),
+            protocol,
+        };
+        let mut connect: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>> =
+            match protocol {
+                ServiceProtocol::Tcp => Box::pin(async {
+                    let _io = core.connect_tcp(&binding).await?;
+                    Ok(())
+                }),
+                ServiceProtocol::Udp => Box::pin(async {
+                    let _io = core.connect_udp(&binding).await?;
+                    Ok(())
+                }),
+            };
+        tokio::select! {
+            result = &mut connect => bail!("connect completed before cancellation: {result:?}"),
+            result = wait_for_active_flow(&core) => result?,
+        }
+        drop(connect);
+        shutdown_with_timeout(&core, "r11 cancelled in-process runtime").await?;
+        assert_eq!(core.status().await.active_flows, 0);
+        assert_eq!(
+            core.state.permits.available_permits(),
+            core.state.config.max_active_flows
+        );
+        assert_eq!(
+            core.state.carrier_permits.available_permits(),
+            core.state.config.max_active_carriers
+        );
+        assert!(core.socket_tasks.tasks.lock().await.is_empty());
+        drop(core);
+        drop(unavailable);
+        drop(StateStore::open(state_path)?);
+    }
+    Ok(())
+}

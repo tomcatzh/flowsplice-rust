@@ -10,7 +10,16 @@ publish = false
 anyhow.workspace = true
 flowsplice-core.workspace = true
 flowsplice-enrollment.workspace = true
+flowsplice-home-core.workspace = true
+flowsplice-travel-core = { workspace = true, default-features = false }
+flowsplice-transport.workspace = true
+flowsplice-pty-client.workspace = true
+flowsplice-pty-protocol.workspace = true
+flowsplice-storage.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [lints]

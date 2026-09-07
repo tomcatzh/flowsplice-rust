@@ -1,0 +1,403 @@
+use crate::{
+    session::{Connection, SessionState},
+    tmux::{Tmux, TmuxConfig},
+};
+use anyhow::{Context, Result, anyhow, bail};
+use flowsplice_core::{
+    business::HomeServiceGrant,
+    protocol::{Service, ServiceProtocol},
+};
+use flowsplice_pty_protocol::{
+    APPLICATION_PROTOCOL, ClientMessage, Operation, PROTOCOL_VERSION, Reply, ServerMessage,
+    read_message, write_message,
+};
+use flowsplice_transport::{BoxStream, DatagramIo, IoFuture, ServicePeer, ServiceProvider};
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::{Semaphore, mpsc, watch};
+use uuid::Uuid;
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PtyDomainConfig {
+    pub service_id: String,
+    pub tmux: TmuxConfig,
+}
+struct Domain {
+    tmux: Arc<Tmux>,
+    sessions: Mutex<BTreeMap<Uuid, Arc<SessionState>>>,
+    control: tokio::sync::Mutex<()>,
+    can_write: AtomicBool,
+}
+impl Domain {
+    async fn refresh(&self) -> Result<Vec<flowsplice_pty_protocol::Session>> {
+        let active = self.tmux.list().await?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session registry poisoned"))?;
+        // Session existence follows tmux. Never recreate an absent session automatically.
+        sessions.retain(|id, _| active.iter().any(|(active, _)| active == id));
+        for (id, created) in active {
+            sessions
+                .entry(id)
+                .or_insert_with(|| SessionState::new(id, created, Arc::clone(&self.tmux)));
+        }
+        sessions.values().map(|s| s.snapshot()).collect()
+    }
+    fn session(&self, id: Uuid) -> Result<Arc<SessionState>> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow!("session registry poisoned"))?
+            .get(&id)
+            .cloned()
+            .context("session ended; refresh the list")
+    }
+    fn attachment(&self, connection: Uuid, id: Uuid) -> Result<Arc<SessionState>> {
+        for session in self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session registry poisoned"))?
+            .values()
+        {
+            if session.owns(connection, id)? {
+                return Ok(Arc::clone(session));
+            }
+        }
+        bail!("attachment is not available on this connection")
+    }
+    fn detach_connection(&self, id: Uuid) {
+        if let Ok(sessions) = self.sessions.lock() {
+            for session in sessions.values() {
+                session.detach_connection(id);
+            }
+        }
+    }
+    async fn operation(&self, connection: &Connection, operation: Operation) -> Result<Reply> {
+        if !connection.active() {
+            bail!("business connection ended");
+        }
+        match operation {
+            Operation::List => {
+                let _control = self.control.lock().await;
+                Ok(Reply::Sessions {
+                    sessions: self.refresh().await?,
+                })
+            }
+            Operation::New { columns, rows } => {
+                if !connection.can_write {
+                    bail!("creating a session requires write permission");
+                }
+                let _control = self.control.lock().await;
+                if self.refresh().await?.len() >= 128 {
+                    bail!("session limit reached");
+                }
+                if !connection.active() {
+                    bail!("business connection ended");
+                }
+                let id = Uuid::new_v4();
+                self.tmux.new_session(id, columns, rows).await?;
+                self.refresh().await?;
+                self.session(id)?
+                    .attach(
+                        connection,
+                        flowsplice_pty_protocol::Mode::ReadWrite,
+                        columns,
+                        rows,
+                    )
+                    .await
+            }
+            Operation::Join {
+                session_id,
+                mode,
+                columns,
+                rows,
+            } => {
+                {
+                    let _control = self.control.lock().await;
+                    self.refresh().await?;
+                }
+                self.session(session_id)?
+                    .attach(connection, mode, columns, rows)
+                    .await
+            }
+            Operation::SetMode {
+                attachment_id,
+                mode,
+                force,
+                expected_epoch,
+            } => {
+                self.attachment(connection.id, attachment_id)?
+                    .set_mode(connection, attachment_id, mode, force, expected_epoch)
+                    .await
+            }
+            Operation::Resize {
+                attachment_id,
+                columns,
+                rows,
+            } => {
+                self.attachment(connection.id, attachment_id)?
+                    .resize(connection, attachment_id, columns, rows)
+                    .await?;
+                Ok(Reply::Ok)
+            }
+            Operation::Input {
+                attachment_id,
+                writer_epoch,
+                data,
+            } => {
+                self.attachment(connection.id, attachment_id)?
+                    .input(connection, attachment_id, writer_epoch, &data)
+                    .await?;
+                Ok(Reply::Ok)
+            }
+            Operation::Detach { attachment_id } => {
+                self.attachment(connection.id, attachment_id)?
+                    .detach(connection.id, attachment_id)?;
+                Ok(Reply::Ok)
+            }
+        }
+    }
+}
+struct ConnectionCleanup {
+    domain: Arc<Domain>,
+    id: Uuid,
+    stop: watch::Sender<bool>,
+}
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.domain.detach_connection(self.id);
+    }
+}
+struct Inner {
+    domains: BTreeMap<String, Arc<Domain>>,
+    ready: AtomicBool,
+    capacity: Arc<Semaphore>,
+    stop: watch::Sender<bool>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+/// Issuer-free terminal service provider. Each logical service has a private tmux domain.
+pub struct PtyBackend {
+    inner: Arc<Inner>,
+}
+impl PtyBackend {
+    /// Opens independent tmux domains without creating any sessions.
+    ///
+    /// # Errors
+    /// Rejects invalid configuration, unavailable tmux or a domain already in use.
+    pub async fn open(configs: Vec<PtyDomainConfig>) -> Result<Self> {
+        if configs.is_empty() || configs.len() > 256 {
+            bail!("configure one or more PTY service domains");
+        }
+        let mut domains = BTreeMap::new();
+        for config in configs {
+            if config.service_id.is_empty() || domains.contains_key(&config.service_id) {
+                bail!("PTY service identifiers must be unique");
+            }
+            let tmux = Arc::new(Tmux::open(config.tmux).await?);
+            domains.insert(
+                config.service_id,
+                Arc::new(Domain {
+                    tmux,
+                    sessions: Mutex::new(BTreeMap::new()),
+                    control: tokio::sync::Mutex::new(()),
+                    can_write: AtomicBool::new(false),
+                }),
+            );
+        }
+        Ok(Self {
+            inner: Arc::new(Inner {
+                domains,
+                ready: AtomicBool::new(false),
+                capacity: Arc::new(Semaphore::new(128)),
+                stop: watch::channel(false).0,
+                tasks: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+    /// Enables service admission only from the grant already verified by `HomeRuntime`.
+    ///
+    /// # Errors
+    /// Rejects mismatched services, application protocols or capabilities.
+    pub fn authorize(&self, grant: &HomeServiceGrant) -> Result<()> {
+        if grant.services.len() != self.inner.domains.len() {
+            bail!("PTY domains must exactly match the approved Home service grant");
+        }
+        for service in &grant.services {
+            let domain = self
+                .inner
+                .domains
+                .get(&service.service_id)
+                .context("approved service has no PTY domain")?;
+            if service.protocol != ServiceProtocol::Tcp
+                || service.application_protocol != APPLICATION_PROTOCOL
+                || !service.capabilities.iter().any(|c| c == "read")
+                || service
+                    .capabilities
+                    .iter()
+                    .any(|c| c != "read" && c != "write")
+            {
+                bail!("unsupported PTY business service capabilities");
+            }
+            domain.can_write.store(
+                service.capabilities.iter().any(|c| c == "write"),
+                Ordering::Release,
+            );
+        }
+        self.inner.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub async fn shutdown(&self) {
+        self.inner.stop.send_replace(true);
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .map(|mut tasks| std::mem::take(&mut *tasks))
+            .unwrap_or_default();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for PtyBackend {
+    fn drop(&mut self) {
+        self.inner.stop.send_replace(true);
+    }
+}
+impl ServiceProvider for PtyBackend {
+    fn connect_tcp<'a>(
+        &'a self,
+        service: &'a Service,
+        peer: ServicePeer,
+    ) -> IoFuture<'a, BoxStream> {
+        Box::pin(async move {
+            if !self.inner.ready.load(Ordering::Acquire)
+                || *self.inner.stop.borrow()
+                || !peer.lifetime.is_active()
+            {
+                bail!("PTY backend is not accepting connections");
+            }
+            let domain = self
+                .inner
+                .domains
+                .get(&service.id)
+                .cloned()
+                .context("unknown PTY service")?;
+            if service.protocol != ServiceProtocol::Tcp {
+                bail!("PTY requires TCP");
+            }
+            let permit = Arc::clone(&self.inner.capacity)
+                .try_acquire_owned()
+                .context("PTY connection limit reached")?;
+            let (application, stream) = tokio::io::duplex(65_536);
+            let mut stop = self.inner.stop.subscribe();
+            let mut tasks = self
+                .inner
+                .tasks
+                .lock()
+                .map_err(|_| anyhow!("PTY task registry poisoned"))?;
+            if *stop.borrow() {
+                bail!("PTY backend is stopping");
+            }
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                if *stop.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => {},
+                    result = serve(domain, Box::new(stream), peer) => {
+                        if result.is_err() { tracing::debug!("PTY business connection ended"); }
+                    }
+                }
+            });
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+            Ok(Box::new(application) as BoxStream)
+        })
+    }
+    fn connect_udp<'a>(
+        &'a self,
+        _: &'a Service,
+        _: ServicePeer,
+    ) -> IoFuture<'a, Arc<dyn DatagramIo>> {
+        Box::pin(async { bail!("PTY requires TCP") })
+    }
+}
+async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let hello: ClientMessage = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_message(&mut reader),
+    )
+    .await??
+    .context("missing PTY hello")?;
+    hello.validate()?;
+    let ClientMessage::Hello { label, .. } = hello else {
+        bail!("first PTY message must be hello");
+    };
+    let (events, mut outgoing) = mpsc::channel(64);
+    let connection = Connection {
+        id: Uuid::new_v4(),
+        travel_id: peer.travel_id,
+        label,
+        lifetime: peer.lifetime,
+        events,
+        stop: watch::channel(false).0,
+        can_write: domain.can_write.load(Ordering::Acquire),
+    };
+    let _cleanup = ConnectionCleanup {
+        domain: Arc::clone(&domain),
+        id: connection.id,
+        stop: connection.stop.clone(),
+    };
+    connection.send(ServerMessage::Hello {
+        version: PROTOCOL_VERSION,
+        can_write: connection.can_write,
+    })?;
+    let requests = async {
+        while let Some(message) = read_message::<ClientMessage>(&mut reader).await? {
+            message.validate()?;
+            let ClientMessage::Request {
+                request_id,
+                operation,
+            } = message
+            else {
+                bail!("duplicate PTY hello");
+            };
+            let result = domain
+                .operation(&connection, operation)
+                .await
+                .unwrap_or_else(|error| Reply::Error {
+                    code: "operation_failed".into(),
+                    message: error.to_string().chars().take(512).collect(),
+                });
+            let attached = if let Reply::Attached { attachment_id, .. } = &result {
+                Some(*attachment_id)
+            } else {
+                None
+            };
+            connection.send(ServerMessage::Response { request_id, result })?;
+            if let Some(id) = attached {
+                domain.attachment(connection.id, id)?.start_output(id)?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let responses = async {
+        while let Some(message) = outgoing.recv().await {
+            write_message(&mut writer, &message).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! { biased; () = connection.ended() => Ok(()), result = requests => result, result = responses => result }
+}

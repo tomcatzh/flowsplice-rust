@@ -45,7 +45,7 @@ use flowsplice_core::{
         peer_identity, require_peer,
     },
 };
-use flowsplice_enrollment::home::{HomeEnrollmentRequest, HomeEnrollmentResponse};
+use flowsplice_enrollment::business::{HomeRequestEnvelope, HomeResponseEnvelope};
 use flowsplice_storage::{
     AcceptedReport, MetricRollup, ReportAcceptance, StateStore, accepted_reports_as_metric_points,
     summarize_metric_points,
@@ -915,12 +915,12 @@ async fn dispatch_home_enrollment(
     {
         bail!("Home bootstrap enrollment request is invalid or oversized");
     }
-    let request: HomeEnrollmentRequest = serde_json::from_slice(&request_json)
+    let request: HomeRequestEnvelope = serde_json::from_slice(&request_json)
         .context("Home bootstrap enrollment request JSON is invalid")?;
     if request.request_id != request_id || request.home_id != home_id {
         bail!("Home bootstrap envelope does not match its signed-key request");
     }
-    flowsplice_enrollment::home::parse_home_enrollment_request(&request, unix_time_secs()?)?;
+    request.validate(unix_time_secs()?)?;
     let request_digest_sha256 =
         hex::encode(digest::digest(&digest::SHA256, &request_json).as_ref());
     let eligible = {
@@ -1031,6 +1031,7 @@ fn validate_relay_advertisement(advertisement: &RelayAdvertisement) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn complete_home_enrollment(
     state: &Arc<State>,
     issuer_home_id: &str,
@@ -1057,14 +1058,14 @@ async fn complete_home_enrollment(
         if !accepted || response_json.len() > 900 * 1024 {
             bail!("Home enrollment response is invalid or oversized");
         }
-        let response: HomeEnrollmentResponse = serde_json::from_slice(&response_json)
+        let response: HomeResponseEnvelope = serde_json::from_slice(&response_json)
             .context("Home enrollment response JSON is invalid")?;
         if response.approval.request.request_id != request_id
             || response.approval.request.home_id != record.home_id
             || hex::encode(
                 digest::digest(
                     &digest::SHA256,
-                    &serde_json::to_vec(&response.approval.request)?,
+                    &serde_json::to_vec(&response.request_envelope())?,
                 )
                 .as_ref(),
             ) != record.request_digest_sha256
@@ -1072,11 +1073,14 @@ async fn complete_home_enrollment(
             bail!("Home enrollment response does not match the dispatched request");
         }
         let root_public_key = &state.control_signer.root_public_key;
-        let (endpoint, _) = flowsplice_enrollment::home::validate_home_enrollment_response(
-            &response,
-            root_public_key,
-            unix_time_secs()?,
-        )?;
+        let trust = response.validate(root_public_key, unix_time_secs()?)?;
+        let endpoint = response
+            .signed_endpoint_credential
+            .verify(&trust, unix_time_secs()?)?;
+        // Dynamic global Homes legitimately receive the existing Home-enrollment
+        // signing key. Its original authority Home is not necessarily the sender.
+        // Admission above verifies the sender's current global-issuer role; the
+        // signed response and exact dispatched request are verified independently.
         if endpoint.home_id != record.home_id {
             bail!("Home enrollment response authorizes a different Home");
         }
@@ -1084,10 +1088,21 @@ async fn complete_home_enrollment(
         drop(pending);
         let snapshot = {
             let mut authorization = state.authorization.write().await;
-            authorization.import_home_endpoint(
-                &state.control_signer.trust,
-                response.signed_endpoint_credential.clone(),
-            )?;
+            match &response {
+                HomeResponseEnvelope::Business(business) => {
+                    authorization.import_business_home(
+                        &state.control_signer.trust,
+                        business.response.signed_endpoint_credential.clone(),
+                        business.grant.clone(),
+                    )?;
+                }
+                HomeResponseEnvelope::Legacy(legacy) => {
+                    authorization.import_home_endpoint(
+                        &state.control_signer.trust,
+                        legacy.signed_endpoint_credential.clone(),
+                    )?;
+                }
+            }
             authorization.snapshot()
         };
         broadcast_authorization(state, snapshot).await;
@@ -1202,6 +1217,12 @@ async fn handle_home(
     if home.endpoint_credential != endpoint_credential {
         bail!("catalog Home endpoint credential does not match Server authorization state");
     }
+    state.authorization.read().await.validate_home_services(
+        &state.control_signer.trust,
+        &identity.id,
+        endpoint_credential.as_ref(),
+        &home.services,
+    )?;
     validate_catalog(&Catalog {
         generation: 1,
         homes: vec![home.clone()],
@@ -1280,6 +1301,9 @@ async fn handle_home(
                             if home.endpoint_credential != endpoint_credential {
                                 bail!("updated catalog changed the authenticated Home endpoint credential");
                             }
+                            state.authorization.read().await.validate_home_services(
+                                &state.control_signer.trust, &identity.id, endpoint_credential.as_ref(), &home.services,
+                            )?;
                             validate_catalog(&Catalog {
                                 generation: 1,
                                 homes: vec![home.clone()],
@@ -2508,19 +2532,13 @@ async fn handle_remote_enrollment_installed(
             &travel_id,
             travel_session_id,
             None,
-            Some(&home_id),
+            None,
         )
         .await
         .map_err(anyhow::Error::msg)?;
         {
             let authorization = state.authorization.read().await;
-            let credential = authorization
-                .verified()
-                .credential(credential_id)
-                .ok_or_else(|| anyhow!("installed Travel credential is unavailable"))?;
-            if credential.enrollment_request_id != request_id {
-                bail!("installed credential does not belong to this enrollment request");
-            }
+            authorization.validate_install_acknowledgement(credential_id, request_id, &home_id)?;
         }
         let home = state
             .homes

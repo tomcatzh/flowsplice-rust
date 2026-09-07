@@ -10,7 +10,7 @@ e2e-remote-ui = ["flowsplice-travel-core/e2e-remote-ui"]
 
 [dependencies]
 anyhow.workspace = true
-flowsplice-travel-core.workspace = true
+flowsplice-travel-core = { workspace = true, features = ["frontend"] }
 
 [lints]
 workspace = true

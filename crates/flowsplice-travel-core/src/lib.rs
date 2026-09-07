@@ -3,11 +3,17 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
-    io::{self, IsTerminal, Read, Write},
+    io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::{Duration, Instant},
+};
+
+#[cfg(feature = "frontend")]
+use std::{
+    io::{self, IsTerminal},
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,6 +22,7 @@ use aws_lc_rs::{
     rand::{SecureRandom, SystemRandom},
     signature::EcdsaKeyPair,
 };
+#[cfg(feature = "frontend")]
 use axum::{
     Json, Router,
     extract::{Query, Request, State},
@@ -24,7 +31,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+#[cfg(feature = "frontend")]
 use clap::{Parser, Subcommand};
+#[cfg(feature = "frontend")]
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
@@ -49,6 +58,8 @@ use flowsplice_core::{
         identity_server_name, peer_identity, require_peer, verify_discovery_certificate,
     },
 };
+#[cfg(feature = "frontend")]
+use flowsplice_enrollment::key::rotate_private_key_passwords;
 use flowsplice_enrollment::{
     BUSINESS_CA_FILE, BUSINESS_CERT_FILE, BUSINESS_KEY_FILE, DEPLOYMENT_TRUST_FILE,
     MANAGEMENT_CA_FILE, MANAGEMENT_CERT_FILE, MANAGEMENT_KEY_FILE, MAX_REQUEST_AGE_SECS,
@@ -56,14 +67,14 @@ use flowsplice_enrollment::{
     install_enrollment_response,
     key::{
         MIN_PRIVATE_KEY_PASSWORD_CHARACTERS, PrivateKeyRotationTarget, is_encrypted_private_key,
-        load_private_key, recover_private_key_password_rotation, rotate_private_key_passwords,
+        load_private_key, recover_private_key_password_rotation,
     },
     load_json, validate_enrollment_response,
 };
-use flowsplice_storage::{
-    LocalStatistics, MetricBatch, MetricPoint, MetricRollup, StateStore, Table, WriteBatch,
-    summarize_metric_points,
-};
+use flowsplice_storage::{LocalStatistics, MetricBatch, StateStore, Table, WriteBatch};
+#[cfg(feature = "frontend")]
+use flowsplice_storage::{MetricPoint, MetricRollup, summarize_metric_points};
+#[cfg(feature = "frontend")]
 use rust_embed::RustEmbed;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
@@ -78,15 +89,20 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+pub mod business;
+mod socket;
 mod tcp_flow;
+pub use socket::{ServiceBinding, SocketDatagrams, SocketStream};
 
 #[cfg(test)]
 mod review_regressions;
 
 #[derive(RustEmbed)]
 #[folder = "../../travelagent/web/dist/"]
+#[cfg(feature = "frontend")]
 struct WebAssets;
 
+#[cfg(feature = "frontend")]
 static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
     EmbeddedSpa::new(EmbeddedSpaConfig::default())
         .unwrap_or_else(|error| panic!("invalid embedded Travel Agent UI: {error}"))
@@ -94,6 +110,7 @@ static SPA: LazyLock<EmbeddedSpa<WebAssets>> = LazyLock::new(|| {
 
 #[derive(Parser)]
 #[command(name = "flowsplice-travelagent", version)]
+#[cfg(feature = "frontend")]
 struct Cli {
     #[arg(long, env = "FLOWSPLICE_CONFIG", default_value = "travelagent.toml")]
     config: PathBuf,
@@ -103,6 +120,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 #[allow(clippy::enum_variant_names)]
+#[cfg(feature = "frontend")]
 enum Command {
     EnrollRemote(EnrollRemoteArgs),
     CheckBootstrapConfig {
@@ -112,6 +130,7 @@ enum Command {
 }
 
 #[derive(clap::Args)]
+#[cfg(feature = "frontend")]
 struct EnrollRemoteArgs {
     #[arg(long)]
     travel_id: String,
@@ -224,6 +243,8 @@ struct VerifiedTravelBootstrap {
 }
 
 /// Inputs for a complete first-device remote enrollment.
+/// Required identity, trust and installation values are validated before enrollment.
+#[derive(Default)]
 pub struct RemoteEnrollmentOptions {
     pub travel_id: String,
     pub home_id: String,
@@ -328,6 +349,8 @@ struct BootstrapEnrollmentState {
     home_id: String,
     request_id: Uuid,
     retrieval_token_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    business: Option<flowsplice_core::business::BusinessDescriptor>,
 }
 
 #[derive(Serialize)]
@@ -438,6 +461,7 @@ const TRAVEL_MAPPINGS_KEY: &[u8] = b"active";
 const LEGACY_CONTROL_STATE_DIGEST_KEY: &[u8] = b"legacy_control_state_sha256";
 const ACTIVE_IDENTITY_DIR_KEY: &[u8] = b"active_identity_dir";
 const REMOTE_ENROLLMENT_VERSION: u32 = 1;
+#[cfg(feature = "frontend")]
 const MAX_REMOTE_ENROLLMENT_OUTBOX_RECORDS: usize = 64;
 const REMOTE_ENROLLMENT_INSTALLED_RETENTION_SECS: u64 = 24 * 60 * 60;
 const RELAY_HISTORY_VERSION: u32 = 1;
@@ -547,7 +571,9 @@ struct AppState {
     carrier_permits: Arc<Semaphore>,
     flow_relays: Arc<Mutex<HashMap<Uuid, String>>>,
     diagnostics: Arc<Mutex<DiagnosticsState>>,
+    #[cfg(feature = "frontend")]
     key_operation: Arc<Mutex<()>>,
+    #[cfg(feature = "frontend")]
     sensitive_operation: Arc<Semaphore>,
     deployment_root_public_key: Arc<String>,
     deployment_trust: Arc<RwLock<DeploymentTrust>>,
@@ -920,6 +946,7 @@ pub struct DiagnosticsSnapshot {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "frontend")]
 struct RotatePrivateKeyPasswordRequest {
     current_password: String,
     new_password: String,
@@ -927,6 +954,7 @@ struct RotatePrivateKeyPasswordRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "frontend")]
 struct CreateRemoteEnrollmentRequest {
     home_id: String,
     password: String,
@@ -934,12 +962,14 @@ struct CreateRemoteEnrollmentRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "frontend")]
 struct InstallRemoteEnrollmentRequest {
     request_id: Uuid,
     password: String,
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct RemoteEnrollmentStatus {
     request_id: Uuid,
     home_id: String,
@@ -949,6 +979,7 @@ struct RemoteEnrollmentStatus {
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct InstallRemoteEnrollmentResponse {
     request_id: Uuid,
     credential_id: Uuid,
@@ -957,6 +988,7 @@ struct InstallRemoteEnrollmentResponse {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "frontend")]
 struct MappingIdentityRequest {
     home_id: String,
     service_id: String,
@@ -964,15 +996,18 @@ struct MappingIdentityRequest {
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct RotatePrivateKeyPasswordResponse {
     rotated_keys: usize,
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct ApiError {
     error: String,
 }
 
+#[cfg(feature = "frontend")]
 type ApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 struct RouteGrant {
@@ -992,6 +1027,7 @@ struct RouteGrant {
 ///
 /// Panics if Tokio cannot construct the process runtime required by `#[tokio::main]`.
 #[tokio::main]
+#[cfg(feature = "frontend")]
 pub async fn run_cli() -> Result<()> {
     init_crypto();
     tracing_subscriber::fmt()
@@ -1082,7 +1118,9 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
         carrier_permits,
         flow_relays: Arc::new(Mutex::new(HashMap::new())),
         diagnostics: Arc::new(Mutex::new(DiagnosticsState::default())),
+        #[cfg(feature = "frontend")]
         key_operation: Arc::new(Mutex::new(())),
+        #[cfg(feature = "frontend")]
         sensitive_operation: Arc::new(Semaphore::new(1)),
         deployment_root_public_key: Arc::new(deployment_root_public_key),
         deployment_trust: Arc::new(RwLock::new(deployment_trust)),
@@ -1187,6 +1225,24 @@ pub struct TravelCore {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shutdown_lock: Mutex<()>,
     stopped: std::sync::atomic::AtomicBool,
+    socket_mode: bool,
+    socket_tasks: socket::SocketTasks,
+}
+
+impl Drop for TravelCore {
+    fn drop(&mut self) {
+        // Explicit shutdown drains these tasks. Drop still cancels them if the owner goes away.
+        self.socket_tasks.shutdown.send_replace(true);
+        for task in self.tasks.get_mut().drain(..) {
+            task.abort();
+        }
+        if let Ok(mut mappings) = self.state.mapping_tasks.try_lock() {
+            for (_, task) in mappings.drain() {
+                task.shutdown.send_replace(true);
+                task.join.abort();
+            }
+        }
+    }
 }
 
 impl TravelCore {
@@ -1196,7 +1252,7 @@ impl TravelCore {
     ///
     /// Returns an error if configuration, state, credentials, or initial mapping listeners fail.
     pub async fn start(config_path: &Path, private_key_password: &str) -> Result<Self> {
-        Self::start_inner(config_path, private_key_password, None).await
+        Self::start_inner(config_path, private_key_password, None, false).await
     }
 
     /// Starts a native runtime only if the installed identity belongs to the packaged deployment.
@@ -1209,13 +1265,29 @@ impl TravelCore {
         trusted_root: &str,
     ) -> Result<Self> {
         let root = normalized_trusted_root(trusted_root)?;
-        Self::start_inner(config_path, private_key_password, Some(root)).await
+        Self::start_inner(config_path, private_key_password, Some(root), false).await
+    }
+
+    /// Starts a business runtime that never opens local listeners, even if legacy mappings exist.
+    ///
+    /// The caller owns its active-use lifetime and must shut it down when the business view closes.
+    ///
+    /// # Errors
+    /// Returns configuration, identity, trust or password errors.
+    pub async fn start_in_process(
+        config_path: &Path,
+        private_key_password: &str,
+        trusted_root: &str,
+    ) -> Result<Self> {
+        let root = normalized_trusted_root(trusted_root)?;
+        Self::start_inner(config_path, private_key_password, Some(root), true).await
     }
 
     async fn start_inner(
         config_path: &Path,
         private_key_password: &str,
         trusted_root: Option<String>,
+        socket_mode: bool,
     ) -> Result<Self> {
         init_crypto();
         let config_path = config_path.to_path_buf();
@@ -1229,7 +1301,9 @@ impl TravelCore {
         })
         .await
         .context("Travel state loading task failed")??;
-        start_initial_mapping_listeners(&state).await?;
+        if !socket_mode {
+            start_initial_mapping_listeners(&state).await?;
+        }
         let catalog_state = state.clone();
         let catalog = tokio::spawn(async move {
             if let Err(error) = run_catalog_subscription(catalog_state).await {
@@ -1247,6 +1321,8 @@ impl TravelCore {
             tasks: Mutex::new(vec![catalog, trust]),
             shutdown_lock: Mutex::new(()),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            socket_mode,
+            socket_tasks: socket::SocketTasks::default(),
         })
     }
 
@@ -1318,6 +1394,9 @@ impl TravelCore {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             bail!("Travel runtime is stopped");
         }
+        if self.socket_mode {
+            bail!("in-process Travel does not support local listeners");
+        }
         upsert_mapping(&self.state, mapping).await
     }
 
@@ -1336,6 +1415,9 @@ impl TravelCore {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             bail!("Travel runtime is stopped");
         }
+        if self.socket_mode {
+            bail!("in-process Travel does not manage local mappings");
+        }
         delete_mapping(&self.state, home_id, service_id, protocol).await
     }
 
@@ -1346,6 +1428,7 @@ impl TravelCore {
             return;
         }
         self.state.mark_status_changed();
+        self.socket_tasks.shutdown().await;
         let tasks = {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks)
@@ -1385,6 +1468,7 @@ async fn monitor_trust_expiry(state: AppState) -> Result<()> {
     }
 }
 
+#[cfg(feature = "frontend")]
 async fn run_command(command: Command) -> Result<()> {
     match command {
         Command::EnrollRemote(args) => run_remote_enrollment_cli(args).await,
@@ -1469,6 +1553,7 @@ fn validate_bootstrap_trust_continuity(
     Ok(())
 }
 
+#[cfg(feature = "frontend")]
 async fn run_remote_enrollment_cli(args: EnrollRemoteArgs) -> Result<()> {
     let password = if let Some(path) = args.test_password_file.as_deref() {
         test_password(path)?
@@ -1549,6 +1634,18 @@ pub async fn enroll_remote<F>(options: RemoteEnrollmentOptions, on_progress: F) 
 where
     F: Fn(RemoteEnrollmentProgress) + Send + Sync,
 {
+    enroll_remote_inner(options, None, on_progress).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn enroll_remote_inner<F>(
+    options: RemoteEnrollmentOptions,
+    business: Option<flowsplice_core::business::BusinessDescriptor>,
+    on_progress: F,
+) -> Result<()>
+where
+    F: Fn(RemoteEnrollmentProgress) + Send + Sync,
+{
     init_crypto();
     if options.wait_timeout_secs == 0 {
         bail!("wait-timeout-secs must be positive");
@@ -1600,6 +1697,16 @@ where
         discover_bootstrap_relay(relay, root).await?
     };
     let root_public_key = bootstrap.deployment_root_public_key.as_str();
+    let business_target = business
+        .as_ref()
+        .map(|descriptor| descriptor.verify(&bootstrap.trust, unix_time_secs()?))
+        .transpose()?;
+    if business_target
+        .as_ref()
+        .is_some_and(|target| target.approving_home_id != options.home_id)
+    {
+        bail!("business descriptor does not match its approving Home");
+    }
     let management_ca = &bootstrap.trust.management_ca_certificate_pem;
     let bootstrap_relays = bootstrap.bootstrap_relays.clone();
     let polling_relays = if let Some(selected) = selected_relay {
@@ -1634,7 +1741,46 @@ where
     let enrollment_dir = install_root.join("cert");
     let bootstrap_state_path = install_root.join("bootstrap-enrollment.json");
     let config_path = install_root.join("travelagent.toml");
-    if config_path.exists() {
+    let binding_path = install_root.join(flowsplice_enrollment::business::BUSINESS_BINDING_FILE);
+    if binding_path.exists()
+        && let Some(descriptor) = &business
+    {
+        let approved = business::load_binding(&config_path, root_public_key, descriptor)?;
+        if approved.travel_id != options.travel_id {
+            bail!("completed business installation belongs to a different Travel identity");
+        }
+        // Verify the supplied password and all installed runtime resources without starting I/O.
+        drop(load_app_state(&config_path, Some(password.as_str()))?);
+        if bootstrap_state_path.exists() {
+            let pending: BootstrapEnrollmentState = load_json(&bootstrap_state_path)?;
+            if pending.request_id != approved.request_id
+                || pending.business.as_ref() != Some(descriptor)
+            {
+                bail!("completed business binding conflicts with leftover enrollment state");
+            }
+            fs::remove_file(&bootstrap_state_path)?;
+        }
+        let journal_path = install_root.join(business::INSTALL_JOURNAL_FILE);
+        if journal_path.exists() {
+            let pending: business::InstallJournal = load_json(&journal_path)?;
+            if pending.response.request.request.request_id != approved.request_id
+                || pending.response.request.descriptor != *descriptor
+            {
+                bail!("completed business binding conflicts with leftover installation journal");
+            }
+            fs::remove_file(journal_path)?;
+        }
+        on_progress(RemoteEnrollmentProgress {
+            phase: RemoteEnrollmentPhase::Installed,
+            travel_id: options.travel_id,
+            request_id: Some(approved.request_id),
+            verification_code: None,
+            config_path: Some(config_path),
+            credential_id: Some(approved.credential_id),
+        });
+        return Ok(());
+    }
+    if config_path.exists() && business.is_none() {
         bail!(
             "Travel configuration already exists: {}",
             config_path.display()
@@ -1644,6 +1790,9 @@ where
         let state: BootstrapEnrollmentState = load_json(&bootstrap_state_path)?;
         if state.version != REMOTE_ENROLLMENT_VERSION || state.home_id != options.home_id {
             bail!("existing first-enrollment state conflicts with the requested Home");
+        }
+        if state.business != business {
+            bail!("resumed enrollment changed the requested business descriptor");
         }
         let request: TravelEnrollmentRequest = load_json(&enrollment_dir.join(REQUEST_FILE))?;
         if request.request_id != state.request_id || request.travel_id != options.travel_id {
@@ -1679,12 +1828,25 @@ where
                 home_id: options.home_id.clone(),
                 request_id: request.request_id,
                 retrieval_token_hex: hex::encode(&token),
+                business: business.clone(),
             },
         )?;
         (request, token)
     };
     let request_id = request.request_id;
-    let request_json = serde_json::to_vec(&request)?;
+    let request_envelope = match &business {
+        Some(descriptor) => flowsplice_enrollment::business::TravelRequestEnvelope::Business(
+            Box::new(flowsplice_enrollment::business::BusinessTravelRequest {
+                version: flowsplice_core::business::BUSINESS_VERSION,
+                object_type: flowsplice_enrollment::business::BUSINESS_TRAVEL_REQUEST_TYPE
+                    .to_owned(),
+                request: request.clone(),
+                descriptor: descriptor.clone(),
+            }),
+        ),
+        None => flowsplice_enrollment::business::TravelRequestEnvelope::Legacy(request.clone()),
+    };
+    let request_json = serde_json::to_vec(&request_envelope)?;
     let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
     on_progress(RemoteEnrollmentProgress {
         phase: RemoteEnrollmentPhase::WaitingForApproval,
@@ -1698,46 +1860,80 @@ where
     let connector = identity_server_auth_connector_from_ca_pem(management_ca)?;
     let deadline = Instant::now() + Duration::from_secs(options.wait_timeout_secs);
     let mut last_error = None;
-    let (response, mut seed_relays) = 'outer: loop {
-        for relay in &polling_relays {
-            let expected_relay_id = bootstrap
-                .relay_address_overrides
-                .iter()
-                .find(|candidate| candidate.management_addr.as_str() == relay.as_str())
-                .map(|candidate| candidate.id.as_str());
-            match poll_bootstrap_relay(
-                relay,
-                expected_relay_id,
-                &connector,
-                &request,
-                &options.home_id,
-                &retrieval_token,
-                &request_json,
-            )
-            .await
-            {
-                Ok(Some(result)) => break 'outer result,
-                Ok(None) => {
-                    last_error = None;
-                }
-                Err(error) => {
-                    last_error = Some(format!("{relay}: {error}"));
+    let journal_path = install_root.join(business::INSTALL_JOURNAL_FILE);
+    let journal: Option<business::InstallJournal> = if business.is_some() && journal_path.exists() {
+        Some(load_json(&journal_path)?)
+    } else {
+        None
+    };
+    let (response, mut seed_relays) = if let Some(journal) = &journal {
+        (
+            flowsplice_enrollment::business::TravelResponseEnvelope::Business(Box::new(
+                journal.response.clone(),
+            )),
+            Vec::new(),
+        )
+    } else {
+        'outer: loop {
+            for relay in &polling_relays {
+                let expected_relay_id = bootstrap
+                    .relay_address_overrides
+                    .iter()
+                    .find(|candidate| candidate.management_addr.as_str() == relay.as_str())
+                    .map(|candidate| candidate.id.as_str());
+                match poll_bootstrap_relay(
+                    relay,
+                    expected_relay_id,
+                    &connector,
+                    &request,
+                    &options.home_id,
+                    &retrieval_token,
+                    &request_json,
+                )
+                .await
+                {
+                    Ok(Some(result)) => break 'outer result,
+                    Ok(None) => {
+                        last_error = None;
+                    }
+                    Err(error) => {
+                        last_error = Some(format!("{relay}: {error}"));
+                    }
                 }
             }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for Home approval{}",
+                    last_error
+                        .as_deref()
+                        .map_or_else(String::new, |error| format!(": {error}"))
+                );
+            }
+            sleep(Duration::from_secs(2)).await;
         }
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for Home approval{}",
-                last_error
-                    .as_deref()
-                    .map_or_else(String::new, |error| format!(": {error}"))
-            );
-        }
-        sleep(Duration::from_secs(2)).await;
     };
 
-    let (credential, trust) =
-        validate_enrollment_response(&response, root_public_key, unix_time_secs()?)?;
+    let (credential, trust) = match (&request_envelope, &response) {
+        (
+            flowsplice_enrollment::business::TravelRequestEnvelope::Business(request),
+            flowsplice_enrollment::business::TravelResponseEnvelope::Business(response),
+        ) => {
+            if **request != response.request {
+                bail!("business enrollment response changed its complete request");
+            }
+            response.validate(root_public_key, unix_time_secs()?)?
+        }
+        (
+            flowsplice_enrollment::business::TravelRequestEnvelope::Legacy(request),
+            flowsplice_enrollment::business::TravelResponseEnvelope::Legacy(response),
+        ) => {
+            if request != &response.approval.request {
+                bail!("enrollment response changed its request");
+            }
+            validate_enrollment_response(response, root_public_key, unix_time_secs()?)?
+        }
+        _ => bail!("enrollment response changed the requested business/legacy format"),
+    };
     validate_bootstrap_trust_continuity(
         &bootstrap.signed_trust,
         &bootstrap.trust,
@@ -1785,7 +1981,9 @@ where
         #[cfg(feature = "e2e-remote-ui")]
         test_admin_token: options.test_admin_token,
         homes: vec![InstalledHome {
-            id: options.home_id.clone(),
+            id: business_target
+                .as_ref()
+                .map_or_else(|| options.home_id.clone(), |target| target.home_id.clone()),
         }],
         seed_relays: seed_relays
             .into_iter()
@@ -1793,18 +1991,41 @@ where
             .collect(),
         relay_address_overrides: bootstrap.relay_address_overrides,
     };
-    let encoded = toml::to_string_pretty(&generated).context("failed to encode Travel config")?;
-    let mut config_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-        .with_context(|| format!("failed to create {}", config_path.display()))?;
-    config_file.write_all(encoded.as_bytes())?;
-    config_file.sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+    let encoded = if let Some(journal) = &journal {
+        journal.config_toml.clone()
+    } else {
+        toml::to_string_pretty(&generated).context("failed to encode Travel config")?
+    };
+    if let flowsplice_enrollment::business::TravelResponseEnvelope::Business(response) = &response {
+        if journal.is_none() {
+            business::write_atomic_private(
+                &journal_path,
+                &serde_json::to_vec_pretty(&business::InstallJournal {
+                    response: (**response).clone(),
+                    config_toml: encoded.clone(),
+                })?,
+            )?;
+        }
+        if config_path.exists() {
+            if fs::read(&config_path)? != encoded.as_bytes() {
+                bail!("existing business configuration conflicts with its pending installation");
+            }
+        } else {
+            business::write_atomic_private(&config_path, encoded.as_bytes())?;
+        }
+    } else {
+        let mut config_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config_path)
+            .with_context(|| format!("failed to create {}", config_path.display()))?;
+        config_file.write_all(encoded.as_bytes())?;
+        config_file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        }
     }
     let store = StateStore::open(&state_store_path)?;
     store.apply_immediate(WriteBatch::new().put_json(
@@ -1815,7 +2036,7 @@ where
             home_id: options.home_id,
             enrollment_dir,
             request,
-            response: Some(response),
+            response: Some((*response).clone()),
             created_at_unix_secs: unix_time_secs()?,
             last_attempt_unix_secs: None,
             restart_required: true,
@@ -1823,12 +2044,32 @@ where
             installed_at_unix_secs: Some(unix_time_secs()?),
         },
     )?)?;
+    drop(store);
+    if let flowsplice_enrollment::business::TravelResponseEnvelope::Business(response) = &response {
+        // Initialize/read back durable trust high-water and validate keys before publishing completion.
+        drop(load_app_state(&config_path, Some(password.as_str()))?);
+        let marker = business::CompletedBinding {
+            version: flowsplice_core::business::BUSINESS_VERSION,
+            config_sha256: sha256_hex(encoded.as_bytes()),
+            response: (**response).clone(),
+        };
+        business::validate_installed_binding(
+            &config_path,
+            &marker,
+            root_public_key,
+            &response.request.descriptor,
+        )?;
+        business::write_atomic_private(&binding_path, &serde_json::to_vec_pretty(&marker)?)?;
+    }
     fs::remove_file(&bootstrap_state_path).with_context(|| {
         format!(
             "failed to remove completed bootstrap state {}",
             bootstrap_state_path.display()
         )
     })?;
+    if journal_path.exists() && business.is_some() {
+        fs::remove_file(&journal_path)?;
+    }
     on_progress(RemoteEnrollmentProgress {
         phase: RemoteEnrollmentPhase::Installed,
         travel_id: options.travel_id,
@@ -1973,7 +2214,12 @@ async fn poll_bootstrap_relay(
     home_id: &str,
     retrieval_token: &[u8],
     request_json: &[u8],
-) -> Result<Option<(TravelEnrollmentResponse, Vec<String>)>> {
+) -> Result<
+    Option<(
+        flowsplice_enrollment::business::TravelResponseEnvelope,
+        Vec<String>,
+    )>,
+> {
     let socket = timeout(Duration::from_secs(10), TcpStream::connect(relay))
         .await
         .context("bootstrap Relay TCP connection timed out")??;
@@ -2326,6 +2572,7 @@ fn local_certificate_identity(path: &Path) -> Result<flowsplice_core::tls::PeerI
     peer_identity(Some(&certificates))
 }
 
+#[cfg(feature = "frontend")]
 fn prompt_new_private_key_password() -> Result<Zeroizing<String>> {
     let password = Zeroizing::new(rpassword::prompt_password(
         "New Travel private-key password: ",
@@ -2393,13 +2640,19 @@ fn runtime_password() -> Result<Zeroizing<String>> {
         }
         return read_password_file(Path::new(&path));
     }
-    let password = Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?);
-    if password.is_empty() {
-        bail!("private-key password must not be empty");
+    #[cfg(not(feature = "frontend"))]
+    bail!("a supplied private-key password is required without the frontend feature");
+    #[cfg(feature = "frontend")]
+    {
+        let password = Zeroizing::new(rpassword::prompt_password("Travel private-key password: ")?);
+        if password.is_empty() {
+            bail!("private-key password must not be empty");
+        }
+        Ok(password)
     }
-    Ok(password)
 }
 
+#[cfg(feature = "frontend")]
 fn test_password(path: &Path) -> Result<Zeroizing<String>> {
     if env::var("FLOWSPLICE_ALLOW_TEST_PASSWORD_FILE").as_deref() != Ok("1") {
         bail!("--test-password-file is disabled outside the explicit test environment");
@@ -2863,6 +3116,7 @@ async fn next_remote_enrollment_message(state: &AppState) -> Result<EnrollmentOu
         .context("Travel enrollment outbox query task failed")?
 }
 
+#[cfg(feature = "frontend")]
 fn prune_remote_enrollment_outbox(store: &StateStore, now: u64) -> Result<()> {
     let mut batch = WriteBatch::new();
     for (key, value) in store.scan_prefix(Table::EnrollmentOutbox, b"")? {
@@ -3899,7 +4153,11 @@ async fn run_udp_listener(
                 state.status_generation.clone(),
             );
             if let Err(error) =
-                run_udp_association(&state, &mapping, socket, peer, rx, association_shutdown).await
+                run_udp_association(
+                    &state, &mapping,
+                    Arc::new(MappingDatagrams { socket, peer, outgoing: Mutex::new(rx) }),
+                    association_shutdown, None, None,
+                ).await
             {
                 warn!(%peer, home_id = %mapping.home_id, service_id = %mapping.service_id, %error, "UDP association closed");
             }
@@ -3918,18 +4176,58 @@ async fn run_udp_listener(
     result
 }
 
+struct MappingDatagrams {
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    outgoing: Mutex<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl flowsplice_transport::DatagramIo for MappingDatagrams {
+    fn send<'a>(&'a self, bytes: &'a [u8]) -> flowsplice_transport::IoFuture<'a, ()> {
+        Box::pin(async move {
+            self.socket.send_to(bytes, self.peer).await?;
+            Ok(())
+        })
+    }
+
+    fn recv(&self) -> flowsplice_transport::IoFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            self.outgoing
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("UDP mapping closed"))
+        })
+    }
+}
+
 async fn run_udp_association(
     state: &AppState,
     mapping: &Mapping,
-    socket: Arc<UdpSocket>,
-    peer: SocketAddr,
-    outgoing: mpsc::Receiver<Vec<u8>>,
-    shutdown: watch::Receiver<bool>,
+    endpoint: Arc<dyn flowsplice_transport::DatagramIo>,
+    mut shutdown: watch::Receiver<bool>,
+    mut ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    failure: Option<watch::Sender<Option<String>>>,
 ) -> Result<()> {
     let flow_id = Uuid::new_v4();
     state.begin_route_flow(flow_id, mapping).await;
-    let result =
-        run_udp_association_inner(state, mapping, socket, peer, outgoing, shutdown, flow_id).await;
+    let inner_shutdown = shutdown.clone();
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopped| *stopped) => Ok((0, 0)),
+        result = run_udp_association_inner(state, mapping, Arc::clone(&endpoint), inner_shutdown, flow_id, &mut ready) => result,
+    };
+    if let Some(ready) = ready {
+        let reason = result.as_ref().err().map_or_else(
+            || "UDP connection cancelled".to_owned(),
+            ToString::to_string,
+        );
+        let _ = ready.send(Err(reason));
+    }
+    if let (Some(failure), Err(error)) = (failure, &result) {
+        failure.send_replace(Some(error.to_string()));
+    }
     let (uploaded_bytes, downloaded_bytes) = result.as_ref().copied().unwrap_or_default();
     state
         .finish_route_flow(
@@ -3947,15 +4245,17 @@ async fn run_udp_association(
 async fn run_udp_association_inner(
     state: &AppState,
     mapping: &Mapping,
-    socket: Arc<UdpSocket>,
-    peer: SocketAddr,
-    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    endpoint: Arc<dyn flowsplice_transport::DatagramIo>,
     mut shutdown: watch::Receiver<bool>,
     flow_id: Uuid,
+    ready: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
 ) -> Result<(u64, u64)> {
     let config = &state.config;
     let mut network_changes = state.network_generation.subscribe();
     let carrier = open_udp_carrier_for_association(state, mapping, flow_id).await?;
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
     let relay_id = carrier.relay_id.clone();
     state.select_route_relay(flow_id, &relay_id, None).await;
     let data_codec = carrier.data_codec;
@@ -3993,8 +4293,8 @@ async fn run_udp_association_inner(
             }
             _ = metrics_tick.tick() => { upload_metrics.flush(); download_metrics.flush(); }
             () = tokio::time::sleep_until(last_activity + Duration::from_secs(config.udp_idle_secs)) => bail!("UDP association idle timeout"),
-            datagram = outgoing.recv() => {
-                let Some(bytes) = datagram else { return Ok(()); };
+            datagram = endpoint.recv() => {
+                let Ok(bytes) = datagram else { return Ok(()); };
                 last_activity = tokio::time::Instant::now();
                 let count = bytes.len() as u64;
                 uploaded_bytes = uploaded_bytes.saturating_add(count);
@@ -4009,7 +4309,7 @@ async fn run_udp_association_inner(
                 match frame? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
-                            socket.send_to(&bytes, peer).await?;
+                            endpoint.send(&bytes).await?;
                             let count = bytes.len() as u64;
                             downloaded_bytes = downloaded_bytes.saturating_add(count);
                             download_metrics.record(unix_time_secs()?, count);
@@ -4083,16 +4383,33 @@ async fn open_udp_carrier_for_association(
     opened.ok_or_else(|| anyhow::anyhow!("all UDP carrier attempts failed"))
 }
 
-fn travel_udp_metric_dimensions(mapping: &Mapping, relay_id: &str) -> BTreeMap<String, String> {
+fn travel_flow_metric_dimensions(mapping: &Mapping) -> BTreeMap<String, String> {
     let mut dimensions = BTreeMap::new();
     dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
     dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
-    dimensions.insert("protocol".to_owned(), "udp".to_owned());
-    dimensions.insert("mapping".to_owned(), mapping.bind.clone());
+    dimensions.insert(
+        "protocol".to_owned(),
+        match mapping.protocol {
+            ServiceProtocol::Tcp => "tcp",
+            ServiceProtocol::Udp => "udp",
+        }
+        .to_owned(),
+    );
+    // Embedded flows have no local address. Empty metric dimensions cannot be signed,
+    // and a failed statistics flush would disconnect the catalog/login session.
+    if !mapping.bind.is_empty() {
+        dimensions.insert("mapping".to_owned(), mapping.bind.clone());
+    }
+    dimensions
+}
+
+fn travel_udp_metric_dimensions(mapping: &Mapping, relay_id: &str) -> BTreeMap<String, String> {
+    let mut dimensions = travel_flow_metric_dimensions(mapping);
     dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
     dimensions
 }
 
+#[cfg(feature = "frontend")]
 async fn run_ui(state: AppState) -> Result<()> {
     let api = Router::new()
         .route("/status", get(api_status))
@@ -4123,6 +4440,7 @@ async fn run_ui(state: AppState) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "frontend")]
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(travel_status(&state).await)
 }
@@ -4162,6 +4480,7 @@ const fn status_is_online(mapping_listeners_ready: bool, relay_connected: bool) 
     mapping_listeners_ready && relay_connected
 }
 
+#[cfg(feature = "frontend")]
 async fn api_upsert_mapping(
     State(state): State<AppState>,
     Json(mapping): Json<Mapping>,
@@ -4215,6 +4534,7 @@ async fn upsert_mapping(state: &AppState, mapping: Mapping) -> Result<Mapping> {
     Ok(mapping)
 }
 
+#[cfg(feature = "frontend")]
 async fn api_delete_mapping(
     State(state): State<AppState>,
     Json(identity): Json<MappingIdentityRequest>,
@@ -4269,14 +4589,17 @@ async fn delete_mapping(
     Ok(removed)
 }
 
+#[cfg(feature = "frontend")]
 async fn api_catalog(State(state): State<AppState>) -> Json<Catalog> {
     Json(state.catalog.read().await.clone())
 }
 
+#[cfg(feature = "frontend")]
 async fn api_relays(State(state): State<AppState>) -> Json<RelayDirectory> {
     Json(state.directory.read().await.clone())
 }
 
+#[cfg(feature = "frontend")]
 async fn api_diagnostics(State(state): State<AppState>) -> Json<DiagnosticsSnapshot> {
     Json(diagnostics_snapshot(&state).await)
 }
@@ -4526,16 +4849,19 @@ fn sanitized_route_reason(value: &str) -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "frontend")]
 struct StatisticsQuery {
     #[serde(default = "default_statistics_period")]
     period: String,
 }
 
+#[cfg(feature = "frontend")]
 fn default_statistics_period() -> String {
     "day".to_owned()
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct TravelStatisticsResponse {
     period: String,
     from_unix_secs: u64,
@@ -4549,6 +4875,7 @@ struct TravelStatisticsResponse {
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "frontend")]
 struct RelayDiscoveryStatus {
     relay_id: Option<String>,
     management_addr: String,
@@ -4561,6 +4888,7 @@ struct RelayDiscoveryStatus {
     consecutive_failures: u32,
 }
 
+#[cfg(feature = "frontend")]
 async fn api_statistics(
     State(state): State<AppState>,
     Query(query): Query<StatisticsQuery>,
@@ -4633,6 +4961,7 @@ async fn api_statistics(
     })
 }
 
+#[cfg(feature = "frontend")]
 async fn api_remote_enrollments(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<RemoteEnrollmentStatus>> {
@@ -4664,6 +4993,7 @@ async fn api_remote_enrollments(
         .map_err(api_error)
 }
 
+#[cfg(feature = "frontend")]
 async fn api_create_remote_enrollment(
     State(state): State<AppState>,
     Json(request): Json<CreateRemoteEnrollmentRequest>,
@@ -4674,6 +5004,7 @@ async fn api_create_remote_enrollment(
         .map_err(api_error)
 }
 
+#[cfg(feature = "frontend")]
 async fn create_remote_enrollment(
     state: &AppState,
     request: CreateRemoteEnrollmentRequest,
@@ -4760,10 +5091,12 @@ async fn create_remote_enrollment(
     Ok(status)
 }
 
+#[cfg(feature = "frontend")]
 fn remote_enrollment_capacity_available(current: usize, maximum: usize) -> bool {
     current < maximum
 }
 
+#[cfg(feature = "frontend")]
 async fn api_install_remote_enrollment(
     State(state): State<AppState>,
     Json(request): Json<InstallRemoteEnrollmentRequest>,
@@ -4774,6 +5107,7 @@ async fn api_install_remote_enrollment(
         .map_err(api_error)
 }
 
+#[cfg(feature = "frontend")]
 async fn install_remote_enrollment(
     state: &AppState,
     request: InstallRemoteEnrollmentRequest,
@@ -4836,6 +5170,7 @@ async fn install_remote_enrollment(
     Ok(response)
 }
 
+#[cfg(feature = "frontend")]
 async fn api_rotate_private_key_password(
     State(state): State<AppState>,
     Json(request): Json<RotatePrivateKeyPasswordRequest>,
@@ -4846,6 +5181,7 @@ async fn api_rotate_private_key_password(
         .map_err(api_error)
 }
 
+#[cfg(feature = "frontend")]
 async fn rotate_travel_private_key_password(
     state: &AppState,
     request: RotatePrivateKeyPasswordRequest,
@@ -4893,6 +5229,7 @@ fn travel_password_rotation_is_local(config: &Config) -> bool {
         || test_remote_ui_enabled(config)
 }
 
+#[cfg(feature = "frontend")]
 fn api_error(error: impl Into<anyhow::Error>) -> (StatusCode, Json<ApiError>) {
     let error = error.into();
     (
@@ -4903,10 +5240,12 @@ fn api_error(error: impl Into<anyhow::Error>) -> (StatusCode, Json<ApiError>) {
     )
 }
 
+#[cfg(feature = "frontend")]
 async fn serve_spa(request: Request) -> Response {
     SPA.serve(request)
 }
 
+#[cfg(feature = "frontend")]
 async fn authorize_ui(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if local_ui_request_allowed(&request, &state.config.ui_listen) {
         return next.run(request).await;
@@ -4930,6 +5269,7 @@ async fn authorize_ui(State(state): State<AppState>, request: Request, next: Nex
     StatusCode::FORBIDDEN.into_response()
 }
 
+#[cfg(feature = "frontend")]
 fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
     let Ok(address) = listen.parse::<SocketAddr>() else {
         return false;
@@ -4997,9 +5337,11 @@ impl Drop for FlowGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "frontend"))]
 mod tests {
+    #[cfg(feature = "frontend")]
     use axum::{body::Body, extract::Request, http::Method};
+    #[cfg(feature = "frontend")]
     use clap::{CommandFactory, Parser};
     use flowsplice_core::{
         authorization::TrustedTravelAuthority,

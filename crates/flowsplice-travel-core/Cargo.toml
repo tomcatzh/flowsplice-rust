@@ -6,28 +6,31 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+default = ["frontend"]
+frontend = ["dep:axum", "dep:clap", "dep:embedded-spa", "dep:rust-embed", "dep:rpassword", "dep:tracing-subscriber"]
 e2e-remote-ui = []
 
 [dependencies]
 anyhow.workspace = true
 aws-lc-rs.workspace = true
-axum.workspace = true
+axum = { workspace = true, optional = true }
 bytes.workspace = true
-clap.workspace = true
-embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }
+clap = { workspace = true, optional = true }
+embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1", optional = true }
 flowsplice-core.workspace = true
-flowsplice-enrollment.workspace = true
+flowsplice-enrollment = { workspace = true, default-features = false }
 flowsplice-storage.workspace = true
+flowsplice-transport.workspace = true
 hex.workspace = true
-rpassword.workspace = true
-rust-embed = { version = "8.7", features = ["debug-embed", "deterministic-timestamps"] }
+rpassword = { workspace = true, optional = true }
+rust-embed = { version = "8.7", features = ["debug-embed", "deterministic-timestamps"], optional = true }
 rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
 toml.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

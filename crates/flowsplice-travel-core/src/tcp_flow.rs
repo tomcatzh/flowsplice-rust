@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -12,13 +12,11 @@ use flowsplice_core::{
     frame::{DataFrameReader, write_data_frame},
     protocol::{DataFrame, ServiceProtocol},
 };
+use flowsplice_transport::BoxStream;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        TcpStream,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    net::TcpStream,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::{Instant, interval, sleep, sleep_until, timeout},
 };
@@ -68,7 +66,7 @@ type OpenResult = (
 
 struct TransferState {
     flow_id: Uuid,
-    local_writer: OwnedWriteHalf,
+    local_writer: WriteHalf<BoxStream>,
     send_offset: u64,
     send_acked: u64,
     receive_offset: u64,
@@ -87,9 +85,21 @@ pub async fn run(
     state: AppState,
     mapping: Mapping,
     local: TcpStream,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     local.set_nodelay(true)?;
+    run_io(state, mapping, Box::new(local), shutdown, None, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) async fn run_io(
+    state: AppState,
+    mapping: Mapping,
+    local: BoxStream,
+    mut shutdown: watch::Receiver<bool>,
+    mut connected: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    failure: Option<watch::Sender<Option<String>>>,
+) -> Result<()> {
     let flow_id = Uuid::new_v4();
     state.begin_route_flow(flow_id, &mapping).await;
     info!(
@@ -101,7 +111,7 @@ pub async fn run(
     );
     let mut io_tasks = JoinSet::new();
     let mut opens = JoinSet::new();
-    let (local_reader, local_writer) = local.into_split();
+    let (local_reader, local_writer) = tokio::io::split(local);
     let (events_tx, mut events) = mpsc::channel(32);
     let send_credit = Arc::new(Semaphore::new(state.config.max_unacked_bytes));
     spawn_local_reader(&mut io_tasks, local_reader, events_tx.clone(), send_credit);
@@ -128,9 +138,19 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = shutdown.changed() => Err(anyhow!("mapping stopped")),
-            result = run_inner(&state, &mapping, flow_id, &events_tx, &mut events, &mut transfer, &mut io_tasks, &mut opens) => result,
+            result = run_inner(&state, &mapping, flow_id, &events_tx, &mut events, &mut transfer, &mut io_tasks, &mut opens, &mut connected) => result,
         }
     };
+    if let (Err(error), Some(failure)) = (&result, failure) {
+        failure.send_replace(Some(error.to_string()));
+    }
+    if let Some(connected) = connected.take() {
+        let reason = result.as_ref().err().map_or_else(
+            || "flow closed before a Carrier was selected".to_owned(),
+            ToString::to_string,
+        );
+        let _ = connected.send(Err(reason));
+    }
     // Own and drain all readers, carriers, and in-progress opens before releasing the flow.
     opens.shutdown().await;
     io_tasks.shutdown().await;
@@ -193,6 +213,7 @@ async fn run_inner(
     transfer: &mut TransferState,
     io_tasks: &mut JoinSet<()>,
     opens: &mut JoinSet<OpenResult>,
+    connected: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
 ) -> Result<()> {
     let mut carriers = HashMap::<Uuid, CarrierHandle>::new();
     let mut active = None;
@@ -252,6 +273,9 @@ async fn run_inner(
                         .insert(flow_id, relay_id.clone());
                     state.mark_status_changed();
                     info!(event = "carrier_selected", %flow_id, carrier_id = %winner, %relay_id, "travel selected carrier");
+                    if let Some(connected) = connected.take() {
+                        let _ = connected.send(Ok(()));
+                    }
                     recovery_started = Instant::now();
                     retry_backoff = Duration::from_millis(250);
                     let stable = previous_active == Some(winner);
@@ -379,11 +403,7 @@ fn record_flow_metric_sample(
     result: Option<&str>,
     histogram_sample: Option<u64>,
 ) {
-    let mut dimensions = BTreeMap::new();
-    dimensions.insert("home_id".to_owned(), mapping.home_id.clone());
-    dimensions.insert("service_id".to_owned(), mapping.service_id.clone());
-    dimensions.insert("protocol".to_owned(), "tcp".to_owned());
-    dimensions.insert("mapping".to_owned(), mapping.bind.clone());
+    let mut dimensions = super::travel_flow_metric_dimensions(mapping);
     if let Some(relay_id) = relay_id {
         dimensions.insert("relay_id".to_owned(), relay_id.to_owned());
     }
@@ -965,7 +985,7 @@ async fn handle_event(
 
 fn spawn_local_reader(
     tasks: &mut JoinSet<()>,
-    mut reader: OwnedReadHalf,
+    mut reader: ReadHalf<BoxStream>,
     events: mpsc::Sender<FlowEvent>,
     send_credit: Arc<Semaphore>,
 ) {
@@ -1099,7 +1119,7 @@ async fn send_to(carriers: &HashMap<Uuid, CarrierHandle>, carrier_id: Uuid, fram
 }
 
 async fn retransmit(
-    transfer: &TransferState,
+    transfer: &mut TransferState,
     carriers: &HashMap<Uuid, CarrierHandle>,
     carrier_id: Uuid,
 ) {
@@ -1211,7 +1231,7 @@ mod live_counter_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let mut peer = TcpStream::connect(listener.local_addr()?).await?;
         let (local, _) = listener.accept().await?;
-        let (_reader, writer) = local.into_split();
+        let (_reader, writer) = tokio::io::split(Box::new(local) as BoxStream);
         let upload = Arc::new(AtomicU64::new(0));
         let download = Arc::new(AtomicU64::new(0));
         let flow_id = Uuid::new_v4();

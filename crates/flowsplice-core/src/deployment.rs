@@ -582,7 +582,10 @@ impl SignedHomeEndpointCredential {
         Ok(payload)
     }
 
-    fn verify_trust_binding(&self, trust: &DeploymentTrust) -> Result<HomeEndpointCredential> {
+    pub(crate) fn verify_trust_binding(
+        &self,
+        trust: &DeploymentTrust,
+    ) -> Result<HomeEndpointCredential> {
         let payload_bytes = hex::decode(&self.payload_hex)
             .context("Home endpoint credential payload must be hexadecimal")?;
         if payload_bytes.len() > 16 * 1_024 {

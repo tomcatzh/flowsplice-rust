@@ -1,0 +1,22 @@
+[package]
+name = "flowsplice-home-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+bytes.workspace = true
+serde.workspace = true
+flowsplice-core.workspace = true
+flowsplice-storage.workspace = true
+flowsplice-transport.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

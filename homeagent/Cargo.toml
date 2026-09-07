@@ -16,6 +16,8 @@ bytes.workspace = true
 clap.workspace = true
 embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }
 flowsplice-core.workspace = true
+flowsplice-home-core.workspace = true
+flowsplice-transport.workspace = true
 flowsplice-enrollment.workspace = true
 flowsplice-storage.workspace = true
 hex.workspace = true

@@ -2,6 +2,8 @@
 /AGENTS.md
 /CLAUDE.md
 /target/
+/pty-web/node_modules/
+/pty-web/dist/
 **/web/node_modules/
 **/web/dist/
 /.env

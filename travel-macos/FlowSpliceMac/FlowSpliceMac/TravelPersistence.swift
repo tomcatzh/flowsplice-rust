@@ -109,34 +109,50 @@ enum EnrollmentStore {
     private static let relayKey = "flowsplice.macos.last-relay"
     private static let autoStartKey = "flowsplice.macos.auto-start"
 
+    #if DEBUG
+    static let uiTestSuiteName = "io.zxf.flowsplice.travel.macos.ui-tests"
+    #endif
+
+    private static var defaults: UserDefaults {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["FLOWSPLICE_UI_TESTING"] == "1" {
+            guard let suite = UserDefaults(suiteName: uiTestSuiteName) else {
+                preconditionFailure("Could not open the isolated UI-test preferences suite")
+            }
+            return suite
+        }
+        #endif
+        return UserDefaults.standard
+    }
+
     static var pending: PendingEnrollment? {
         get {
-            guard let data = UserDefaults.standard.data(forKey: pendingKey) else { return nil }
+            guard let data = defaults.data(forKey: pendingKey) else { return nil }
             return try? JSONDecoder().decode(PendingEnrollment.self, from: data)
         }
         set {
             if let newValue, let data = try? JSONEncoder().encode(newValue) {
-                UserDefaults.standard.set(data, forKey: pendingKey)
+                defaults.set(data, forKey: pendingKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: pendingKey)
+                defaults.removeObject(forKey: pendingKey)
             }
         }
     }
 
     static var lastRelay: String {
-        get { UserDefaults.standard.string(forKey: relayKey) ?? "" }
-        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: relayKey) }
+        get { defaults.string(forKey: relayKey) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: relayKey) }
     }
 
     static var autoStart: Bool {
-        get { UserDefaults.standard.object(forKey: autoStartKey) as? Bool ?? false }
-        set { UserDefaults.standard.set(newValue, forKey: autoStartKey) }
+        get { defaults.object(forKey: autoStartKey) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: autoStartKey) }
     }
 
     static func reset() {
         pending = nil
-        UserDefaults.standard.removeObject(forKey: relayKey)
-        UserDefaults.standard.removeObject(forKey: autoStartKey)
+        defaults.removeObject(forKey: relayKey)
+        defaults.removeObject(forKey: autoStartKey)
     }
 }
 
