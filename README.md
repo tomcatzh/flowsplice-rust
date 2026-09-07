@@ -10,6 +10,11 @@ plane and never binds a business-data listener.
 > configuration, protocols, persisted state, and deployment artifacts may change without backward
 > compatibility.
 
+Version 0.3.1 includes native Travel clients for Android, iOS/iPadOS, and macOS, alongside the
+command-line applications. The [public 0.3.1 release](docs/releases/0.3.1.md) contains source and
+release notes only, with no binary attachments. Native installers are built privately for each
+deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
+
 ## How it works
 
 ![How FlowSplice works](docs/flowsplice-how-it-works.en.svg)
@@ -36,12 +41,17 @@ not interchangeable failover replicas.
 | `flowsplice-relay` | Provides public management/data ingress and opaque forwarding; Linux builds use `splice(2)` for paired data sockets. |
 | `flowsplice-homeagent` | Publishes services, terminates business TLS, connects authorized Flows to local targets, and optionally hosts the local issuer/revocation UI. |
 | `flowsplice-travelagent` | Creates local mappings, verifies signed discovery state, races Relays, and originates end-to-end business TLS. |
+| Native Travel clients | Android, iOS/iPadOS, and macOS interfaces for enrollment, local mappings, and runtime status. |
+| `flowsplice-travel-core` | Provides the shared Travel runtime and application-facing enrollment, mapping, and status operations. |
+| `flowsplice-travel-android` | Connects the Android Kotlin client to Travel Core through JNI. |
+| `flowsplice-travel-apple` | Connects the Apple native clients to Travel Core through the Apple adapter. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
 | `flowsplice-core` | Implements shared framing, authorization, deployment trust, TLS identity, and route admission. |
 | `flowsplice-enrollment` | Implements remote Travel enrollment installation, Home-side issuance, encrypted-key handling, and the offline deployment-root `flowsplice-trust` utility. |
 | `flowsplice-storage` | Provides redb-backed local state, five-minute statistics buckets/outboxes, Relay history, and remote-enrollment inbox/outbox storage. |
 
-The repository is one Rust workspace. The Home and Travel frontends are TypeScript/Vite SPAs
+The Rust components form one workspace, alongside Kotlin and Swift native clients. The Home and
+CLI Travel frontends are TypeScript/Vite SPAs
 embedded into their Rust executables with
 [`embedded-spa`](https://github.com/tomcatzh/embedded-spa/tree/v0.1.1).
 
@@ -72,9 +82,11 @@ role, stable ID, SPKI, authorization scope, and protocol checks. TLS is restrict
 - A password-encrypted, offline P-256 deployment root signs a versioned deployment-trust document.
 - The document binds both CA roots, Server control-signing key epochs, every Home endpoint's
   management/business SPKIs, and Home/global Travel authorities with their scopes and validity.
-- Home and Travel executables contain no deployment root, CA, topology, identity, address, domain,
-  port, or production path. The public root and root-signed trust are separate configuration files;
-  the root private key and password are never runtime inputs.
+- Deployment-neutral Home and Travel CLI/runtime executables contain no deployment root, CA,
+  topology, identity, address, domain, port, or production path. Their public root and root-signed
+  trust are separate configuration files. Private native Travel bundles require the operator's
+  deployment public root as a resource, injected before signing; it is not compiled into the
+  neutral runtime executable. The root private key and password are never runtime inputs.
 - Home SPKIs are read from verified deployment trust; operators do not repeat them in Server or
   Travel TOML.
 - A Seed Relay is an untrusted transport address. Relay IDs and SPKIs are learned from the signed
@@ -172,11 +184,12 @@ private keys, bearer tokens, or route/work secrets.
 
 ## Travel Quick Start
 
-The public Travel package contains a deployment-neutral binary and no deployment address or trust
-material. A fresh CLI installation needs a reachable Relay management address and a deployment root
+A deployment-neutral Travel CLI package contains no deployment address or trust material. A fresh CLI installation needs a reachable Relay management address and a deployment root
 public key obtained independently from the deployment operator. It does not need a generated runtime
 TOML or client certificate directory. Private native packages include this root as a signed resource
-without an extra user verification step; see [private packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
+without an extra user verification step. Current native clients require that packaged root; no
+public native installer with an empty root is offered. Operators build private packages with their
+own deployment root and signing identities; see [private packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
 
 ```bash
 mkdir -m 700 ./my-travel
@@ -256,8 +269,9 @@ handover failures are not hidden by a new connection. See [Foobar](foobar/README
 
 The loopback Home and Travel UIs can change their encrypted private-key passwords. Home re-encrypts
 its CA/authority key group; Travel re-encrypts both device private keys. Public keys, certificates,
-grants, and active Flows do not change. Passwords are not stored in macOS Keychain or another
-password store.
+grants, and active Flows do not change. These CLI/Web flows do not store passwords in macOS
+Keychain or another password store. Native Apple clients use Keychain; Android protects the saved
+password with an Android Keystore key.
 
 Revoke a credential from the issuing Home UI. Revocation is irreversible. It blocks new authorization
 immediately and prevents a revoked Carrier from reattaching; a local TCP socket already waiting for
@@ -353,8 +367,8 @@ The script uses the lockfile and produces:
 - `dist/linux-arm64/` — static PIE, musl;
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
-`make home2-macos-package` and `make travel-macos-package` build and verify public, deployment-neutral
-macOS bundles. Each bundle contains one generic binary, a Chinese Quick Start, an
+`make home2-macos-package` and `make travel-macos-package` build and verify deployment-neutral
+macOS CLI bundles suitable for public distribution; they do not build the native desktop app. Each bundle contains one generic binary, a Chinese Quick Start, an
 deployment-neutral Quick Start, and internal SHA-256 checksums. The
 public builders accept no operator-supplied configuration input. Their package tests use a strict
 member allowlist and reject bootstrap files, deployment roots, signed deployment trust,
@@ -363,12 +377,22 @@ Operators enter the Relay address at enrollment time; no deployment material is 
 public bundle.
 
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
-contained in single executables. The release builder explicitly applies and verifies free ad-hoc
-signatures with stable `io.zxf.flowsplice.*` identifiers (using the reverse-DNS form of the
-project owner's `zxf.io` domain) and the hardened runtime. Ad-hoc signing seals
-each exact binary but carries no developer identity. Current macOS artifacts are not Developer ID
-signed or notarized, so Gatekeeper may block a quarantined download on another Mac. Public distribution should use
-[Apple Developer ID signing and notarization](https://developer.apple.com/developer-id/).
+contained in single executables. The legacy `build-release.sh` path and the CLI package helpers
+apply and verify ad-hoc signatures with stable `io.zxf.flowsplice.*` identifiers and the hardened
+runtime. Those signatures seal each exact binary but carry no developer identity; Gatekeeper may
+block a quarantined download produced by those helpers.
+
+Signed Apple distribution uses `scripts/build-apple-products.sh`, coordinated for private native
+packages by `scripts/build-private-travel-packages.sh`. It uses Developer ID signing and Apple
+notarization for the macOS app, DMG, and CLI bundle, and Apple Distribution signing for the iOS/iPadOS
+IPA. These are separate from the ad-hoc CLI helper outputs. See
+[Apple Developer ID signing and notarization](https://developer.apple.com/developer-id/) and the
+[private packaging guide](docs/PRIVATE_TRAVEL_PACKAGING.md) for the required operator inputs.
+
+Actual deployment public roots, certificates, private keys, signing configuration, and private
+installers stay outside Git and public releases. The native build injects the operator's public root
+into the app resource before signing. The public [0.3.1 release](docs/releases/0.3.1.md) publishes
+source and notes only; it has no binary attachments.
 
 ## Current limits
 
@@ -381,19 +405,22 @@ signed or notarized, so Gatekeeper may block a quarantined download on another M
 - Signed control state protects integrity and rollback, not availability or Server equivocation.
 - Unattended signing, automatic certificate renewal, CRL/OCSP, HSM-backed keys, cross-process Flow
   recovery, authenticated automatic updates, and GA compatibility guarantees are not implemented.
-- Current release artifacts provide only ad-hoc macOS signing, not Developer ID notarization, update anti-rollback,
-  reproducible-build attestation, or published release hashes.
+- Update anti-rollback and reproducible-build attestation are not implemented. Local package
+  checksums do not provide either guarantee.
 - The project has not undergone a professional third-party security audit and should not be treated
   as a certified security product.
 
 ## Repository layout
 
 ```text
-crates/       shared core, enrollment, and redb storage crates
+crates/       shared core, Travel Core, JNI/Apple adapters, enrollment, and redb storage crates
 server/       Server application
 relay/        Relay application
 homeagent/    Home Agent and issuer UI
-travelagent/  Travel Agent and local UI
+travelagent/  CLI Travel Agent and local Web UI
+travel-android/ Android native Travel client
+travel-apple/ iOS/iPadOS native Travel client
+travel-macos/ macOS native Travel client
 foobar/       continuity target and probe
 openwrt/      UCI, procd, LuCI, and IPK sources
 tests/        fixtures and Docker E2E suite
