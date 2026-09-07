@@ -692,7 +692,7 @@ async fn bind_listener(address: &str, device: Option<&str>, backlog: i32) -> Res
         socket.listen(backlog)?;
         socket.set_nonblocking(true)?;
         let listener: std::net::TcpListener = socket.into();
-        return TcpListener::from_std(listener).context("failed to create Tokio listener");
+        TcpListener::from_std(listener).context("failed to create Tokio listener")
     }
 
     #[cfg(not(target_os = "linux"))]
