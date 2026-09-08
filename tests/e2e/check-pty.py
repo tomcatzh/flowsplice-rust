@@ -23,6 +23,42 @@ def execute(run, business_home, alpha, root, scope):
         "request_id": pending["request_id"], "scope": scope, "valid_days": 365, "password": run.password,
     })
     require("business-enrollment-installed" in run.finish(enrollment), "second PTY enrollment incomplete")
+    secondary_setup = run.start("secondary-setup", "flowsplice-homeagent", [
+        "init", "--server", run.server, "--bootstrap-config", "/config/home-bootstrap.toml",
+        "--business-services", "/business/services.json", "--install-dir", "/business/home-secondary",
+    ], setup=True)
+    secondary_home = run.directory / "home-secondary"
+    wait(lambda: (secondary_home / "home-bootstrap.json").exists(), "secondary Home bootstrap")
+    secondary_id = json.loads((secondary_home / "home-bootstrap.json").read_text())["home_id"]
+    require(secondary_id != scope["home_id"], "secondary Home identity was reused")
+    pending = run.pending("/api/home-enrollment/pending", "home_id", secondary_id)
+    wait(lambda: pending["verification_code"] in run.logs(secondary_setup), "secondary Home verification code")
+    issuer.request(19084, "POST", "/api/home-enrollment/approve", {
+        "request_id": pending["request_id"], "profile": "serving_only", "valid_days": 365,
+        "services": ["svc-alpha"], "password": run.password,
+    })
+    run.finish(secondary_setup)
+    secondary_descriptor = "/business/home-secondary/business-" + b"svc-alpha".hex() + ".json"
+    secondary_scope = dict(scope, home_id=secondary_id)
+    secondary_travel = "pty-other-home-" + run.token
+    enrollment = run.start("secondary-travel-enroll", "flowsplice-business-probe", [
+        "enroll", run.relay, secondary_descriptor, root, "/business/pty-other-home",
+        "/business/password.txt", secondary_travel,
+    ])
+    pending = run.pending("/api/enrollment/pending", "travel_id", secondary_travel)
+    wait(lambda: pending["verification_code"] in run.logs(enrollment), "secondary Travel verification code")
+    issuer.request(19084, "POST", "/api/enrollment/approve", {
+        "request_id": pending["request_id"], "scope": secondary_scope, "valid_days": 365, "password": run.password,
+    })
+    require("business-enrollment-installed" in run.finish(enrollment), "secondary PTY enrollment incomplete")
+    (run.directory / "pty-home-secondary.toml").write_text('\n'.join([
+        'home_runtime = "/business/home-secondary/home-runtime.toml"', '[[domains]]',
+        'service_id = "svc-alpha"', '[domains.tmux]', 'binary = "/usr/bin/tmux"',
+        'socket = "/tmp/fs-pty/alpha/tmux.sock"', 'shell = "/bin/sh"', 'working_directory = "/business"',
+    ]) + '\n')
+    secondary_container = run.start("secondary-pty-home", "/bin/sh", ["-c", "trap 'exit 0' TERM INT; while :; do sleep 1; done"])
+    command(["docker", "exec", "-d", secondary_container, "/bin/sh", "-c",
+             "exec /usr/local/bin/flowsplice-pty-home --config /business/pty-home-secondary.toml >> /business/pty-home-secondary.log 2>&1"])
     command(["docker", "stop", business_home])
     config = ['home_runtime = "/business/home/home-runtime.toml"']
     for name in ("alpha", "beta"):
@@ -51,6 +87,8 @@ def execute(run, business_home, alpha, root, scope):
     base = ["/business/travel/travelagent.toml", "/business/password.txt", root, alpha]
     try:
         probe("pty-exercise", ["exercise", base[0], "/business/pty-second/travelagent.toml", *base[1:]])
+        probe("pty-multi-home", ["multi-home", base[0], "/business/pty-other-home/travelagent.toml", *base[1:], secondary_descriptor])
+        run.passed.append("pty-concurrent-distinct-homes")
         probe("pty-seed", ["seed", *base, "/business/pty-session.json"])
         home_stop("TERM")
         home_start()
@@ -70,7 +108,13 @@ def execute(run, business_home, alpha, root, scope):
             for source, name in [(root, "deployment-root.pub"), (alpha, "business.json"), ("/business/password.txt", "password.txt")]:
                 shutil.copyfile(run.directory / source.removeprefix("/business/"), destination / name)
                 (destination / name).chmod(0o600)
-            (destination / "fixture.json").write_text(json.dumps({"project":run.project,"image":run.image,"pty_home_container":container,"scope":scope,"business_directory":str(run.directory),"issuer_port":19084}))
+            homes = {"version": 1, "homes": [
+                {"id": "default", "name": "测试 Mac", "platform": "macos", "relay": "", "descriptor": json.loads((destination / "business.json").read_text())},
+                {"id": "secondary", "name": "测试 VPS", "platform": "linux", "relay": "", "descriptor": json.loads((run.directory / secondary_descriptor.removeprefix("/business/")).read_text())},
+            ]}
+            (destination / "homes.json").write_text(json.dumps(homes, ensure_ascii=False))
+            (destination / "homes.json").chmod(0o600)
+            (destination / "fixture.json").write_text(json.dumps({"project":run.project,"image":run.image,"pty_home_container":container,"secondary_pty_home_container":secondary_container,"secondary_scope":secondary_scope,"scope":scope,"business_directory":str(run.directory),"issuer_port":19084}))
             print(json.dumps({"checkpoint":"pty-native-fixture-ready","directory":str(destination)}), flush=True)
             deadline = time.monotonic() + 7200
             while not (destination / "native-complete.json").exists():
@@ -112,8 +156,9 @@ def execute(run, business_home, alpha, root, scope):
         run.passed += ["encrypted-pty-operations", "pty-home-graceful-restart", "pty-home-crash-restart", "pty-tmux-natural-state"]
         print(json.dumps({"checkpoint":"encrypted-pty-e2e-complete","logs":str(run.evidence)}))
     finally:
-        log = run.directory / "pty-home.log"
-        if log.exists():
-            destination = run.evidence / "pty-home.log"
-            destination.write_text(log.read_text().replace(run.password,"[REDACTED PASSWORD]"))
-            destination.chmod(0o600)
+        for name in ("pty-home.log", "pty-home-secondary.log"):
+            log = run.directory / name
+            if log.exists():
+                destination = run.evidence / name
+                destination.write_text(log.read_text().replace(run.password,"[REDACTED PASSWORD]"))
+                destination.chmod(0o600)

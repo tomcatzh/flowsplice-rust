@@ -465,3 +465,59 @@ async fn idle_expiry_and_guard_drop_remove_attachment_without_ending_session() -
     .await
     .context("idle lifetime test timed out")?
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_survives_reconstruction_and_counts_attachments() -> Result<()> {
+    let fixture = DomainFixture::new().await?;
+    let session = fixture.session().await?;
+    let name = " 部署 $(touch injected); ' | #{session_name} 😀 ";
+    fixture.tmux.set_display_name(session.id, name).await?;
+    let (saved, last) = fixture.tmux.metadata(session.id).await?;
+    assert_eq!(saved, name.trim());
+    assert_eq!(last, None);
+    assert!(!fixture.directory.path().join("injected").exists());
+    let session = SessionState::with_metadata(
+        session.id,
+        session.snapshot()?.created_at_unix_secs,
+        saved,
+        last,
+        Arc::clone(&fixture.tmux),
+    );
+    assert_eq!(session.details()?.connection_count, 0);
+    let (first, _events, _guard) = connection("first", unix_time_secs()? + 60);
+    let (a, _, _) = attached(session.attach(&first, Mode::ReadWrite, 80, 24).await?)?;
+    let first_time = session
+        .details()?
+        .last_connected_at_unix_secs
+        .context("missing connect time")?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (second, _events2, _guard2) = connection("second", unix_time_secs()? + 60);
+    let (b, _, _) = attached(session.attach(&second, Mode::ReadOnly, 80, 24).await?)?;
+    let details = session.details()?;
+    assert_eq!(details.connection_count, 2);
+    assert!(
+        details
+            .last_connected_at_unix_secs
+            .context("missing latest connect time")?
+            > first_time
+    );
+    session.detach(first.id, a)?;
+    assert_eq!(session.details()?.connection_count, 1);
+    session.detach(second.id, b)?;
+    assert_eq!(session.details()?.connection_count, 0);
+    let (name, last) = fixture.tmux.metadata(session.id).await?;
+    let recovered = SessionState::with_metadata(
+        session.id,
+        details.created_at_unix_secs,
+        name,
+        last,
+        Arc::clone(&fixture.tmux),
+    );
+    assert_eq!(recovered.details()?.name, details.name);
+    assert_eq!(
+        recovered.details()?.last_connected_at_unix_secs,
+        details.last_connected_at_unix_secs
+    );
+    assert_eq!(recovered.details()?.connection_count, 0);
+    Ok(())
+}

@@ -38,16 +38,33 @@ struct Domain {
 impl Domain {
     async fn refresh(&self) -> Result<Vec<flowsplice_pty_protocol::Session>> {
         let active = self.tmux.list().await?;
+        let missing = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session registry poisoned"))?;
+            active
+                .iter()
+                .filter(|(id, _)| !sessions.contains_key(id))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let mut discovered = Vec::new();
+        for (id, created) in missing {
+            let (name, last) = self.tmux.metadata(id).await?;
+            discovered.push((
+                id,
+                SessionState::with_metadata(id, created, name, last, Arc::clone(&self.tmux)),
+            ));
+        }
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow!("session registry poisoned"))?;
         // Session existence follows tmux. Never recreate an absent session automatically.
         sessions.retain(|id, _| active.iter().any(|(active, _)| active == id));
-        for (id, created) in active {
-            sessions
-                .entry(id)
-                .or_insert_with(|| SessionState::new(id, created, Arc::clone(&self.tmux)));
+        for (id, session) in discovered {
+            sessions.entry(id).or_insert(session);
         }
         sessions.values().map(|s| s.snapshot()).collect()
     }
@@ -79,6 +96,38 @@ impl Domain {
             }
         }
     }
+    async fn new_session(
+        &self,
+        connection: &Connection,
+        name: Option<&str>,
+        columns: u16,
+        rows: u16,
+    ) -> Result<Reply> {
+        if !connection.can_write {
+            bail!("creating a session requires write permission");
+        }
+        let _control = self.control.lock().await;
+        if self.refresh().await?.len() >= 128 {
+            bail!("session limit reached");
+        }
+        if !connection.active() {
+            bail!("business connection ended");
+        }
+        let id = Uuid::new_v4();
+        self.tmux.new_session(id, columns, rows).await?;
+        if let Some(name) = name {
+            self.tmux.set_display_name(id, name).await?;
+        }
+        self.refresh().await?;
+        self.session(id)?
+            .attach(
+                connection,
+                flowsplice_pty_protocol::Mode::ReadWrite,
+                columns,
+                rows,
+            )
+            .await
+    }
     async fn operation(&self, connection: &Connection, operation: Operation) -> Result<Reply> {
         if !connection.active() {
             bail!("business connection ended");
@@ -90,27 +139,28 @@ impl Domain {
                     sessions: self.refresh().await?,
                 })
             }
-            Operation::New { columns, rows } => {
-                if !connection.can_write {
-                    bail!("creating a session requires write permission");
-                }
+            Operation::ListDetails => {
                 let _control = self.control.lock().await;
-                if self.refresh().await?.len() >= 128 {
-                    bail!("session limit reached");
-                }
-                if !connection.active() {
-                    bail!("business connection ended");
-                }
-                let id = Uuid::new_v4();
-                self.tmux.new_session(id, columns, rows).await?;
                 self.refresh().await?;
-                self.session(id)?
-                    .attach(
-                        connection,
-                        flowsplice_pty_protocol::Mode::ReadWrite,
-                        columns,
-                        rows,
-                    )
+                let sessions = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow!("session registry poisoned"))?
+                    .values()
+                    .map(|session| session.details())
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Reply::SessionDetails { sessions })
+            }
+            Operation::New { columns, rows } => {
+                self.new_session(connection, None, columns, rows).await
+            }
+            Operation::NewNamed {
+                name,
+                columns,
+                rows,
+            } => {
+                flowsplice_pty_protocol::validate_session_name(&name)?;
+                self.new_session(connection, Some(&name), columns, rows)
                     .await
             }
             Operation::Join {
@@ -400,4 +450,113 @@ async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Res
         Ok::<(), anyhow::Error>(())
     };
     tokio::select! { biased; () = connection.ended() => Ok(()), result = requests => result, result = responses => result }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use flowsplice_core::authorization::unix_time_secs;
+    use flowsplice_transport::ServiceLifetime;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn named_creation_rejects_invalid_name_before_shell_and_registry_recovers() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let binary = if cfg!(target_os = "macos") {
+            "/opt/homebrew/bin/tmux"
+        } else {
+            "/usr/bin/tmux"
+        };
+        let socket = directory.path().join("domain/tmux.sock");
+        let config = TmuxConfig {
+            binary: binary.into(),
+            socket: socket.clone(),
+            shell: "/bin/sh".into(),
+            working_directory: directory.path().into(),
+        };
+        let tmux = Arc::new(Tmux::open(config.clone()).await?);
+        let domain = |tmux| Domain {
+            tmux,
+            sessions: Mutex::new(BTreeMap::new()),
+            control: tokio::sync::Mutex::new(()),
+            can_write: AtomicBool::new(true),
+        };
+        let backend = domain(Arc::clone(&tmux));
+        let (lifetime, _guard) = ServiceLifetime::new(unix_time_secs()? + 60);
+        let (events, _receiver) = mpsc::channel(64);
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            travel_id: "metadata-test".into(),
+            label: "test".into(),
+            lifetime,
+            events,
+            stop: watch::channel(false).0,
+            can_write: true,
+        };
+        assert!(
+            backend
+                .operation(
+                    &connection,
+                    Operation::NewNamed {
+                        name: " \n ".into(),
+                        columns: 80,
+                        rows: 24
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(tmux.list().await?.is_empty());
+        let reply = backend
+            .operation(
+                &connection,
+                Operation::NewNamed {
+                    name: "  中文 $(touch nope); 😀  ".into(),
+                    columns: 80,
+                    rows: 24,
+                },
+            )
+            .await?;
+        let Reply::Attached {
+            attachment_id,
+            session,
+            ..
+        } = reply
+        else {
+            bail!("missing attachment");
+        };
+        backend
+            .operation(&connection, Operation::Detach { attachment_id })
+            .await?;
+        let Reply::SessionDetails { sessions } = backend
+            .operation(&connection, Operation::ListDetails)
+            .await?
+        else {
+            bail!("missing details");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "中文 $(touch nope); 😀");
+        assert_eq!(sessions[0].connection_count, 0);
+        assert!(sessions[0].last_connected_at_unix_secs.is_some());
+        assert!(!directory.path().join("nope").exists());
+        connection.stop.send_replace(true);
+        drop(backend);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while Arc::strong_count(&tmux) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(tmux);
+        let recovered = domain(Arc::new(Tmux::open(config).await?));
+        assert_eq!(recovered.refresh().await?[0].id, session.id);
+        assert_eq!(recovered.session(session.id)?.details()?, sessions[0]);
+        let _ = tokio::process::Command::new(binary)
+            .arg("-S")
+            .arg(socket)
+            .arg("kill-server")
+            .output()
+            .await?;
+        Ok(())
+    }
 }

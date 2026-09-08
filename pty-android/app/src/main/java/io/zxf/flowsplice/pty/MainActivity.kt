@@ -2,6 +2,8 @@ package io.zxf.flowsplice.pty
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Build
+import android.provider.Settings
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
@@ -11,17 +13,18 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.TextView
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.ByteArrayInputStream
 import java.util.UUID
 
 class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var web: WebView? = null
-    private var handle = 0L
+    private data class Home(val id: String, val info: JSONObject, var handle: Long = 0L, var error: String? = null, var pendingPassword: String? = null)
+    private val homes = linkedMapOf<String, Home>()
     private var foreground = false
     private var ready = false
     private var rendering = false
-    private var pendingPassword: String? = null
     private val origin = "https://appassets.androidplatform.net"
     private val page get() = "$origin/assets/pty/index.html"
 
@@ -29,20 +32,32 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         try {
             val root = assets.open("bootstrap/deployment-root.pub").bufferedReader().use { it.readText() }.trim()
-            val descriptor = JSONObject(assets.open("bootstrap/business.json").bufferedReader().use { it.readText() })
+            val entries = if (assets.list("bootstrap").orEmpty().contains("homes.json")) {
+                parseHomes(JSONObject(assets.open("bootstrap/homes.json").bufferedReader().use { it.readText() }))
+            } else listOf(JSONObject().put("id", "default").put("name", "我的 Mac").put("platform", "macos")
+                .put("descriptor", JSONObject(assets.open("bootstrap/business.json").bufferedReader().use { it.readText() })))
             assets.open("pty/index.html").close()
-            val prefs = getSharedPreferences("pty-identity", MODE_PRIVATE)
-            val id = prefs.getString("travel-id", null) ?: UUID.randomUUID().toString().also {
-                check(prefs.edit().putString("travel-id", it).commit())
+            for (entry in entries) {
+                val id = entry.getString("id")
+                val home = Home(id, JSONObject().put("id", id).put("name", entry.getString("name"))
+                    .put("platform", entry.getString("platform")).put("relay", entry.optString("relay")))
+                homes[id] = home
+                try {
+                    val prefs = getSharedPreferences(if (id == "default") "pty-identity" else "pty-identity-home-$id", MODE_PRIVATE)
+                    val identity = prefs.getString("travel-id", null) ?: UUID.randomUUID().toString().also {
+                        check(prefs.edit().putString("travel-id", it).commit())
+                    }
+                    val directory = if (id == "default") filesDir.resolve("installation") else filesDir.resolve("installation/homes/$id")
+                    val options = JSONObject().put("install_dir", directory.absolutePath).put("root_public_key", root)
+                        .put("descriptor", entry.getJSONObject("descriptor")).put("travel_id", identity).put("label", deviceLabel(runCatching { Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) }.getOrNull(), Build.MODEL))
+                    val opened = JSONObject(NativePty.open(options.toString()))
+                    check(opened.optBoolean("ok"))
+                    home.handle = opened.getJSONObject("data").getLong("handle")
+                } catch (_: Exception) { home.error = "此 Home 的私有配置无法初始化" }
             }
-            val options = JSONObject().put("install_dir", filesDir.resolve("installation").absolutePath)
-                .put("root_public_key", root).put("descriptor", descriptor).put("travel_id", id).put("label", "Android")
-            val opened = JSONObject(NativePty.open(options.toString()))
-            check(opened.optBoolean("ok")) { opened.optString("error", "本机初始化失败") }
-            handle = opened.getJSONObject("data").getLong("handle")
             createWebView()
         } catch (_: Throwable) {
-            if (handle != 0L) { NativePty.close(handle); handle = 0L }
+            homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }; homes.clear()
             setContentView(TextView(this).apply { text = "FlowSplice PTY 尚未配置。请安装包含私有部署信任、业务描述和终端资源的安装包。"; setPadding(24, 48, 24, 24) })
         }
     }
@@ -66,7 +81,7 @@ class MainActivity : Activity() {
         view.addJavascriptInterface(object {
             @JavascriptInterface fun rendered() { handler.post { if (view.url == page) rendering = false } }
             @JavascriptInterface fun send(json: String) {
-                handler.post { if (foreground && ready && view.url == page) action(json) }
+                handler.post { if (foreground && view.url == page) action(json) }
             }
         }, "FlowSpliceNative")
         view.webViewClient = object : WebViewClient() {
@@ -82,8 +97,7 @@ class MainActivity : Activity() {
                 } catch (_: Exception) { blocked() }
             }
             override fun onPageFinished(view: WebView, url: String) {
-                ready = url == page
-                if (ready && foreground) { handler.removeCallbacks(poll); handler.post(poll) }
+                if (url != page) ready = false
             }
         }
         view.setDownloadListener { _, _, _, _, _ -> }
@@ -96,54 +110,123 @@ class MainActivity : Activity() {
         web?.evaluateJavascript("window.flowsplice.receive(JSON.parse(${JSONObject.quote(event.toString())}));", null)
     }
     private fun action(json: String) {
+        if (json.toByteArray(Charsets.UTF_8).size > 128 * 1024) return
+        var home: Home? = null
         try {
             val action = JSONObject(json)
-            if (action.optString("op") in listOf("enroll", "connect")) {
-                val password = action.optString("password").ifEmpty { PasswordStore.load(this).orEmpty() }
-                action.put("password", password)
-                if (action.optString("op") == "enroll") pendingPassword = password
+            if (action.optString("op") == "ready" && action.length() == 1) {
+                ready = true
+                dispatch(JSONObject().put("type", "homes").put("platform", "android").put("homes", JSONArray(homes.values.map { it.info })))
+                homes.values.forEach { h -> h.error?.let { dispatch(JSONObject().put("type", "error").put("home_id", h.id).put("message", it)) } }
+                handler.removeCallbacks(poll); handler.post(poll)
+                return
             }
-            val result = JSONObject(NativePty.send(handle, action.toString()))
-            if (!result.optBoolean("ok")) { pendingPassword = null; dispatch(JSONObject().put("type", "error").put("message", result.optString("error"))) }
-        } catch (_: Exception) { pendingPassword = null; dispatch(JSONObject().put("type", "error").put("message", "本机操作失败")) }
+            if (!ready) return
+            home = homes[action.optString("home_id")] ?: return
+            if (home.handle == 0L) return
+            action.remove("home_id")
+            if (action.optString("op") in listOf("enroll", "connect")) {
+                val supplied = action.optString("password")
+                val password = supplied.ifEmpty { PasswordStore.load(this, home.id).orEmpty() }
+                if (password.isEmpty()) {
+                    dispatch(JSONObject().put("type", "error").put("home_id", home.id).put("code", "credential_required").put("message", "此 Home 缺少已保存的私钥密码，请输入密码。")); return
+                }
+                action.put("password", password)
+                if (action.optString("op") == "enroll") PasswordStore.save(this, password, home.id)
+                else if (supplied.isNotEmpty()) home.pendingPassword = supplied
+            }
+            val result = JSONObject(NativePty.send(home.handle, action.toString()))
+            if (!result.optBoolean("ok")) {
+                home.pendingPassword = null
+                dispatch(JSONObject().put("type", "error").put("home_id", home.id).put("message", result.optString("error")))
+            }
+            if (action.optString("op") == "disconnect") home.pendingPassword = null
+        } catch (_: Exception) {
+            home?.pendingPassword = null
+            dispatch(JSONObject().put("type", "error").put("home_id", home?.id ?: JSONObject.NULL).put("message", "本机操作失败"))
+        }
     }
     private val poll = object : Runnable {
         override fun run() {
-            if (!foreground || !ready || handle == 0L) return
+            if (!foreground || !ready) return
             if (rendering) { handler.postDelayed(this, 25); return }
-            try {
-                val result = JSONObject(NativePty.poll(handle))
-                if (result.optBoolean("ok")) {
+            val batch = JSONArray()
+            // Eight native queues, each bounded at 128 events; one awaited JS batch.
+            for (home in homes.values.filter { it.handle != 0L }) {
+                try {
+                    val result = JSONObject(NativePty.poll(home.handle))
+                    check(result.optBoolean("ok"))
                     val events = result.getJSONArray("data")
                     for (index in 0 until events.length()) {
                         val event = events.getJSONObject(index)
-                        if (event.optString("type") == "progress" && event.optJSONObject("progress")?.optString("phase") == "installed") {
-                            pendingPassword?.let { PasswordStore.save(this@MainActivity, it) }; pendingPassword = null
+                        if (event.optString("type") == "state" && event.optBoolean("connected")) {
+                            home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id) }; home.pendingPassword = null
                         }
-                        if (event.optString("type") == "error") pendingPassword = null
+                        if (event.optString("type") == "error") home.pendingPassword = null
+                        batch.put(event.put("home_id", home.id))
                     }
-                    if (events.length() > 0) {
-                        rendering = true
-                        web?.evaluateJavascript("window.flowsplice.receiveBatch(JSON.parse(${JSONObject.quote(events.toString())})).finally(() => window.FlowSpliceNative.rendered());", null)
-                    }
-                } else dispatch(JSONObject().put("type", "error").put("message", result.optString("error")))
-            } catch (_: Exception) { dispatch(JSONObject().put("type", "error").put("message", "本机事件读取失败")) }
+                } catch (_: Exception) {
+                    home.pendingPassword = null
+                    batch.put(JSONObject().put("type", "error").put("home_id", home.id).put("message", "本机事件读取失败"))
+                }
+            }
+            if (batch.length() > 0) {
+                rendering = true
+                web?.evaluateJavascript("window.flowsplice.receiveBatch(JSON.parse(${JSONObject.quote(batch.toString())})).finally(() => window.FlowSpliceNative.rendered());", null)
+            }
             handler.postDelayed(this, 25)
+        }
+    }
+    companion object {
+        internal fun deviceLabel(name: String?, model: String?): String {
+            fun clean(value: String?): String = buildString {
+                value.orEmpty().codePoints().forEach { point ->
+                    if (!Character.isISOControl(point) && point !in 0x202A..0x202E && point !in 0x2066..0x2069) appendCodePoint(point)
+                }
+            }.trim()
+            val base = clean(name).ifEmpty { clean(model).ifEmpty { "Android" } }
+            val suffix = " · PTY"
+            val result = StringBuilder()
+            var bytes = 0
+            for (point in base.codePoints().toArray()) {
+                val part = String(Character.toChars(point))
+                val size = part.toByteArray(Charsets.UTF_8).size
+                if (bytes + size + suffix.toByteArray(Charsets.UTF_8).size > 64) break
+                result.append(part); bytes += size
+            }
+            return result.toString().trimEnd() + suffix
+        }
+
+        internal fun parseHomes(catalog: JSONObject): List<JSONObject> {
+            require(catalog.get("version") == 1)
+            val array = catalog.getJSONArray("homes")
+            require(array.length() in 1..8)
+            val ids = mutableSetOf<String>()
+            return (0 until array.length()).map { index ->
+                array.getJSONObject(index).also {
+                    val id = it.getString("id")
+                    val name = it.getString("name")
+                    require(Regex("[a-z0-9][a-z0-9_-]{0,47}").matches(id) && ids.add(id))
+                    require(name.isNotBlank() && name.toByteArray(Charsets.UTF_8).size <= 128 && name.none { c -> Character.isISOControl(c) })
+                    require(it.getString("platform") in listOf("linux", "macos"))
+                    require(!it.has("relay") || it.get("relay") is String)
+                    require(it.optString("relay").toByteArray(Charsets.UTF_8).size <= 512)
+                    it.getJSONObject("descriptor")
+                }
+            }
         }
     }
     override fun onResume() { super.onResume(); foreground = true; if (ready) handler.post(poll) }
     override fun onStop() {
         foreground = false
-        if (handle != 0L) NativePty.send(handle, "{\"op\":\"disconnect\"}")
+        homes.values.forEach { if (it.handle != 0L) NativePty.send(it.handle, "{\"op\":\"disconnect\"}"); it.pendingPassword = null }
         handler.removeCallbacks(poll)
-        pendingPassword = null
         super.onStop()
     }
     override fun onDestroy() {
         foreground = false; ready = false; handler.removeCallbacks(poll)
-        if (handle != 0L) { NativePty.close(handle); handle = 0L }
+        homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }; homes.clear()
         web?.removeJavascriptInterface("FlowSpliceNative"); web?.destroy(); web = null
-        pendingPassword = null
         super.onDestroy()
     }
 }

@@ -217,6 +217,84 @@ impl Tmux {
         }
         Ok(())
     }
+    pub async fn set_display_name(&self, id: Uuid, name: &str) -> Result<()> {
+        flowsplice_pty_protocol::validate_session_name(name)?;
+        let mut encoded = String::with_capacity(name.len() * 2);
+        for byte in name.trim().as_bytes() {
+            use std::fmt::Write;
+            write!(&mut encoded, "{byte:02x}")?;
+        }
+        self.set_metadata(id, "@flowsplice-name-hex", encoded).await
+    }
+    pub async fn set_last_connected(&self, id: Uuid, timestamp: u64) -> Result<()> {
+        self.set_metadata(id, "@flowsplice-last-connected", timestamp.to_string())
+            .await
+    }
+    async fn set_metadata(&self, id: Uuid, option: &str, value: String) -> Result<()> {
+        let output = self
+            .execute(&[
+                "set-option".into(),
+                "-t".into(),
+                Self::name(id),
+                option.into(),
+                value,
+            ])
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "could not persist tmux session metadata: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+    pub async fn metadata(&self, id: Uuid) -> Result<(String, Option<u64>)> {
+        let output = self
+            .execute(&[
+                "display-message".into(),
+                "-p".into(),
+                "-t".into(),
+                Self::name(id),
+                "#{@flowsplice-name-hex}|#{@flowsplice-last-connected}".into(),
+            ])
+            .await?;
+        if !output.status.success() {
+            bail!("could not read tmux session metadata");
+        }
+        let text = String::from_utf8(output.stdout)?;
+        let (encoded, last) = text
+            .trim_end()
+            .split_once('|')
+            .context("invalid tmux session metadata")?;
+        let name = if encoded.is_empty() {
+            Self::fallback_name(id)
+        } else {
+            if encoded.len() > 512
+                || encoded.len() % 2 != 0
+                || !encoded.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("invalid tmux session name encoding");
+            }
+            let bytes = (0..encoded.len())
+                .step_by(2)
+                .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16))
+                .collect::<Result<Vec<_>, _>>()?;
+            let name = String::from_utf8(bytes)?;
+            flowsplice_pty_protocol::validate_session_name(&name)?;
+            name
+        };
+        Ok((
+            name,
+            if last.is_empty() {
+                None
+            } else {
+                Some(last.parse()?)
+            },
+        ))
+    }
+    pub fn fallback_name(id: Uuid) -> String {
+        format!("终端 {}", &id.to_string()[..8])
+    }
     pub fn attach_command(&self, id: Uuid) -> CommandBuilder {
         let mut command = CommandBuilder::new(&self.config.binary);
         // All supported terminal clients speak UTF-8, regardless of Home's locale.

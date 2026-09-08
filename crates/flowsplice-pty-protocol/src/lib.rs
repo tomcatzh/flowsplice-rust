@@ -24,6 +24,32 @@ pub struct Session {
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SessionDetails {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at_unix_secs: u64,
+    pub last_connected_at_unix_secs: Option<u64>,
+    pub connection_count: u32,
+    pub writer: Option<Writer>,
+}
+
+/// Validate a user-facing session name before creating a shell.
+///
+/// # Errors
+/// Rejects blank, oversized or control-containing names.
+pub fn validate_session_name(value: &str) -> Result<()> {
+    if value.trim().is_empty()
+        || value.len() > 256
+        || value.chars().count() > 64
+        || value.chars().any(char::is_control)
+    {
+        bail!("session name must contain 1 to 64 characters without controls");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Writer {
     pub attachment_id: Uuid,
     pub travel_id: String,
@@ -46,6 +72,12 @@ pub enum ClientMessage {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     List,
+    ListDetails,
+    NewNamed {
+        name: String,
+        columns: u16,
+        rows: u16,
+    },
     New {
         columns: u16,
         rows: u16,
@@ -110,6 +142,9 @@ pub enum Reply {
     Sessions {
         sessions: Vec<Session>,
     },
+    SessionDetails {
+        sessions: Vec<SessionDetails>,
+    },
     Attached {
         session: Session,
         attachment_id: Uuid,
@@ -137,6 +172,12 @@ pub enum Reply {
 )]
 enum OperationWire {
     List,
+    ListDetails,
+    NewNamed {
+        name: String,
+        columns: u16,
+        rows: u16,
+    },
     New {
         columns: u16,
         rows: u16,
@@ -173,8 +214,10 @@ impl<'de> Deserialize<'de> for Operation {
     ) -> std::result::Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
         // Serde's internally tagged unit variants otherwise ignore additional fields.
-        if value.get("op").and_then(serde_json::Value::as_str) == Some("list")
-            && value.as_object().is_some_and(|object| object.len() != 1)
+        if matches!(
+            value.get("op").and_then(serde_json::Value::as_str),
+            Some("list" | "list_details")
+        ) && value.as_object().is_some_and(|object| object.len() != 1)
         {
             return Err(serde::de::Error::custom("unknown field in unit variant"));
         }
@@ -192,6 +235,9 @@ impl<'de> Deserialize<'de> for Operation {
 enum ReplyWire {
     Sessions {
         sessions: Vec<Session>,
+    },
+    SessionDetails {
+        sessions: Vec<SessionDetails>,
     },
     Attached {
         session: Session,
@@ -284,7 +330,15 @@ impl Session {
 impl Operation {
     fn validate(&self) -> Result<()> {
         match self {
-            Self::List => Ok(()),
+            Self::List | Self::ListDetails => Ok(()),
+            Self::NewNamed {
+                name,
+                columns,
+                rows,
+            } => {
+                validate_session_name(name)?;
+                dimensions(*columns, *rows)
+            }
             Self::New { columns, rows } => dimensions(*columns, *rows),
             Self::Join {
                 session_id,
@@ -357,6 +411,22 @@ impl ClientMessage {
 impl Reply {
     fn validate(&self) -> Result<()> {
         match self {
+            Self::SessionDetails { sessions } => {
+                if sessions.len() > 128 {
+                    bail!("too many sessions");
+                }
+                for session in sessions {
+                    identifier(session.id)?;
+                    validate_session_name(&session.name)?;
+                    if session.connection_count > 32 {
+                        bail!("too many connections");
+                    }
+                    if let Some(writer) = &session.writer {
+                        writer.validate()?;
+                    }
+                }
+                Ok(())
+            }
             Self::Sessions { sessions } => {
                 if sessions.len() > 128 {
                     bail!("too many sessions");
@@ -719,6 +789,69 @@ mod tests {
             .validate()
             .is_err()
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wire_shapes_stay_exact() -> Result<()> {
+        let id = Uuid::parse_str("11111111-1111-4111-8111-111111111111")?;
+        assert_eq!(serde_json::to_string(&Operation::List)?, r#"{"op":"list"}"#);
+        assert_eq!(
+            serde_json::to_string(&Operation::New {
+                columns: 80,
+                rows: 24
+            })?,
+            r#"{"op":"new","columns":80,"rows":24}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Reply::Sessions {
+                sessions: vec![Session {
+                    id,
+                    created_at_unix_secs: 1,
+                    writer: None
+                }]
+            })?,
+            r#"{"status":"sessions","sessions":[{"id":"11111111-1111-4111-8111-111111111111","created_at_unix_secs":1,"writer":null}]}"#
+        );
+        Ok(())
+    }
+    #[test]
+    fn named_operations_validate_unicode_and_strict_fields() -> Result<()> {
+        for name in ["部署 $(touch nope); ' | #{x}", &"😀".repeat(64)] {
+            validate_session_name(name)?;
+        }
+        for name in ["", "   ", "x\ny", "x\0y", &"😀".repeat(65)] {
+            assert!(validate_session_name(name).is_err());
+        }
+        for wire in [
+            r#"{"op":"list_details","extra":1}"#,
+            r#"{"op":"new_named","name":"a","columns":80,"rows":24,"extra":1}"#,
+        ] {
+            assert!(serde_json::from_str::<Operation>(wire).is_err());
+        }
+        let operation: Operation =
+            serde_json::from_str(r#"{"op":"new_named","name":"部署","columns":80,"rows":24}"#)?;
+        operation.validate()?;
+        let reply = Reply::SessionDetails {
+            sessions: vec![SessionDetails {
+                id: Uuid::new_v4(),
+                name: "部署".into(),
+                created_at_unix_secs: 1,
+                last_connected_at_unix_secs: None,
+                connection_count: 0,
+                writer: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::from_str::<Reply>(&serde_json::to_string(&reply)?)?,
+            reply
+        );
+        reply.validate()?;
         Ok(())
     }
 }

@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use flowsplice_enrollment::load_json;
 use flowsplice_pty_client::{ConnectOptions, PtyClient};
-use flowsplice_pty_protocol::{Mode, Operation, Reply, ServerMessage, Session};
+use flowsplice_pty_protocol::{Mode, Operation, Reply, ServerMessage, Session, SessionDetails};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -139,6 +139,22 @@ impl Probe {
             data: text.as_bytes().to_vec(),
         })
         .await
+    }
+    async fn details(&mut self) -> Result<Vec<SessionDetails>> {
+        let Reply::SessionDetails { sessions } = self.request(Operation::ListDetails).await? else {
+            bail!("details failed");
+        };
+        Ok(sessions)
+    }
+    async fn wait_empty(&mut self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self.list().await?.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
     }
     async fn list(&mut self) -> Result<Vec<Session>> {
         let Reply::Sessions { sessions } = self.request(Operation::List).await? else {
@@ -376,6 +392,129 @@ async fn exercise(args: &[String]) -> Result<()> {
     );
     Ok(())
 }
+#[allow(clippy::too_many_lines)]
+async fn multi_home(args: &[String]) -> Result<()> {
+    let (first, second) = tokio::join!(
+        Probe::connect(&args[0], &args[2], &args[3], &args[4], "multi-first"),
+        Probe::connect(&args[1], &args[2], &args[3], &args[5], "multi-second")
+    );
+    let (mut first, mut second) = (first?, second?);
+    ensure!(
+        first.initial.is_empty() && second.initial.is_empty(),
+        "multi-home requires empty Homes"
+    );
+    let name = "相同会话 😀 $(touch never-execute)";
+    let named = || Operation::NewNamed {
+        name: name.into(),
+        columns: 80,
+        rows: 24,
+    };
+    let (a, b) = tokio::join!(first.request(named()), second.request(named()));
+    let (sid_a, aid, mode_a, epoch_a) = attachment(a?)?;
+    let (sid_b, bid, mode_b, epoch_b) = attachment(b?)?;
+    ensure!(
+        sid_a != sid_b && mode_a == Mode::ReadWrite && mode_b == Mode::ReadWrite,
+        "Homes share session identity or ownership"
+    );
+    for (probe, sid) in [(&mut first, sid_a), (&mut second, sid_b)] {
+        let details = probe.details().await?;
+        ensure!(
+            details.len() == 1 && details[0].id == sid && details[0].name == name,
+            "Home metadata crossed scope"
+        );
+        ensure!(
+            details[0].connection_count == 1
+                && details[0].created_at_unix_secs > 0
+                && details[0].last_connected_at_unix_secs.is_some(),
+            "missing attachment metadata"
+        );
+    }
+    for (probe, foreign_session, foreign_attachment, foreign_epoch) in [
+        (&mut first, sid_b, bid, epoch_b),
+        (&mut second, sid_a, aid, epoch_a),
+    ] {
+        for operation in [
+            Operation::Join {
+                session_id: foreign_session,
+                mode: Mode::ReadWrite,
+                columns: 80,
+                rows: 24,
+            },
+            Operation::Input {
+                attachment_id: foreign_attachment,
+                writer_epoch: foreign_epoch,
+                data: b"forbidden\r".to_vec(),
+            },
+            Operation::Detach {
+                attachment_id: foreign_attachment,
+            },
+        ] {
+            ensure!(
+                matches!(probe.request(operation).await?, Reply::Error { .. }),
+                "cross-Home operation accepted"
+            );
+        }
+    }
+    let marker_a = format!("第一台-{}", Uuid::new_v4());
+    let marker_b = format!("第二台-{}", Uuid::new_v4());
+    first
+        .input(
+            aid,
+            epoch_a,
+            &format!("FS_MULTI='{marker_a}'; {}", print_command(&marker_a)),
+        )
+        .await?;
+    second
+        .input(bid, epoch_b, &print_command(&marker_b))
+        .await?;
+    first.text(&marker_a).await?;
+    second.text(&marker_b).await?;
+    no_listeners()?;
+    first.client.shutdown().await;
+    drop(first);
+    let survivor = format!("继续工作-{}", Uuid::new_v4());
+    second
+        .input(bid, epoch_b, &print_command(&survivor))
+        .await?;
+    second.text(&survivor).await?;
+    let mut first = Probe::connect(&args[0], &args[2], &args[3], &args[4], "multi-rejoin").await?;
+    let details = first.details().await?;
+    ensure!(
+        details.len() == 1 && details[0].id == sid_a && details[0].connection_count == 0,
+        "disconnect changed first Home session"
+    );
+    let (_, aid, mode, epoch) = attachment(
+        first
+            .request(Operation::Join {
+                session_id: sid_a,
+                mode: Mode::ReadWrite,
+                columns: 80,
+                rows: 24,
+            })
+            .await?,
+    )?;
+    ensure!(mode == Mode::ReadWrite, "rejoin retained old writer");
+    first.output.clear();
+    first
+        .input(aid, epoch, "printf '%s\\n' \"$FS_MULTI\"\r")
+        .await?;
+    first.text(&marker_a).await?;
+    ensure!(
+        second.details().await?[0].connection_count == 1,
+        "first reconnect affected second Home"
+    );
+    first.input(aid, epoch, "exit\r").await?;
+    second.input(bid, epoch_b, "exit\r").await?;
+    first.wait_empty().await?;
+    second.wait_empty().await?;
+    no_listeners()?;
+    first.client.shutdown().await;
+    second.client.shutdown().await;
+    println!("{{\"checkpoint\":\"encrypted-pty-multi-home-complete\"}}");
+    Ok(())
+}
+// Keep the seed and restart acceptance sequence together for auditability.
+#[allow(clippy::too_many_lines)]
 async fn persistence(mode: &str, args: &[String]) -> Result<()> {
     let mut client = Probe::connect(&args[0], &args[1], &args[2], &args[3], "persistence").await?;
     if mode == "empty" {
@@ -391,7 +530,8 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
         ensure!(client.initial.is_empty(), "seed requires empty list");
         let (sid, aid, _, epoch) = attachment(
             client
-                .request(Operation::New {
+                .request(Operation::NewNamed {
+                    name: "持久化 😀".into(),
                     columns: 80,
                     rows: 24,
                 })
@@ -406,9 +546,17 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
             )
             .await?;
         client.text("seed-ready").await?;
+        let metadata = client
+            .details()
+            .await?
+            .into_iter()
+            .find(|detail| detail.id == sid)
+            .context("seed metadata missing")?;
         std::fs::write(
             file,
-            serde_json::to_vec(&serde_json::json!({"session_id":sid,"marker":marker}))?,
+            serde_json::to_vec(
+                &serde_json::json!({"session_id":sid,"marker":marker,"metadata":metadata}),
+            )?,
         )?;
     } else {
         let value: serde_json::Value = load_json(file)?;
@@ -417,6 +565,22 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
             client.initial.len() == 1 && client.initial[0].id == sid,
             "Home restart lost session"
         );
+        if !value["metadata"].is_null() {
+            let saved: SessionDetails = serde_json::from_value(value["metadata"].clone())?;
+            let current = client
+                .details()
+                .await?
+                .into_iter()
+                .find(|detail| detail.id == sid)
+                .context("resumed metadata missing")?;
+            ensure!(
+                current.name == saved.name
+                    && current.created_at_unix_secs == saved.created_at_unix_secs
+                    && current.last_connected_at_unix_secs == saved.last_connected_at_unix_secs
+                    && current.connection_count == 0,
+                "Home restart lost metadata"
+            );
+        }
         let (_, aid, _, epoch) = attachment(
             client
                 .request(Operation::Join {
@@ -438,6 +602,17 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
                     .context("missing persistence marker")?,
             )
             .await?;
+        if !value["metadata"].is_null() {
+            let mut value = value;
+            let metadata = client
+                .details()
+                .await?
+                .into_iter()
+                .find(|detail| detail.id == sid)
+                .context("joined metadata missing")?;
+            value["metadata"] = serde_json::to_value(metadata)?;
+            std::fs::write(file, serde_json::to_vec(&value)?)?;
+        }
     }
     client.client.shutdown().await;
     println!(
@@ -516,6 +691,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     tokio::time::timeout(Duration::from_secs(210),async {
         match args.get(1).map(String::as_str) {
+            Some("multi-home") if args.len()==8=>multi_home(&args[2..]).await,
             Some("exercise") if args.len()==7=>exercise(&args[2..]).await,
             Some(mode @ ("seed"|"resume"|"empty")) if args.len()==7=>persistence(mode,&args[2..]).await,
             Some("access-end") if args.len()==7=>access_end(&args[2..]).await,

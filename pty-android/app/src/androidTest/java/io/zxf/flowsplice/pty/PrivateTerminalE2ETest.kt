@@ -47,8 +47,8 @@ class PrivateTerminalE2ETest {
             (()=>({
                 status:document.getElementById('status')?.textContent,
                 notice:document.getElementById('notice')?.textContent,
-                terminalAccessibility:Array.from(document.querySelectorAll('.xterm-rows,.xterm-accessibility')).map(e=>e.textContent),
-                terminalTextarea:document.querySelector('.xterm-helper-textarea')?.value,
+                terminalAccessibility:Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility')).map(e=>e.textContent),
+                terminalTextarea:document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea')?.value,
                 activeElementClass:document.activeElement?.className
             }))()
         """.trimIndent())
@@ -90,7 +90,7 @@ class PrivateTerminalE2ETest {
             assertTrue("WebView native focus unavailable", web.requestFocus())
         }
         assertEquals("Terminal textarea is unavailable", "true", evaluate(scenario,
-            "(()=>{const e=document.querySelector('.xterm-helper-textarea');if(!e)return false;e.focus();return document.activeElement===e})()"))
+            "(()=>{const e=document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea');if(!e)return false;e.focus();return document.activeElement===e})()"))
         instrumentation.waitForIdleSync()
         Thread.sleep(250)
         scenario.onActivity { activity ->
@@ -115,7 +115,7 @@ class PrivateTerminalE2ETest {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Requires an explicitly isolated device/app installation", args.getString("isolated") == "true")
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        assumeTrue("Requires externally packaged private bootstrap", context.assets.list("bootstrap").orEmpty().contains("business.json"))
+        assumeTrue("Requires externally packaged private bootstrap", context.assets.list("bootstrap").orEmpty().contains("homes.json"))
         val relay = args.getString("ptyRelay") ?: error("External ptyRelay argument required")
         val passwordPath = args.getString("ptyPasswordFile") ?: error("External ptyPasswordFile argument required")
         assertTrue("Password fixture path must be absolute", File(passwordPath).isAbsolute)
@@ -123,52 +123,90 @@ class PrivateTerminalE2ETest {
         assertTrue("Password fixture must be nonempty", password.isNotEmpty())
         assertFalse("Requires a fresh isolated installation", context.filesDir.resolve("installation/travelagent.toml").exists())
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario, "document.getElementById('enter')?.textContent==='注册'", "initial enrollment form")
-            // Drive the same DOM form and native message bridge used by the actual user UI.
-            assertEquals("true", evaluate(scenario,
-                "(()=>{document.getElementById('relay').value=${JSONObject.quote(relay)};document.getElementById('password').value=${JSONObject.quote(password)};return true})()"))
-            click(scenario, "enter")
-            waitFor(scenario, "document.getElementById('notice').textContent.includes('等待批准')", "external approval pending", 60)
-            context.filesDir.resolve("e2e-verification.json").writeText(evaluate(scenario, "document.getElementById('notice').textContent"))
-            waitFor(scenario, "document.getElementById('enter').textContent==='连接'&&!document.getElementById('enter').disabled", "externally approved installation", 120)
-            click(scenario, "enter")
-            waitFor(scenario, "document.getElementById('status').textContent==='已连接'", "connected")
-            waitFor(scenario, "document.getElementById('list').textContent==='暂无会话'", "empty fixture session list")
-            click(scenario, "new")
-            waitFor(scenario, "!document.getElementById('terminal-controls').hidden&&document.getElementById('mode-label').textContent==='读写'", "new writable terminal")
-            val session = evaluate(scenario, "document.querySelector('#tabs button')?.textContent")
-            assertNotEquals("null", session)
-            waitFor(scenario,
-                "document.querySelectorAll('#list .session').length===1&&document.querySelector('#list .session span')?.textContent===$session",
-                "new session immediately appears in refreshed list")
+            fun management() { click(scenario, "terminal-back") }
+            fun select(id: String) {
+                if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") management()
+                click(scenario, "mobile-home")
+                assertEquals("true", evaluate(scenario, "(()=>{const b=document.querySelector('#home-cards [data-home-id=\"$id\"]');if(!b)return false;b.click();return true})()"))
+            }
+            fun enroll(id: String) {
+                select(id)
+                waitFor(scenario, "document.getElementById('enter').textContent==='注册'", "enrollment form $id")
+                assertEquals("true", evaluate(scenario,
+                    "(()=>{document.getElementById('relay').value=${JSONObject.quote(relay)};document.getElementById('password').value=${JSONObject.quote(password)};return true})()"))
+                click(scenario, "enter")
+                waitFor(scenario, "!document.getElementById('waiting').hidden&&!document.getElementById('verification-code').textContent.includes('正在')", "approval code $id", 120)
+                context.filesDir.resolve("e2e-verification.json").writeText(evaluate(scenario, "'等待批准，校验码：'+document.getElementById('verification-code').textContent"))
+                waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')", "automatic post-enrollment connection $id", 180)
+                assertEquals("true", evaluate(scenario, "document.getElementById('password-label').hidden"))
+                waitFor(scenario, "document.querySelectorAll('#list .session').length===0", "empty Home $id")
+            }
+            fun create(): String {
+                click(scenario, "new")
+                click(scenario, "cancel-new")
+                assertEquals("0", evaluate(scenario, "document.querySelectorAll('#list .session').length"))
+                click(scenario, "new")
+                assertEquals("true", evaluate(scenario, "(()=>{document.getElementById('session-name').value='E2E shell';return true})()"))
+                click(scenario, "confirm-new")
+                waitFor(scenario, "!document.getElementById('terminal-view').hidden&&document.getElementById('mode-label').textContent==='读写'", "named writable terminal")
+                management()
+                waitFor(scenario, "document.querySelector('#list .session-name')?.textContent==='E2E shell'&&document.querySelector('#list .connection')?.textContent.includes('1 个连接')", "name and attachment metadata")
+                assertEquals("true", evaluate(scenario, "Array.from(document.querySelectorAll('#list .session-time')).length===2&&Array.from(document.querySelectorAll('#list .session-time')).every(e=>e.textContent&&!e.textContent.includes('尚未'))"))
+                val session = evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId")
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='继续');if(!b)return false;b.click();return true})()"))
+                return session
+            }
+            fun output(marker: String) {
+                val octal = marker.toByteArray(Charsets.US_ASCII).joinToString("") { "\\%03o".format(it.toInt() and 255) }
+                typeTerminal(scenario, "printf '\\n${octal}\\n'")
+                waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility')).some(e=>e.textContent.includes(${JSONObject.quote(marker)}))", "remote rendered output $marker", 30)
+            }
+            fun switch(name: String) {
+                click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E shell")});if(!b)return false;b.click();return true})()"))
+            }
+            waitFor(scenario, "document.querySelectorAll('#home-cards [data-home-id]').length===2", "two Home catalog")
+            enroll("default")
+            val first = create()
+            assertEquals("7", evaluate(scenario, "document.querySelectorAll('#keys button').length"))
             val marker = "PTY_E2E_" + UUID.randomUUID().toString().replace("-", "").take(8)
-            val octal = marker.toByteArray(Charsets.US_ASCII).joinToString("") { "\\%03o".format(it.toInt() and 255) }
-            typeTerminal(scenario, "printf '\\n${octal}\\n'")
-            // The source command contains only octal bytes; finding decoded text proves output.
-            waitFor(scenario,
-                "Array.from(document.querySelectorAll('.xterm-rows,.xterm-accessibility')).some(e=>e.textContent.includes(${JSONObject.quote(marker)}))",
-                "decoded rendered terminal output (DOM accessibility must be available)", 20)
-            screenshot(scenario)
+            output(marker)
             click(scenario, "mode")
-            waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "read-only ownership")
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "readonly")
             click(scenario, "mode")
-            waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "restored writer")
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "writer restored")
+            enroll("secondary")
+            val second = create()
+            assertNotEquals("Same names on different Homes must have different session identities", first, second)
+            output(marker + "SECOND")
+            assertEquals("2", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
+            switch("测试 Mac"); output(marker + "FIRST")
+            switch("测试 VPS"); output(marker + "SECONDAGAIN")
+            management(); click(scenario, "disconnect")
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===1", "one Home disconnect preserves other tab")
+            switch("测试 Mac"); output(marker + "SURVIVED")
+            // Reconnect only the secondary Home, list its shell, and explicitly rejoin.
+            select("secondary")
+            waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.querySelectorAll('#list .session').length===1", "secondary reconnect", 180)
+            assertEquals(second, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
+            assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===2", "two joined Homes before background")
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
-            waitFor(scenario, "document.getElementById('status').textContent==='未连接'", "foreground disconnected")
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===0", "background disconnects all Homes")
             repeat(20) {
-                assertEquals("No automatic reconnect", "true", evaluate(scenario, "document.getElementById('status').textContent==='未连接'"))
+                assertEquals("No automatic foreground reconnect", "true", evaluate(scenario, "!document.getElementById('status').textContent.includes('已连接')"))
                 Thread.sleep(100)
             }
             click(scenario, "enter")
-            waitFor(scenario, "document.getElementById('status').textContent==='已连接'&&document.querySelectorAll('#list .session').length===1", "existing session list")
-            assertEquals("No unsolicited terminal join", "0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
-            assertEquals("Reconnect must retain the same session", session, evaluate(scenario, "document.querySelector('#list .session span').textContent"))
-            assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='读写加入');if(!b)return false;b.click();return true})()"))
-            waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'&&!document.getElementById('terminal-controls').hidden", "explicit rejoin")
-            assertEquals(session, evaluate(scenario, "document.querySelector('#tabs button').textContent"))
-            click(scenario, "disconnect")
-            waitFor(scenario, "document.getElementById('status').textContent==='未连接'", "final disconnect")
+            waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.querySelectorAll('#list .session').length===1", "foreground explicit reconnect", 180)
+            assertEquals(second, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
+            assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
+            assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
+            waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows')).some(e=>e.textContent.includes(${JSONObject.quote(marker + "SECONDAGAIN")}))", "tmux restores prior output")
+            output(marker + "RESUMED")
+            screenshot(scenario)
+            management(); click(scenario, "disconnect")
         }
     }
 }

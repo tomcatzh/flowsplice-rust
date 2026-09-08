@@ -1,6 +1,6 @@
 use crate::{pty::PtyProcess, tmux::Tmux};
 use anyhow::{Context, Result, anyhow, bail};
-use flowsplice_pty_protocol::{Mode, Reply, ServerMessage, Session, Writer};
+use flowsplice_pty_protocol::{Mode, Reply, ServerMessage, Session, SessionDetails, Writer};
 use flowsplice_transport::ServiceLifetime;
 use std::{
     collections::BTreeMap,
@@ -50,6 +50,7 @@ struct Attachment {
     started: watch::Sender<bool>,
 }
 struct Ownership {
+    last_connected: Option<u64>,
     epoch: u64,
     writer: Option<Uuid>,
     attachments: BTreeMap<Uuid, Attachment>,
@@ -57,18 +58,33 @@ struct Ownership {
 pub(crate) struct SessionState {
     pub id: Uuid,
     created: u64,
+    name: String,
+    metadata_update: tokio::sync::Mutex<()>,
     tmux: Arc<Tmux>,
     ownership: Mutex<Ownership>,
     transition: tokio::sync::Mutex<()>,
     changes: watch::Sender<u64>,
 }
 impl SessionState {
+    #[cfg(test)]
     pub fn new(id: Uuid, created: u64, tmux: Arc<Tmux>) -> Arc<Self> {
+        Self::with_metadata(id, created, Tmux::fallback_name(id), None, tmux)
+    }
+    pub fn with_metadata(
+        id: Uuid,
+        created: u64,
+        name: String,
+        last_connected: Option<u64>,
+        tmux: Arc<Tmux>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             created,
+            name,
+            metadata_update: tokio::sync::Mutex::new(()),
             tmux,
             ownership: Mutex::new(Ownership {
+                last_connected,
                 epoch: 1,
                 writer: None,
                 attachments: BTreeMap::new(),
@@ -97,6 +113,28 @@ impl SessionState {
             created_at_unix_secs: self.created,
             writer: Self::writer(&*self.lock()?),
         })
+    }
+    pub fn details(&self) -> Result<SessionDetails> {
+        let state = self.lock()?;
+        Ok(SessionDetails {
+            id: self.id,
+            name: self.name.clone(),
+            created_at_unix_secs: self.created,
+            last_connected_at_unix_secs: state.last_connected,
+            connection_count: u32::try_from(state.attachments.len())?,
+            writer: Self::writer(&state),
+        })
+    }
+    async fn record_attachment(&self, connection: &Connection, id: Uuid) -> Result<()> {
+        let _update = self.metadata_update.lock().await;
+        if !connection.active() || !self.owns(connection.id, id)? {
+            bail!("attachment ended");
+        }
+        let timestamp = flowsplice_core::authorization::unix_time_secs()?
+            .max(self.lock()?.last_connected.unwrap_or(0));
+        self.tmux.set_last_connected(self.id, timestamp).await?;
+        self.lock()?.last_connected = Some(timestamp);
+        Ok(())
     }
     fn notify(&self, state: &Ownership) {
         self.changes.send_replace(state.epoch);
@@ -168,6 +206,10 @@ impl SessionState {
                 self.detach(connection.id, id)?;
                 return Err(error);
             }
+        }
+        if let Err(error) = self.record_attachment(connection, id).await {
+            self.detach(connection.id, id)?;
+            return Err(error);
         }
         let state = self.lock()?;
         let reply = Reply::Attached {

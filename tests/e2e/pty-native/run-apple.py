@@ -18,6 +18,8 @@ parser.add_argument("--device")
 args = parser.parse_args()
 os.environ.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
 fixture = Fixture(args.fixture)
+if len(fixture.targets) != 2:
+    raise SystemExit("This acceptance requires the two-Home fixture")
 build = Path(args.build).resolve(strict=True)
 acceptance = build / (args.platform + "-acceptance.json")
 if acceptance.exists():
@@ -40,6 +42,33 @@ else:
 
 with original.open("rb") as stream:
     run = plistlib.load(stream)
+if args.platform == "macos":
+    expected = "io.zxf.flowsplice.pty.macos.e2e"
+    entry = manifest["platforms"]["macos"]
+    if entry.get("bundle_id") != expected or entry.get("test_only_bundle_id") is not True:
+        raise SystemExit("Refusing a macOS test manifest without isolated application identity")
+    app = Path(entry["app"]).resolve(strict=True)
+    if plistlib.loads((app / "Contents/Info.plist").read_bytes()).get("CFBundleIdentifier") != expected:
+        raise SystemExit("Refusing macOS UI tests against the production application")
+    def mac_targets(value):
+        if isinstance(value, dict):
+            if "TestBundlePath" in value: yield value
+            for child in value.values(): yield from mac_targets(child)
+        elif isinstance(value, list):
+            for child in value: yield from mac_targets(child)
+    mac = list(mac_targets(run))
+    if len(mac) != 1:
+        raise SystemExit("Expected exactly one isolated macOS UI test target")
+    target = mac[0]
+    # Current Xcode emits UITargetAppPath, not TestTargetBundleIdentifier.
+    # Verify that resolved target bundle directly; reject an explicit ID if present.
+    target_path = Path(target.get("UITargetAppPath", "").replace("__TESTROOT__", str(original.parent))).resolve(strict=True)
+    if target_path != app or target.get("TestTargetBundleIdentifier", expected) != expected:
+        raise SystemExit("macOS xctestrun points outside the isolated test application")
+    if target.get("TestHostBundleIdentifier") != expected + ".uitests.xctrunner":
+        raise SystemExit("macOS xctestrun runner identity is not isolated")
+    if target.get("BundleIdentifiersForCrashReportEmphasis") != [expected, expected + ".uitests"]:
+        raise SystemExit("macOS xctestrun application identities are not isolated")
 environment = {
     "DEVELOPER_DIR": os.environ["DEVELOPER_DIR"],
     "FLOWSPLICE_PTY_E2E_ISOLATED": "1",
@@ -71,27 +100,27 @@ log = build / (args.platform + "-private-ui-e2e.log")
 if log.exists():
     log.rename(build / (args.platform + "-private-ui-e2e-previous-" + str(time.time_ns()) + ".log"))
 result = build / (args.platform + "-private-ui-" + str(time.time_ns()) + ".xcresult")
-approval = None
+approvals = {}
 with log.open("wb") as output:
     process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(configured),
         "-destination", destination, "-parallel-testing-enabled", "NO", "-resultBundlePath", str(result)],
         stdout=output, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + 360
+    deadline = time.monotonic() + 900
     try:
         while process.poll() is None:
             if time.monotonic() > deadline:
                 raise RuntimeError("Apple PTY UI test exceeded its deadline")
-            if approval is None:
-                match = re.search(r"PTY_E2E_VERIFICATION ([^\r\n]+)", log.read_text(errors="replace"))
-                if match:
-                    approval = fixture.approve_notice(match.group(1))
+            for notice in re.findall(r"PTY_E2E_VERIFICATION ([^\r\n]+)", log.read_text(errors="replace")):
+                if notice not in approvals:
+                    approved = fixture.approve_notice(notice)
+                    if approved is not None: approvals[notice] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or approval is None:
+        if process.returncode != 0 or len(approvals) != 2:
             raise RuntimeError("Apple private PTY UI acceptance failed; inspect the xcresult")
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=10)
 acceptance.write_text(json.dumps({"platform":args.platform,"passed":True,
-    "result":str(result),"completed_at_unix_ns":time.time_ns(),**approval}, indent=2))
+    "result":str(result),"completed_at_unix_ns":time.time_ns(),"approvals":list(approvals.values())}, indent=2))
 print(json.dumps({"checkpoint":"private-apple-pty-ui-passed","platform":args.platform,"result":str(result)}))

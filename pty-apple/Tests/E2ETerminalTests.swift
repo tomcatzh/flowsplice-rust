@@ -85,16 +85,33 @@ final class E2ETerminalTests: XCTestCase {
         app.webViews.staticTexts.matching(NSPredicate(format: "label == %@ OR value == %@", value, value)).firstMatch
     }
 
+    private func inputField(containing name: String) -> XCUIElement {
+#if os(macOS)
+        return app.webViews.textFields.matching(NSPredicate(format:"title CONTAINS %@", name)).firstMatch
+#else
+        return app.webViews.textFields.matching(NSPredicate(format:"label CONTAINS %@", name)).firstMatch
+#endif
+    }
+
+    private func visibleTextSnapshot() -> [String] {
+        // One immutable accessibility tree per poll: live query indices can
+        // disappear while WebKit replaces the pending enrollment page.
+        guard let root = try? app.webViews.firstMatch.snapshot() else { return [] }
+        func collect(_ node: XCUIElementSnapshot) -> [String] {
+            let own = node.elementType == .staticText ? [node.label, node.value as? String ?? ""] : []
+            return own + node.children.flatMap { collect($0) }
+        }
+        return collect(root)
+    }
+
     private func waitForText(containing fragment: String, timeout: TimeInterval) -> String {
         var found: String?
         // WebKit exposes text as label on iOS and value on macOS. Heading
         // values can be numbers, so string predicates cannot safely query all values.
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { [unowned self] _, _ in
-            for element in self.app.webViews.staticTexts.allElementsBoundByIndex {
-                for value in [element.label, element.value as? String ?? ""] where value.contains(fragment) {
-                    found = value
-                    return true
-                }
+            for value in self.visibleTextSnapshot() where value.contains(fragment) {
+                found = value
+                return true
             }
             return false
         }, object: app)
@@ -146,70 +163,119 @@ final class E2ETerminalTests: XCTestCase {
         app.launch()
         let web = app.webViews.firstMatch
         XCTAssertTrue(web.waitForExistence(timeout: 20))
-        let relayField = web.textFields.firstMatch
-        tap(relayField); relayField.typeText(relay)
-        XCTAssertEqual(relayField.value as? String, relay, "Relay input must reach the actual field unchanged")
-        let passwordField = web.secureTextFields.firstMatch
-        tap(passwordField); passwordField.typeText(password)
-        tap(web.buttons["注册"])
-        let pending = waitForText(containing: "等待批准", timeout: 60)
-        print("PTY_E2E_VERIFICATION " + pending)
-        // Parent observes the actual pending request and approves it outside this UI process.
-        tap(web.buttons["连接"], timeout: 120)
-        // Debug Rust builds execute both private-key derivations without release
-        // optimizations. Keep the real cryptography and allow its measured latency.
-        XCTAssertTrue(text("已连接").waitForExistence(timeout: 120))
-        XCTAssertTrue(text("暂无会话").waitForExistence(timeout: 30), "Fixture must begin without sessions")
-        tap(web.buttons["新建"])
-        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout: 30))
-        XCTAssertTrue(text("读写").exists)
+        func management() {
+            if let control = web.buttons.matching(identifier:"Home 管理").allElementsBoundByIndex.first(where:{ $0.isHittable }) { tap(control) }
+        }
+        func home(_ name: String) {
+            // Both desktop and mobile retain the real Home management action.
+            management()
+            if web.buttons["返回 Home"].isHittable { tap(web.buttons["返回 Home"]) }
+            let buttons = web.buttons.matching(identifier:name)
+            let visible = buttons.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? buttons.firstMatch
+            tap(visible)
+        }
+        func enroll(_ name: String) {
+            home(name)
+            let relayField = inputField(containing:"Relay")
+            tap(relayField)
+            relayField.typeText(relay)
+            let passwordField = web.secureTextFields.firstMatch
+            tap(passwordField); passwordField.typeText(password)
+            tap(web.buttons["注册"])
+            _ = waitForText(containing:"等待超级 Home 批准", timeout:120)
+            var code = ""
+            let expectation = XCTNSPredicateExpectation(predicate:NSPredicate { _, _ in
+                for value in self.visibleTextSnapshot() {
+                    if value.range(of:"^[0-9A-Fa-f]{4}([ -][0-9A-Fa-f]{4})+$", options:.regularExpression) != nil {
+                        code = value; return true
+                    }
+                }
+                return false
+            }, object:app)
+            XCTAssertEqual(XCTWaiter.wait(for:[expectation], timeout:120), .completed, "Rendered approval code unavailable")
+            print("PTY_E2E_VERIFICATION 等待批准，校验码：" + code)
+            _ = waitForText(containing:"已连接", timeout:180)
+            XCTAssertTrue(text("暂无会话，点击「新建会话」开始。").waitForExistence(timeout:30))
+        }
+        func create() {
+            tap(web.buttons["＋ 新建会话"])
+            tap(web.buttons["取消"])
+            XCTAssertTrue(text("暂无会话，点击「新建会话」开始。").exists, "Cancel must not create a shell")
+            tap(web.buttons["＋ 新建会话"])
+            let field = inputField(containing:"会话名称")
+            tap(field); field.typeText("E2E shell")
+            tap(web.buttons["创建并打开"])
+            XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
+            management()
+            _ = waitForText(containing:"1 个连接", timeout:30)
+            XCTAssertTrue(text("E2E shell").exists)
+            XCTAssertFalse(text("尚未连接").exists, "Successful initial join must set latest connection time")
+#if os(macOS)
+            _ = waitForText(containing:"创建时间", timeout:20)
+            _ = waitForText(containing:"最近连接", timeout:20)
+#endif
+            tap(web.buttons["继续"])
+        }
+        func switchTerminal(_ name: String) {
+            if let control = web.buttons.matching(identifier:"已打开终端").allElementsBoundByIndex.first(where:{ $0.isHittable }) { tap(control) }
+            else { tap(web.buttons["切换终端"]) }
+            let matches = web.buttons.matching(identifier:name + " / E2E shell")
+            tap(matches.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? matches.firstMatch)
+        }
+        func output(_ marker: String) {
+            let terminal = web.textViews.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? web.textViews.firstMatch
+            tap(terminal)
+            let octal = marker.utf8.map { String(format:"\\%03o", Int($0)) }.joined()
+            terminal.typeText("printf '\\n" + octal + "\\n'\n")
+            waitForRenderedOutput(marker)
+        }
+        enroll("测试 Mac"); create()
         for label in ["Ctrl+C", "Tab", "Esc", "↑", "↓", "←", "→"] {
 #if os(macOS)
-            XCTAssertFalse(web.buttons[label].exists, "macOS must use the physical keyboard without virtual terminal keys")
+            XCTAssertFalse(web.buttons[label].exists, "macOS must have no virtual terminal keys")
 #else
-            XCTAssertTrue(web.buttons[label].exists, "iOS must retain its virtual terminal keys")
+            XCTAssertTrue(web.buttons[label].exists)
 #endif
         }
-
-        // xterm's real accessibility input is used, with no direct Rust or JS test hook.
-        let terminal = web.textViews.firstMatch
-        XCTAssertTrue(terminal.waitForExistence(timeout: 10), "xterm input is not exposed through WKWebView accessibility")
-        tap(terminal)
-        // Avoid slashed zero and lookalike I/O glyphs in pixel-only acceptance.
         let alphabet = Array("ABCDEFGHJKLMNPRS")
-        let random = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)
+        let random = UUID().uuidString.replacingOccurrences(of:"-", with:"").prefix(8)
         let marker = "PTYCHECK" + String(random.map { alphabet[$0.hexDigitValue!] })
-        let octal = marker.utf8.map { String(format: "\\%03o", Int($0)) }.joined()
-        terminal.typeText("printf '\\n" + octal + "\\n'\n")
-        waitForRenderedOutput(marker)
+        output(marker)
         tap(web.buttons["切换只读"])
-        XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout: 20))
-        XCTAssertTrue(text("只读").exists)
         tap(web.buttons["申请读写"])
-        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout: 20))
-
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
+        enroll("测试 VPS"); create(); output(marker + "SECOND")
+        switchTerminal("测试 Mac"); output(marker + "FIRST")
+        switchTerminal("测试 VPS"); output(marker + "SECONDAGAIN")
+        management(); tap(web.buttons["断开连接"])
+        _ = waitForText(containing:"未连接", timeout:20)
+        switchTerminal("测试 Mac"); output(marker + "SURVIVED")
+        home("测试 VPS")
+        _ = waitForText(containing:"已连接", timeout:180)
+        XCTAssertEqual(web.buttons.matching(identifier:"打开").count, 1)
+        tap(web.buttons["打开"])
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
 #if os(macOS)
-        app.typeKey("h", modifierFlags: .command)
-        wait(NSPredicate(format: "state == %d", XCUIApplication.State.runningBackground.rawValue), object: app)
+        app.typeKey("h", modifierFlags:.command)
 #else
         XCUIDevice.shared.press(.home)
-        wait(NSPredicate(format: "state == %d", XCUIApplication.State.runningBackground.rawValue), object: app)
 #endif
+        wait(NSPredicate(format:"state == %d", XCUIApplication.State.runningBackground.rawValue), object:app!)
         app.activate()
-        XCTAssertTrue(text("未连接").waitForExistence(timeout: 20))
+        _ = waitForText(containing:"未连接", timeout:20)
         XCTAssertFalse(web.buttons["关闭标签"].exists)
-        let staysDisconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: text("已连接"))
+        let staysDisconnected = XCTNSPredicateExpectation(predicate:NSPredicate { [unowned self] _, _ in
+            self.visibleTextSnapshot().contains { $0.contains("已连接") }
+        }, object:app)
         staysDisconnected.isInverted = true
-        XCTAssertEqual(XCTWaiter.wait(for: [staysDisconnected], timeout: 2), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for:[staysDisconnected], timeout:2), .completed)
         tap(web.buttons["连接"])
-        XCTAssertTrue(text("已连接").waitForExistence(timeout: 120))
-        let joins = web.buttons.matching(identifier: "读写加入")
-        XCTAssertTrue(joins.firstMatch.waitForExistence(timeout: 20))
-        XCTAssertEqual(joins.count, 1, "Reconnect must list the existing session without creating another")
+        _ = waitForText(containing:"已连接", timeout:180)
+        XCTAssertEqual(web.buttons.matching(identifier:"打开").count, 1, "Reconnect must list the existing shell only")
         XCTAssertFalse(web.buttons["关闭标签"].exists, "Reconnect must not join automatically")
-        tap(joins.firstMatch)
-        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout: 20))
-        tap(web.buttons["断开"])
-        XCTAssertTrue(text("未连接").waitForExistence(timeout: 20))
+        tap(web.buttons["打开"])
+        waitForRenderedOutput(marker + "SECONDAGAIN")
+        output(marker + "RESUMED")
+        management(); tap(web.buttons["断开连接"])
     }
 }

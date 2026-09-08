@@ -1,8 +1,10 @@
 # Private FlowSplice PTY
 
 The first PTY application uses the shared encrypted Home/Travel crates. Its Travel
-side opens no local TCP, UDP, HTTP or WebSocket listener. One foreground runtime
-serves the terminal tabs; disconnecting or backgrounding the app releases that runtime.
+side opens no local TCP, UDP, HTTP or WebSocket listener. Each connected Home owns
+an independent foreground runtime. Switching Home pages or terminal tabs preserves
+other connections; disconnecting one Home releases only that runtime. Backgrounding
+the app disconnects all Homes.
 The generic Travel applications retain their existing forwarding and background behavior.
 
 ## Provisioning
@@ -42,17 +44,44 @@ lock. Use separate accounts and domains when stronger operating-system isolation
 needed. First-version backends target Linux arm64/amd64 and macOS arm64, with tmux
 3.3 or later; the acceptance suite exercises actual installed tmux versions.
 
-Package the deployment root and the chosen business descriptor as private resources
+Package the deployment root and the chosen business descriptors as private resources
 using [Android packaging](../pty-android/README.md) or [Apple packaging](../pty-apple/README.md).
 Neither private configuration nor keys belong in Git or neutral Rust binaries. The
-client asks only for the Relay IP:port and private-key password, waits for the fixed
+client initially asks for the Relay IP:port and private-key password, waits for the fixed
 Super Home's approval, and stores the approved service binding automatically. Its
-password is saved locally only after installation completes.
+password is saved in native secure storage before enrollment starts so interrupted
+enrollment can resume. Daily connections use that stored password without a login
+prompt. A missing stored credential opens a recovery prompt.
+
+Private multi-Home builds accept `homes.json` in place of `business.json`:
+
+```json
+{"version":1,"homes":[{"id":"default","name":"Mac 工作站","platform":"macos","relay":"192.0.2.1:8443","descriptor":{}}]}
+```
+
+Replace the illustrative empty descriptor with that Home's complete signed business
+descriptor. A catalog contains one to eight unique profile IDs, matching
+`[a-z0-9][a-z0-9_-]{0,47}`, and each profile selects `linux` or `macos`. Each profile
+has isolated enrollment state and secure credentials. Keep the existing Home under
+`default`: that profile preserves the previous single-Home installation directory,
+Travel ID and secure-store account. A legacy package containing only `business.json`
+still loads that default profile.
 
 ## Sessions and ownership
 
-A successful connection opens the session list. New creates one tmux session with
-one shell and joins it read-write. Join can request read-only or read-write; an occupied
+A successful connection opens the session list. Creation first prompts for a display
+name, then creates one tmux session with one shell and joins it read-write. Names are
+trimmed, may repeat, and accept up to 64 Unicode scalars / 256 UTF-8 bytes without
+control characters. The internal UUID stays separate from the display name.
+
+The list shows creation time, latest successful attachment time and active attachment
+count. Read-only observers count; clients only browsing the list do not. Names and
+latest attachment times are stored in private tmux options and survive Home restart
+with the session. Old unnamed sessions receive a short UUID-based display name.
+Explicit `list_details` and `new_named` operations provide these additions while
+the legacy List, New, Session and Attached shapes remain unchanged.
+
+Join can request read-only or read-write; an occupied
 session initially admits another client as an observer. Taking over requires a warning
 and confirmation. Home checks the current ownership epoch for every input write,
 and immediately demotes the previous writer without waiting for its acknowledgement.

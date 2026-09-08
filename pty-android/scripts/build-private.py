@@ -7,9 +7,30 @@ from pathlib import Path
 import shutil
 import subprocess
 
+def validate_homes(path):
+    import re
+    catalog = json.loads(path.read_text())
+    homes = catalog.get('homes')
+    if type(catalog.get('version')) is not int or catalog['version'] != 1 or not isinstance(homes, list) or not 1 <= len(homes) <= 8:
+        raise ValueError('Invalid Home catalog')
+    ids = set()
+    for home in homes:
+        identifier = home.get('id', '')
+        name = home.get('name', '')
+        relay = home.get('relay', '')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', identifier) or identifier in ids:
+            raise ValueError('Invalid or duplicate Home id')
+        ids.add(identifier)
+        if not isinstance(name, str) or not name.strip() or len(name.encode()) > 128 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
+            raise ValueError('Invalid Home name')
+        if home.get('platform') not in ('linux', 'macos') or not isinstance(home.get('descriptor'), dict) or not isinstance(relay, str) or len(relay.encode()) > 512:
+            raise ValueError('Invalid Home configuration')
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', required=True, type=Path)
-parser.add_argument('--descriptor', required=True, type=Path)
+inputs = parser.add_mutually_exclusive_group(required=True)
+inputs.add_argument('--descriptor', type=Path)
+inputs.add_argument('--homes', type=Path)
 parser.add_argument('--output', required=True, type=Path)
 parser.add_argument('--target', required=True, choices=['aarch64-linux-android', 'x86_64-linux-android'])
 parser.add_argument('--release', action='store_true')
@@ -20,11 +41,13 @@ def outside(path):
     if not path.is_absolute():
         raise SystemExit('Private paths must be absolute')
     subprocess.run(['python3', str(helper), 'check-path', '--path', str(path)], check=True, stdout=subprocess.DEVNULL)
-for path in [args.root, args.descriptor, args.output]:
+configuration = args.homes or args.descriptor
+for path in [args.root, configuration, args.output]:
     outside(path)
-if not args.root.is_file() or not args.descriptor.is_file():
+if not args.root.is_file() or not configuration.is_file():
     raise SystemExit('Both private bootstrap files are required')
-json.loads(args.descriptor.read_text())
+if args.homes: validate_homes(args.homes)
+else: json.loads(args.descriptor.read_text())
 if args.release:
     for name in ['FLOWSPLICE_PTY_KEYSTORE', 'FLOWSPLICE_PTY_KEY_ALIAS', 'FLOWSPLICE_PTY_STORE_PASSWORD', 'FLOWSPLICE_PTY_KEY_PASSWORD']:
         if not os.environ.get(name): raise SystemExit('Release requires external signing environment')
@@ -51,7 +74,7 @@ subprocess.run(['npm', 'run', 'build', '--prefix', str(stage / 'pty-web')], env=
 assets = stage / 'pty-android/app/src/main/assets'
 (assets / 'bootstrap').mkdir(parents=True)
 subprocess.run(['python3',str(helper),'copy-root','--source',str(args.root),'--destination',str(assets / 'bootstrap/deployment-root.pub')], check=True)
-shutil.copyfile(args.descriptor, assets / 'bootstrap/business.json')
+shutil.copyfile(configuration, assets / 'bootstrap' / ('homes.json' if args.homes else 'business.json'))
 shutil.copytree(stage / 'pty-web/dist', assets / 'pty')
 subprocess.run(['bash', str(stage / 'pty-android/scripts/build-native.sh'), args.target], cwd=stage, env=env, check=True)
 if not args.release:

@@ -75,8 +75,9 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 
 function scopeLabel(scope: Scope): string {
   if (scope.kind === "global") return "全局超级授权";
-  if (scope.kind === "home") return `当前 Home（${scope.home_id}）`;
-  return `指定业务（${scope.service_id.toUpperCase()} · ${scope.protocol.toUpperCase()}）`;
+  const home = scope.home_id === status.home_id ? `${status.home_alias} · ${scope.home_id}` : scope.home_id;
+  if (scope.kind === "home") return `指定 Home（${home}）`;
+  return `指定业务（${home} · ${scope.service_id.toUpperCase()} · ${scope.protocol.toUpperCase()}）`;
 }
 
 function metricLabel(value: string): string { return value.replaceAll("_", " "); }

@@ -145,7 +145,10 @@ impl PtyClient {
         if *self.cancel.borrow() || *self.finished.borrow() {
             bail!("PTY connection closed");
         }
-        let is_new = matches!(operation, Operation::New { .. });
+        let is_new = matches!(
+            operation,
+            Operation::New { .. } | Operation::NewNamed { .. }
+        );
         let request_id = Uuid::new_v4();
         let message = ClientMessage::Request {
             request_id,

@@ -16,6 +16,8 @@ args = parser.parse_args()
 if not args.serial.startswith("emulator-"):
     raise SystemExit("This runner accepts a dedicated emulator only")
 fixture = Fixture(args.fixture)
+if len(fixture.targets) != 2:
+    raise SystemExit("This acceptance requires the two-Home fixture")
 build = Path(args.build).resolve(strict=True)
 acceptance = build / "acceptance.json"
 if acceptance.exists():
@@ -47,19 +49,19 @@ if copied.rstrip(b"\r\n") != fixture.password.encode():
 log = build / "private-ui-e2e.log"
 if log.exists():
     log.rename(build / ("private-ui-e2e-previous-" + str(time.time_ns()) + ".log"))
-approval = None
+approvals = {}
 with log.open("wb") as output:
     process = subprocess.Popen(base + ["shell", "am", "instrument", "-w", "-r",
         "-e", "class", "io.zxf.flowsplice.pty.PrivateTerminalE2ETest",
         "-e", "isolated", "true", "-e", "ptyRelay", "10.0.2.2:18446",
         "-e", "ptyPasswordFile", "/data/user/0/" + package + "/files/fixture-password",
         package + ".test/androidx.test.runner.AndroidJUnitRunner"], stdout=output, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + 300
+    deadline = time.monotonic() + 720
     try:
         while process.poll() is None:
             if time.monotonic() > deadline:
                 raise RuntimeError("Android PTY UI test exceeded its deadline")
-            if approval is None:
+            if len(approvals) < 2:
                 result = subprocess.run(base + ["exec-out", "run-as", package, "cat", "files/e2e-verification.json"],
                                         capture_output=True, timeout=10, check=False)
                 if result.returncode == 0 and result.stdout.strip():
@@ -69,9 +71,11 @@ with log.open("wb") as output:
                         # exec-out may return remote cat errors on stdout with host exit 0.
                         notice = ""
                     if isinstance(notice, str):
-                        approval = fixture.approve_notice(notice)
+                        if notice not in approvals:
+                            approved = fixture.approve_notice(notice)
+                            if approved is not None: approvals[notice] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or approval is None or "OK (1 test)" not in log.read_text():
+        if process.returncode != 0 or len(approvals) != 2 or "OK (1 test)" not in log.read_text():
             raise RuntimeError("Android private PTY UI acceptance failed; see private-ui-e2e.log")
     finally:
         if process.poll() is None:
@@ -79,5 +83,5 @@ with log.open("wb") as output:
             process.wait(timeout=10)
         command(base + ["shell", "run-as", package, "rm", "-f", "files/fixture-password"])
 acceptance.write_text(json.dumps({"platform":"android", "passed":True,
-    "log":str(log),"completed_at_unix_ns":time.time_ns(), **approval}, indent=2))
+    "log":str(log),"completed_at_unix_ns":time.time_ns(), "approvals":list(approvals.values())}, indent=2))
 print(json.dumps({"checkpoint":"private-android-pty-ui-passed", "evidence":str(build / "acceptance.json")}))

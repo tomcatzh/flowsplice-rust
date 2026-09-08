@@ -201,3 +201,49 @@ async fn shutdown_half_closes_before_waiting_for_live_peer_eof() -> Result<()> {
     .await
     .context("half-close regression timed out")?
 }
+
+#[tokio::test]
+async fn named_and_legacy_create_share_one_pending_guard() -> Result<()> {
+    let (client, mut events, mut server) = pair().await?;
+    events.recv().await.context("missing Hello")?;
+    events.recv().await.context("missing initial list")?;
+    let named = Operation::NewNamed {
+        name: "部署终端".into(),
+        columns: 80,
+        rows: 24,
+    };
+    let id = client.send(named.clone()).await?;
+    assert!(client.send(named.clone()).await.is_err());
+    assert!(
+        client
+            .send(Operation::New {
+                columns: 80,
+                rows: 24
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        read_message::<ClientMessage>(&mut server).await?,
+        Some(ClientMessage::Request {
+            request_id: id,
+            operation: named.clone()
+        })
+    );
+    write_message(
+        &mut server,
+        &ServerMessage::Response {
+            request_id: id,
+            result: Reply::Error {
+                code: "test".into(),
+                message: "not created".into(),
+            },
+        },
+    )
+    .await?;
+    events.recv().await.context("missing create result")?;
+    client.send(named).await?;
+    drop(server);
+    client.shutdown().await;
+    Ok(())
+}

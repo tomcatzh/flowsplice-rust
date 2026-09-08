@@ -1,0 +1,68 @@
+[
+  {
+    "key": "a-desktop",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-b358db81-8017-4b8c-9886-fce070f6be29.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/a-desktop.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "b-desktop",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-1c9c47bf-080b-47e5-a397-c59106be8613.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/b-desktop.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "c-desktop",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-b0670b72-3fc7-466e-af11-cdbd53093469.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/c-desktop.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "a-mobile",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-4ac8ec34-6235-4496-ad4f-7be52a48eef3.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/a-mobile.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "b-mobile",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-457d7d17-243f-4e4a-9369-81469a2c2e55.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/b-mobile.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "c-mobile",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-a33aac92-2445-42e1-914b-b89670c9c9fe.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/initial-v1/c-mobile.png",
+    "status": "superseded-single-home-study"
+  },
+  {
+    "key": "a-desktop-v2",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-8eb2febe-a40a-4ba4-a963-d0cd74f688da.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/a-desktop-v2.png",
+    "status": "current-design-proposal"
+  },
+  {
+    "key": "b-desktop-v2",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-10729e54-4304-4265-95f9-dc233ff66e2b.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/b-desktop-v2.png",
+    "status": "current-design-proposal"
+  },
+  {
+    "key": "c-desktop-v2",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-1e447984-7408-4aac-b19c-c681c227d0d2.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/c-desktop-v2.png",
+    "status": "current-design-proposal"
+  },
+  {
+    "key": "mobile-v2",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-0f7c3d74-b5a7-4e4e-8708-94ec4968dafb.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/mobile-v2.png",
+    "status": "current-design-proposal"
+  },
+  {
+    "key": "ipad-v2",
+    "source": "/Users/tomcat/.codex/generated_images/01a07aad-7c0d-7031-bce6-8172710d08b4/exec-2c137ea8-9b7d-4e4d-bfd6-02853e40c3c7.png",
+    "destination": "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/design-demos/pty-redesign-2026-09-08/ipad-v2.png",
+    "status": "current-design-proposal"
+  }
+]

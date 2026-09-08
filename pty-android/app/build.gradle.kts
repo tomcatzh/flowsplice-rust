@@ -15,7 +15,15 @@ if (privateBuild) {
     outside(File(System.getenv("CARGO_TARGET_DIR") ?: error("CARGO_TARGET_DIR required")))
     check(!gradle.startParameter.isBuildScan && !gradle.startParameter.isConfigurationCacheRequested) { "Private build must disable scans/configuration cache" }
     gradle.startParameter.setBuildCacheEnabled(false)
-    listOf("deployment-root.pub", "business.json").forEach { check(file("src/main/assets/bootstrap/$it").isFile) { "Missing private bootstrap input" } }
+    val bootstrap = file("src/main/assets/bootstrap")
+    val configuration = listOf("homes.json", "business.json").filter { bootstrap.resolve(it).isFile }
+    check(bootstrap.resolve("deployment-root.pub").isFile && configuration.size == 1) {
+        "Private bootstrap requires root and exactly one Home catalog or business descriptor"
+    }
+    val allowed = setOf("deployment-root.pub", configuration.single())
+    check(bootstrap.listFiles().orEmpty().all { it.isFile && it.name in allowed }) {
+        "Private bootstrap contains unexpected inputs; passwords must never be bundled"
+    }
 }
 android {
     namespace = "io.zxf.flowsplice.pty"

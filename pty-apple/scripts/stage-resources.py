@@ -1,10 +1,30 @@
 #!/usr/bin/env python3
 """Copy shared UI; private inputs and every build staging path must be Git-free."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
 import sys
+
+def validate_homes(path):
+    import re
+    catalog = json.loads(path.read_text())
+    homes = catalog.get('homes')
+    if type(catalog.get('version')) is not int or catalog['version'] != 1 or not isinstance(homes, list) or not 1 <= len(homes) <= 8:
+        raise ValueError('Invalid Home catalog')
+    ids = set()
+    for home in homes:
+        identifier = home.get('id', '')
+        name = home.get('name', '')
+        relay = home.get('relay', '')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', identifier) or identifier in ids:
+            raise ValueError('Invalid or duplicate Home id')
+        ids.add(identifier)
+        if not isinstance(name, str) or not name.strip() or len(name.encode()) > 128 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
+            raise ValueError('Invalid Home name')
+        if home.get('platform') not in ('linux', 'macos') or not isinstance(home.get('descriptor'), dict) or not isinstance(relay, str) or len(relay.encode()) > 512:
+            raise ValueError('Invalid Home configuration')
 
 project = Path(os.environ['SRCROOT']).resolve()
 repo = project.parent
@@ -22,8 +42,10 @@ if private:
         if os.environ.get(key):
             policy.external_path(os.environ[key])
     source = policy.external_path(private, require_directory=True, must_exist=True)
-    for name in ['deployment-root.pub', 'business.json']:
+    names = ['deployment-root.pub', 'homes.json' if (source / 'homes.json').exists() else 'business.json']
+    for name in names:
         policy.external_path(str(source / name), require_file=True, must_exist=True)
+    if 'homes.json' in names: validate_homes(source / 'homes.json')
 output.mkdir(parents=True, exist_ok=True)
 ui = output / 'pty-ui'
 if ui.exists():
@@ -34,6 +56,6 @@ if bootstrap.exists():
     shutil.rmtree(bootstrap)
 if private:
     bootstrap.mkdir(mode=0o700)
-    for name in ['deployment-root.pub', 'business.json']:
+    for name in names:
         shutil.copyfile(source / name, bootstrap / name)
         (bootstrap / name).chmod(0o600)
