@@ -396,8 +396,10 @@ public bundle.
 macOS system libraries cannot be fully statically linked, but FlowSplice code and web assets are
 contained in single executables. The legacy `build-release.sh` path and the CLI package helpers
 apply and verify ad-hoc signatures with stable `io.zxf.flowsplice.*` identifiers and the hardened
-runtime. Those signatures seal each exact binary but carry no developer identity; Gatekeeper may
-block a quarantined download produced by those helpers.
+runtime. Those outputs are intermediates for isolated development and testing only, carry no
+developer identity, and must not be treated as final deliveries. macOS apps, DMGs and deployment
+binaries delivered to the maintainer must pass the complete tests, Developer ID signing, Apple
+notarization, stapling where applicable, and final verification.
 
 Signed Apple distribution uses `scripts/build-apple-products.sh`, coordinated for private native
 packages by `scripts/build-private-travel-packages.sh`. It uses Developer ID signing and Apple

@@ -46,6 +46,8 @@ class PrivateTerminalE2ETest {
         val diagnostic = evaluate(scenario, """
             (()=>({
                 status:document.getElementById('status')?.textContent,
+                identityStatus:document.getElementById('identity-status')?.textContent,
+                globalNotice:document.getElementById('global-notice')?.textContent,
                 notice:document.getElementById('notice')?.textContent,
                 terminalAccessibility:Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility')).map(e=>e.textContent),
                 terminalTextarea:document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea')?.value,
@@ -83,51 +85,122 @@ class PrivateTerminalE2ETest {
             "(()=>{const e=document.getElementById($quoted);if(!e||e.hidden||e.disabled)return false;e.click();return true})()"))
     }
 
-    private fun typeTerminal(scenario: ActivityScenario<MainActivity>, command: String) {
+    private fun imeDiagnostic(scenario: ActivityScenario<MainActivity>, stage: String, phase: String, connectionAvailable: Boolean? = null) {
+        // Deliberately omit values, terminal text, commands and credentials.
+        val dom = evaluate(scenario, """
+            (()=>({
+                activeElementClass:document.activeElement?.className,
+                activeElementTag:document.activeElement?.tagName,
+                documentHasFocus:document.hasFocus(),
+                identityStatus:document.getElementById('identity-status')?.textContent,
+                globalNotice:document.getElementById('global-notice')?.textContent,
+                status:document.getElementById('status')?.textContent,
+                notice:document.getElementById('notice')?.textContent,
+                terminalNotice:document.getElementById('terminal-notice')?.textContent,
+                tabCount:document.querySelectorAll('#tabs button').length,
+                page:document.getElementById('app')?.dataset.page,
+                terminalViewVisible:!document.getElementById('terminal-view')?.hidden,
+                visibleTerminalCount:document.querySelectorAll('#panes > .terminal:not([hidden])').length,
+                terminalTextareaPresent:!!document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea'),
+                terminalTextareaFocused:document.activeElement===document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea')
+            }))()
+        """.trimIndent())
+        scenario.onActivity { activity ->
+            val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+            val record = JSONObject().put("stage", stage).put("phase", phase)
+                .put("elapsedRealtimeMs", android.os.SystemClock.elapsedRealtime())
+                .put("dom", JSONObject(dom)).put("webHasFocus", web.hasFocus())
+                .put("webHasWindowFocus", web.hasWindowFocus()).put("webIsShown", web.isShown)
+                .put("webIsTextEditor", web.onCheckIsTextEditor())
+                .put("connectionAvailable", connectionAvailable ?: JSONObject.NULL)
+            activity.openFileOutput("e2e-ime-phases.jsonl", android.content.Context.MODE_APPEND).use {
+                it.write((record.toString() + "\n").toByteArray(Charsets.UTF_8))
+            }
+        }
+    }
+
+    private fun typeTerminal(scenario: ActivityScenario<MainActivity>, command: String, stage: String) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        scenario.onActivity { activity ->
-            val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
-            assertTrue("WebView native focus unavailable", web.requestFocus())
-        }
-        assertEquals("Terminal textarea is unavailable", "true", evaluate(scenario,
-            "(()=>{const e=document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea');if(!e)return false;e.focus();return document.activeElement===e})()"))
+        imeDiagnostic(scenario, stage, "before-native-focus")
+        try {
+            scenario.onActivity { activity ->
+                val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+                assertTrue("WebView native focus unavailable [$stage]", web.requestFocus())
+            }
+        } finally { imeDiagnostic(scenario, stage, "after-native-focus") }
+        imeDiagnostic(scenario, stage, "before-dom-focus")
+        try {
+            assertEquals("Terminal textarea is unavailable [$stage]", "true", evaluate(scenario,
+                "(()=>{const e=document.querySelector('#panes > .terminal:not([hidden]) .xterm-helper-textarea');if(!e)return false;e.focus();return document.activeElement===e})()"))
+        } finally { imeDiagnostic(scenario, stage, "after-dom-focus") }
         instrumentation.waitForIdleSync()
         Thread.sleep(250)
-        scenario.onActivity { activity ->
-            val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
-            val connection = web.onCreateInputConnection(EditorInfo())
-            assertNotNull("WebView terminal does not expose an IME input connection", connection)
-            assertTrue("Terminal IME rejected text", connection!!.commitText(command, 1))
-            assertTrue("Terminal IME rejected composition completion", connection.finishComposingText())
-        }
+        var connectionAvailable: Boolean? = null
+        imeDiagnostic(scenario, stage, "before-commit")
+        try {
+            scenario.onActivity { activity ->
+                val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+                val connection = web.onCreateInputConnection(EditorInfo())
+                connectionAvailable = connection != null
+                assertNotNull("WebView terminal does not expose an IME input connection [$stage]", connection)
+                assertTrue("Terminal IME rejected text [$stage]", connection!!.commitText(command, 1))
+                assertTrue("Terminal IME rejected composition completion [$stage]", connection.finishComposingText())
+            }
+        } finally { imeDiagnostic(scenario, stage, "after-commit-and-composition", connectionAvailable) }
         instrumentation.waitForIdleSync()
         Thread.sleep(250)
-        scenario.onActivity { activity ->
-            val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
-            val connection = web.onCreateInputConnection(EditorInfo())
-            assertNotNull("Terminal IME connection unavailable for Return", connection)
-            assertTrue("Terminal IME rejected Return", connection!!.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)))
-            assertTrue(connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER)))
-        }
+        connectionAvailable = null
+        imeDiagnostic(scenario, stage, "before-return")
+        try {
+            scenario.onActivity { activity ->
+                val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+                val connection = web.onCreateInputConnection(EditorInfo())
+                connectionAvailable = connection != null
+                assertNotNull("Terminal IME connection unavailable for Return [$stage]", connection)
+                assertTrue("Terminal IME rejected Return [$stage]", connection!!.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)))
+                assertTrue(connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER)))
+            }
+        } finally { imeDiagnostic(scenario, stage, "after-return", connectionAvailable) }
     }
 
     @Test fun enrollCreateAndResumeExistingSession() {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Requires an explicitly isolated device/app installation", args.getString("isolated") == "true")
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        assumeTrue("Requires externally packaged private bootstrap", context.assets.list("bootstrap").orEmpty().contains("homes.json"))
+        val isClass = args.getString("ptyServiceClass") == "true"
+        assumeTrue("Requires externally packaged private bootstrap", context.assets.list("bootstrap").orEmpty().contains(if (isClass) "service-class.json" else "homes.json"))
+        fun targetArg(name: String): String = String(android.util.Base64.decode(args.getString(name + "Base64") ?: error("Missing target argument $name"), android.util.Base64.NO_WRAP), Charsets.UTF_8)
+        val firstId = if (isClass) targetArg("ptyFirstHomeId") else "default"
+        val secondId = if (isClass) targetArg("ptySecondHomeId") else "secondary"
+        val firstName = if (isClass) targetArg("ptyFirstHomeName") else "测试 Mac"
+        val secondName = if (isClass) targetArg("ptySecondHomeName") else "测试 VPS"
         val relay = args.getString("ptyRelay") ?: error("External ptyRelay argument required")
         val passwordPath = args.getString("ptyPasswordFile") ?: error("External ptyPasswordFile argument required")
         assertTrue("Password fixture path must be absolute", File(passwordPath).isAbsolute)
         val password = File(passwordPath).readText().trimEnd('\r', '\n')
         assertTrue("Password fixture must be nonempty", password.isNotEmpty())
-        assertFalse("Requires a fresh isolated installation", context.filesDir.resolve("installation/travelagent.toml").exists())
+        assertFalse("Requires a fresh isolated installation", context.filesDir.resolve(if (isClass) "service-class/travelagent.toml" else "installation/travelagent.toml").exists())
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             fun management() { click(scenario, "terminal-back") }
             fun select(id: String) {
                 if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") management()
                 click(scenario, "mobile-home")
-                assertEquals("true", evaluate(scenario, "(()=>{const b=document.querySelector('#home-cards [data-home-id=\"$id\"]');if(!b)return false;b.click();return true})()"))
+                waitFor(scenario, "Array.from(document.querySelectorAll('#home-cards [data-home-id]')).some(e=>e.dataset.homeId===${JSONObject.quote(id)})", "target discovered $id")
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#home-cards [data-home-id]')).find(e=>e.dataset.homeId===${JSONObject.quote(id)});if(!b)return false;b.click();return true})()"))
+            }
+            fun enrollClass() {
+                waitFor(scenario, "!document.getElementById('identity-panel').hidden", "class identity setup")
+                assertEquals("true", evaluate(scenario, "(()=>{document.getElementById('identity-relay').value=${JSONObject.quote(relay)};document.getElementById('identity-password').value=${JSONObject.quote(password)};return true})()"))
+                click(scenario, "identity-enter")
+                waitFor(scenario, "!document.getElementById('identity-waiting').hidden&&!document.getElementById('identity-code').textContent.includes('正在')", "class approval code", 120)
+                context.filesDir.resolve("e2e-verification.json").writeText(evaluate(scenario, "({notice:'等待批准，校验码：'+document.getElementById('identity-code').textContent,client_label:document.getElementById('identity-label').textContent})"))
+                waitFor(scenario, "document.getElementById('identity-status').textContent==='服务目录已连接'", "shared class connection", 180)
+                assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
+            }
+            fun connectHome(id: String) {
+                select(id)
+                waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&!document.getElementById('new').disabled", "class target connection", 180)
+                assertEquals("true", evaluate(scenario, "document.getElementById('password-label').hidden&&document.getElementById('relay-label').hidden"))
             }
             fun enroll(id: String) {
                 select(id)
@@ -156,37 +229,43 @@ class PrivateTerminalE2ETest {
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='继续');if(!b)return false;b.click();return true})()"))
                 return session
             }
-            fun output(marker: String) {
+            fun output(marker: String, stage: String) {
                 val octal = marker.toByteArray(Charsets.US_ASCII).joinToString("") { "\\%03o".format(it.toInt() and 255) }
-                typeTerminal(scenario, "printf '\\n${octal}\\n'")
+                typeTerminal(scenario, "printf '\\n${octal}\\n'", stage)
                 waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility')).some(e=>e.textContent.includes(${JSONObject.quote(marker)}))", "remote rendered output $marker", 30)
             }
             fun switch(name: String) {
                 click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E shell")});if(!b)return false;b.click();return true})()"))
             }
-            waitFor(scenario, "document.querySelectorAll('#home-cards [data-home-id]').length===2", "two Home catalog")
-            enroll("default")
+            if (isClass) {
+                enrollClass()
+                waitFor(scenario, "[${JSONObject.quote(firstId)},${JSONObject.quote(secondId)}].every(id=>Array.from(document.querySelectorAll('#home-cards [data-home-id]')).some(e=>e.dataset.homeId===id))", "two discovered Home targets")
+                connectHome(firstId)
+            } else {
+                waitFor(scenario, "document.querySelectorAll('#home-cards [data-home-id]').length===2", "two Home catalog")
+                enroll(firstId)
+            }
             val first = create()
             assertEquals("7", evaluate(scenario, "document.querySelectorAll('#keys button').length"))
             val marker = "PTY_E2E_" + UUID.randomUUID().toString().replace("-", "").take(8)
-            output(marker)
+            output(marker, "first-home-initial")
             click(scenario, "mode")
             waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "readonly")
             click(scenario, "mode")
             waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "writer restored")
-            enroll("secondary")
+            if (isClass) connectHome(secondId) else enroll(secondId)
             val second = create()
             assertNotEquals("Same names on different Homes must have different session identities", first, second)
-            output(marker + "SECOND")
+            output(marker + "SECOND", "second-home-initial")
             assertEquals("2", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
-            switch("测试 Mac"); output(marker + "FIRST")
-            switch("测试 VPS"); output(marker + "SECONDAGAIN")
+            switch(firstName); output(marker + "FIRST", "first-home-switched")
+            switch(secondName); output(marker + "SECONDAGAIN", "second-home-switched")
             management(); click(scenario, "disconnect")
             waitFor(scenario, "document.querySelectorAll('#tabs button').length===1", "one Home disconnect preserves other tab")
-            switch("测试 Mac"); output(marker + "SURVIVED")
+            switch(firstName); output(marker + "SURVIVED", "first-home-survived-disconnect")
             // Reconnect only the secondary Home, list its shell, and explicitly rejoin.
-            select("secondary")
+            select(secondId)
             waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.querySelectorAll('#list .session').length===1", "secondary reconnect", 180)
             assertEquals(second, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
             assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
@@ -198,13 +277,18 @@ class PrivateTerminalE2ETest {
                 assertEquals("No automatic foreground reconnect", "true", evaluate(scenario, "!document.getElementById('status').textContent.includes('已连接')"))
                 Thread.sleep(100)
             }
-            click(scenario, "enter")
+            if (isClass) {
+                click(scenario, "identity-enter")
+                waitFor(scenario, "document.getElementById('identity-status').textContent==='服务目录已连接'", "foreground shared reconnect", 180)
+                assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
+                connectHome(secondId)
+            } else click(scenario, "enter")
             waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.querySelectorAll('#list .session').length===1", "foreground explicit reconnect", 180)
             assertEquals(second, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
             assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
             assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
             waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows')).some(e=>e.textContent.includes(${JSONObject.quote(marker + "SECONDAGAIN")}))", "tmux restores prior output")
-            output(marker + "RESUMED")
+            output(marker + "RESUMED", "second-home-foreground-resumed")
             screenshot(scenario)
             management(); click(scenario, "disconnect")
         }

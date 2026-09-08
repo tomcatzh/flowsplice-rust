@@ -26,6 +26,10 @@ pub const TRAVEL_CREDENTIAL_OBJECT_TYPE: &str = "flowsplice.travel_credential";
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TravelCredentialScope {
     Global,
+    ServiceClass {
+        application_protocol: String,
+        protocol: ServiceProtocol,
+    },
     Home {
         home_id: String,
     },
@@ -322,12 +326,29 @@ impl TravelCredential {
     ) -> bool {
         self.scope.allows_service(home_id, service_id, protocol)
     }
+
+    /// Checks a service against metadata verified from its Home's signed grant.
+    #[must_use]
+    pub fn allows_business_service(
+        &self,
+        home_id: &str,
+        service_id: &str,
+        protocol: ServiceProtocol,
+        business: Option<&crate::business::BusinessService>,
+    ) -> bool {
+        self.scope
+            .allows_business_service(home_id, service_id, protocol, business)
+    }
 }
 
 impl TravelCredentialScope {
     fn validate(&self) -> Result<()> {
         match self {
             Self::Global => Ok(()),
+            Self::ServiceClass {
+                application_protocol,
+                ..
+            } => crate::business::validate_application_protocol(application_protocol),
             Self::Home { home_id } if !home_id.is_empty() => Ok(()),
             Self::Service {
                 home_id,
@@ -344,7 +365,7 @@ impl TravelCredentialScope {
     #[must_use]
     pub fn home_id(&self) -> Option<&str> {
         match self {
-            Self::Global => None,
+            Self::Global | Self::ServiceClass { .. } => None,
             Self::Home { home_id } | Self::Service { home_id, .. } => Some(home_id),
         }
     }
@@ -352,7 +373,7 @@ impl TravelCredentialScope {
     #[must_use]
     pub fn allows_home(&self, home_id: &str) -> bool {
         match self {
-            Self::Global => true,
+            Self::Global | Self::ServiceClass { .. } => true,
             Self::Home {
                 home_id: allowed_home,
             }
@@ -372,6 +393,8 @@ impl TravelCredentialScope {
     ) -> bool {
         match self {
             Self::Global => true,
+            // Class grants require signed Home service metadata at final admission.
+            Self::ServiceClass { .. } => false,
             Self::Home {
                 home_id: allowed_home,
             } => allowed_home == home_id,
@@ -385,6 +408,32 @@ impl TravelCredentialScope {
                     && *allowed_protocol == protocol
             }
         }
+    }
+}
+
+impl TravelCredentialScope {
+    /// Class matching requires trusted metadata; an ordinary TCP/UDP service is insufficient.
+    #[must_use]
+    pub fn allows_business_service(
+        &self,
+        home_id: &str,
+        service_id: &str,
+        protocol: ServiceProtocol,
+        business: Option<&crate::business::BusinessService>,
+    ) -> bool {
+        if let Self::ServiceClass {
+            application_protocol,
+            protocol: allowed,
+        } = self
+        {
+            return business.is_some_and(|service| {
+                service.service_id == service_id
+                    && service.protocol == protocol
+                    && protocol == *allowed
+                    && service.application_protocol == *application_protocol
+            });
+        }
+        self.allows_service(home_id, service_id, protocol)
     }
 }
 

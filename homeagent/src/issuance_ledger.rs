@@ -57,6 +57,10 @@ impl IssuanceRecord {
                 TravelResponseEnvelope::Business(response),
                 TravelRequestEnvelope::Business(request),
             ) => &response.request == request.as_ref(),
+            (
+                TravelResponseEnvelope::ServiceClass(response),
+                TravelRequestEnvelope::ServiceClass(request),
+            ) => &response.request == request.as_ref(),
             _ => false,
         }
     }
@@ -102,6 +106,22 @@ impl IssuanceLedger {
             };
         validate_state(&state)?;
         Ok(Self { path, state })
+    }
+
+    pub fn client_labels(&self, root: &str) -> std::collections::HashMap<Uuid, String> {
+        self.state
+            .records
+            .iter()
+            .filter_map(|record| {
+                let TravelResponseEnvelope::ServiceClass(response) = &record.enrollment else {
+                    return None;
+                };
+                let issued_at = response.response.approval.not_before_unix_secs;
+                let (credential, _) = response.validate(root, issued_at).ok()?;
+                (credential.credential_id == record.credential_id())
+                    .then(|| (record.credential_id(), response.request.label.clone()))
+            })
+            .collect()
     }
 
     pub fn find(&self, request: &TravelEnrollmentRequest) -> Result<Option<IssuanceRecord>> {
@@ -208,6 +228,11 @@ fn validate_state(state: &LedgerState) -> Result<()> {
 }
 
 fn validate_record(record: &IssuanceRecord) -> Result<()> {
+    if let TravelResponseEnvelope::ServiceClass(response) = &record.enrollment
+        && response.request.request != response.response.approval.request
+    {
+        bail!("issuance ledger contains an inconsistent service class enrollment request");
+    }
     if let TravelResponseEnvelope::Business(response) = &record.enrollment
         && response.request.request != response.response.approval.request
     {
@@ -450,6 +475,80 @@ mod tests {
             response.request.request.travel_id = "different-travel".to_owned();
         }
         assert!(validate_record(&business_record).is_err());
+        Ok(())
+    }
+    #[test]
+    fn service_class_ledger_replay_keeps_complete_named_intent() -> Result<()> {
+        use flowsplice_core::business::{ServiceClassDescriptor, SignedServiceClassApproval};
+        use flowsplice_core::protocol::ServiceProtocol;
+        use flowsplice_enrollment::business::{
+            ServiceClassTravelRequest, ServiceClassTravelResponse,
+        };
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join(ISSUANCE_LEDGER_FILE);
+        let original = request(Uuid::new_v4());
+        let request = ServiceClassTravelRequest {
+            version: 1,
+            object_type: "flowsplice.service_class_travel_request".into(),
+            request: original.clone(),
+            descriptor: ServiceClassDescriptor {
+                version: 1,
+                approving_home_id: "home-1".into(),
+                application_protocol: "flowsplice.pty.v1".into(),
+                protocol: ServiceProtocol::Tcp,
+            },
+            label: "iPad".into(),
+        };
+        let scope = request.descriptor.scope();
+        let enrollment =
+            TravelResponseEnvelope::ServiceClass(Box::new(ServiceClassTravelResponse {
+                version: 1,
+                object_type: "flowsplice.service_class_travel_response".into(),
+                request: request.clone(),
+                response: response(original.clone(), "global-authority", scope.clone()),
+                approval: SignedServiceClassApproval {
+                    authority_id: "global-authority".into(),
+                    payload_hex: "payload".into(),
+                    signature_hex: "signature".into(),
+                },
+            }));
+        let mut ledger = IssuanceLedger::load(path.clone())?;
+        ledger.insert_pending(
+            &original,
+            "global-authority",
+            &scope,
+            3600,
+            enrollment.clone(),
+        )?;
+        assert!(
+            ledger
+                .insert_pending(&original, "global-authority", &scope, 3600, enrollment)
+                .is_err()
+        );
+        let ledger = IssuanceLedger::load(path)?;
+        let record = ledger.find(&original)?.context("missing restored record")?;
+        assert!(
+            record.matches_request_envelope(&TravelRequestEnvelope::ServiceClass(Box::new(
+                request.clone()
+            )))
+        );
+        assert!(!record.matches_request_envelope(&TravelRequestEnvelope::Legacy(original)));
+        let mut changed = request.clone();
+        changed.label = "other".into();
+        assert!(
+            !record
+                .matches_request_envelope(&TravelRequestEnvelope::ServiceClass(Box::new(changed)))
+        );
+        let mut changed = request;
+        changed.descriptor.application_protocol = "other.v1".into();
+        assert!(
+            !record
+                .matches_request_envelope(&TravelRequestEnvelope::ServiceClass(Box::new(changed)))
+        );
+        assert!(
+            ledger.client_labels("invalid-root").is_empty(),
+            "unverified names entered history"
+        );
         Ok(())
     }
 }

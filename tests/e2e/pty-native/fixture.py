@@ -33,6 +33,29 @@ class Fixture:
             info = json.loads(command(["docker", "inspect", container]).stdout)[0]
             if not info["State"]["Running"] or info["Config"]["Image"] != self.data["image"]:
                 raise RuntimeError("Disposable PTY Home is unavailable")
+        self.service_class = None
+        self.native_targets = []
+        if (self.directory / "service-class.json").is_file():
+            self.service_class = json.loads((self.directory / "service-class.json").read_text())
+            if (set(self.service_class) != {"version", "approving_home_id", "application_protocol", "protocol"}
+                    or self.service_class["version"] != 1
+                    or self.service_class["application_protocol"] != "flowsplice.pty.v1"
+                    or self.service_class["protocol"] != "tcp"):
+                raise RuntimeError("Unexpected native service class descriptor")
+            self.native_targets = self.data.get("native_targets", [])
+            if len(self.native_targets) != 2:
+                raise RuntimeError("Class acceptance requires exactly two explicit native targets")
+            ids, home_ids = set(), set()
+            for target in self.native_targets:
+                if (json.loads(target["id"]) != [target["home_id"], target["service_id"]]
+                        or not target["name"].strip() or target["id"] in ids):
+                    raise RuntimeError("Invalid native class target")
+                ids.add(target["id"]); home_ids.add(target["home_id"])
+            if len(home_ids) != 2 or len(self.containers) != 2 or len({target["name"] for target in self.native_targets}) != 2:
+                raise RuntimeError("Class acceptance requires two different fixture Homes")
+            self.targets = self.native_targets
+            self.password = (self.directory / "password.txt").read_text().rstrip("\r\n")
+            return
         self.descriptor = json.loads((self.directory / "business.json").read_text())
         self.targets = [(self.descriptor, self.data["scope"])]
         if self.data.get("secondary_scope"):
@@ -41,7 +64,16 @@ class Fixture:
             self.targets.append((secondary, self.data["secondary_scope"]))
         self.password = (self.directory / "password.txt").read_text().rstrip("\r\n")
 
-    def approve_notice(self, notice):
+    @property
+    def expected_approvals(self):
+        return 1 if self.service_class else 2
+
+    def approve_notice(self, notice, client_label=None):
+        if isinstance(notice, dict):
+            client_label = notice.get("client_label")
+            notice = notice.get("notice")
+        if not isinstance(notice, str):
+            raise RuntimeError("Invalid rendered verification evidence")
         # The code must come from the actual rendered native UI, not the inbox itself.
         if "等待批准，校验码：" not in notice:
             return None
@@ -56,6 +88,21 @@ class Fixture:
             raise RuntimeError("Rendered verification code has no unique pending request")
         item = matches[0]
         uuid.UUID(item["travel_id"].removeprefix("pty-"))
+        if self.service_class:
+            if (not isinstance(client_label, str) or not client_label.endswith(" · PTY")
+                    or len(client_label.encode()) > 64
+                    or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0x202A <= ord(c) <= 0x202E or 0x2066 <= ord(c) <= 0x2069 for c in client_label)
+                    or item.get("client_label") != client_label
+                    or item.get("service_class") != self.service_class):
+                raise RuntimeError("Native class request differs from rendered identity or fixture class")
+            scope = {"kind":"service_class", "application_protocol":self.service_class["application_protocol"], "protocol":self.service_class["protocol"]}
+            issuer.request(19084, "POST", "/api/enrollment/approve", {
+                "request_id":item["request_id"], "scope":scope,
+                "valid_days":365, "password":self.password,
+            })
+            return {"request_id":item["request_id"], "travel_id":item["travel_id"],
+                    "rendered_code_matched":True, "client_label":client_label,
+                    "service_class":self.service_class, "scope":scope}
         business = item.get("business") or {}
         targets = [(descriptor, scope) for descriptor, scope in self.targets if scope["home_id"] == business.get("home_id")]
         if len(targets) != 1:

@@ -20,13 +20,13 @@ object PasswordStore {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
         }.generateKey()
     }
-    fun save(context: Context, password: String, homeID: String = "default") {
+    fun save(context: Context, password: String, homeID: String = "default", serviceClass: Boolean = false) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
         val encoded = Base64.encodeToString(cipher.iv + cipher.doFinal(password.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
-        check(context.getSharedPreferences(if (homeID == "default") "pty-credentials" else "pty-credentials-home-$homeID", Context.MODE_PRIVATE).edit().putString("password", encoded).commit())
+        check(context.getSharedPreferences(if (serviceClass) "pty-credentials-service-class" else if (homeID == "default") "pty-credentials" else "pty-credentials-home-$homeID", Context.MODE_PRIVATE).edit().putString("password", encoded).commit())
     }
-    fun load(context: Context, homeID: String = "default"): String? = runCatching {
-        val encoded = context.getSharedPreferences(if (homeID == "default") "pty-credentials" else "pty-credentials-home-$homeID", Context.MODE_PRIVATE).getString("password", null) ?: return null
+    fun load(context: Context, homeID: String = "default", serviceClass: Boolean = false): String? = runCatching {
+        val encoded = context.getSharedPreferences(if (serviceClass) "pty-credentials-service-class" else if (homeID == "default") "pty-credentials" else "pty-credentials-home-$homeID", Context.MODE_PRIVATE).getString("password", null) ?: return null
         val bytes = Base64.decode(encoded, Base64.NO_WRAP)
         if (bytes.size <= 12) return null
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12))) }

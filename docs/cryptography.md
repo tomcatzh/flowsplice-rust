@@ -562,8 +562,11 @@ Travel build, and reissuance under the replacement deployment.
   Travel, Home, or target process from its own host administrator or malware.
 - Signed state protects integrity and rollback only within the persisted history available to that
   component. Deleting or maliciously replacing local high-water files defeats that local history.
-- Release binaries are not yet Developer ID notarized, reproducibly attested, or delivered by an
-  authenticated anti-rollback updater. Separate configuration prevents deployment coupling but does
+- Legacy macOS helper outputs are ad hoc signed intermediates for isolated development and testing,
+  not final deliveries. macOS apps, DMGs and deployment binaries delivered to the maintainer require
+  complete testing, Developer ID signing, Apple notarization, stapling where applicable, and final
+  verification. Releases are not reproducibly attested or delivered by an authenticated anti-rollback
+  updater. Separate configuration prevents deployment coupling but does
   not by itself authenticate the adjacent root file; package provenance or an independently verified
   root fingerprint remains required.
 - The project has not undergone a professional third-party security audit and is not a certified

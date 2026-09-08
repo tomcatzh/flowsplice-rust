@@ -5,7 +5,7 @@ use flowsplice_pty_protocol::{
     APPLICATION_PROTOCOL, ClientMessage, Operation, PROTOCOL_VERSION, Reply, ServerMessage,
     read_message, write_message,
 };
-use flowsplice_travel_core::TravelCore;
+use flowsplice_travel_core::{ServiceBinding, TravelCore};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -87,6 +87,19 @@ impl PtyClient {
                 Err(error)
             }
         }
+    }
+
+    /// Opens a PTY stream on an existing runtime without owning its lifetime.
+    ///
+    /// # Errors
+    /// Returns binding, transport, or terminal handshake errors.
+    pub async fn connect_shared(
+        runtime: &TravelCore,
+        binding: &ServiceBinding,
+        label: String,
+    ) -> Result<(Self, mpsc::Receiver<ServerMessage>)> {
+        let stream = runtime.connect_tcp(binding).await?;
+        Self::from_stream(stream, label).await
     }
 
     async fn from_stream<S>(

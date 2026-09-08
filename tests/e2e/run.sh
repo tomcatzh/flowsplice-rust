@@ -9,6 +9,10 @@ export FLOWSPLICE_E2E_UID="$(id -u)"
 export FLOWSPLICE_E2E_GID="$(id -g)"
 export COMPOSE_PROJECT_NAME="${FLOWSPLICE_E2E_PROJECT_NAME:-flowsplice-e2e-$$}"
 export FLOWSPLICE_E2E_IMAGE="${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e-0-3-$$:local}"
+if [[ -n "${FLOWSPLICE_PTY_NATIVE_FIXTURE_EXPORT:-}" && "${FLOWSPLICE_PTY_E2E:-0}" != "1" ]]; then
+  printf 'Native PTY fixture export requires FLOWSPLICE_PTY_E2E=1.\n' >&2
+  exit 1
+fi
 docker_pull="${FLOWSPLICE_DOCKER_PULL:-false}"
 if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2

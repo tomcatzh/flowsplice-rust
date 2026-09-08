@@ -159,12 +159,13 @@ impl TravelCore {
         }
         if binding.protocol != ServiceProtocol::Tcp
             || binding.service_id.is_empty()
-            || !self
+            || !(self
                 .state
                 .config
                 .homes
                 .iter()
                 .any(|home| home.id == binding.home_id)
+                || self.class_binding_allowed(binding).await?)
         {
             bail!("invalid TCP business binding");
         }
@@ -279,12 +280,13 @@ impl TravelCore {
         }
         if binding.protocol != ServiceProtocol::Udp
             || binding.service_id.is_empty()
-            || !self
+            || !(self
                 .state
                 .config
                 .homes
                 .iter()
                 .any(|home| home.id == binding.home_id)
+                || self.class_binding_allowed(binding).await?)
         {
             bail!("invalid UDP business binding");
         }
@@ -437,6 +439,7 @@ mod datagram_tests {
                 home_id: "home-a".to_owned(),
                 home_alias: "A".to_owned(),
                 endpoint_credential: None,
+                service_grant: None,
                 services: vec![
                     Service {
                         id: "tcp-only".to_owned(),

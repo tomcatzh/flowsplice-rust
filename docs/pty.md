@@ -1,10 +1,11 @@
 # Private FlowSplice PTY
 
 The first PTY application uses the shared encrypted Home/Travel crates. Its Travel
-side opens no local TCP, UDP, HTTP or WebSocket listener. Each connected Home owns
-an independent foreground runtime. Switching Home pages or terminal tabs preserves
-other connections; disconnecting one Home releases only that runtime. Backgrounding
-the app disconnects all Homes.
+side opens no local TCP, UDP, HTTP or WebSocket listener. The primary service-class
+mode has one identity and one foreground Travel runtime shared by up to eight
+simultaneously connected PTY Home targets. Switching Home pages or terminal tabs
+preserves other connections; disconnecting one Home releases only its PTY connection.
+Backgrounding the app disconnects all Home targets and then the shared runtime.
 The generic Travel applications retain their existing forwarding and background behavior.
 
 ## Provisioning
@@ -44,14 +45,37 @@ lock. Use separate accounts and domains when stronger operating-system isolation
 needed. First-version backends target Linux arm64/amd64 and macOS arm64, with tmux
 3.3 or later; the acceptance suite exercises actual installed tmux versions.
 
-Package the deployment root and the chosen business descriptors as private resources
-using [Android packaging](../pty-android/README.md) or [Apple packaging](../pty-apple/README.md).
+Package the deployment root and a `service-class.json` descriptor as private resources
+using [Android packaging](../pty-android/README.md) or [Apple packaging](../pty-apple/README.md):
+
+```json
+{"version":1,"approving_home_id":"super-home","application_protocol":"flowsplice.pty.v1","protocol":"tcp"}
+```
+
 Neither private configuration nor keys belong in Git or neutral Rust binaries. The
-client initially asks for the Relay IP:port and private-key password, waits for the fixed
-Super Home's approval, and stores the approved service binding automatically. Its
-password is saved in native secure storage before enrollment starts so interrupted
-enrollment can resume. Daily connections use that stored password without a login
-prompt. A missing stored credential opens a recovery prompt.
+client asks for the Relay IP:port and private-key password once, displays its device
+name followed by ` · PTY`, and waits for the specified Global issuer's approval. This
+approval covers current and future properly authorized business Homes with the exact
+application protocol and transport in the descriptor. It is not Global Travel access,
+and a matching alias or service ID does not confer authorization.
+
+After approval, one class identity connects the shared runtime and discovers authorized
+PTY targets from the service directory. Connecting each Home opens its session list;
+there is no per-Home enrollment or password prompt. The class installation and native
+secure-store namespace are separate from existing installations. The enrollment password
+is saved securely before enrollment starts so interrupted enrollment can resume. Daily
+connections reuse it without a login prompt; a missing credential opens recovery.
+
+Upgrade all Server, Relay and Home authorization consumers before issuing the first
+service-class grant. Older infrastructure cannot parse the new credential-scope enum.
+Existing generic Travel applications remain unchanged; their credentials and forwarding
+behavior are preserved. Existing narrow credentials are never automatically widened.
+
+### Legacy private bootstrap compatibility
+
+`service-class.json` is mutually exclusive with the legacy bootstrap files below.
+These legacy packages continue to use separate per-Home identities and foreground
+runtimes; their installed files and secure-store accounts remain intact.
 
 Private multi-Home builds accept `homes.json` in place of `business.json`:
 
@@ -120,6 +144,8 @@ machine is outside the keepalive promise.
 
 ## Validation
 
+Deploy a coordinated current-version system. Mixed old/new runtime support and old-client compatibility tests are not required release gates. Run configuration migration tests only when a configuration format changes; retain current-version functional, regression, E2E and Release validation. Preserve existing configuration and identity material during ordinary upgrades.
+
 `tests/e2e/check-pty-platforms.sh` runs real tmux ownership, blocked-input takeover,
 resize, detach and natural-exit tests on both Linux architectures. Set
 `FLOWSPLICE_PTY_E2E=1` for the full Docker runner's encrypted PTY scenario, including
@@ -127,12 +153,17 @@ Home process termination and crash/restart. Native UI tests live in `pty-android
 `pty-apple`; external build drivers are under `tests/e2e/pty-native`.
 
 The native drivers consume an externally exported disposable fixture and approve
-only the exact request whose verification code was rendered in the app. Build
-outputs and fixture secrets stay outside Git. On macOS, an existing developer
-signing identity can be supplied to the test build through
-`FLOWSPLICE_PTY_MACOS_SIGNING_IDENTITY` and, when needed,
-`FLOWSPLICE_PTY_MACOS_DEVELOPMENT_TEAM`; signature verification and successful
-test-runner launch are separate checks.
+only the exact request whose verification code was rendered in the app. Class-mode
+acceptance additionally matches the rendered device label and full descriptor, issues
+exactly one class approval, and connects two distinct Homes through the shared runtime. Build
+outputs and fixture secrets stay outside Git. Isolated macOS native tests use Xcode
+ad hoc signing with `CODE_SIGNING_ALLOWED=YES` and `CODE_SIGN_IDENTITY=-`,
+preserving ordinary Debug entitlements. Both app and runner must pass signature
+verification and report ad hoc signing without a certificate authority; unsigned
+bundles are rejected. Each build uses a fresh test-only application and runner
+identity, avoiding sandbox containers owned by older signing identities. This
+authorization is for tests only. Final macOS distribution
+packages require Apple notarization after the complete test suite passes.
 
 Use dedicated simulators with an English keyboard for deterministic shell-command
 input. Apple UI acceptance reads the rendered terminal with local Vision OCR; the

@@ -543,3 +543,210 @@ test("cancelled or failed enrollment cannot trigger a later automatic connection
   state("mac", false, true, false);
   expect(actions.some((a) => a.op === "connect")).toBe(false);
 });
+
+function classIdentity(connected = false, installed = false, busy = false) {
+  window.flowsplice.receive({
+    type: "identity",
+    label: "My Mac · PTY",
+    connected,
+    installed,
+    busy,
+  });
+}
+function classCatalog(ids = ["one", "two"]) {
+  window.flowsplice.receive({
+    type: "homes",
+    homes: ids.map((id) => ({
+      id: JSON.stringify([id, "pty"]),
+      home_id: id,
+      name: `Home ${id}`,
+      service_id: "pty",
+      platform: "host",
+      relay: "",
+    })),
+  });
+}
+test("service class enrollment happens once at app level and connects shared runtime", () => {
+  classIdentity();
+  classCatalog([]);
+  actions = [];
+  expect(el("identity-panel").hidden).toBe(false);
+  expect(el("identity-label").textContent).toBe("My Mac · PTY");
+  (el("identity-relay") as HTMLInputElement).value = "relay.example:7000";
+  (el("identity-password") as HTMLInputElement).value = "private-password";
+  submit("identity-access");
+  expect(actions).toEqual([
+    { op: "enroll", relay: "relay.example:7000", password: "private-password" },
+  ]);
+  window.flowsplice.receive({
+    type: "progress",
+    progress: { verification_code: "123456" },
+  });
+  expect(el("identity-code").textContent).toBe("123456");
+  classIdentity(false, true, false);
+  expect(actions.at(-1)).toEqual({ op: "connect", password: "" });
+  expect(ops("new_named")).toHaveLength(0);
+});
+test("class targets use scoped actions without enrollment or passwords", () => {
+  classIdentity(true, true);
+  classCatalog();
+  actions = [];
+  (document.querySelector("#home-cards button") as HTMLButtonElement).click();
+  const id = JSON.stringify(["one", "pty"]);
+  expect(actions.at(-1)).toEqual({ op: "connect_home", home_id: id });
+  expect(el("password-label").hidden).toBe(true);
+  state(id, true);
+  send({ type: "protocol", message: { type: "hello", can_write: true } }, id);
+  attach(id);
+  terminals.at(-1).onInput("hello");
+  expect(actions.at(-1)).toMatchObject({
+    op: "operation_home",
+    home_id: id,
+    operation: { op: "input" },
+  });
+  click("manage");
+  click("disconnect");
+  expect(
+    actions.some((a) => a.op === "disconnect_home" && a.home_id === id),
+  ).toBe(true);
+  expect(actions.some((a) => a.op === "enroll" || a.op === "disconnect")).toBe(
+    false,
+  );
+});
+test("class catalog refresh preserves connections and discovers or removes only exact target", () => {
+  classIdentity(true, true);
+  classCatalog();
+  const one = JSON.stringify(["one", "pty"]),
+    two = JSON.stringify(["two", "pty"]);
+  state(one);
+  state(two);
+  attach(one);
+  attach(two);
+  classCatalog(["one", "two", "three"]);
+  expect(terminals.every((t) => t.dispose.mock.calls.length === 0)).toBe(true);
+  expect(document.querySelectorAll("#home-cards button")).toHaveLength(3);
+  expect(el("tabs").children).toHaveLength(2);
+  classCatalog(["two", "three"]);
+  expect(terminals[0].dispose).toHaveBeenCalledOnce();
+  expect(terminals[1].dispose).not.toHaveBeenCalled();
+  expect(el("tabs").children).toHaveLength(1);
+  terminals[1].onInput("still connected");
+  expect(actions.at(-1)).toMatchObject({ op: "operation_home", home_id: two });
+});
+test("class global recovery sends only shared connection action", () => {
+  classIdentity(false, true);
+  classCatalog([]);
+  actions = [];
+  window.flowsplice.receive({
+    type: "error",
+    code: "credential_required",
+    message: "stored password missing",
+  });
+  expect((el("recovery") as HTMLDialogElement).open).toBe(true);
+  (el("recovery-password") as HTMLInputElement).value = "recovered";
+  submit("recovery-form");
+  expect(actions.at(-1)).toEqual({ op: "connect", password: "recovered" });
+});
+test("class global disconnect closes all tabs without any automatic rejoin", () => {
+  classIdentity(true, true);
+  classCatalog();
+  const one = JSON.stringify(["one", "pty"]);
+  state(one);
+  attach(one);
+  actions = [];
+  classIdentity(false, true);
+  expect(terminals[0].dispose).toHaveBeenCalledOnce();
+  classIdentity(true, true);
+  classCatalog();
+  expect(
+    actions.some((a) => a.op === "connect_home" || a.operation?.op === "join"),
+  ).toBe(false);
+});
+test("class catalog does not overwrite native macOS platform info", () => {
+  window.flowsplice.receive({ type: "platform", platform: "macos" });
+  classIdentity();
+  classCatalog([]);
+  expect(el("keys").hidden).toBe(true);
+  expect(el("keys").children).toHaveLength(0);
+});
+
+test("native press target survives repeated catalog and other Home events and still selects its Home", () => {
+  classIdentity(true, true);
+  classCatalog();
+  const one = JSON.stringify(["one", "pty"]),
+    two = JSON.stringify(["two", "pty"]);
+  state(one);
+  state(two);
+  attach(one);
+  const second = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("#home-cards button"),
+  ).find((b) => b.dataset.homeId === two)!;
+  const navigation = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("#home-nav button"),
+  ).find((b) => b.dataset.homeId === two)!;
+  const terminal = el("tabs").firstElementChild as HTMLButtonElement;
+  second.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+  for (let i = 0; i < 3; i++) {
+    classCatalog();
+    info(one);
+    send({ type: "state", installed: true, connected: true, busy: false }, one);
+  }
+  expect(second.isConnected).toBe(true);
+  expect(document.querySelectorAll("#home-cards button")[1]).toBe(second);
+  expect(document.querySelectorAll("#home-nav button")[1]).toBe(navigation);
+  expect(el("tabs").firstElementChild).toBe(terminal);
+  second.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  second.click();
+  expect(el("home-name").textContent).toBe("Home two");
+  expect(el("app").dataset.page).toBe("manage");
+  terminal.click();
+  expect(el("terminal-title").textContent).toContain("Home one");
+  expect(el("app").dataset.page).toBe("terminal");
+});
+test("catalog changes update retained controls and remove only absent target nodes", () => {
+  classIdentity(true, true);
+  classCatalog();
+  const one = JSON.stringify(["one", "pty"]),
+    two = JSON.stringify(["two", "pty"]);
+  state(one);
+  state(two);
+  attach(one);
+  attach(two);
+  const cards = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("#home-cards button"),
+  );
+  const first = cards[0],
+    second = cards[1],
+    tabsBefore = Array.from(el("tabs").children);
+  window.flowsplice.receive({
+    type: "homes",
+    homes: [
+      {
+        id: two,
+        home_id: "two",
+        service_id: "pty",
+        name: "Renamed VPS",
+        platform: "host",
+        relay: "",
+      },
+      {
+        id: JSON.stringify(["three", "pty"]),
+        home_id: "three",
+        service_id: "pty",
+        name: "Third",
+        platform: "host",
+        relay: "",
+      },
+    ],
+  });
+  expect(first.isConnected).toBe(false);
+  expect(document.querySelector("#home-cards button")).toBe(second);
+  expect(second.getAttribute("aria-label")).toBe("Renamed VPS");
+  expect(el("tabs").children).toHaveLength(1);
+  expect(el("tabs").firstElementChild).toBe(tabsBefore[1]);
+  expect(tabsBefore[0].isConnected).toBe(false);
+  second.click();
+  expect(el("home-name").textContent).toBe("Renamed VPS");
+  (tabsBefore[1] as HTMLButtonElement).click();
+  expect(el("terminal-title").textContent).toContain("Renamed VPS");
+});

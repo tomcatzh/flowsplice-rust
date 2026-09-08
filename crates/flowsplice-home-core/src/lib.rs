@@ -38,6 +38,8 @@ pub use tcp_flow::{IncomingCarrier, TcpFlowRegistry};
 pub struct HomeFlowConfig {
     pub id: String,
     pub services: Vec<Service>,
+    /// Metadata loaded from the verified signed Home service grant, never raw advertisements.
+    pub business_services: Vec<flowsplice_core::business::BusinessService>,
     pub handshake_timeout_secs: u64,
     pub udp_idle_secs: u64,
 }
@@ -160,7 +162,15 @@ pub async fn run_work(
         .find(|candidate| candidate.id == service_id && candidate.protocol == protocol)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("unknown or mismatched service"))?;
-    if !credential.allows_service(&config.id, &service.id, service.protocol) {
+    if !credential.allows_business_service(
+        &config.id,
+        &service.id,
+        service.protocol,
+        config
+            .business_services
+            .iter()
+            .find(|approved| approved.service_id == service.id),
+    ) {
         bail!("Travel credential is not authorized for this logical service");
     }
 

@@ -434,7 +434,7 @@ Home 的真实部署仍需在被版本控制忽略的私有目录中复制样例
 
 仓库的 Dockerfile 还必须把 frontend 和所有基础镜像锁到不可变 digest。`FLOWSPLICE_DOCKER_PULL=false` 禁止主动更新；如果本机缺少该 digest，应停止并安排一次明确的缓存准备，不能在普通发布或部署时临时下载新层。
 
-macOS 文件使用免费的 ad-hoc codesign 与稳定的 `io.zxf.flowsplice.*` identifier。它能校验签名后未被修改，但没有 Apple Developer ID 身份，也未 notarize；公开分发时必须如实说明 Gatekeeper 限制。
+旧 macOS 构建 helper 仍生成使用稳定 `io.zxf.flowsplice.*` identifier 的 ad-hoc 签名中间产物；它们仅限隔离开发和测试，没有 Apple Developer ID 身份，也未公证，不得当作最终交付。交付给维护者的 macOS App、DMG 及部署用二进制必须完成完整测试、Developer ID 签名、Apple 公证、适用产物的 stapling 和最终验证。
 
 记录每个发布文件的 SHA-256，并从解包后的最终文件重新验证 checksum、架构和 codesign。公开客户端包只能包含通用二进制、Quick Start、`*.example.toml` 和内部校验文件；不得包含真实配置、root 公钥、签名 trust、`*.key`、密码、运行期 endpoint TOML、证书、凭据或 token。私有发布前用不回显原值的检查验证二进制不得出现配置中的 root、Relay 地址、Server ID/主机名或 CA PEM。
 

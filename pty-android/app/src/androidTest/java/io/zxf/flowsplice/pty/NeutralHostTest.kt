@@ -21,7 +21,7 @@ class NeutralHostTest {
     private val context: Context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
     @Before fun requireNeutralPackage() {
-        assertFalse("Do not run neutral tests against a private package", context.assets.list("bootstrap").orEmpty().any { it == "business.json" || it == "homes.json" })
+        assertFalse("Do not run neutral tests against a private package", context.assets.list("bootstrap").orEmpty().any { it == "business.json" || it == "homes.json" || it == "service-class.json" })
         assertFalse(context.filesDir.resolve("installation/travelagent.toml").exists())
     }
 
@@ -89,6 +89,19 @@ class NeutralHostTest {
             assertNotNull(legacy.getString("password", null))
             assertNotEquals(legacy.getString("password", null), other.getString("password", null))
         } finally { legacy.edit().clear().commit(); other.edit().clear().commit() }
+    }
+
+    @Test fun serviceClassPasswordDoesNotReuseLegacyOrSameNamedHomeAccount() {
+        val names = listOf("pty-credentials", "pty-credentials-home-service-class", "pty-credentials-service-class")
+        try {
+            PasswordStore.save(context, "old-default")
+            PasswordStore.save(context, "old-home", "service-class")
+            assertNull(PasswordStore.load(context, "service-class", true))
+            PasswordStore.save(context, "new-class", "service-class", true)
+            assertEquals("old-default", PasswordStore.load(context))
+            assertEquals("old-home", PasswordStore.load(context, "service-class"))
+            assertEquals("new-class", PasswordStore.load(context, "service-class", true))
+        } finally { names.forEach { context.getSharedPreferences(it, Context.MODE_PRIVATE).edit().clear().commit() } }
     }
 
     @Test fun manifestHasNoBackgroundComponentsOrPrivilegedPermissions() {

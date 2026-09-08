@@ -50,7 +50,7 @@ pub struct ApprovedBusiness {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct InstallJournal {
-    pub response: BusinessTravelResponse,
+    pub response: flowsplice_enrollment::business::TravelResponseEnvelope,
     pub config_toml: String,
 }
 

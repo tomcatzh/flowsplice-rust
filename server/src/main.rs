@@ -1205,7 +1205,7 @@ async fn handle_home(
     )
     .await?;
 
-    let ControlMessage::HomeRegister { home } = reader
+    let ControlMessage::HomeRegister { mut home } = reader
         .read_with_timeout::<ControlMessage>(setup_timeout)
         .await?
     else {
@@ -1223,6 +1223,11 @@ async fn handle_home(
         endpoint_credential.as_ref(),
         &home.services,
     )?;
+    home.service_grant = state
+        .authorization
+        .read()
+        .await
+        .home_service_grant(&identity.id);
     validate_catalog(&Catalog {
         generation: 1,
         homes: vec![home.clone()],
@@ -1294,7 +1299,7 @@ async fn handle_home(
                 }
                 message = reader.read_with_timeout::<ControlMessage>(idle_timeout) => {
                     match message? {
-                        ControlMessage::HomeRegister { home } => {
+                        ControlMessage::HomeRegister { mut home } => {
                             if home.home_id != identity.id {
                                 bail!("catalog home id does not match the authenticated home");
                             }
@@ -1304,6 +1309,7 @@ async fn handle_home(
                             state.authorization.read().await.validate_home_services(
                                 &state.control_signer.trust, &identity.id, endpoint_credential.as_ref(), &home.services,
                             )?;
+                            home.service_grant = state.authorization.read().await.home_service_grant(&identity.id);
                             validate_catalog(&Catalog {
                                 generation: 1,
                                 homes: vec![home.clone()],
@@ -2945,7 +2951,8 @@ async fn authorize_travel(
     }
     let directory = state.relay_directory.lock().await.directory();
     let catalog = state.homes.lock().await.catalog();
-    let catalog = catalog_for_credentials(&catalog, &credentials);
+    let catalog =
+        catalog_for_credentials(&catalog, &credentials, Some(&state.control_signer.trust));
     state
         .control_signer
         .sign(
@@ -2960,6 +2967,7 @@ async fn authorize_travel(
 fn catalog_for_credentials(
     catalog: &Catalog,
     credentials: &[flowsplice_core::authorization::TravelCredential],
+    trust: Option<&flowsplice_core::deployment::DeploymentTrust>,
 ) -> Catalog {
     let homes = catalog
         .homes
@@ -2971,20 +2979,55 @@ fn catalog_for_credentials(
             {
                 return None;
             }
+            let grant = trust
+                .and_then(|trust| {
+                    home.service_grant
+                        .as_ref()?
+                        .verify(
+                            trust,
+                            home.endpoint_credential.as_ref()?,
+                            flowsplice_core::authorization::unix_time_secs().ok()?,
+                        )
+                        .ok()
+                })
+                .filter(|grant| {
+                    grant.home_id == home.home_id
+                        && grant.validate_catalog_services(&home.services).is_ok()
+                });
             let services = home
                 .services
                 .iter()
                 .filter(|service| {
                     credentials.iter().any(|credential| {
-                        credential.allows_service(&home.home_id, &service.id, service.protocol)
+                        credential.allows_business_service(
+                            &home.home_id,
+                            &service.id,
+                            service.protocol,
+                            grant.as_ref().and_then(|grant| {
+                                grant
+                                    .services
+                                    .iter()
+                                    .find(|approved| approved.service_id == service.id)
+                            }),
+                        )
                     })
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            if services.is_empty() && !credentials.iter().any(|credential| {
+                credential.allows_home(&home.home_id)
+                    && !matches!(
+                        credential.scope,
+                        flowsplice_core::authorization::TravelCredentialScope::ServiceClass { .. }
+                    )
+            }) {
+                return None;
+            }
             Some(HomeCatalog {
                 home_id: home.home_id.clone(),
                 home_alias: home.home_alias.clone(),
                 endpoint_credential: home.endpoint_credential.clone(),
+                service_grant: home.service_grant.clone(),
                 services,
             })
         })
@@ -3089,6 +3132,7 @@ mod tests {
         HomeCatalog {
             home_id: home_id.to_owned(),
             home_alias: home_id.to_owned(),
+            service_grant: None,
             services: vec![Service {
                 id: "same-service".to_owned(),
                 alias: "Same name".to_owned(),
@@ -3130,6 +3174,7 @@ mod tests {
         let catalog = Catalog {
             generation: 1,
             homes: vec![HomeCatalog {
+                service_grant: None,
                 services: Vec::new(),
                 ..endpoint
             }],
@@ -3137,6 +3182,7 @@ mod tests {
         let filtered = catalog_for_credentials(
             &catalog,
             &[travel_credential(TravelCredentialScope::Global)],
+            None,
         );
 
         assert_eq!(filtered.homes.len(), 1);
@@ -3612,3 +3658,6 @@ mod tests {
         assert!(validate_metric_ownership(Role::Server, "server_control_bytes").is_err());
     }
 }
+
+#[cfg(test)]
+mod service_class_tests;

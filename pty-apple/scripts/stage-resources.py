@@ -42,7 +42,10 @@ if private:
         if os.environ.get(key):
             policy.external_path(os.environ[key])
     source = policy.external_path(private, require_directory=True, must_exist=True)
-    names = ['deployment-root.pub', 'homes.json' if (source / 'homes.json').exists() else 'business.json']
+    configurations = [name for name in ['service-class.json', 'homes.json', 'business.json'] if (source / name).is_file()]
+    if len(configurations) != 1: raise ValueError('Private bootstrap requires exactly one service class, Home catalog or business descriptor')
+    names = ['deployment-root.pub', configurations[0]]
+    if any(not item.is_file() or item.name not in names for item in source.iterdir()): raise ValueError('Unexpected private bootstrap input')
     for name in names:
         policy.external_path(str(source / name), require_file=True, must_exist=True)
     if 'homes.json' in names: validate_homes(source / 'homes.json')

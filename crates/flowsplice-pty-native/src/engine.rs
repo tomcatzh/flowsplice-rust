@@ -28,18 +28,35 @@ pub struct NativeOptions {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    Enroll { relay: String, password: String },
-    Connect { password: String },
+    Enroll {
+        relay: String,
+        password: String,
+    },
+    Connect {
+        password: String,
+    },
     Disconnect,
-    Operation { operation: Operation },
+    Operation {
+        operation: Operation,
+    },
+    ConnectHome {
+        home_id: String,
+    },
+    DisconnectHome {
+        home_id: String,
+    },
+    OperationHome {
+        home_id: String,
+        operation: Operation,
+    },
 }
-struct Outbox {
-    queue: Mutex<VecDeque<Value>>,
-    cancel: watch::Sender<bool>,
-    overflow: watch::Sender<bool>,
+pub(crate) struct Outbox {
+    pub(crate) queue: Mutex<VecDeque<Value>>,
+    pub(crate) cancel: watch::Sender<bool>,
+    pub(crate) overflow: watch::Sender<bool>,
 }
 impl Outbox {
-    fn emit(&self, value: Value) {
+    pub(crate) fn emit(&self, value: Value) {
         let mut queue = self
             .queue
             .lock()
@@ -60,15 +77,15 @@ impl Outbox {
     fn state(&self, options: &NativeOptions, connected: bool, busy: bool) {
         self.emit(json!({"type":"state","installed":options.install_dir.join("approved-business-binding.json").exists(),"connected":connected,"busy":busy}));
     }
-    fn error(&self, error: &anyhow::Error) {
+    pub(crate) fn error(&self, error: &anyhow::Error) {
         self.emit(json!({"type":"error","message":error.to_string().chars().take(512).collect::<String>()}));
     }
 }
 /// An opaque native session. Platform code owns keychain storage and visibility policy.
 pub struct NativeSession {
-    actions: mpsc::Sender<Action>,
-    outbox: Arc<Outbox>,
-    task: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) actions: mpsc::Sender<Action>,
+    pub(crate) outbox: Arc<Outbox>,
+    pub(crate) task: Mutex<Option<JoinHandle<()>>>,
 }
 impl NativeSession {
     /// Starts the native actor in the current Tokio runtime.
@@ -198,6 +215,9 @@ async fn actor(
                             config_path: config.install_dir.join("travelagent.toml"), password, root_public_key: config.root_public_key,
                             descriptor: config.descriptor, label: config.label,
                         }).await)) }));
+                    },
+                    Action::ConnectHome { .. } | Action::DisconnectHome { .. } | Action::OperationHome { .. } => {
+                        outbox.error(&anyhow::anyhow!("class actions require a service-class installation"));
                     },
                     Action::Operation { operation } => {
                         if let Some(client) = &client {

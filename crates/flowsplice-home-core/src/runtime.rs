@@ -198,6 +198,9 @@ impl HomeRuntime {
             server_spki_pins: config.server_spki_pins,
             endpoint_credential: config.endpoint_credential,
             services: config.services,
+            business_services: business_service_grant
+                .as_ref()
+                .map_or_else(Vec::new, |grant| grant.services.clone()),
             handshake_timeout_secs: config.handshake_timeout_secs,
             udp_idle_secs: config.udp_idle_secs,
             travel_authorization_cache: config.travel_authorization_cache,

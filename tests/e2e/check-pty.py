@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Encrypted PTY checks reuse only a disposable business enrollment fixture."""
 import json
+import importlib.util
+import tomllib
 import os
 from pathlib import Path
 import subprocess
@@ -99,22 +101,28 @@ def execute(run, business_home, alpha, root, scope):
         # The fixture owns this tmux server; production exposes no remove operation.
         command(["docker", "exec", container, "/usr/bin/tmux", "-S", "/tmp/fs-pty/alpha/tmux.sock", "kill-server"])
         probe("pty-tmux-ended", ["empty", *base, "/business/pty-session.json"])
+        class_spec = importlib.util.spec_from_file_location("class_acceptance", Path(__file__).with_name("check-service-class.py"))
+        class_acceptance = importlib.util.module_from_spec(class_spec)
+        class_spec.loader.exec_module(class_acceptance)
+        service_class = class_acceptance.execute(run, alpha, root, container, secondary_container, scope, secondary_scope)
         export = os.environ.get("FLOWSPLICE_PTY_NATIVE_FIXTURE_EXPORT")
         if export:
             destination = Path(export)
             helper = Path(__file__).resolve().parents[2] / "scripts/private-travel-trust.py"
             command(["python3", str(helper), "check-path", "--path", str(destination)])
             destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-            for source, name in [(root, "deployment-root.pub"), (alpha, "business.json"), ("/business/password.txt", "password.txt")]:
+            for source, name in [(root, "deployment-root.pub"), ("/business/service-class.json", "service-class.json"), ("/business/password.txt", "password.txt")]:
                 shutil.copyfile(run.directory / source.removeprefix("/business/"), destination / name)
                 (destination / name).chmod(0o600)
-            homes = {"version": 1, "homes": [
-                {"id": "default", "name": "测试 Mac", "platform": "macos", "relay": "", "descriptor": json.loads((destination / "business.json").read_text())},
-                {"id": "secondary", "name": "测试 VPS", "platform": "linux", "relay": "", "descriptor": json.loads((run.directory / secondary_descriptor.removeprefix("/business/")).read_text())},
-            ]}
-            (destination / "homes.json").write_text(json.dumps(homes, ensure_ascii=False))
-            (destination / "homes.json").chmod(0o600)
-            (destination / "fixture.json").write_text(json.dumps({"project":run.project,"image":run.image,"pty_home_container":container,"secondary_pty_home_container":secondary_container,"secondary_scope":secondary_scope,"scope":scope,"business_directory":str(run.directory),"issuer_port":19084}))
+            native_targets = []
+            for home_scope, folder in [(scope, "home"), (secondary_scope, "home-secondary")]:
+                runtime = tomllib.loads((run.directory / folder / "home-runtime.toml").read_text())
+                service = next(s for s in runtime["services"] if s["id"] == home_scope["service_id"])
+                name = runtime["alias"]
+                if len(runtime["services"]) > 1:
+                    name += " · " + service["alias"]
+                native_targets.append({"id": json.dumps([home_scope["home_id"], home_scope["service_id"]], separators=(",", ":")), "home_id": home_scope["home_id"], "service_id": home_scope["service_id"], "name": name})
+            (destination / "fixture.json").write_text(json.dumps({"project":run.project,"image":run.image,"pty_home_container":container,"secondary_pty_home_container":secondary_container,"secondary_scope":secondary_scope,"scope":scope,"service_class":service_class,"native_targets":native_targets,"business_directory":str(run.directory),"issuer_port":19084}))
             print(json.dumps({"checkpoint":"pty-native-fixture-ready","directory":str(destination)}), flush=True)
             deadline = time.monotonic() + 7200
             while not (destination / "native-complete.json").exists():

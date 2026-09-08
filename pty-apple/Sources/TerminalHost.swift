@@ -57,9 +57,10 @@ private enum InstallationScope {
 
 private struct PasswordStore {
     var homeID = "default"
+    var serviceClass = false
     var query: [String: Any] { [kSecClass as String:kSecClassGenericPassword,
         kSecAttrService as String:(Bundle.main.bundleIdentifier ?? "io.zxf.flowsplice.pty") + ".private-key",
-        kSecAttrAccount as String:InstallationScope.account + (homeID == "default" ? "" : ".home." + homeID)] }
+        kSecAttrAccount as String:InstallationScope.account + (serviceClass ? ".service-class" : homeID == "default" ? "" : ".home." + homeID)] }
     func load() throws -> String? {
         var q = query; q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?; let status = SecItemCopyMatching(q as CFDictionary, &result)
@@ -95,6 +96,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
         var pendingPassword: String?
     }
     private var homes: [Home] = []
+    private var classMode = false
     private var timer: Timer?
     private var ready = false
     private var rendering = false
@@ -121,8 +123,14 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 throw HostError.native("Private configuration missing. Install a privately configured FlowSplice PTY build.")
             }
             let catalogURL = resources.appendingPathComponent("bootstrap/homes.json")
+            let configurationNames = ["service-class.json", "homes.json", "business.json"].filter { FileManager.default.fileExists(atPath:resources.appendingPathComponent("bootstrap/" + $0).path) }
+            guard configurationNames.count == 1 else { throw HostError.invalidResponse }
+            classMode = configurationNames[0] == "service-class.json"
             let entries: [[String:Any]]
-            if FileManager.default.fileExists(atPath:catalogURL.path) {
+            if classMode {
+                let descriptor = try JSONSerialization.jsonObject(with:Data(contentsOf:resources.appendingPathComponent("bootstrap/service-class.json")))
+                entries = [["id":"service-class", "name":"PTY", "platform":"host", "descriptor":descriptor]]
+            } else if FileManager.default.fileExists(atPath:catalogURL.path) {
                 guard let catalog = try JSONSerialization.jsonObject(with:Data(contentsOf:catalogURL)) as? [String:Any],
                       catalog["version"] as? Int == 1, let values = catalog["homes"] as? [[String:Any]],
                       !values.isEmpty, values.count <= 8 else { throw HostError.invalidResponse }
@@ -137,7 +145,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                       ids.insert(id).inserted, let name = entry["name"] as? String,
                       !name.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty, name.utf8.count <= 128,
                       !name.unicodeScalars.contains(where:{ CharacterSet.controlCharacters.contains($0) }),
-                      let platform = entry["platform"] as? String, ["linux","macos"].contains(platform),
+                      let platform = entry["platform"] as? String, (classMode ? platform == "host" : ["linux","macos"].contains(platform)),
                       entry["descriptor"] is [String:Any],
                       entry["relay"] == nil || entry["relay"] is String,
                       (entry["relay"] as? String ?? "").utf8.count <= 512 else { throw HostError.invalidResponse }
@@ -149,7 +157,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 let id = entry["id"] as! String
                 var home = Home(id:id, info:["id":id,"name":entry["name"]!,"platform":entry["platform"]!,"relay":entry["relay"] as? String ?? ""])
                 do {
-                    let directory = id == "default" ? support : support.appendingPathComponent("homes").appendingPathComponent(id)
+                    let directory = classMode ? support.appendingPathComponent("service-class") : id == "default" ? support : support.appendingPathComponent("homes").appendingPathComponent(id)
                     try FileManager.default.createDirectory(at:directory, withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
                     let identityFile = directory.appendingPathComponent("travel-id")
                     let identity: String
@@ -163,7 +171,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
 #else
                     let label = DeviceLabel.make(UIDevice.current.name, fallback:UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone")
 #endif
-                    let options: [String:Any] = ["install_dir":directory.path,"root_public_key":root.trimmingCharacters(in:.whitespacesAndNewlines),"descriptor":entry["descriptor"]!,"travel_id":identity,"label":label]
+                    let options: [String:Any] = ["install_dir":directory.path,"root_public_key":root.trimmingCharacters(in:.whitespacesAndNewlines),(classMode ? "service_class" : "descriptor"):entry["descriptor"]!,"travel_id":identity,"label":label]
                     let json = String(data:try JSONSerialization.data(withJSONObject:options), encoding:.utf8)!
                     let data = try json.withCString { try response(flowsplice_pty_open($0)) }
                     guard let opened = (data as? [String:Any])?["handle"] as? NSNumber else { throw HostError.invalidResponse }
@@ -214,30 +222,32 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
 #else
                 let platform = "ios"
 #endif
-                deliver(["type":"homes","platform":platform,"homes":homes.map { $0.info }])
+                deliver(["type":"platform","platform":platform])
+                if !classMode { deliver(["type":"homes","platform":platform,"homes":homes.map { $0.info }]) }
                 if let error = configurationError { deliver(["type":"error","message":error]) }
-                for home in homes { if let error = home.error { deliver(["type":"error","home_id":home.id,"message":error]) } }
+                for home in homes { if let error = home.error { deliver(classMode ? ["type":"error","message":error] : ["type":"error","home_id":home.id,"message":error]) } }
                 startPolling()
                 return
             }
-            guard ready, visible, let id = action.removeValue(forKey:"home_id") as? String,
-                  let index = homes.firstIndex(where:{ $0.id == id }), homes[index].handle != 0 else { return }
+            guard ready, visible else { return }
+            let id = classMode ? "service-class" : action.removeValue(forKey:"home_id") as? String ?? ""
+            guard let index = homes.firstIndex(where:{ $0.id == id }), homes[index].handle != 0 else { return }
             do {
                 if let op = action["op"] as? String, op == "enroll" || op == "connect" {
                     let supplied = action["password"] as? String ?? ""
-                    let password = supplied.isEmpty ? try PasswordStore(homeID:id).load() ?? "" : supplied
+                    let password = supplied.isEmpty ? try PasswordStore(homeID:id, serviceClass:classMode).load() ?? "" : supplied
                     guard !password.isEmpty else {
-                        deliver(["type":"error","home_id":id,"code":"credential_required","message":"此 Home 缺少已保存的私钥密码，请输入密码。"]); return
+                        deliver(classMode ? ["type":"error","code":"credential_required","message":"缺少已保存的私钥密码，请输入密码。"] : ["type":"error","home_id":id,"code":"credential_required","message":"此 Home 缺少已保存的私钥密码，请输入密码。"]); return
                     }
                     action["password"] = password
-                    if op == "enroll" { try PasswordStore(homeID:id).save(password) }
+                    if op == "enroll" { try PasswordStore(homeID:id, serviceClass:classMode).save(password) }
                     else if !supplied.isEmpty { homes[index].pendingPassword = supplied }
                 }
                 try send(action, handle:homes[index].handle)
                 if action["op"] as? String == "disconnect" { homes[index].pendingPassword = nil }
             } catch {
                 homes[index].pendingPassword = nil
-                deliver(["type":"error","home_id":id,"message":describe(error)])
+                deliver(classMode ? ["type":"error","message":describe(error)] : ["type":"error","home_id":id,"message":describe(error)])
             }
         } catch { deliver(["type":"error","message":describe(error)]) }
     }
@@ -258,21 +268,21 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private func poll() {
         guard !rendering else { return }
         var batch: [[String:Any]] = []
-        // Native queues are bounded at 128 events per Home; at most eight are drained.
+        // Drain one shared class queue or up to eight legacy queues into one awaited batch.
         for index in homes.indices where homes[index].handle != 0 {
             let id = homes[index].id
             do {
                 guard let events = try response(flowsplice_pty_poll(homes[index].handle)) as? [[String:Any]] else { throw HostError.invalidResponse }
                 for var event in events {
-                    if event["type"] as? String == "state", event["connected"] as? Bool == true, let password = homes[index].pendingPassword {
-                        try PasswordStore(homeID:id).save(password); homes[index].pendingPassword = nil
+                    if event["type"] as? String == (classMode ? "identity" : "state"), event["connected"] as? Bool == true, let password = homes[index].pendingPassword {
+                        try PasswordStore(homeID:id, serviceClass:classMode).save(password); homes[index].pendingPassword = nil
                     }
                     if event["type"] as? String == "error" { homes[index].pendingPassword = nil }
-                    event["home_id"] = id; batch.append(event)
+                    if !classMode { event["home_id"] = id }; batch.append(event)
                 }
             } catch {
                 homes[index].pendingPassword = nil
-                batch.append(["type":"error","home_id":id,"message":describe(error)])
+                batch.append(classMode ? ["type":"error","message":describe(error)] : ["type":"error","home_id":id,"message":describe(error)])
             }
         }
         if !batch.isEmpty {

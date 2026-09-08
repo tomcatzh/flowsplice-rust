@@ -1,5 +1,8 @@
 //! Additive business authorization. Legacy endpoint and Travel credential bytes stay unchanged.
 
+mod service_class;
+pub use service_class::*;
+
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -405,6 +408,10 @@ fn validate_token(value: &str, limit: usize) -> Result<()> {
         bail!("business identifiers must be bounded ASCII tokens");
     }
     Ok(())
+}
+
+pub(crate) fn validate_application_protocol(value: &str) -> Result<()> {
+    validate_token(value, 128)
 }
 
 fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {

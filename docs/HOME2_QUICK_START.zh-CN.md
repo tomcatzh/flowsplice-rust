@@ -21,9 +21,9 @@ codesign -dvvv ./bin/flowsplice-homeagent 2>&1 \
   | grep 'Identifier=io.zxf.flowsplice.homeagent'
 ```
 
-包内二进制使用免费的 ad-hoc codesign。它不是 Developer ID 签名，也没有 notarization；`SHA256SUMS` 用于校验发布文件，ad-hoc 签名用于校验 Mach-O 没有在签名后被修改。
+旧打包 helper 生成的 ad-hoc 签名二进制仅限隔离开发和测试，没有 Developer ID 身份，也未公证，不得当作最终交付。交付给维护者的 macOS App、DMG 及部署用二进制必须完成完整测试、Developer ID 签名、Apple 公证、适用产物的 stapling 和最终验证。
 
-这两种校验都不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256；私下取得部署根公钥后，还应通过独立可信渠道核对其 SHA-256 指纹。
+`SHA256SUMS` 和 ad-hoc 签名本身都不能证明发布者身份。首次使用前，必须通过另一个可信渠道核对整个包的 SHA-256；私下取得部署根公钥后，还应通过独立可信渠道核对其 SHA-256 指纹。
 
 解包后的包结构必须是：
 

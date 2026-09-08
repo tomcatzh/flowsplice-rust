@@ -86,6 +86,11 @@ app.innerHTML = `<header id="topbar">
 <button id="add-home">＋ 添加 Home</button>
 </aside>
 <section id="management">
+<section id="identity-panel" hidden>
+<div class="heading"><div><h2 id="identity-label"></h2><p class="muted">所有 Home 的 PTY 服务</p><p id="identity-status" role="status"></p></div><button id="identity-disconnect" hidden>断开全部连接</button></div>
+<form id="identity-access"><label id="identity-relay-label">Relay IP:端口<input id="identity-relay" autocomplete="off" required></label><label id="identity-password-label">设置私钥密码<input id="identity-password" type="password" autocomplete="new-password" minlength="12" required></label><p id="identity-password-note" class="muted">一次批准即可访问所有已授权的 Home 的 PTY 服务。私钥密码安全保存在此设备，之后无需重复输入。</p><button id="identity-enter" class="primary">注册此设备</button></form>
+<div id="identity-waiting" hidden><p>等待超级 Home 批准</p><strong id="identity-code"></strong><button id="identity-cancel">取消注册</button></div>
+</section>
 <div id="overview">
 <div class="heading">
 <h1>Home</h1>
@@ -231,6 +236,16 @@ let selected: string | null = null,
   page = "manage",
   newHome: string | null = null,
   recoveryHome: string | null = null;
+let classMode = false;
+let identity = {
+  installed: false,
+  connected: false,
+  busy: false,
+  label: "此设备 · PTY",
+  code: "",
+  connectAfterEnroll: false,
+};
+let classRecovery = false;
 let warning: {
   home: string;
   attachment: string;
@@ -247,6 +262,21 @@ function send(value: unknown) {
   else window.webkit?.messageHandlers.pty.postMessage(json);
 }
 function action(home: Home, value: object) {
+  if (classMode) {
+    if (!identity.connected) return;
+    const request = value as Operation;
+    if (request.op === "connect")
+      send({ op: "connect_home", home_id: home.id });
+    else if (request.op === "disconnect")
+      send({ op: "disconnect_home", home_id: home.id });
+    else if (request.op === "operation")
+      send({
+        op: "operation_home",
+        home_id: home.id,
+        operation: request.operation,
+      });
+    return;
+  }
   send({ ...value, home_id: home.id });
 }
 function operation(home: Home, value: Operation) {
@@ -304,7 +334,12 @@ function selectHome(id: string, connect = true) {
   if (h) {
     el<HTMLInputElement>("relay").value = h.relay;
     if (h.connected) details(h);
-    else if (connect && h.installed && !h.busy) {
+    else if (
+      connect &&
+      h.installed &&
+      !h.busy &&
+      (!classMode || identity.connected)
+    ) {
       h.busy = true;
       action(h, { op: "connect", password: "" });
     }
@@ -333,10 +368,50 @@ function focus(tab: Tab) {
   fit(tab);
   tab.terminal.focus();
 }
+// Native pointer down/up can straddle a catalog or protocol event batch.
+function reconcileChildren(parent: HTMLElement, desired: HTMLElement[]) {
+  const retained = new Set(desired);
+  for (const child of Array.from(parent.children))
+    if (!retained.has(child as HTMLElement)) child.remove();
+  desired.forEach((child, index) => {
+    if (parent.children[index] !== child)
+      parent.insertBefore(child, parent.children[index] ?? null);
+  });
+}
+function updateText(node: HTMLElement, value: string) {
+  if (node.textContent !== value) node.textContent = value;
+}
 function render() {
   const h = current(),
     tab = activeTab();
   app.dataset.page = page;
+  el("identity-panel").hidden = !classMode;
+  if (classMode) {
+    el("identity-label").textContent = identity.label;
+    el("identity-status").textContent = identity.connected
+      ? "服务目录已连接"
+      : identity.busy
+        ? "正在连接 / 等待批准"
+        : "服务目录未连接";
+    el("identity-disconnect").hidden = !identity.connected;
+    el("identity-access").hidden =
+      identity.connected || (identity.busy && !identity.installed);
+    el("identity-waiting").hidden = identity.installed || !identity.busy;
+    el("identity-code").textContent = identity.code || "正在获取校验码…";
+    for (const id of [
+      "identity-relay-label",
+      "identity-password-label",
+      "identity-password-note",
+    ])
+      el(id).hidden = identity.installed;
+    el<HTMLInputElement>("identity-relay").required = !identity.installed;
+    el<HTMLInputElement>("identity-password").required = !identity.installed;
+    el<HTMLButtonElement>("identity-enter").disabled = identity.busy;
+    el("identity-enter").textContent = identity.installed
+      ? "连接服务目录"
+      : "注册此设备";
+  }
+  for (const id of ["add-home", "add-mobile"]) el(id).hidden = classMode;
   el("management").hidden = page !== "manage";
   el("sidebar").hidden = page !== "manage";
   el("terminal-view").hidden = page !== "terminal";
@@ -347,39 +422,68 @@ function render() {
   for (const id of ["tab-count", "mobile-count"])
     el(id).textContent = String(tabs.size);
   for (const target of ["home-nav", "home-cards"]) {
-    el(target).replaceChildren();
+    const parent = el(target);
+    const existing = new Map(
+      Array.from(parent.children).map((child) => [
+        (child as HTMLElement).dataset.homeId,
+        child as HTMLButtonElement,
+      ]),
+    );
+    const desired: HTMLElement[] = [];
     for (const home of homes.values()) {
-      const b = button("", () => selectHome(home.id), "home-card");
-      b.dataset.homeId = home.id;
+      let b = existing.get(home.id);
+      if (!b) {
+        const id = home.id;
+        b = button("", () => selectHome(id), "home-card");
+        b.dataset.homeId = id;
+        const copy = text("span", "", "home-copy");
+        copy.append(text("strong", ""), text("small", ""));
+        b.append(
+          text("span", ""),
+          text("span", "", "device"),
+          copy,
+          text("span", "›"),
+        );
+      }
       b.setAttribute("aria-label", home.name);
       b.setAttribute("aria-selected", String(selected === home.id));
-      b.append(
-        text(
-          "span",
-          home.connected ? "●" : "○",
-          home.connected ? "online" : "muted",
-        ),
-        text("span", home.platform === "macos" ? "▣" : "▤", "device"),
-      );
-      const copy = text("span", "", "home-copy");
-      copy.append(
-        text("strong", home.name),
-        text("small", status(home), home.connected ? "online" : "muted"),
-      );
-      b.append(copy, text("span", "›"));
-      el(target).append(b);
+      const [dot, device, copy] = Array.from(b.children) as HTMLElement[];
+      updateText(dot, home.connected ? "●" : "○");
+      dot.className = home.connected ? "online" : "muted";
+      updateText(device, home.platform === "macos" ? "▣" : "▤");
+      updateText(copy.children[0] as HTMLElement, home.name);
+      updateText(copy.children[1] as HTMLElement, status(home));
+      copy.children[1].className = home.connected ? "online" : "muted";
+      desired.push(b);
     }
+    reconcileChildren(parent, desired);
   }
-  el("tabs").replaceChildren();
+  const tabParent = el("tabs");
+  const existingTabs = new Map(
+    Array.from(tabParent.children).map((child) => [
+      (child as HTMLElement).dataset.tabKey,
+      child as HTMLButtonElement,
+    ]),
+  );
+  const desiredTabs: HTMLElement[] = [];
   el("opened-list").replaceChildren();
   for (const t of tabs.values()) {
-    const b = button(`${t.home.name} / ${title(t)}`, () => focus(t));
+    let b = existingTabs.get(t.key);
+    if (!b) {
+      const key = t.key;
+      b = button("", () => {
+        const current = tabs.get(key);
+        if (current) focus(current);
+      });
+      b.dataset.tabKey = key;
+    }
+    updateText(b, `${t.home.name} / ${title(t)}`);
     b.title = b.textContent!;
     b.setAttribute(
       "aria-selected",
       String(active === t.key && page === "terminal"),
     );
-    el("tabs").append(b);
+    desiredTabs.push(b);
     const card = text("div", "", "opened-card");
     card.append(
       button(`${t.home.name} / ${title(t)}`, () => focus(t)),
@@ -389,6 +493,7 @@ function render() {
     el("opened-list").append(card);
     t.pane.hidden = page !== "terminal" || active !== t.key;
   }
+  reconcileChildren(tabParent, desiredTabs);
   if (!tabs.size)
     el("opened-list").append(
       text("p", "还没有打开的终端。选择 Home 加入或新建会话。", "muted"),
@@ -396,7 +501,7 @@ function render() {
   if (h) {
     el("home-name").textContent = h.name;
     el("status").textContent =
-      `${h.platform === "macos" ? "macOS" : "Linux"} · ${status(h)}`;
+      `${h.platform === "macos" ? "macOS" : h.platform === "linux" ? "Linux" : "PTY 服务"} · ${status(h)}`;
     el("status").className = h.connected ? "online" : "muted";
     el("notice").textContent = h.notice;
     el("notice").hidden = !h.notice;
@@ -407,13 +512,14 @@ function render() {
     el("access-description").textContent = h.installed
       ? "使用此设备已保存的凭据连接。"
       : "私钥以密码加密并安全保存，之后连接无需再次输入。";
-    el("relay-label").hidden = h.installed;
-    el("password-label").hidden = h.installed;
-    el<HTMLInputElement>("password").required = !h.installed;
+    el("relay-label").hidden = classMode || h.installed;
+    el("password-label").hidden = classMode || h.installed;
+    el<HTMLInputElement>("password").required = !classMode && !h.installed;
     el("access").hidden = h.busy && !h.installed;
     el("waiting").hidden = !(h.busy && !h.installed);
     el("verification-code").textContent = h.code || "正在获取校验码…";
-    el<HTMLButtonElement>("enter").disabled = h.busy;
+    el<HTMLButtonElement>("enter").disabled =
+      h.busy || (classMode && !identity.connected);
     el("enter").textContent = h.installed
       ? h.busy
         ? "连接中…"
@@ -730,8 +836,53 @@ window.flowsplice = {
     }
   },
   receive(e) {
-    if (e.type === "homes") {
+    if (e.type === "platform") {
       platform(e.platform);
+      return;
+    }
+    if (e.type === "identity") {
+      classMode = true;
+      const wasBusy = identity.busy;
+      identity = {
+        ...identity,
+        installed: e.installed,
+        connected: e.connected,
+        busy: e.busy,
+        label: e.label || identity.label,
+      };
+      if (!identity.connected) {
+        for (const home of homes.values()) {
+          home.connected = false;
+          home.busy = false;
+          clear(home);
+        }
+      }
+      if (!identity.installed && !identity.busy && wasBusy)
+        identity.connectAfterEnroll = false;
+      if (
+        identity.connectAfterEnroll &&
+        identity.installed &&
+        !identity.busy &&
+        !identity.connected
+      ) {
+        identity.connectAfterEnroll = false;
+        identity.busy = true;
+        send({ op: "connect", password: "" });
+      }
+      render();
+      return;
+    }
+    if (e.type === "homes") {
+      if (e.platform) platform(e.platform);
+      if (classMode) {
+        const retained = new Set(e.homes.map((home: any) => home.id));
+        for (const [id, home] of homes)
+          if (!retained.has(id)) {
+            clear(home);
+            homes.delete(id);
+            if (selected === id) selected = null;
+          }
+      }
       for (const item of e.homes) {
         const old = homes.get(item.id);
         if (old)
@@ -743,7 +894,7 @@ window.flowsplice = {
         else
           homes.set(item.id, {
             ...item,
-            installed: false,
+            installed: classMode,
             connected: false,
             busy: false,
             canWrite: false,
@@ -758,6 +909,26 @@ window.flowsplice = {
             detailsPending: false,
           });
       }
+      render();
+      return;
+    }
+    if (classMode && !e.home_id && e.type === "progress") {
+      identity.code = e.progress.verification_code || identity.code;
+      render();
+      return;
+    }
+    if (classMode && !e.home_id && e.type === "error") {
+      identity.busy = false;
+      identity.connectAfterEnroll = false;
+      if (e.code === "credential_required") {
+        classRecovery = true;
+        recoveryHome = null;
+        el("recovery-message").textContent = e.message;
+        el<HTMLInputElement>("recovery-password").value = "";
+        el<HTMLDialogElement>("recovery").showModal();
+      }
+      el("global-notice").textContent = e.message;
+      el("global-notice").hidden = false;
       render();
       return;
     }
@@ -807,6 +978,7 @@ window.flowsplice = {
       h.notice = e.message;
       h.busy = false;
       if (e.code === "credential_required") {
+        classRecovery = false;
         recoveryHome = h.id;
         el("recovery-message").textContent = e.message;
         el<HTMLInputElement>("recovery-password").value = "";
@@ -815,6 +987,34 @@ window.flowsplice = {
       render();
     }
   },
+};
+el("identity-access").onsubmit = (e) => {
+  e.preventDefault();
+  if (identity.busy) return;
+  identity.busy = true;
+  el("global-notice").hidden = true;
+  if (identity.installed) send({ op: "connect", password: "" });
+  else {
+    identity.connectAfterEnroll = true;
+    send({
+      op: "enroll",
+      relay: el<HTMLInputElement>("identity-relay").value.trim(),
+      password: el<HTMLInputElement>("identity-password").value,
+    });
+    el<HTMLInputElement>("identity-password").value = "";
+  }
+  render();
+};
+el("identity-disconnect").onclick = () => {
+  identity.connectAfterEnroll = false;
+  send({ op: "disconnect" });
+};
+el("identity-cancel").onclick = () => {
+  identity.connectAfterEnroll = false;
+  identity.busy = false;
+  identity.code = "";
+  send({ op: "disconnect" });
+  render();
 };
 el("manage").onclick = manage;
 el("back-home").onclick = () => {
@@ -957,7 +1157,12 @@ el("confirm-takeover").onclick = () => {
 el("recovery-form").onsubmit = (e) => {
   e.preventDefault();
   const h = homes.get(recoveryHome || "");
-  if (h)
+  if (classRecovery)
+    send({
+      op: "connect",
+      password: el<HTMLInputElement>("recovery-password").value,
+    });
+  else if (h)
     action(h, {
       op: "connect",
       password: el<HTMLInputElement>("recovery-password").value,

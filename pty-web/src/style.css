@@ -659,3 +659,30 @@ dialog form > button {
   flex-shrink: 0;
   overflow-wrap: anywhere;
 }
+
+#identity-panel {
+  border-bottom: 1px solid #35403b;
+  padding-bottom: 22px;
+  margin-bottom: 26px;
+}
+#identity-panel h2 {
+  margin: 0 0 7px;
+}
+#identity-panel .heading {
+  margin-bottom: 12px;
+}
+#identity-access {
+  max-width: 440px;
+}
+#identity-code {
+  display: block;
+  color: #61d69d;
+  font-size: 26px;
+  letter-spacing: 3px;
+  margin-bottom: 12px;
+}
+
+/* iOS zooms focused form inputs below 16px; terminal input remains xterm-owned. */
+#app[data-platform="ios"] input:not(.xterm-helper-textarea) {
+  font-size: 16px;
+}

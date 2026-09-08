@@ -81,6 +81,8 @@ pub struct HomeCatalog {
     pub home_alias: String,
     #[serde(default)]
     pub endpoint_credential: Option<SignedHomeEndpointCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_grant: Option<crate::business::SignedHomeServiceGrant>,
     pub services: Vec<Service>,
 }
 
@@ -588,12 +590,14 @@ mod tests {
                 HomeCatalog {
                     home_id: "home-1".to_owned(),
                     home_alias: "Home One".to_owned(),
+                    service_grant: None,
                     services: vec![service("127.0.0.1:22")],
                     endpoint_credential: None,
                 },
                 HomeCatalog {
                     home_id: "home-2".to_owned(),
                     home_alias: "Home Two".to_owned(),
+                    service_grant: None,
                     services: vec![service("127.0.0.1:22")],
                     endpoint_credential: None,
                 },

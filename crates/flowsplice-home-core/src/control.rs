@@ -41,6 +41,7 @@ pub struct HomeControlConfig {
     pub server_spki_pins: Vec<String>,
     pub endpoint_credential: Option<PathBuf>,
     pub services: Vec<Service>,
+    pub business_services: Vec<flowsplice_core::business::BusinessService>,
     pub handshake_timeout_secs: u64,
     pub udp_idle_secs: u64,
     pub travel_authorization_cache: PathBuf,
@@ -268,6 +269,7 @@ async fn run_control_session(
                     .as_deref()
                     .map(load_json)
                     .transpose()?,
+                service_grant: None,
                 services: config.services.clone(),
             },
         },
@@ -345,7 +347,7 @@ async fn run_control_session(
                         expires_at_unix_secs,
                     } => {
                         ensure_credential_active(&authorization.subscribe(), credential_id)?;
-                        let config = Arc::new(HomeFlowConfig { id: config.id.clone(), services: config.services.clone(), handshake_timeout_secs: config.handshake_timeout_secs, udp_idle_secs: config.udp_idle_secs });
+                        let config = Arc::new(HomeFlowConfig { id: config.id.clone(), services: config.services.clone(), business_services: config.business_services.clone(), handshake_timeout_secs: config.handshake_timeout_secs, udp_idle_secs: config.udp_idle_secs });
                         let tls = tls.business_acceptor();
                         let permits = Arc::clone(&permits);
                         let work_registry = Arc::clone(&tcp_flows);

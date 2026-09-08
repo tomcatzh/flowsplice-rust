@@ -1,4 +1,12 @@
-use crate::{Action, NativeOptions, NativeSession};
+use crate::{Action, ClassNativeOptions, NativeOptions, NativeSession};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OpenOptions {
+    Class(ClassNativeOptions),
+    Legacy(NativeOptions),
+}
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
@@ -36,7 +44,7 @@ pub(crate) fn open(value: &str) -> Result<Value> {
     if value.len() > 512 * 1024 {
         bail!("private terminal configuration too large");
     }
-    let options: NativeOptions = serde_json::from_str(value)?;
+    let options: OpenOptions = serde_json::from_str(value)?;
     let _entered = runtime()?.enter();
     let mut sessions = SESSIONS
         .lock()
@@ -48,7 +56,10 @@ pub(crate) fn open(value: &str) -> Result<Value> {
     if id == 0 {
         bail!("native handle identifiers exhausted");
     }
-    let handle = Arc::new(NativeSession::open(options)?);
+    let handle = Arc::new(match options {
+        OpenOptions::Class(options) => NativeSession::open_class(options)?,
+        OpenOptions::Legacy(options) => NativeSession::open(options)?,
+    });
     sessions.insert(id, handle);
     Ok(json!({"handle":id}))
 }

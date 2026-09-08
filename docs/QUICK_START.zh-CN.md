@@ -13,11 +13,11 @@ flowsplice-travel-0.3.1-macos-arm64/
 └── SHA256SUMS
 ```
 
-macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。免费签名是 ad-hoc codesign：它能校验文件未被签名后修改，但不提供 Apple Developer ID 身份，也没有 notarization。若文件经浏览器下载而被 Gatekeeper 隔离，仍可能需要在 macOS 的“隐私与安全性”页面由用户明确允许。
+macOS arm64 文件位于发布包的 `macos-arm64/flowsplice-travelagent`。旧打包 helper 生成的 ad-hoc 签名产物仅限隔离开发和测试，不提供 Apple Developer ID 身份，也未公证，不得当作最终交付。交付给维护者的 macOS App、DMG 及部署用二进制必须完成完整测试、Developer ID 签名、Apple 公证、适用产物的 stapling 和最终验证。
 
 ad-hoc 签名和包内 `SHA256SUMS` 不能证明发布者身份。首次使用前，应通过另一个可信渠道核对整个包的 SHA-256。
 
-解包后进入包目录，验证全部文件和 ad-hoc 签名：
+解包后进入包目录，验证全部文件和代码签名；以下检查不能替代正式交付所需的 Developer ID 身份与公证验证：
 
 ```bash
 shasum -a 256 -c SHA256SUMS

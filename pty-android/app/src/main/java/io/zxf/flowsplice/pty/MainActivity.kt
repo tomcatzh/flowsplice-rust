@@ -22,6 +22,7 @@ class MainActivity : Activity() {
     private var web: WebView? = null
     private data class Home(val id: String, val info: JSONObject, var handle: Long = 0L, var error: String? = null, var pendingPassword: String? = null)
     private val homes = linkedMapOf<String, Home>()
+    private var classMode = false
     private var foreground = false
     private var ready = false
     private var rendering = false
@@ -32,7 +33,13 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         try {
             val root = assets.open("bootstrap/deployment-root.pub").bufferedReader().use { it.readText() }.trim()
-            val entries = if (assets.list("bootstrap").orEmpty().contains("homes.json")) {
+            val configurations = assets.list("bootstrap").orEmpty().filter { it in listOf("service-class.json", "homes.json", "business.json") }
+            require(configurations.size == 1)
+            classMode = configurations.single() == "service-class.json"
+            val entries = if (classMode) {
+                listOf(JSONObject().put("id", "service-class").put("name", "PTY").put("platform", "host")
+                    .put("descriptor", JSONObject(assets.open("bootstrap/service-class.json").bufferedReader().use { it.readText() })))
+            } else if (configurations.single() == "homes.json") {
                 parseHomes(JSONObject(assets.open("bootstrap/homes.json").bufferedReader().use { it.readText() }))
             } else listOf(JSONObject().put("id", "default").put("name", "我的 Mac").put("platform", "macos")
                 .put("descriptor", JSONObject(assets.open("bootstrap/business.json").bufferedReader().use { it.readText() })))
@@ -43,13 +50,13 @@ class MainActivity : Activity() {
                     .put("platform", entry.getString("platform")).put("relay", entry.optString("relay")))
                 homes[id] = home
                 try {
-                    val prefs = getSharedPreferences(if (id == "default") "pty-identity" else "pty-identity-home-$id", MODE_PRIVATE)
+                    val prefs = getSharedPreferences(if (classMode) "pty-identity-service-class" else if (id == "default") "pty-identity" else "pty-identity-home-$id", MODE_PRIVATE)
                     val identity = prefs.getString("travel-id", null) ?: UUID.randomUUID().toString().also {
                         check(prefs.edit().putString("travel-id", it).commit())
                     }
-                    val directory = if (id == "default") filesDir.resolve("installation") else filesDir.resolve("installation/homes/$id")
+                    val directory = if (classMode) filesDir.resolve("service-class") else if (id == "default") filesDir.resolve("installation") else filesDir.resolve("installation/homes/$id")
                     val options = JSONObject().put("install_dir", directory.absolutePath).put("root_public_key", root)
-                        .put("descriptor", entry.getJSONObject("descriptor")).put("travel_id", identity).put("label", deviceLabel(runCatching { Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) }.getOrNull(), Build.MODEL))
+                        .put(if (classMode) "service_class" else "descriptor", entry.getJSONObject("descriptor")).put("travel_id", identity).put("label", deviceLabel(runCatching { Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) }.getOrNull(), Build.MODEL))
                     val opened = JSONObject(NativePty.open(options.toString()))
                     check(opened.optBoolean("ok"))
                     home.handle = opened.getJSONObject("data").getLong("handle")
@@ -116,34 +123,36 @@ class MainActivity : Activity() {
             val action = JSONObject(json)
             if (action.optString("op") == "ready" && action.length() == 1) {
                 ready = true
-                dispatch(JSONObject().put("type", "homes").put("platform", "android").put("homes", JSONArray(homes.values.map { it.info })))
-                homes.values.forEach { h -> h.error?.let { dispatch(JSONObject().put("type", "error").put("home_id", h.id).put("message", it)) } }
+                dispatch(JSONObject().put("type", "platform").put("platform", "android"))
+                if (!classMode) dispatch(JSONObject().put("type", "homes").put("platform", "android").put("homes", JSONArray(homes.values.map { it.info })))
+                homes.values.forEach { h -> h.error?.let { dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else h.id).put("message", it)) } }
                 handler.removeCallbacks(poll); handler.post(poll)
                 return
             }
             if (!ready) return
-            home = homes[action.optString("home_id")] ?: return
+            home = if (classMode) homes.values.firstOrNull() else homes[action.optString("home_id")]
+            if (home == null) return
             if (home.handle == 0L) return
-            action.remove("home_id")
+            if (!classMode) action.remove("home_id")
             if (action.optString("op") in listOf("enroll", "connect")) {
                 val supplied = action.optString("password")
-                val password = supplied.ifEmpty { PasswordStore.load(this, home.id).orEmpty() }
+                val password = supplied.ifEmpty { PasswordStore.load(this, home.id, classMode).orEmpty() }
                 if (password.isEmpty()) {
-                    dispatch(JSONObject().put("type", "error").put("home_id", home.id).put("code", "credential_required").put("message", "此 Home 缺少已保存的私钥密码，请输入密码。")); return
+                    dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("code", "credential_required").put("message", if (classMode) "缺少已保存的私钥密码，请输入密码。" else "此 Home 缺少已保存的私钥密码，请输入密码。")); return
                 }
                 action.put("password", password)
-                if (action.optString("op") == "enroll") PasswordStore.save(this, password, home.id)
+                if (action.optString("op") == "enroll") PasswordStore.save(this, password, home.id, classMode)
                 else if (supplied.isNotEmpty()) home.pendingPassword = supplied
             }
             val result = JSONObject(NativePty.send(home.handle, action.toString()))
             if (!result.optBoolean("ok")) {
                 home.pendingPassword = null
-                dispatch(JSONObject().put("type", "error").put("home_id", home.id).put("message", result.optString("error")))
+                dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) action.opt("home_id") ?: JSONObject.NULL else home.id).put("message", result.optString("error")))
             }
             if (action.optString("op") == "disconnect") home.pendingPassword = null
         } catch (_: Exception) {
             home?.pendingPassword = null
-            dispatch(JSONObject().put("type", "error").put("home_id", home?.id ?: JSONObject.NULL).put("message", "本机操作失败"))
+            dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home?.id ?: JSONObject.NULL).put("message", "本机操作失败"))
         }
     }
     private val poll = object : Runnable {
@@ -151,7 +160,7 @@ class MainActivity : Activity() {
             if (!foreground || !ready) return
             if (rendering) { handler.postDelayed(this, 25); return }
             val batch = JSONArray()
-            // Eight native queues, each bounded at 128 events; one awaited JS batch.
+            // One shared class queue or up to eight legacy queues; one awaited JS batch.
             for (home in homes.values.filter { it.handle != 0L }) {
                 try {
                     val result = JSONObject(NativePty.poll(home.handle))
@@ -159,15 +168,15 @@ class MainActivity : Activity() {
                     val events = result.getJSONArray("data")
                     for (index in 0 until events.length()) {
                         val event = events.getJSONObject(index)
-                        if (event.optString("type") == "state" && event.optBoolean("connected")) {
-                            home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id) }; home.pendingPassword = null
+                        if (event.optString("type") == (if (classMode) "identity" else "state") && event.optBoolean("connected")) {
+                            home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id, classMode) }; home.pendingPassword = null
                         }
                         if (event.optString("type") == "error") home.pendingPassword = null
-                        batch.put(event.put("home_id", home.id))
+                        batch.put(if (classMode) event else event.put("home_id", home.id))
                     }
                 } catch (_: Exception) {
                     home.pendingPassword = null
-                    batch.put(JSONObject().put("type", "error").put("home_id", home.id).put("message", "本机事件读取失败"))
+                    batch.put(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("message", "本机事件读取失败"))
                 }
             }
             if (batch.length() > 0) {

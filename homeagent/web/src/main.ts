@@ -1,4 +1,5 @@
 import "./style.css";
+import { classApprovalScope } from "./class-scope";
 import { decodeServiceOption, encodeServiceOption, type Protocol } from "./service-option";
 
 type Page = "approvals" | "credentials" | "statistics";
@@ -6,7 +7,8 @@ type CredentialStatus = "active" | "revoked" | "expired" | "all";
 type Scope =
   | { kind: "home"; home_id: string }
   | { kind: "service"; home_id: string; service_id: string; protocol: Protocol }
-  | { kind: "global" };
+  | { kind: "global" }
+  | { kind: "service_class"; application_protocol: string; protocol: Protocol };
 
 interface Service { id: string; alias: string; protocol: Protocol; target: string }
 interface Status {
@@ -19,6 +21,7 @@ interface Status {
   services: Service[];
 }
 interface Credential {
+  client_label?: string;
   credential_id: string;
   travel_id: string;
   authority_id: string;
@@ -31,7 +34,8 @@ interface IssueResult { generation: number; enrollment: unknown; reused: boolean
 interface RotatePasswordResult { rotated_keys: number }
 interface BusinessService { service_id: string; protocol: Protocol; application_protocol: string; capabilities: string[] }
 interface BusinessBinding { home_id: string; approving_home_id: string; service: BusinessService; not_after_unix_secs: number }
-interface PendingEnrollment { business?: BusinessBinding; request_id: string; travel_id: string; home_id: string; received_at_unix_secs: number; approved: boolean; bootstrap: boolean; verification_code?: string }
+interface ServiceClass { version: number; approving_home_id: string; application_protocol: string; protocol: Protocol }
+interface PendingEnrollment { client_label?: string; service_class?: ServiceClass; business?: BusinessBinding; request_id: string; travel_id: string; home_id: string; received_at_unix_secs: number; approved: boolean; bootstrap: boolean; verification_code?: string }
 type HomeProfile = "serving_only" | "home_issuer" | "global_issuer";
 interface PendingHomeEnrollment { requested_services?: BusinessService[]; request_id: string; home_id: string; received_at_unix_secs: number; approved: boolean; verification_code: string; profile?: HomeProfile }
 interface Paged<T> { items: T[]; page: number; page_size: number; total: number; total_pages: number }
@@ -54,6 +58,7 @@ let pendingHomeRequestId: string | null = null;
 let pendingTravelItems = new Map<string, PendingEnrollment>();
 let pendingHomeItems = new Map<string, PendingHomeEnrollment>();
 let approvalBusiness: BusinessBinding | undefined;
+let approvalClass: ServiceClass | undefined;
 let approvalHomeServices: BusinessService[] | undefined;
 let revokeCredentialId: string | null = null;
 
@@ -74,6 +79,7 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function scopeLabel(scope: Scope): string {
+  if (scope.kind === "service_class") return `业务类别（所有 Home · ${scope.application_protocol} · ${scope.protocol.toUpperCase()}）`;
   if (scope.kind === "global") return "全局超级授权";
   const home = scope.home_id === status.home_id ? `${status.home_alias} · ${scope.home_id}` : scope.home_id;
   if (scope.kind === "home") return `指定 Home（${home}）`;
@@ -248,7 +254,7 @@ async function renderCredentials(): Promise<void> {
   const table = document.querySelector<HTMLElement>("#credentials");
   if (!table) return;
   table.innerHTML = response.items.length ? response.items.map((credential) => `<tr>
-    <td><strong>${escapeHtml(credential.travel_id)}</strong><small>${escapeHtml(credential.credential_id)}</small></td>
+    <td><strong>${escapeHtml(credential.client_label ?? credential.travel_id)}</strong>${credential.client_label ? `<small>${escapeHtml(credential.travel_id)}</small>` : ""}<small>${escapeHtml(credential.credential_id)}</small></td>
     <td>${escapeHtml(scopeLabel(credential.scope))}</td>
     <td>${new Date(credential.not_after_unix_secs * 1000).toLocaleDateString("zh-CN")}</td>
     <td><span class="state ${credential.active ? "active" : "inactive"}">${credential.revoked ? "已撤销" : credential.active ? "有效" : "已失效"}</span></td>
@@ -268,6 +274,7 @@ async function renderCredentials(): Promise<void> {
 function clearApprovalDialog(): void {
   pendingRequestId = null;
   approvalBusiness = undefined;
+  approvalClass = undefined;
   document.querySelector<HTMLElement>("#approval-service-field")?.classList.remove("hidden");
   document.querySelector<HTMLElement>("#approval-scope-options")?.classList.remove("hidden");
   document.querySelectorAll<HTMLInputElement>('[name="approval-scope"], #approval-service').forEach((input) => { input.disabled = false; });
@@ -285,6 +292,17 @@ function openApprovalDialog(requestId: string, travelId: string, verificationCod
   clearApprovalDialog();
   pendingRequestId = requestId;
   approvalBusiness = pendingTravelItems.get(requestId)?.business;
+  approvalClass = pendingTravelItems.get(requestId)?.service_class;
+  if (approvalClass) {
+    const details = document.querySelector<HTMLElement>("#approval-business");
+    if (details) {
+      details.textContent = `业务类别：${approvalClass.application_protocol} / ${approvalClass.protocol}；批准后可访问现在及以后所有 Home 中获准的同类业务，无需逐台批准。其他业务不在授权范围内。`;
+      details.classList.remove("hidden");
+    }
+    document.querySelector<HTMLElement>("#approval-scope-options")?.classList.add("hidden");
+    document.querySelector<HTMLElement>("#approval-service-field")?.classList.add("hidden");
+    document.querySelectorAll<HTMLInputElement>('[name="approval-scope"], #approval-service').forEach((input) => { input.disabled = true; });
+  }
   if (approvalBusiness) {
     const business = approvalBusiness;
     const details = document.querySelector<HTMLElement>("#approval-business");
@@ -297,7 +315,7 @@ function openApprovalDialog(requestId: string, travelId: string, verificationCod
     document.querySelectorAll<HTMLInputElement>('[name="approval-scope"], #approval-service').forEach((input) => { input.disabled = true; });
   }
   const target = document.querySelector<HTMLElement>("#approval-target");
-  if (target) target.textContent = travelId;
+  if (target) target.textContent = pendingTravelItems.get(requestId)?.client_label ? `${pendingTravelItems.get(requestId)?.client_label} · ${travelId}` : travelId;
   const code = document.querySelector<HTMLElement>("#approval-verification-code");
   if (code) {
     code.textContent = verificationCode ?? "";
@@ -316,7 +334,7 @@ async function approveRemote(): Promise<void> {
   try {
     await json<IssueResult>("/api/enrollment/approve", {
       method: "POST",
-      body: JSON.stringify({ request_id: pendingRequestId, valid_days: days, scope: approvalBusiness ? { kind: "service", home_id: approvalBusiness.home_id, service_id: approvalBusiness.service.service_id, protocol: approvalBusiness.service.protocol } : selectedScope("approval-scope", "#approval-service"), password }),
+      body: JSON.stringify({ request_id: pendingRequestId, valid_days: days, scope: approvalClass ? classApprovalScope(approvalClass) : approvalBusiness ? { kind: "service", home_id: approvalBusiness.home_id, service_id: approvalBusiness.service.service_id, protocol: approvalBusiness.service.protocol } : selectedScope("approval-scope", "#approval-service"), password }),
     });
     document.querySelector<HTMLDialogElement>("#approval-dialog")?.close();
     flash("远程申请已签发；Travel 将通过控制连接自动取回结果。");
@@ -332,7 +350,7 @@ async function renderPending(): Promise<void> {
   pendingTravelItems = new Map(response.items.map((item) => [item.request_id, item]));
   const table = document.querySelector<HTMLElement>("#pending-enrollments");
   if (!table) return;
-  table.innerHTML = response.items.length ? response.items.map((item) => `<tr><td><strong>${escapeHtml(item.travel_id)}</strong><small>${escapeHtml(item.request_id)}</small>${item.bootstrap && item.verification_code ? `<small>首次注册校验码：<code>${escapeHtml(item.verification_code)}</code></small>` : ""}</td><td>${new Date(item.received_at_unix_secs * 1000).toLocaleString("zh-CN")}</td><td><span class="state inactive">${item.bootstrap ? "首次注册待核对" : "待批准"}</span></td><td><button class="approve-remote" data-id="${escapeHtml(item.request_id)}" data-travel-id="${escapeHtml(item.travel_id)}" data-verification-code="${escapeHtml(item.verification_code ?? "")}">审核并批准</button></td></tr>`).join("") : '<tr><td colspan="4" class="empty">暂无待审批的 Travel 申请</td></tr>';
+  table.innerHTML = response.items.length ? response.items.map((item) => `<tr><td><strong>${escapeHtml(item.client_label ?? item.travel_id)}</strong>${item.client_label ? `<small>${escapeHtml(item.travel_id)}</small>` : ""}<small>${escapeHtml(item.request_id)}</small>${item.bootstrap && item.verification_code ? `<small>首次注册校验码：<code>${escapeHtml(item.verification_code)}</code></small>` : ""}</td><td>${new Date(item.received_at_unix_secs * 1000).toLocaleString("zh-CN")}</td><td><span class="state inactive">${item.bootstrap ? "首次注册待核对" : "待批准"}</span></td><td><button class="approve-remote" data-id="${escapeHtml(item.request_id)}" data-travel-id="${escapeHtml(item.travel_id)}" data-verification-code="${escapeHtml(item.verification_code ?? "")}">审核并批准</button></td></tr>`).join("") : '<tr><td colspan="4" class="empty">暂无待审批的 Travel 申请</td></tr>';
   table.querySelectorAll<HTMLButtonElement>(".approve-remote").forEach((button) => button.addEventListener("click", () => openApprovalDialog(button.dataset.id ?? "", button.dataset.travelId ?? "", button.dataset.verificationCode || undefined)));
   const pager = document.querySelector<HTMLElement>("#pending-travel-pager");
   if (pager) pager.innerHTML = pagerMarkup(response);

@@ -1095,12 +1095,14 @@ mod tests {
                     HomeCatalog {
                         home_id: "home-1".to_owned(),
                         home_alias: "Home One".to_owned(),
+                        service_grant: None,
                         services: services.clone(),
                         endpoint_credential: None,
                     },
                     HomeCatalog {
                         home_id: "home-2".to_owned(),
                         home_alias: "Home Two".to_owned(),
+                        service_grant: None,
                         services,
                         endpoint_credential: None,
                     },

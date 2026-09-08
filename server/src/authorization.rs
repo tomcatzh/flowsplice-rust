@@ -330,6 +330,10 @@ impl ServerAuthorization {
         Ok(())
     }
 
+    pub fn home_service_grant(&self, home_id: &str) -> Option<SignedHomeServiceGrant> {
+        self.business_home_grants.get(home_id).cloned()
+    }
+
     pub fn revoke_from_home(
         &mut self,
         credential_id: Uuid,

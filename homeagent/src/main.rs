@@ -27,8 +27,8 @@ use axum::{
 use clap::{Parser, Subcommand};
 use embedded_spa::{EmbeddedSpa, EmbeddedSpaConfig};
 use flowsplice_core::business::{
-    BUSINESS_VERSION, BusinessDescriptor, BusinessService, VerifiedBusinessDescriptor,
-    validate_services as validate_business_services,
+    BUSINESS_VERSION, BusinessDescriptor, BusinessService, ServiceClassDescriptor,
+    VerifiedBusinessDescriptor, validate_services as validate_business_services,
 };
 use flowsplice_core::{
     CONTROL_FRAME_LIMIT,
@@ -55,7 +55,7 @@ use flowsplice_core::{
 use flowsplice_enrollment::business::{
     BUSINESS_HOME_REQUEST_TYPE, BusinessHomeRequest, HOME_SERVICE_GRANT_FILE, HomeRequestEnvelope,
     HomeResponseEnvelope, TravelRequestEnvelope, TravelResponseEnvelope, issue_business_home,
-    issue_business_travel,
+    issue_business_travel, issue_service_class_travel,
 };
 use flowsplice_enrollment::home::{
     HOME_BUSINESS_CERT_FILE, HOME_BUSINESS_KEY_FILE, HOME_ENDPOINT_CREDENTIAL_FILE,
@@ -482,6 +482,8 @@ struct IssuerStatus {
 #[derive(Serialize)]
 struct IssuedCredentialStatus {
     credential_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_label: Option<String>,
     travel_id: String,
     authority_id: String,
     scope: TravelCredentialScope,
@@ -1574,6 +1576,17 @@ async fn persist_remote_enrollment_request(
         bail!("first enrollment retrieval token has an invalid length");
     }
     match &request {
+        TravelRequestEnvelope::ServiceClass(request) => {
+            let (_, trust) = load_home_trust(config)?;
+            request.validate(&trust, &config.id, unix_time_secs()?)?;
+            if config
+                .issuer
+                .as_ref()
+                .is_none_or(|issuer| issuer.global_authority.is_none())
+            {
+                bail!("service class enrollment requires a global Home issuer");
+            }
+        }
         TravelRequestEnvelope::Business(request) => {
             let (_, trust) = load_home_trust(config)?;
             request.validate(&trust, &config.id, unix_time_secs()?)?;
@@ -2015,6 +2028,10 @@ struct RemoteEnrollmentStatus {
     verification_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     business: Option<VerifiedBusinessDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_class: Option<ServiceClassDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_label: Option<String>,
 }
 
 fn pagination_values(page: Option<usize>, page_size: Option<usize>) -> Result<(usize, usize)> {
@@ -2071,12 +2088,24 @@ async fn api_pending_remote_enrollments(
                 approved: false,
                 bootstrap: record.bootstrap_token_sha256.is_some(),
                 verification_code: record.verification_code,
+                service_class: match &record.request {
+                    TravelRequestEnvelope::ServiceClass(request) => {
+                        Some(request.descriptor.clone())
+                    }
+                    _ => None,
+                },
+                client_label: match &record.request {
+                    TravelRequestEnvelope::ServiceClass(request) => Some(request.label.clone()),
+                    _ => None,
+                },
                 business: match &record.request {
                     TravelRequestEnvelope::Business(request) => request
                         .descriptor
                         .verify(&trust, unix_time_secs().unwrap_or_default())
                         .ok(),
-                    TravelRequestEnvelope::Legacy(_) => None,
+                    TravelRequestEnvelope::Legacy(_) | TravelRequestEnvelope::ServiceClass(_) => {
+                        None
+                    }
                 },
             })
             .collect();
@@ -2397,11 +2426,19 @@ async fn api_issued_credentials(
     let Some(authorization) = state.authorization.current() else {
         return Ok(Json(paginate(Vec::new(), page, page_size)));
     };
+    let root =
+        std::fs::read_to_string(&state.config.deployment_root_public_key).map_err(api_error)?;
+    let labels = state
+        .issuance_ledger
+        .lock()
+        .await
+        .client_labels(root.trim());
     let mut credentials = authorization
         .credentials()
         .filter(|credential| authority_ids.contains(credential.authority_id.as_str()))
         .map(|credential| IssuedCredentialStatus {
             credential_id: credential.credential_id,
+            client_label: labels.get(&credential.credential_id).cloned(),
             travel_id: credential.travel_id.clone(),
             authority_id: credential.authority_id.clone(),
             scope: credential.scope.clone(),
@@ -2421,7 +2458,11 @@ async fn api_issued_credentials(
         })
         .filter(|credential| {
             search.as_ref().is_none_or(|search| {
-                credential.travel_id.to_lowercase().contains(search)
+                credential
+                    .client_label
+                    .as_ref()
+                    .is_some_and(|label| label.to_lowercase().contains(search))
+                    || credential.travel_id.to_lowercase().contains(search)
                     || credential
                         .credential_id
                         .to_string()
@@ -2498,6 +2539,16 @@ async fn issue_from_home_with_password(
         requested_validity_secs(valid_days, valid_minutes, state.issuer.default_valid_days)?;
     let authority =
         match &request {
+            TravelRequestEnvelope::ServiceClass(request) => {
+                let (_, trust) = load_home_trust(&state.config)?;
+                request.validate(&trust, &state.config.id, unix_time_secs()?)?;
+                if scope != request.descriptor.scope() {
+                    bail!("service class enrollment must approve exactly the requested class");
+                }
+                state.issuer.global_authority.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("service class enrollment requires the global issuer")
+                })?
+            }
             TravelRequestEnvelope::Business(request) => {
                 let (_, trust) = load_home_trust(&state.config)?;
                 request.validate(&trust, &state.config.id, unix_time_secs()?)?;
@@ -2518,7 +2569,7 @@ async fn issue_from_home_with_password(
             TravelRequestEnvelope::Legacy(_) => {
                 validate_requested_scope(&state.config, &state.issuer, &scope)?;
                 match &scope {
-                    TravelCredentialScope::Global => {
+                    TravelCredentialScope::Global | TravelCredentialScope::ServiceClass { .. } => {
                         state.issuer.global_authority.as_ref().ok_or_else(|| {
                             anyhow::anyhow!("global super authorization is not configured")
                         })?
@@ -2588,6 +2639,14 @@ async fn issue_from_home_with_password(
     let key_operation = state.key_operation.lock().await;
     recover_private_key_password_rotation(&issuer_key_targets(&state.issuer))?;
     let enrollment = match &request {
+        TravelRequestEnvelope::ServiceClass(request) => {
+            TravelResponseEnvelope::ServiceClass(Box::new(issue_service_class_travel(
+                (**request).clone(),
+                approval,
+                &material,
+                unix_time_secs()?,
+            )?))
+        }
         TravelRequestEnvelope::Business(request) => TravelResponseEnvelope::Business(Box::new(
             issue_business_travel((**request).clone(), approval, &material, unix_time_secs()?)?,
         )),
@@ -2726,6 +2785,9 @@ fn validate_requested_scope(
     scope: &TravelCredentialScope,
 ) -> Result<()> {
     match scope {
+        TravelCredentialScope::ServiceClass { .. } => {
+            bail!("service class approval requires a complete service class enrollment request")
+        }
         TravelCredentialScope::Global => {
             if issuer.global_authority.is_none() {
                 bail!("global super authorization is not configured");

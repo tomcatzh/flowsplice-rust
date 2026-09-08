@@ -17,7 +17,17 @@ for path in "$fixture_dir" "$output_dir"; do
 done
 configuration=business.json
 configuration_flag=--descriptor
-if [[ -f "$fixture_dir/homes.json" ]]; then configuration=homes.json; configuration_flag=--homes; fi
+if [[ -f "$fixture_dir/service-class.json" ]]; then
+  if [[ -e "$fixture_dir/homes.json" || -e "$fixture_dir/business.json" ]]; then
+    printf 'Service-class fixture cannot also select a legacy bootstrap.\n' >&2
+    exit 2
+  fi
+  configuration=service-class.json
+  configuration_flag=--service-class
+elif [[ -f "$fixture_dir/homes.json" ]]; then
+  configuration=homes.json
+  configuration_flag=--homes
+fi
 for name in deployment-root.pub "$configuration"; do
   if [[ ! -f "$fixture_dir/$name" ]]; then
     printf 'Required private fixture input is missing: %s\n' "$name" >&2
@@ -48,8 +58,9 @@ with zipfile.ZipFile(output / 'source/pty-android/app/build/outputs/apk/debug/ap
     for name in ['deployment-root.pub', configuration]:
         if apk.read('assets/bootstrap/' + name) != (fixture / name).read_bytes():
             raise SystemExit('Bundled bootstrap differs from fixture')
-    if any(name.startswith('assets/bootstrap/') and 'password' in name for name in apk.namelist()):
-        raise SystemExit('Password fixture must never be bundled')
+    bundled = {name for name in apk.namelist() if name.startswith('assets/bootstrap/') and not name.endswith('/')}
+    if bundled != {'assets/bootstrap/deployment-root.pub', 'assets/bootstrap/' + configuration}:
+        raise SystemExit('Unexpected bundled bootstrap input; fixture passwords and metadata must not be bundled')
 PY_VERIFY
 printf 'Application APK: %s/source/pty-android/app/build/outputs/apk/debug/app-debug.apk\n' "$output_dir"
 printf 'Instrumentation APK: %s/source/pty-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk\n' "$output_dir"

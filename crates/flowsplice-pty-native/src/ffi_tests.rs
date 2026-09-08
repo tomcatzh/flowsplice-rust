@@ -157,3 +157,38 @@ fn c_abi_owned_responses_and_uninstalled_lifecycle() -> Result<()> {
     assert!(!second_path.exists());
     Ok(())
 }
+
+#[test]
+fn class_open_emits_global_identity_and_rejects_mixed_options() -> Result<()> {
+    let path = std::env::temp_dir().join(format!("pty-class-ffi-{}", Uuid::new_v4()));
+    let options = json!({"install_dir":path,"root_public_key":"not-a-real-root","travel_id":format!("pty-{}",Uuid::new_v4()),"label":"Device · PTY","service_class":{"version":1,"approving_home_id":"fixture-super-home","application_protocol":"flowsplice.pty.v1","protocol":"tcp"}});
+    let text = CString::new(serde_json::to_vec(&options)?)?;
+    // SAFETY: CString retains the JSON for the duration of the ABI call.
+    let opened = response(unsafe { flowsplice_pty_open(text.as_ptr()) })?;
+    assert_eq!(opened["ok"], true);
+    let handle = Handle(opened["data"]["handle"].as_u64().context("class handle")?);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let polled = response(flowsplice_pty_poll(handle.0))?;
+        let events = polled["data"].as_array().context("class event array")?;
+        if let Some(identity) = events.iter().find(|event| event["type"] == "identity") {
+            assert_eq!(identity["installed"], false);
+            assert_eq!(identity["connected"], false);
+            assert_eq!(identity["label"], "Device · PTY");
+            assert!(identity.get("home_id").is_none());
+            break;
+        }
+        ensure!(Instant::now() < deadline, "class identity missing");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let mut mixed = options;
+    mixed["descriptor"] = json!({});
+    let text = CString::new(serde_json::to_vec(&mixed)?)?;
+    // SAFETY: CString remains live throughout the call.
+    rejected(&response(unsafe { flowsplice_pty_open(text.as_ptr()) })?);
+    assert!(
+        !path.exists(),
+        "opening an uninstalled identity must not write credentials"
+    );
+    Ok(())
+}

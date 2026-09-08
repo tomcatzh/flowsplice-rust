@@ -43,9 +43,9 @@ else:
 with original.open("rb") as stream:
     run = plistlib.load(stream)
 if args.platform == "macos":
-    expected = "io.zxf.flowsplice.pty.macos.e2e"
     entry = manifest["platforms"]["macos"]
-    if entry.get("bundle_id") != expected or entry.get("test_only_bundle_id") is not True:
+    expected = entry.get("bundle_id", "")
+    if not isinstance(expected, str) or re.fullmatch(r"io\.zxf\.flowsplice\.pty\.macos\.e2e\.[0-9a-f]{32}", expected) is None or entry.get("test_only_bundle_id") is not True or entry.get("code_signing") != "ad-hoc":
         raise SystemExit("Refusing a macOS test manifest without isolated application identity")
     app = Path(entry["app"]).resolve(strict=True)
     if plistlib.loads((app / "Contents/Info.plist").read_bytes()).get("CFBundleIdentifier") != expected:
@@ -67,6 +67,15 @@ if args.platform == "macos":
         raise SystemExit("macOS xctestrun points outside the isolated test application")
     if target.get("TestHostBundleIdentifier") != expected + ".uitests.xctrunner":
         raise SystemExit("macOS xctestrun runner identity is not isolated")
+    runner = Path(target["TestHostPath"].replace("__TESTROOT__", str(original.parent))).resolve(strict=True)
+    if plistlib.loads((runner / "Contents/Info.plist").read_bytes()).get("CFBundleIdentifier") != expected + ".uitests.xctrunner":
+        raise SystemExit("macOS runner bundle differs from isolated identity")
+    for bundle in [app, runner]:
+        subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
+        signature = subprocess.run(["codesign", "-d", "--verbose=4", str(bundle)], capture_output=True, text=True, check=True)
+        lines = {line.strip() for line in (signature.stdout + signature.stderr).splitlines()}
+        if "Signature=adhoc" not in lines or any(line.startswith("Authority=") for line in lines):
+            raise SystemExit("macOS tests require valid ad hoc signatures without certificate authority")
     if target.get("BundleIdentifiersForCrashReportEmphasis") != [expected, expected + ".uitests"]:
         raise SystemExit("macOS xctestrun application identities are not isolated")
 environment = {
@@ -75,6 +84,12 @@ environment = {
     "FLOWSPLICE_PTY_E2E_RELAY": "127.0.0.1:18446",
     "FLOWSPLICE_PTY_E2E_PASSWORD_FILE": str(fixture.directory / "password.txt"),
 }
+if fixture.service_class:
+    environment.update({
+        "FLOWSPLICE_PTY_E2E_SERVICE_CLASS":"1",
+        "FLOWSPLICE_PTY_E2E_FIRST_HOME":fixture.native_targets[0]["name"],
+        "FLOWSPLICE_PTY_E2E_SECOND_HOME":fixture.native_targets[1]["name"],
+    })
 targets = []
 def configure(value):
     if isinstance(value, dict):
@@ -110,12 +125,15 @@ with log.open("wb") as output:
         while process.poll() is None:
             if time.monotonic() > deadline:
                 raise RuntimeError("Apple PTY UI test exceeded its deadline")
-            for notice in re.findall(r"PTY_E2E_VERIFICATION ([^\r\n]+)", log.read_text(errors="replace")):
+            rendered_log = log.read_text(errors="replace")
+            labels = re.findall(r"PTY_E2E_IDENTITY ([^\r\n]+)", rendered_log)
+            client_label = labels[-1] if labels else None
+            for notice in re.findall(r"PTY_E2E_VERIFICATION ([^\r\n]+)", rendered_log):
                 if notice not in approvals:
-                    approved = fixture.approve_notice(notice)
+                    approved = fixture.approve_notice(notice, client_label)
                     if approved is not None: approvals[notice] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or len(approvals) != 2:
+        if process.returncode != 0 or len(approvals) != fixture.expected_approvals:
             raise RuntimeError("Apple private PTY UI acceptance failed; inspect the xcresult")
     finally:
         if process.poll() is None:

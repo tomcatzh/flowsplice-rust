@@ -31,6 +31,7 @@ parser.add_argument('--root', required=True, type=Path)
 inputs = parser.add_mutually_exclusive_group(required=True)
 inputs.add_argument('--descriptor', type=Path)
 inputs.add_argument('--homes', type=Path)
+inputs.add_argument('--service-class', type=Path)
 parser.add_argument('--output', required=True, type=Path)
 parser.add_argument('--target', required=True, choices=['aarch64-linux-android', 'x86_64-linux-android'])
 parser.add_argument('--release', action='store_true')
@@ -41,13 +42,13 @@ def outside(path):
     if not path.is_absolute():
         raise SystemExit('Private paths must be absolute')
     subprocess.run(['python3', str(helper), 'check-path', '--path', str(path)], check=True, stdout=subprocess.DEVNULL)
-configuration = args.homes or args.descriptor
+configuration = args.service_class or args.homes or args.descriptor
 for path in [args.root, configuration, args.output]:
     outside(path)
 if not args.root.is_file() or not configuration.is_file():
     raise SystemExit('Both private bootstrap files are required')
 if args.homes: validate_homes(args.homes)
-else: json.loads(args.descriptor.read_text())
+else: json.loads(configuration.read_text())
 if args.release:
     for name in ['FLOWSPLICE_PTY_KEYSTORE', 'FLOWSPLICE_PTY_KEY_ALIAS', 'FLOWSPLICE_PTY_STORE_PASSWORD', 'FLOWSPLICE_PTY_KEY_PASSWORD']:
         if not os.environ.get(name): raise SystemExit('Release requires external signing environment')
@@ -74,7 +75,7 @@ subprocess.run(['npm', 'run', 'build', '--prefix', str(stage / 'pty-web')], env=
 assets = stage / 'pty-android/app/src/main/assets'
 (assets / 'bootstrap').mkdir(parents=True)
 subprocess.run(['python3',str(helper),'copy-root','--source',str(args.root),'--destination',str(assets / 'bootstrap/deployment-root.pub')], check=True)
-shutil.copyfile(configuration, assets / 'bootstrap' / ('homes.json' if args.homes else 'business.json'))
+shutil.copyfile(configuration, assets / 'bootstrap' / ('service-class.json' if args.service_class else 'homes.json' if args.homes else 'business.json'))
 shutil.copytree(stage / 'pty-web/dist', assets / 'pty')
 subprocess.run(['bash', str(stage / 'pty-android/scripts/build-native.sh'), args.target], cwd=stage, env=env, check=True)
 if not args.release:

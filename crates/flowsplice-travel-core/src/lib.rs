@@ -90,6 +90,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub mod business;
+pub mod service_class;
 mod socket;
 mod tcp_flow;
 pub use socket::{ServiceBinding, SocketDatagrams, SocketStream};
@@ -176,6 +177,8 @@ struct Config {
     #[serde(default)]
     relay_address_overrides: Vec<RelayAddressOverride>,
     homes: Vec<ConfiguredHome>,
+    #[serde(default)]
+    service_class: Option<flowsplice_core::business::ServiceClassDescriptor>,
     deployment_root_public_key: PathBuf,
     deployment_trust: PathBuf,
     management_cert: PathBuf,
@@ -351,6 +354,8 @@ struct BootstrapEnrollmentState {
     retrieval_token_hex: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     business: Option<flowsplice_core::business::BusinessDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_class: Option<service_class::EnrollmentIntent>,
 }
 
 #[derive(Serialize)]
@@ -372,6 +377,8 @@ struct InstalledTravelConfig {
     #[cfg(feature = "e2e-remote-ui")]
     test_admin_token: Option<String>,
     homes: Vec<InstalledHome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_class: Option<flowsplice_core::business::ServiceClassDescriptor>,
     seed_relays: Vec<SeedRelayOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     relay_address_overrides: Vec<RelayAddressOverride>,
@@ -1646,7 +1653,30 @@ async fn enroll_remote_inner<F>(
 where
     F: Fn(RemoteEnrollmentProgress) + Send + Sync,
 {
+    enroll_remote_intent(options, business, None, on_progress).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn enroll_remote_intent<F>(
+    options: RemoteEnrollmentOptions,
+    business: Option<flowsplice_core::business::BusinessDescriptor>,
+    service_class: Option<service_class::EnrollmentIntent>,
+    on_progress: F,
+) -> Result<()>
+where
+    F: Fn(RemoteEnrollmentProgress) + Send + Sync,
+{
     init_crypto();
+    if business.is_some() && service_class.is_some() {
+        bail!("conflicting enrollment intents");
+    }
+    let directed = business.is_some() || service_class.is_some();
+    if let Some(intent) = &service_class {
+        intent.descriptor.validate()?;
+        if intent.descriptor.approving_home_id != options.home_id {
+            bail!("class approver mismatch");
+        }
+    }
     if options.wait_timeout_secs == 0 {
         bail!("wait-timeout-secs must be positive");
     }
@@ -1741,7 +1771,56 @@ where
     let enrollment_dir = install_root.join("cert");
     let bootstrap_state_path = install_root.join("bootstrap-enrollment.json");
     let config_path = install_root.join("travelagent.toml");
-    let binding_path = install_root.join(flowsplice_enrollment::business::BUSINESS_BINDING_FILE);
+    let binding_path = install_root.join(if service_class.is_some() {
+        service_class::BINDING_FILE
+    } else {
+        flowsplice_enrollment::business::BUSINESS_BINDING_FILE
+    });
+    if binding_path.exists()
+        && let Some(intent) = &service_class
+    {
+        let approved =
+            service_class::load_binding(&config_path, root_public_key, &intent.descriptor)?;
+        if approved.travel_id != options.travel_id {
+            bail!("completed class installation identity mismatch");
+        }
+        drop(load_app_state(&config_path, Some(password.as_str()))?);
+        if bootstrap_state_path.exists() {
+            let pending: BootstrapEnrollmentState = load_json(&bootstrap_state_path)?;
+            if pending.request_id != approved.request_id
+                || pending.service_class.as_ref() != Some(intent)
+                || pending.business.is_some()
+            {
+                bail!("class bootstrap state conflicts with completed binding");
+            }
+            fs::remove_file(&bootstrap_state_path)?;
+        }
+        let journal_path = install_root.join(business::INSTALL_JOURNAL_FILE);
+        if journal_path.exists() {
+            let pending: business::InstallJournal = load_json(&journal_path)?;
+            let flowsplice_enrollment::business::TravelResponseEnvelope::ServiceClass(response) =
+                &pending.response
+            else {
+                bail!("class journal format mismatch");
+            };
+            if response.request.request.request_id != approved.request_id
+                || response.request.descriptor != intent.descriptor
+                || response.request.label != intent.label
+            {
+                bail!("class installation journal conflicts with completed binding");
+            }
+            fs::remove_file(journal_path)?;
+        }
+        on_progress(RemoteEnrollmentProgress {
+            phase: RemoteEnrollmentPhase::Installed,
+            travel_id: options.travel_id,
+            request_id: Some(approved.request_id),
+            verification_code: None,
+            config_path: Some(config_path),
+            credential_id: Some(approved.credential_id),
+        });
+        return Ok(());
+    }
     if binding_path.exists()
         && let Some(descriptor) = &business
     {
@@ -1763,8 +1842,13 @@ where
         let journal_path = install_root.join(business::INSTALL_JOURNAL_FILE);
         if journal_path.exists() {
             let pending: business::InstallJournal = load_json(&journal_path)?;
-            if pending.response.request.request.request_id != approved.request_id
-                || pending.response.request.descriptor != *descriptor
+            let flowsplice_enrollment::business::TravelResponseEnvelope::Business(response) =
+                &pending.response
+            else {
+                bail!("business journal format mismatch");
+            };
+            if response.request.request.request_id != approved.request_id
+                || response.request.descriptor != *descriptor
             {
                 bail!("completed business binding conflicts with leftover installation journal");
             }
@@ -1780,7 +1864,7 @@ where
         });
         return Ok(());
     }
-    if config_path.exists() && business.is_none() {
+    if config_path.exists() && !directed {
         bail!(
             "Travel configuration already exists: {}",
             config_path.display()
@@ -1791,7 +1875,7 @@ where
         if state.version != REMOTE_ENROLLMENT_VERSION || state.home_id != options.home_id {
             bail!("existing first-enrollment state conflicts with the requested Home");
         }
-        if state.business != business {
+        if state.business != business || state.service_class != service_class {
             bail!("resumed enrollment changed the requested business descriptor");
         }
         let request: TravelEnrollmentRequest = load_json(&enrollment_dir.join(REQUEST_FILE))?;
@@ -1829,6 +1913,7 @@ where
                 request_id: request.request_id,
                 retrieval_token_hex: hex::encode(&token),
                 business: business.clone(),
+                service_class: service_class.clone(),
             },
         )?;
         (request, token)
@@ -1844,7 +1929,23 @@ where
                 descriptor: descriptor.clone(),
             }),
         ),
-        None => flowsplice_enrollment::business::TravelRequestEnvelope::Legacy(request.clone()),
+        None => {
+            if let Some(intent) = &service_class {
+                flowsplice_enrollment::business::TravelRequestEnvelope::ServiceClass(Box::new(
+                    flowsplice_enrollment::business::ServiceClassTravelRequest {
+                        version: flowsplice_core::business::BUSINESS_VERSION,
+                        object_type:
+                            flowsplice_enrollment::business::SERVICE_CLASS_TRAVEL_REQUEST_TYPE
+                                .into(),
+                        request: request.clone(),
+                        descriptor: intent.descriptor.clone(),
+                        label: intent.label.clone(),
+                    },
+                ))
+            } else {
+                flowsplice_enrollment::business::TravelRequestEnvelope::Legacy(request.clone())
+            }
+        }
     };
     let request_json = serde_json::to_vec(&request_envelope)?;
     let verification_code = bootstrap_verification_code(&request_json, &retrieval_token);
@@ -1861,18 +1962,13 @@ where
     let deadline = Instant::now() + Duration::from_secs(options.wait_timeout_secs);
     let mut last_error = None;
     let journal_path = install_root.join(business::INSTALL_JOURNAL_FILE);
-    let journal: Option<business::InstallJournal> = if business.is_some() && journal_path.exists() {
+    let journal: Option<business::InstallJournal> = if directed && journal_path.exists() {
         Some(load_json(&journal_path)?)
     } else {
         None
     };
     let (response, mut seed_relays) = if let Some(journal) = &journal {
-        (
-            flowsplice_enrollment::business::TravelResponseEnvelope::Business(Box::new(
-                journal.response.clone(),
-            )),
-            Vec::new(),
-        )
+        (journal.response.clone(), Vec::new())
     } else {
         'outer: loop {
             for relay in &polling_relays {
@@ -1914,6 +2010,15 @@ where
     };
 
     let (credential, trust) = match (&request_envelope, &response) {
+        (
+            flowsplice_enrollment::business::TravelRequestEnvelope::ServiceClass(request),
+            flowsplice_enrollment::business::TravelResponseEnvelope::ServiceClass(response),
+        ) => {
+            if **request != response.request {
+                bail!("class response changed its complete request");
+            }
+            response.validate(root_public_key, unix_time_secs()?)?
+        }
         (
             flowsplice_enrollment::business::TravelRequestEnvelope::Business(request),
             flowsplice_enrollment::business::TravelResponseEnvelope::Business(response),
@@ -1980,11 +2085,18 @@ where
         test_allow_remote_listen: options.test_allow_remote_listen,
         #[cfg(feature = "e2e-remote-ui")]
         test_admin_token: options.test_admin_token,
-        homes: vec![InstalledHome {
-            id: business_target
-                .as_ref()
-                .map_or_else(|| options.home_id.clone(), |target| target.home_id.clone()),
-        }],
+        service_class: service_class
+            .as_ref()
+            .map(|intent| intent.descriptor.clone()),
+        homes: if service_class.is_some() {
+            Vec::new()
+        } else {
+            vec![InstalledHome {
+                id: business_target
+                    .as_ref()
+                    .map_or_else(|| options.home_id.clone(), |target| target.home_id.clone()),
+            }]
+        },
         seed_relays: seed_relays
             .into_iter()
             .map(|management_addr| SeedRelayOutput { management_addr })
@@ -1996,12 +2108,12 @@ where
     } else {
         toml::to_string_pretty(&generated).context("failed to encode Travel config")?
     };
-    if let flowsplice_enrollment::business::TravelResponseEnvelope::Business(response) = &response {
+    if directed {
         if journal.is_none() {
             business::write_atomic_private(
                 &journal_path,
                 &serde_json::to_vec_pretty(&business::InstallJournal {
-                    response: (**response).clone(),
+                    response: response.clone(),
                     config_toml: encoded.clone(),
                 })?,
             )?;
@@ -2061,13 +2173,30 @@ where
         )?;
         business::write_atomic_private(&binding_path, &serde_json::to_vec_pretty(&marker)?)?;
     }
+    if let flowsplice_enrollment::business::TravelResponseEnvelope::ServiceClass(response) =
+        &response
+    {
+        drop(load_app_state(&config_path, Some(password.as_str()))?);
+        let marker = service_class::CompletedBinding {
+            version: flowsplice_core::business::BUSINESS_VERSION,
+            config_sha256: sha256_hex(encoded.as_bytes()),
+            response: (**response).clone(),
+        };
+        service_class::validate_installed_binding(
+            &config_path,
+            &marker,
+            root_public_key,
+            &response.request.descriptor,
+        )?;
+        business::write_atomic_private(&binding_path, &serde_json::to_vec_pretty(&marker)?)?;
+    }
     fs::remove_file(&bootstrap_state_path).with_context(|| {
         format!(
             "failed to remove completed bootstrap state {}",
             bootstrap_state_path.display()
         )
     })?;
-    if journal_path.exists() && business.is_some() {
+    if journal_path.exists() && directed {
         fs::remove_file(&journal_path)?;
     }
     on_progress(RemoteEnrollmentProgress {
@@ -2675,7 +2804,14 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    configured_home_ids(&config.homes)?;
+    if let Some(class) = &config.service_class {
+        class.validate()?;
+        if !config.homes.is_empty() || !config.mappings.is_empty() {
+            bail!("class configuration cannot pin Homes or install listeners");
+        }
+    } else {
+        configured_home_ids(&config.homes)?;
+    }
     if config.state_store.as_os_str().is_empty() {
         bail!("state_store must be non-empty");
     }
@@ -2727,6 +2863,12 @@ fn validate_config(config: &Config) -> Result<()> {
 }
 
 fn validate_mapping_set(config: &Config, mappings: &[Mapping]) -> Result<()> {
+    if config.service_class.is_some() {
+        if !mappings.is_empty() {
+            bail!("class configuration cannot install listeners");
+        }
+        return Ok(());
+    }
     let home_ids = configured_home_ids(&config.homes)?;
     let mut services = HashSet::new();
     let mut binds = HashSet::new();
@@ -3440,20 +3582,20 @@ async fn open_business_on(
     home_id: &str,
 ) -> Result<BusinessCarrier> {
     let config = &state.config;
-    let home = config
-        .homes
-        .iter()
-        .find(|home| home.id == home_id)
-        .ok_or_else(|| anyhow!("Home {home_id} is not configured"))?;
-    let home_spki_pins = {
+    let home_spki_pins = if let Some(descriptor) = &config.service_class {
+        service_class::home_business_pins(state, descriptor, home_id, service_id, protocol).await?
+    } else {
+        if !config.homes.iter().any(|home| home.id == home_id) {
+            bail!("Home {home_id} is not configured");
+        }
         let trust = state.deployment_trust.read().await;
         let catalog = state.catalog.read().await;
         let endpoint_credential = catalog
             .homes
             .iter()
-            .find(|candidate| candidate.home_id == home.id)
+            .find(|candidate| candidate.home_id == home_id)
             .and_then(|home| home.endpoint_credential.as_ref());
-        trusted_home_business_pins(&trust, &home.id, endpoint_credential, unix_time_secs()?)?
+        trusted_home_business_pins(&trust, home_id, endpoint_credential, unix_time_secs()?)?
     };
     let (grant, relay_id) = request_route(state, relay, home_id).await?;
     let addresses =
@@ -3499,7 +3641,7 @@ async fn open_business_on(
     .await
     .context("business TLS handshake timed out")??;
     let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Home, Some(&home.id), &home_spki_pins)?;
+    require_peer(&identity, Role::Home, Some(home_id), &home_spki_pins)?;
     write_json(
         &mut stream,
         &DataFrame::Open {

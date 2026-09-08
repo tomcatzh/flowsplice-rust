@@ -23,15 +23,7 @@ final class E2ETerminalTests: XCTestCase {
         originalInputSource = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
         let asciiInputSource = TISCopyCurrentASCIICapableKeyboardInputSource().takeRetainedValue()
         XCTAssertEqual(TISSelectInputSource(asciiInputSource), noErr)
-        // A failed older local test build can leave this specific Gatekeeper alert
-        // on screen after its process exits. Cancel it; never override the policy.
-        let system = XCUIApplication(bundleIdentifier: "com.apple.coreservices.uiagent")
-        for dialog in system.dialogs.allElementsBoundByIndex {
-            let runner = dialog.staticTexts.matching(NSPredicate(
-                format: "value CONTAINS %@ OR label CONTAINS %@",
-                "FlowSplicePTY-macOSUITests-Runner", "FlowSplicePTY-macOSUITests-Runner")).firstMatch
-            if runner.exists && dialog.buttons["取消"].exists { dialog.buttons["取消"].click() }
-        }
+        dismissStaleMacPrompts()
 #else
         // A previous screen-off acceptance run may leave this dedicated device asleep.
         XCUIDevice.shared.press(.home)
@@ -57,6 +49,50 @@ final class E2ETerminalTests: XCTestCase {
 #endif
     }
 
+#if os(macOS)
+    private func dismissStaleMacPrompts() {
+        func candidates() -> [(XCUIElement, String, Bool)] {
+            var result: [(XCUIElement, String, Bool)] = []
+            for identifier in ["com.apple.UserNotificationCenter", "com.apple.coreservices.uiagent"] {
+                let system = XCUIApplication(bundleIdentifier: identifier)
+                guard system.state != .notRunning else { continue }
+                for dialog in system.dialogs.allElementsBoundByIndex + system.alerts.allElementsBoundByIndex {
+                    let message = dialog.staticTexts.allElementsBoundByIndex
+                        .map { $0.label + " " + ($0.value as? String ?? "") }.joined(separator: " ")
+                    let network = message.contains("FlowSplicePTY") &&
+                        (message.contains("本地网络") || message.lowercased().contains("local network"))
+                    if network || message.contains("FlowSplicePTY-macOSUITests-Runner") {
+                        result.append((dialog, message, network))
+                    }
+                }
+            }
+            return result.sorted { $0.2 && !$1.2 }
+        }
+        for _ in 0..<8 {
+            let pending = candidates()
+            if pending.isEmpty { return }
+            var clicked = false
+            for (dialog, _, network) in pending {
+                let titles: Set<String> = network
+                    ? ["不允许", "Don't Allow", "Don’t Allow", "Do Not Allow", "取消", "Cancel"]
+                    : ["不打开", "Don't Open", "Do Not Open", "取消", "Cancel"]
+                guard let button = dialog.buttons.allElementsBoundByIndex.first(where: {
+                    titles.contains($0.title) && $0.isEnabled && $0.isHittable
+                }) else { continue }
+                button.click()
+                clicked = true
+                break // Every subsequent action starts with a fresh hierarchy query.
+            }
+            if !clicked {
+                XCTFail("Cannot dismiss stale PTY prompts: " + pending.map { $0.1 }.joined(separator: " | "))
+                return
+            }
+        }
+        let remaining = candidates()
+        XCTAssertTrue(remaining.isEmpty, "Stale PTY prompts remain: " + remaining.map { $0.1 }.joined(separator: " | "))
+    }
+#endif
+
     private func allowOwnLocalNetworkPrompt() {
 #if os(macOS)
         let system = XCUIApplication(bundleIdentifier: "com.apple.UserNotificationCenter")
@@ -68,16 +104,24 @@ final class E2ETerminalTests: XCTestCase {
         for dialog in dialogs {
             let message = dialog.staticTexts.allElementsBoundByIndex
                 .map { $0.label + " " + ($0.value as? String ?? "") }.joined(separator: " ")
+#if os(macOS)
+            guard app.state != .notRunning, message.contains("FlowSplicePTY"),
+                  message.contains("本地网络") || message.lowercased().contains("local network") else { continue }
+            let titles: Set<String> = ["允许", "Allow", "好", "OK"]
+            if let button = dialog.buttons.allElementsBoundByIndex.first(where: {
+                titles.contains($0.title) && $0.isEnabled && $0.isHittable
+            }) {
+                button.click()
+                return
+            }
+#else
             guard message.contains("FlowSplice"),
                   message.contains("本地网络") || message.lowercased().contains("local network") else { continue }
             for title in ["允许", "Allow", "好", "OK"] where dialog.buttons[title].exists {
-#if os(macOS)
-                dialog.buttons[title].click()
-#else
                 dialog.buttons[title].tap()
-#endif
                 return
             }
+#endif
         }
     }
 
@@ -90,6 +134,20 @@ final class E2ETerminalTests: XCTestCase {
         return app.webViews.textFields.matching(NSPredicate(format:"title CONTAINS %@", name)).firstMatch
 #else
         return app.webViews.textFields.matching(NSPredicate(format:"label CONTAINS %@", name)).firstMatch
+#endif
+    }
+
+    private func finishFormEditing() {
+#if !os(macOS)
+        // Dismiss WebKit's form keyboard before locating the submit button;
+        // hiding it changes the visual viewport and the button's screen position.
+        if app.keyboards.firstMatch.exists {
+            let done = app.buttons.matching(NSPredicate(format:"label IN %@", ["Done", "完成", "Hide keyboard", "Dismiss keyboard", "隐藏键盘", "收起键盘"]))
+                .allElementsBoundByIndex.first(where: { $0.isHittable })
+            XCTAssertNotNil(done, "The native form keyboard must expose a dismissal control")
+            if let done { tap(done) }
+            wait(NSPredicate(format:"exists == false"), object:app.keyboards.firstMatch)
+        }
 #endif
     }
 
@@ -109,13 +167,30 @@ final class E2ETerminalTests: XCTestCase {
         // WebKit exposes text as label on iOS and value on macOS. Heading
         // values can be numbers, so string predicates cannot safely query all values.
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { [unowned self] _, _ in
+#if os(macOS)
+            self.allowOwnLocalNetworkPrompt()
+#endif
             for value in self.visibleTextSnapshot() where value.contains(fragment) {
                 found = value
                 return true
             }
             return false
         }, object: app)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
+        let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        if result != .completed {
+            let window = app.windows.firstMatch
+            if window.exists {
+                let screenshot = XCTAttachment(screenshot: window.screenshot())
+                screenshot.name = "PTY app window at text timeout"
+                screenshot.lifetime = .keepAlways
+                add(screenshot)
+            }
+            let snapshot = XCTAttachment(string: app.webViews.debugDescription)
+            snapshot.name = "PTY WebView snapshot at text timeout"
+            snapshot.lifetime = .keepAlways
+            add(snapshot)
+        }
+        XCTAssertEqual(result, .completed,
             "Required visible text is missing: \(fragment)")
         return found ?? ""
     }
@@ -161,6 +236,9 @@ final class E2ETerminalTests: XCTestCase {
             .trimmingCharacters(in: .newlines)
         XCTAssertFalse(password.isEmpty, "Fixture password cannot be empty")
         app.launch()
+        let isClass = environment["FLOWSPLICE_PTY_E2E_SERVICE_CLASS"] == "1"
+        let firstHome = isClass ? try XCTUnwrap(environment["FLOWSPLICE_PTY_E2E_FIRST_HOME"]) : "测试 Mac"
+        let secondHome = isClass ? try XCTUnwrap(environment["FLOWSPLICE_PTY_E2E_SECOND_HOME"]) : "测试 VPS"
         let web = app.webViews.firstMatch
         XCTAssertTrue(web.waitForExistence(timeout: 20))
         func management() {
@@ -174,18 +252,14 @@ final class E2ETerminalTests: XCTestCase {
             let visible = buttons.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? buttons.firstMatch
             tap(visible)
         }
-        func enroll(_ name: String) {
-            home(name)
-            let relayField = inputField(containing:"Relay")
-            tap(relayField)
-            relayField.typeText(relay)
-            let passwordField = web.secureTextFields.firstMatch
-            tap(passwordField); passwordField.typeText(password)
-            tap(web.buttons["注册"])
+        func approveRenderedRequest() {
             _ = waitForText(containing:"等待超级 Home 批准", timeout:120)
             var code = ""
             let expectation = XCTNSPredicateExpectation(predicate:NSPredicate { _, _ in
-                for value in self.visibleTextSnapshot() {
+    #if os(macOS)
+            self.allowOwnLocalNetworkPrompt()
+#endif
+            for value in self.visibleTextSnapshot() {
                     if value.range(of:"^[0-9A-Fa-f]{4}([ -][0-9A-Fa-f]{4})+$", options:.regularExpression) != nil {
                         code = value; return true
                     }
@@ -194,6 +268,34 @@ final class E2ETerminalTests: XCTestCase {
             }, object:app)
             XCTAssertEqual(XCTWaiter.wait(for:[expectation], timeout:120), .completed, "Rendered approval code unavailable")
             print("PTY_E2E_VERIFICATION 等待批准，校验码：" + code)
+        }
+        func waitForHome() {
+            _ = waitForText(containing:isClass ? "PTY 服务 · 已连接" : "已连接", timeout:180)
+        }
+        func enrollClass() {
+            _ = waitForText(containing:"所有 Home 的 PTY 服务", timeout:30)
+            let label = waitForText(containing:" · PTY", timeout:30)
+            XCTAssertTrue(label.hasSuffix(" · PTY"))
+            print("PTY_E2E_IDENTITY " + label)
+            let relayField = inputField(containing:"Relay")
+            tap(relayField); relayField.typeText(relay)
+            let passwordField = web.secureTextFields.firstMatch
+            tap(passwordField); passwordField.typeText(password)
+            finishFormEditing()
+            tap(web.buttons["注册此设备"])
+            approveRenderedRequest()
+            _ = waitForText(containing:"服务目录已连接", timeout:180)
+        }
+        func enroll(_ name: String) {
+            home(name)
+            let relayField = inputField(containing:"Relay")
+            tap(relayField)
+            relayField.typeText(relay)
+            let passwordField = web.secureTextFields.firstMatch
+            tap(passwordField); passwordField.typeText(password)
+            finishFormEditing()
+            tap(web.buttons["注册"])
+            approveRenderedRequest()
             _ = waitForText(containing:"已连接", timeout:180)
             XCTAssertTrue(text("暂无会话，点击「新建会话」开始。").waitForExistence(timeout:30))
         }
@@ -204,6 +306,7 @@ final class E2ETerminalTests: XCTestCase {
             tap(web.buttons["＋ 新建会话"])
             let field = inputField(containing:"会话名称")
             tap(field); field.typeText("E2E shell")
+            finishFormEditing()
             tap(web.buttons["创建并打开"])
             XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
             management()
@@ -229,7 +332,9 @@ final class E2ETerminalTests: XCTestCase {
             terminal.typeText("printf '\\n" + octal + "\\n'\n")
             waitForRenderedOutput(marker)
         }
-        enroll("测试 Mac"); create()
+        if isClass { enrollClass(); home(firstHome); waitForHome() }
+        else { enroll(firstHome) }
+        create()
         for label in ["Ctrl+C", "Tab", "Esc", "↑", "↓", "←", "→"] {
 #if os(macOS)
             XCTAssertFalse(web.buttons[label].exists, "macOS must have no virtual terminal keys")
@@ -244,14 +349,16 @@ final class E2ETerminalTests: XCTestCase {
         tap(web.buttons["切换只读"])
         tap(web.buttons["申请读写"])
         XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
-        enroll("测试 VPS"); create(); output(marker + "SECOND")
-        switchTerminal("测试 Mac"); output(marker + "FIRST")
-        switchTerminal("测试 VPS"); output(marker + "SECONDAGAIN")
+        if isClass { home(secondHome); waitForHome() }
+        else { enroll(secondHome) }
+        create(); output(marker + "SECOND")
+        switchTerminal(firstHome); output(marker + "FIRST")
+        switchTerminal(secondHome); output(marker + "SECONDAGAIN")
         management(); tap(web.buttons["断开连接"])
         _ = waitForText(containing:"未连接", timeout:20)
-        switchTerminal("测试 Mac"); output(marker + "SURVIVED")
-        home("测试 VPS")
-        _ = waitForText(containing:"已连接", timeout:180)
+        switchTerminal(firstHome); output(marker + "SURVIVED")
+        home(secondHome)
+        waitForHome()
         XCTAssertEqual(web.buttons.matching(identifier:"打开").count, 1)
         tap(web.buttons["打开"])
         XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
@@ -269,8 +376,13 @@ final class E2ETerminalTests: XCTestCase {
         }, object:app)
         staysDisconnected.isInverted = true
         XCTAssertEqual(XCTWaiter.wait(for:[staysDisconnected], timeout:2), .completed)
-        tap(web.buttons["连接"])
-        _ = waitForText(containing:"已连接", timeout:180)
+        if isClass {
+            tap(web.buttons["连接服务目录"])
+            _ = waitForText(containing:"服务目录已连接", timeout:180)
+            XCTAssertFalse(web.buttons["关闭标签"].exists, "Shared connect must not join any Home")
+            home(secondHome)
+        } else { tap(web.buttons["连接"]) }
+        waitForHome()
         XCTAssertEqual(web.buttons.matching(identifier:"打开").count, 1, "Reconnect must list the existing shell only")
         XCTAssertFalse(web.buttons["关闭标签"].exists, "Reconnect must not join automatically")
         tap(web.buttons["打开"])

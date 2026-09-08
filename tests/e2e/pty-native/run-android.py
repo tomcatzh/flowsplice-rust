@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run private PTY UI acceptance on the dedicated emulator, with matched approval."""
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -50,18 +51,24 @@ log = build / "private-ui-e2e.log"
 if log.exists():
     log.rename(build / ("private-ui-e2e-previous-" + str(time.time_ns()) + ".log"))
 approvals = {}
+class_arguments = []
+if fixture.service_class:
+    class_arguments = ["-e", "ptyServiceClass", "true"]
+    for prefix, target in zip(["ptyFirst", "ptySecond"], fixture.native_targets):
+        for suffix, key in [("HomeId", "id"), ("HomeName", "name")]:
+            class_arguments += ["-e", prefix + suffix + "Base64", base64.b64encode(target[key].encode()).decode()]
 with log.open("wb") as output:
     process = subprocess.Popen(base + ["shell", "am", "instrument", "-w", "-r",
         "-e", "class", "io.zxf.flowsplice.pty.PrivateTerminalE2ETest",
         "-e", "isolated", "true", "-e", "ptyRelay", "10.0.2.2:18446",
         "-e", "ptyPasswordFile", "/data/user/0/" + package + "/files/fixture-password",
-        package + ".test/androidx.test.runner.AndroidJUnitRunner"], stdout=output, stderr=subprocess.STDOUT)
+        *class_arguments, package + ".test/androidx.test.runner.AndroidJUnitRunner"], stdout=output, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + 720
     try:
         while process.poll() is None:
             if time.monotonic() > deadline:
                 raise RuntimeError("Android PTY UI test exceeded its deadline")
-            if len(approvals) < 2:
+            if len(approvals) < fixture.expected_approvals:
                 result = subprocess.run(base + ["exec-out", "run-as", package, "cat", "files/e2e-verification.json"],
                                         capture_output=True, timeout=10, check=False)
                 if result.returncode == 0 and result.stdout.strip():
@@ -70,12 +77,13 @@ with log.open("wb") as output:
                     except json.JSONDecodeError:
                         # exec-out may return remote cat errors on stdout with host exit 0.
                         notice = ""
-                    if isinstance(notice, str):
-                        if notice not in approvals:
+                    if isinstance(notice, (str, dict)):
+                        notice_key = json.dumps(notice, sort_keys=True)
+                        if notice_key not in approvals:
                             approved = fixture.approve_notice(notice)
-                            if approved is not None: approvals[notice] = approved
+                            if approved is not None: approvals[notice_key] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or len(approvals) != 2 or "OK (1 test)" not in log.read_text():
+        if process.returncode != 0 or len(approvals) != fixture.expected_approvals or "OK (1 test)" not in log.read_text():
             raise RuntimeError("Android private PTY UI acceptance failed; see private-ui-e2e.log")
     finally:
         if process.poll() is None:

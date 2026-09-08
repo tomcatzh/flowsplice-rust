@@ -1,8 +1,8 @@
 # Embedded socket runtimes
 
 The generic Home and Travel applications and embedded businesses use the same encrypted
-transport implementations. Existing protocol frames, certificates and stored authorization
-formats are retained.
+transport implementations. Existing transport frames, certificates and legacy authorization
+shapes are retained; service-category authorization adds an explicit new scope and signed catalog metadata.
 
 - `flowsplice-home-core` owns serving identity validation, Server control, authorization
   synchronization, business TLS, Carrier recovery and TCP/UDP flow handling.
@@ -47,6 +47,28 @@ runtime also cancels its tasks, while explicit shutdown provides the drain bound
 The destination binding contains no local bind address. Constructing one does not grant
 access: Server/Relay/Home still enforce the signed device authorization and exact service.
 
+## Service-category enrollment and discovery
+
+Use `service_class::enroll` with `BusinessEnrollmentOptions`, a `ServiceClassDescriptor`
+and the readable device label. It shares the resumable enrollment/journal engine with
+exact business enrollment. `TravelCore::start_service_class` validates the installed
+signed intent and returns `(TravelCore, ApprovedServiceClass)`; there is one device
+identity and management connection for all matching Homes.
+
+Call `service_class_targets(&approved)` to obtain verified current Home/service
+bindings. The category is the exact application protocol and TCP/UDP transport,
+independent of Home ID or service display name. Each target must have a valid signed
+Home service grant and endpoint. New matching Homes appear without another client
+enrollment or a packaged Home list. `connect_tcp` / `connect_udp` retain ordinary
+socket semantics; disconnecting one socket does not shut down the shared runtime.
+
+The new `ServiceClass` credential must be issued by the selected Global authority.
+It grants only matching approved businesses. Upgrade all Server, Relay and Home
+components consuming authorization snapshots before issuing it: older infrastructure
+cannot parse this new scope. Existing generic Travel clients keep their old credentials
+and message shapes. Legacy exact business installations are preserved and do not
+silently acquire category-wide access. See [PTY provisioning](pty.md).
+
 ## Home
 
 Create listeners before starting the provisioned serving runtime:
@@ -61,8 +83,9 @@ let (stream, peer) = listener.accept().await?;
 
 The configured service catalog still supplies the ID, protocol and display metadata.
 For a virtual service, `target` is nonempty opaque metadata such as `in-process`; it is
-never opened as a socket by the runtime. Catalog formats remain readable by old Travel
-clients. `peer` contains the verified Travel credential and Flow identity; application
+never opened as a socket by the runtime. Upgrade the deployment as one coordinated
+current-version system; mixed-version support is not required. `peer` contains the verified
+Travel credential and Flow identity; application
 permissions can narrow that authorization further.
 
 `bind_udp` accepts separate datagram endpoints with authenticated peer context. Replies
