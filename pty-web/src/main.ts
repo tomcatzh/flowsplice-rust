@@ -32,6 +32,7 @@ type Home = {
   pendingNewId: string | null;
   connectAfterEnroll: boolean;
   detailsPending: boolean;
+  detailsAgain?: boolean;
 };
 type Tab = {
   key: string;
@@ -68,6 +69,12 @@ declare global {
     };
   }
 }
+let renaming: {
+  home: string;
+  session: string;
+  pending: boolean;
+  request?: string;
+} | null = null;
 const app = document.querySelector<HTMLElement>("#app")!;
 app.innerHTML = `<header id="topbar">
 <button id="manage" aria-label="Home 管理">⌘ Home</button>
@@ -159,6 +166,7 @@ app.innerHTML = `<header id="topbar">
 </div>
 <span id="terminal-connections">
 </span>
+<button id="rename-terminal">重命名</button>
 <button id="mode">
 <span id="mode-label">
 </span>
@@ -202,6 +210,7 @@ app.innerHTML = `<header id="topbar">
 <button id="cancel-new" type="button">取消</button>
 </form>
 </dialog>
+<dialog id="rename-session"><form id="rename-form"><h2>重命名会话</h2><p id="rename-target" class="muted"></p><label>会话名称<input id="rename-name" autocomplete="off" required></label><p id="rename-error" role="alert"></p><button id="save-rename" class="primary">保存</button><button id="cancel-rename" type="button">取消</button></form></dialog>
 <dialog id="takeover">
 <h2>接管读写权限</h2>
 <p id="warning">
@@ -529,7 +538,24 @@ function render() {
       !h.canWrite || h.pendingNew !== null;
     renderList(h);
   }
+  if (renaming) {
+    const target = homes.get(renaming.home);
+    const available =
+      target?.connected &&
+      target.canWrite &&
+      target.sessions.has(renaming.session);
+    el<HTMLButtonElement>("save-rename").disabled =
+      !available || renaming.pending;
+    el<HTMLInputElement>("rename-name").disabled = renaming.pending;
+    el<HTMLButtonElement>("cancel-rename").disabled = renaming.pending;
+    if (!available)
+      el("rename-error").textContent = "会话已不可用或没有重命名权限。";
+  }
   if (tab) {
+    el<HTMLButtonElement>("rename-terminal").disabled =
+      !tab.home.connected ||
+      !tab.home.canWrite ||
+      !tab.home.sessions.has(tab.session);
     const terminalNotice = [
       tab.notice,
       tab.home.notice
@@ -614,6 +640,7 @@ function renderList(h: Home) {
         actions.append(write);
       }
     }
+    if (h.canWrite) actions.append(button("重命名", () => openRename(h, s.id)));
     row.append(actions);
     el("list").append(row);
   }
@@ -649,6 +676,12 @@ function detach(tab: Tab) {
   details(tab.home);
 }
 function clear(home: Home) {
+  if (renaming?.home === home.id) {
+    renaming.pending = false;
+    renaming.request = undefined;
+    el<HTMLDialogElement>("rename-session").close();
+    renaming = null;
+  }
   home.detailsPending = false;
   if (newHome === home.id) {
     newHome = null;
@@ -657,6 +690,7 @@ function clear(home: Home) {
   for (const tab of [...tabs.values()]) if (tab.home === home) remove(tab);
   home.requests.clear();
   home.joining.clear();
+  home.detailsAgain = false;
   home.pendingNew = null;
   home.pendingNewId = null;
   home.canWrite = false;
@@ -734,6 +768,22 @@ function protocol(h: Home, m: any) {
     const r = m.result;
     if (req?.op === "list_details" || r.status === "session_details")
       h.detailsPending = false;
+    if (req?.op === "rename") {
+      if (renaming?.home === h.id && renaming.request === m.request_id) {
+        renaming.pending = false;
+        if (r.status === "ok") {
+          el<HTMLDialogElement>("rename-session").close();
+          renaming = null;
+        } else
+          el("rename-error").textContent = r.message || "重命名失败，请重试。";
+      }
+      if (r.status === "ok") {
+        if (h.detailsPending) h.detailsAgain = true;
+        else details(h);
+      }
+      render();
+      return;
+    }
     if (r.status === "ok" && req?.op !== "new_named" && req?.op !== "join")
       return;
     const name = req?.op === "new_named" ? String(req.name) : undefined;
@@ -747,6 +797,10 @@ function protocol(h: Home, m: any) {
       for (const s of r.sessions)
         next.set(s.id, { ...h.sessions.get(s.id), ...s });
       h.sessions = next;
+      if (r.status === "session_details" && h.detailsAgain) {
+        h.detailsAgain = false;
+        details(h);
+      }
     } else if (r.status === "attached") attach(h, r, name);
     else if (r.status === "error") h.notice = r.message;
     else if (r.status === "takeover_required" && req?.op === "set_mode") {
@@ -962,6 +1016,13 @@ window.flowsplice = {
     } else if (e.type === "protocol") protocol(h, e.message);
     else if (e.type === "submitted") {
       h.requests.set(e.request_id, e.operation);
+      if (
+        e.operation.op === "rename" &&
+        renaming?.home === h.id &&
+        renaming.session === e.operation.session_id &&
+        renaming.pending
+      )
+        renaming.request = e.request_id;
       if (e.operation.op === "new_named") h.pendingNewId = e.request_id;
       if (h.requests.size > 256)
         h.requests.delete(h.requests.keys().next().value!);
@@ -976,6 +1037,10 @@ window.flowsplice = {
       h.pendingNewId = null;
       h.joining.clear();
       h.notice = e.message;
+      if (renaming?.home === h.id && !renaming.request) {
+        renaming.pending = false;
+        el("rename-error").textContent = e.message;
+      }
       h.busy = false;
       if (e.code === "credential_required") {
         classRecovery = false;
@@ -1092,6 +1157,67 @@ el("refresh").onclick = () => {
 };
 el("search").oninput = () => {
   if (current()) renderList(current()!);
+};
+function openRename(h: Home, session: string) {
+  if (
+    !h.connected ||
+    !h.canWrite ||
+    !h.sessions.has(session) ||
+    renaming?.pending
+  )
+    return;
+  renaming = { home: h.id, session, pending: false };
+  el("rename-target").textContent =
+    `${h.name} / ${h.sessions.get(session)?.name || session}`;
+  el<HTMLInputElement>("rename-name").value =
+    h.sessions.get(session)?.name || session;
+  el("rename-error").textContent = "";
+  el<HTMLDialogElement>("rename-session").showModal();
+  render();
+  el<HTMLInputElement>("rename-name").focus();
+  el<HTMLInputElement>("rename-name").select();
+}
+el("rename-terminal").onclick = () => {
+  const t = activeTab();
+  if (t) openRename(t.home, t.session);
+};
+el("cancel-rename").onclick = () => {
+  if (renaming?.pending) return;
+  el<HTMLDialogElement>("rename-session").close();
+  renaming = null;
+};
+el("rename-session").addEventListener("cancel", (event) => {
+  if (renaming?.pending) event.preventDefault();
+  else renaming = null;
+});
+el("rename-form").onsubmit = (event) => {
+  event.preventDefault();
+  const target = renaming,
+    h = homes.get(target?.home || "");
+  if (
+    !target ||
+    target.pending ||
+    !h?.connected ||
+    !h.canWrite ||
+    !h.sessions.has(target.session)
+  )
+    return;
+  const name = el<HTMLInputElement>("rename-name").value.trim();
+  if (
+    !name ||
+    Array.from(name).length > 64 ||
+    new TextEncoder().encode(name).length > 256 ||
+    /[\u0000-\u001f\u007f-\u009f]/u.test(name)
+  ) {
+    el("rename-error").textContent =
+      "请输入 1–64 个字符的名称，不可包含控制字符。";
+    return;
+  }
+  target.request = undefined;
+  target.pending = true;
+  el("rename-error").textContent = "";
+  operation(h, { op: "rename", session_id: target.session, name });
+  render();
 };
 el("new").onclick = () => {
   const h = current();

@@ -537,6 +537,60 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
                 })
                 .await?,
         )?;
+        let before = client
+            .details()
+            .await?
+            .into_iter()
+            .find(|d| d.id == sid)
+            .context("pre-rename metadata missing")?;
+        let renamed = "重命名 😀 ; $(false)";
+        client
+            .ok(Operation::Rename {
+                session_id: sid,
+                name: renamed.into(),
+            })
+            .await?;
+        let mut observer =
+            Probe::connect(&args[5], &args[1], &args[2], &args[3], "rename-observer").await?;
+        let after = observer
+            .details()
+            .await?
+            .into_iter()
+            .find(|d| d.id == sid)
+            .context("renamed session missing from another connection")?;
+        ensure!(
+            after.name == renamed
+                && after.writer == before.writer
+                && after.connection_count == before.connection_count
+                && after.created_at_unix_secs == before.created_at_unix_secs
+                && after.last_connected_at_unix_secs == before.last_connected_at_unix_secs,
+            "rename changed attachment or session metadata"
+        );
+        ensure!(
+            matches!(
+                observer
+                    .request(Operation::Rename {
+                        session_id: Uuid::new_v4(),
+                        name: "missing".into()
+                    })
+                    .await?,
+                Reply::Error { .. }
+            ),
+            "unknown session rename succeeded"
+        );
+        ensure!(
+            observer
+                .details()
+                .await?
+                .into_iter()
+                .find(|d| d.id == sid)
+                .context("session vanished")?
+                .name
+                == renamed,
+            "unknown rename mutated existing session"
+        );
+        observer.client.shutdown().await;
+        println!("encrypted-pty-rename-observer-and-unknown-rejected");
         let marker = format!("persist-{}", Uuid::new_v4());
         client
             .input(
@@ -546,6 +600,7 @@ async fn persistence(mode: &str, args: &[String]) -> Result<()> {
             )
             .await?;
         client.text("seed-ready").await?;
+        println!("encrypted-pty-rename-attached-writer-io");
         let metadata = client
             .details()
             .await?
@@ -693,9 +748,10 @@ async fn main() -> Result<()> {
         match args.get(1).map(String::as_str) {
             Some("multi-home") if args.len()==8=>multi_home(&args[2..]).await,
             Some("exercise") if args.len()==7=>exercise(&args[2..]).await,
-            Some(mode @ ("seed"|"resume"|"empty")) if args.len()==7=>persistence(mode,&args[2..]).await,
+            Some("seed") if args.len()==8=>persistence("seed",&args[2..]).await,
+            Some(mode @ ("resume"|"empty")) if args.len()==7=>persistence(mode,&args[2..]).await,
             Some("access-end") if args.len()==7=>access_end(&args[2..]).await,
-            _=>bail!("usage: pty-probe exercise CONFIG_A CONFIG_B PASSWORD ROOT DESCRIPTOR | seed/resume/empty CONFIG PASSWORD ROOT DESCRIPTOR STATE_FILE"),
+            _=>bail!("usage: pty-probe exercise CONFIG_A CONFIG_B PASSWORD ROOT DESCRIPTOR | seed CONFIG PASSWORD ROOT DESCRIPTOR STATE_FILE OBSERVER_CONFIG | resume/empty CONFIG PASSWORD ROOT DESCRIPTOR STATE_FILE"),
         }
     }).await.context("PTY acceptance timed out")?
 }

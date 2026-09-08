@@ -91,13 +91,14 @@ def execute(run, business_home, alpha, root, scope):
         probe("pty-exercise", ["exercise", base[0], "/business/pty-second/travelagent.toml", *base[1:]])
         probe("pty-multi-home", ["multi-home", base[0], "/business/pty-other-home/travelagent.toml", *base[1:], secondary_descriptor])
         run.passed.append("pty-concurrent-distinct-homes")
-        probe("pty-seed", ["seed", *base, "/business/pty-session.json"])
+        probe("pty-seed", ["seed", *base, "/business/pty-session.json", "/business/pty-second/travelagent.toml"])
         home_stop("TERM")
         home_start()
         probe("pty-graceful-resume", ["resume", *base, "/business/pty-session.json"])
         home_stop("KILL")
         home_start()
         probe("pty-crash-resume", ["resume", *base, "/business/pty-session.json"])
+        run.passed += ["pty-rename-attached-writer-and-observer", "pty-rename-persists-term-and-kill"]
         # The fixture owns this tmux server; production exposes no remove operation.
         command(["docker", "exec", container, "/usr/bin/tmux", "-S", "/tmp/fs-pty/alpha/tmux.sock", "kill-server"])
         probe("pty-tmux-ended", ["empty", *base, "/business/pty-session.json"])

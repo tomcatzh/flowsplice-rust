@@ -33,7 +33,7 @@ pub struct SessionDetails {
     pub writer: Option<Writer>,
 }
 
-/// Validate a user-facing session name before creating a shell.
+/// Validate a user-facing session name before creation or renaming.
 ///
 /// # Errors
 /// Rejects blank, oversized or control-containing names.
@@ -73,6 +73,10 @@ pub enum ClientMessage {
 pub enum Operation {
     List,
     ListDetails,
+    Rename {
+        session_id: Uuid,
+        name: String,
+    },
     NewNamed {
         name: String,
         columns: u16,
@@ -173,6 +177,10 @@ pub enum Reply {
 enum OperationWire {
     List,
     ListDetails,
+    Rename {
+        session_id: Uuid,
+        name: String,
+    },
     NewNamed {
         name: String,
         columns: u16,
@@ -330,6 +338,10 @@ impl Session {
 impl Operation {
     fn validate(&self) -> Result<()> {
         match self {
+            Self::Rename { session_id, name } => {
+                identifier(*session_id)?;
+                validate_session_name(name)
+            }
             Self::List | Self::ListDetails => Ok(()),
             Self::NewNamed {
                 name,
@@ -718,6 +730,51 @@ mod tests {
             .validate()
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rename_requires_stable_identity_and_bounded_name() -> Result<()> {
+        let operation = Operation::Rename {
+            session_id: Uuid::new_v4(),
+            name: "维护 😀 #{session_name}".into(),
+        };
+        operation.validate()?;
+        let wire = serde_json::to_value(&operation)?;
+        assert_eq!(wire["op"], "rename");
+        assert_eq!(
+            serde_json::from_value::<Operation>(wire.clone())?,
+            operation
+        );
+        for (field, value) in [
+            ("extra", serde_json::json!(true)),
+            ("session_id", serde_json::json!("not-an-id")),
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<Operation>(invalid).is_err());
+        }
+        for (id, name) in [
+            (Uuid::nil(), "valid".into()),
+            (Uuid::new_v4(), "   ".into()),
+            (Uuid::new_v4(), "line\nbreak".into()),
+            (Uuid::new_v4(), "x".repeat(65)),
+            (Uuid::new_v4(), "😀".repeat(65)),
+        ] {
+            assert!(
+                Operation::Rename {
+                    session_id: id,
+                    name
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        Operation::Rename {
+            session_id: Uuid::new_v4(),
+            name: "😀".repeat(64),
+        }
+        .validate()?;
         Ok(())
     }
     #[test]

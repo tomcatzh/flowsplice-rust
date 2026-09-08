@@ -227,6 +227,20 @@ class PrivateTerminalE2ETest {
                 assertEquals("true", evaluate(scenario, "Array.from(document.querySelectorAll('#list .session-time')).length===2&&Array.from(document.querySelectorAll('#list .session-time')).every(e=>e.textContent&&!e.textContent.includes('尚未'))"))
                 val session = evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId")
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='继续');if(!b)return false;b.click();return true})()"))
+                click(scenario, "rename-terminal")
+                waitFor(scenario, "document.getElementById('rename-name').value==='E2E shell'", "prefilled rename")
+                evaluate(scenario, "document.getElementById('rename-name').value='Cancelled name'")
+                click(scenario, "cancel-rename")
+                management()
+                assertEquals("true", evaluate(scenario, "document.querySelector('#list .session-name').textContent==='E2E shell'"))
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='重命名');if(!b)return false;b.click();return true})()"))
+                waitFor(scenario, "document.getElementById('rename-name').value==='E2E shell'", "list rename prefilled")
+                evaluate(scenario, "document.getElementById('rename-name').value='E2E renamed'")
+                click(scenario, "save-rename")
+                waitFor(scenario, "document.querySelector('#list .session-name')?.textContent==='E2E renamed'", "renamed session list")
+                assertEquals(session, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='继续');if(!b)return false;b.click();return true})()"))
+                waitFor(scenario, "Array.from(document.querySelectorAll('#tabs button')).some(e=>e.textContent.includes('E2E renamed'))&&document.getElementById('mode-label').textContent==='读写'", "renamed writable terminal tab")
                 return session
             }
             fun output(marker: String, stage: String) {
@@ -236,7 +250,7 @@ class PrivateTerminalE2ETest {
             }
             fun switch(name: String) {
                 click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
-                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E shell")});if(!b)return false;b.click();return true})()"))
+                assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E renamed")});if(!b)return false;b.click();return true})()"))
             }
             if (isClass) {
                 enrollClass()

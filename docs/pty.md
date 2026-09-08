@@ -98,6 +98,14 @@ name, then creates one tmux session with one shell and joins it read-write. Name
 trimmed, may repeat, and accept up to 64 Unicode scalars / 256 UTF-8 bytes without
 control characters. The internal UUID stays separate from the display name.
 
+Rename is available from the session list and terminal controls. It requires an
+active business connection with write permission, independently of the terminal
+writer lease. Saving changes the persistent display name without recreating the
+shell or changing attachments, ownership, dimensions or timestamps. Cancel before
+saving leaves the name unchanged. After Home confirms the `rename` request, the
+client refreshes names in the list, tabs and terminal switcher; other connected
+clients pick up the name through their existing five-second details refresh.
+
 The list shows creation time, latest successful attachment time and active attachment
 count. Read-only observers count; clients only browsing the list do not. Names and
 latest attachment times are stored in private tmux options and survive Home restart

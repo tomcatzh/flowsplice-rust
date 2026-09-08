@@ -318,11 +318,32 @@ final class E2ETerminalTests: XCTestCase {
             _ = waitForText(containing:"最近连接", timeout:20)
 #endif
             tap(web.buttons["继续"])
+            tap(web.buttons["重命名"])
+            let renameField = inputField(containing:"会话名称")
+            XCTAssertEqual(renameField.value as? String, "E2E shell")
+            tap(renameField)
+            renameField.typeText(" cancelled")
+            finishFormEditing()
+            tap(web.buttons["取消"])
+            management()
+            XCTAssertTrue(text("E2E shell").exists, "Cancel must preserve the session name")
+            tap(web.buttons["重命名"])
+            let savedName = inputField(containing:"会话名称")
+            XCTAssertEqual(savedName.value as? String, "E2E shell")
+            // Rename selects the existing text. Tapping again can move the iOS
+            // caret before the old name instead of replacing that selection.
+            savedName.typeText("E2E renamed")
+            XCTAssertEqual(savedName.value as? String, "E2E renamed")
+            finishFormEditing()
+            tap(web.buttons["保存"])
+            XCTAssertTrue(text("E2E renamed").waitForExistence(timeout:30))
+            tap(web.buttons["继续"])
+            XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
         }
         func switchTerminal(_ name: String) {
             if let control = web.buttons.matching(identifier:"已打开终端").allElementsBoundByIndex.first(where:{ $0.isHittable }) { tap(control) }
             else { tap(web.buttons["切换终端"]) }
-            let matches = web.buttons.matching(identifier:name + " / E2E shell")
+            let matches = web.buttons.matching(identifier:name + " / E2E renamed")
             tap(matches.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? matches.firstMatch)
         }
         func output(_ marker: String) {

@@ -154,6 +154,16 @@ impl Domain {
             Operation::New { columns, rows } => {
                 self.new_session(connection, None, columns, rows).await
             }
+            Operation::Rename { session_id, name } => {
+                flowsplice_pty_protocol::validate_session_name(&name)?;
+                if !connection.can_write {
+                    bail!("renaming a session requires write permission");
+                }
+                let _control = self.control.lock().await;
+                self.refresh().await?;
+                self.session(session_id)?.rename(connection, &name).await?;
+                Ok(Reply::Ok)
+            }
             Operation::NewNamed {
                 name,
                 columns,
@@ -459,7 +469,8 @@ mod metadata_tests {
     use flowsplice_transport::ServiceLifetime;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn named_creation_rejects_invalid_name_before_shell_and_registry_recovers() -> Result<()>
+    #[allow(clippy::too_many_lines)] // One real tmux lifecycle, including restart recovery.
+    async fn named_sessions_validate_rename_preserve_attachments_and_recover_metadata() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
         let binary = if cfg!(target_os = "macos") {
@@ -525,6 +536,77 @@ mod metadata_tests {
         else {
             bail!("missing attachment");
         };
+        let before = backend.session(session.id)?.details()?;
+        assert_eq!(before.name, "中文 $(touch nope); 😀");
+        let rename = |name: &str| Operation::Rename {
+            session_id: session.id,
+            name: name.into(),
+        };
+        let observer = Connection {
+            id: Uuid::new_v4(),
+            can_write: false,
+            stop: watch::channel(false).0,
+            ..connection.clone()
+        };
+        assert!(
+            backend
+                .operation(&observer, rename("forbidden"))
+                .await
+                .is_err()
+        );
+        for invalid in [
+            " ".to_owned(),
+            "a\nb".into(),
+            "x".repeat(65),
+            "😀".repeat(65),
+        ] {
+            assert!(
+                backend
+                    .operation(&connection, rename(&invalid))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            backend
+                .operation(
+                    &connection,
+                    Operation::Rename {
+                        session_id: Uuid::new_v4(),
+                        name: "absent".into(),
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.session(session.id)?.details()?, before);
+        let name = "renamed #{session_id}; $(touch nope) 中文 😀";
+        assert_eq!(
+            backend
+                .operation(&connection, rename(&format!("  {name}  ")))
+                .await?,
+            Reply::Ok
+        );
+        let mut expected = before.clone();
+        expected.name = name.into();
+        assert_eq!(backend.session(session.id)?.details()?, expected);
+        assert!(
+            backend
+                .session(session.id)?
+                .owns(connection.id, attachment_id)?
+        );
+        assert_eq!(
+            tmux.list().await?,
+            vec![(session.id, before.created_at_unix_secs)]
+        );
+        // A separate list connection sees the committed name without acquiring
+        // the writer lease or creating an attachment.
+        assert_eq!(
+            backend.operation(&observer, Operation::ListDetails).await?,
+            Reply::SessionDetails {
+                sessions: vec![expected]
+            }
+        );
         backend
             .operation(&connection, Operation::Detach { attachment_id })
             .await?;
@@ -535,11 +617,28 @@ mod metadata_tests {
             bail!("missing details");
         };
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].name, "中文 $(touch nope); 😀");
+        assert_eq!(sessions[0].name, name);
         assert_eq!(sessions[0].connection_count, 0);
         assert!(sessions[0].last_connected_at_unix_secs.is_some());
         assert!(!directory.path().join("nope").exists());
+        // Management from the session list needs business write permission but
+        // does not require being attached or owning terminal input.
+        assert_eq!(
+            backend
+                .operation(&connection, rename("Detached session"))
+                .await?,
+            Reply::Ok
+        );
+        let mut expected_recovered = sessions[0].clone();
+        expected_recovered.name = "Detached session".into();
         connection.stop.send_replace(true);
+        assert!(
+            backend
+                .operation(&connection, rename("inactive"))
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.session(session.id)?.details()?, expected_recovered);
         drop(backend);
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while Arc::strong_count(&tmux) != 1 {
@@ -550,13 +649,29 @@ mod metadata_tests {
         drop(tmux);
         let recovered = domain(Arc::new(Tmux::open(config).await?));
         assert_eq!(recovered.refresh().await?[0].id, session.id);
-        assert_eq!(recovered.session(session.id)?.details()?, sessions[0]);
+        assert_eq!(
+            recovered.session(session.id)?.details()?,
+            expected_recovered
+        );
         let _ = tokio::process::Command::new(binary)
             .arg("-S")
             .arg(socket)
             .arg("kill-server")
             .output()
             .await?;
+        assert!(
+            recovered
+                .operation(
+                    &Connection {
+                        can_write: true,
+                        ..observer
+                    },
+                    rename("ended")
+                )
+                .await
+                .is_err()
+        );
+        assert!(recovered.tmux.list().await?.is_empty());
         Ok(())
     }
 }

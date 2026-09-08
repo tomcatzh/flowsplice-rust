@@ -50,6 +50,7 @@ struct Attachment {
     started: watch::Sender<bool>,
 }
 struct Ownership {
+    name: String,
     last_connected: Option<u64>,
     epoch: u64,
     writer: Option<Uuid>,
@@ -58,7 +59,6 @@ struct Ownership {
 pub(crate) struct SessionState {
     pub id: Uuid,
     created: u64,
-    name: String,
     metadata_update: tokio::sync::Mutex<()>,
     tmux: Arc<Tmux>,
     ownership: Mutex<Ownership>,
@@ -80,10 +80,10 @@ impl SessionState {
         Arc::new(Self {
             id,
             created,
-            name,
             metadata_update: tokio::sync::Mutex::new(()),
             tmux,
             ownership: Mutex::new(Ownership {
+                name,
                 last_connected,
                 epoch: 1,
                 writer: None,
@@ -118,12 +118,31 @@ impl SessionState {
         let state = self.lock()?;
         Ok(SessionDetails {
             id: self.id,
-            name: self.name.clone(),
+            name: state.name.clone(),
             created_at_unix_secs: self.created,
             last_connected_at_unix_secs: state.last_connected,
             connection_count: u32::try_from(state.attachments.len())?,
             writer: Self::writer(&state),
         })
+    }
+    pub async fn rename(self: &Arc<Self>, connection: &Connection, name: &str) -> Result<()> {
+        let session = Arc::clone(self);
+        let connection = connection.clone();
+        let name = name.to_owned();
+        // Once admitted, finish the bounded metadata write even if the caller
+        // disconnects. Otherwise tmux could commit while the registry stays stale.
+        tokio::spawn(async move {
+            let _update = session.metadata_update.lock().await;
+            if !connection.active() || !connection.can_write {
+                bail!("renaming requires an active business connection with write permission");
+            }
+            // Keep the stable tmux identity and all attachments. Persist first so a
+            // failed write cannot advertise an uncommitted name to other clients.
+            session.tmux.set_display_name(session.id, &name).await?;
+            name.trim().clone_into(&mut session.lock()?.name);
+            Ok(())
+        })
+        .await?
     }
     async fn record_attachment(&self, connection: &Connection, id: Uuid) -> Result<()> {
         let _update = self.metadata_update.lock().await;
@@ -477,4 +496,102 @@ fn close_process(process: Arc<PtyProcess>) {
     tokio::task::spawn_blocking(move || {
         let _ = process.close();
     });
+}
+
+#[cfg(test)]
+mod rename_cancellation_tests {
+    use super::*;
+    use crate::tmux::TmuxConfig;
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+
+    #[tokio::test]
+    async fn admitted_rename_finishes_after_caller_cancellation() -> Result<()> {
+        let directory = tempfile::Builder::new()
+            .prefix("fs-rename-")
+            .tempdir_in("/tmp")?;
+        let binary = directory.path().join("tmux");
+        let id = Uuid::new_v4();
+        // Only the generated UUID is interpolated. All paths are derived from
+        // the executable location and every shell expansion is quoted.
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = '-V' ]; then printf 'tmux 3.3\n'; exit 0; fi
+base=${{0%/*}}
+[ "$#" -eq 10 ]
+[ "$1" = '-u' ] && [ "$2" = '-S' ] && [ "$3" = "$base/domain/tmux.sock" ]
+[ "$4" = '-f' ] && [ "$5" = "$base/domain/flowsplice-tmux.conf" ]
+shift 5
+[ "$1" = 'set-option' ] && [ "$2" = '-t' ] && [ "$3" = 'fs-{id}' ]
+[ "$4" = '@flowsplice-name-hex' ] && [ "$5" = '72656e616d6564' ]
+: > "$base/entered"
+count=0
+while [ ! -f "$base/release" ]; do
+    count=$((count + 1))
+    [ "$count" -lt 200 ] || exit 1
+    sleep 0.01
+done
+: > "$base/committed"
+"#
+            ),
+        )?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+        let tmux = Arc::new(
+            Tmux::open(TmuxConfig {
+                binary,
+                socket: directory.path().join("domain/tmux.sock"),
+                shell: "/bin/sh".into(),
+                working_directory: directory.path().to_path_buf(),
+            })
+            .await?,
+        );
+        let session = SessionState::with_metadata(id, 123, "original".into(), Some(456), tmux);
+        let before = session.details()?;
+        let (lifetime, _guard) =
+            ServiceLifetime::new(flowsplice_core::authorization::unix_time_secs()? + 60);
+        let (events, _receiver) = mpsc::channel(4);
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            travel_id: "rename-test".into(),
+            label: "test".into(),
+            lifetime,
+            events,
+            stop: watch::channel(false).0,
+            can_write: true,
+        };
+        let caller_session = Arc::clone(&session);
+        let caller =
+            tokio::spawn(async move { caller_session.rename(&connection, "renamed").await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory.path().join("entered").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            session.details()?,
+            before,
+            "uncommitted name became visible"
+        );
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        fs::write(directory.path().join("release"), [])?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if session.details()?.name == "renamed" {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await??;
+        assert!(directory.path().join("committed").exists());
+        let mut expected = before;
+        expected.name = "renamed".into();
+        assert_eq!(session.details()?, expected);
+        assert_eq!(session.lock()?.epoch, 1);
+        Ok(())
+    }
 }

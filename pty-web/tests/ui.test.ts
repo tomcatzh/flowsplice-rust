@@ -750,3 +750,139 @@ test("catalog changes update retained controls and remove only absent target nod
   (tabsBefore[1] as HTMLButtonElement).click();
   expect(el("terminal-title").textContent).toContain("Renamed VPS");
 });
+test("rename routes Home, waits for Ok, refreshes details and allows error retry", () => {
+  info();
+  info("vps");
+  attach("mac", "read_only");
+  click("rename-terminal");
+  expect((el("rename-name") as HTMLInputElement).value).toBe("日常开发");
+  (el("rename-name") as HTMLInputElement).value = "renamed";
+  submit("rename-form");
+  submit("rename-form");
+  expect(ops("rename")).toHaveLength(1);
+  expect(ops("rename")[0]).toMatchObject({
+    home_id: "mac",
+    operation: { session_id: "session", name: "renamed" },
+  });
+  send({
+    type: "submitted",
+    request_id: "rename1",
+    operation: ops("rename")[0].operation,
+  });
+  response({ status: "ok" }, "vps", "rename1");
+  expect((el("rename-session") as HTMLDialogElement).open).toBe(true);
+  response({ status: "error", message: "retry" }, "mac", "rename1");
+  expect(el("rename-error").textContent).toBe("retry");
+  submit("rename-form");
+  expect(ops("rename")).toHaveLength(2);
+  send({
+    type: "submitted",
+    request_id: "rename2",
+    operation: ops("rename")[1].operation,
+  });
+  info();
+  actions = [];
+  response({ status: "ok" }, "mac", "rename2");
+  expect((el("rename-session") as HTMLDialogElement).open).toBe(false);
+  expect(ops("list_details")).toHaveLength(1);
+  expect(el("tabs").textContent).toContain("日常开发");
+  response({
+    status: "session_details",
+    sessions: [
+      { id: "session", name: "renamed", writer: null, created_at_unix_secs: 1 },
+    ],
+  });
+  expect(el("tabs").textContent).toContain("renamed");
+});
+test("rename cancel, Escape, invalid names and ended targets never mutate", () => {
+  info();
+  attach();
+  click("rename-terminal");
+  click("cancel-rename");
+  submit("rename-form");
+  click("rename-terminal");
+  el("rename-session").dispatchEvent(new Event("cancel"));
+  submit("rename-form");
+  click("rename-terminal");
+  for (const name of [" ", "x".repeat(65), "bad\u0001name"]) {
+    (el("rename-name") as HTMLInputElement).value = name;
+    submit("rename-form");
+  }
+  expect(ops("rename")).toHaveLength(0);
+  send({
+    type: "protocol",
+    message: { type: "session_ended", session_id: "session" },
+  });
+  (el("rename-name") as HTMLInputElement).value = "valid";
+  submit("rename-form");
+  expect(ops("rename")).toHaveLength(0);
+});
+test("rename requires Home write permission and a connected target", () => {
+  info();
+  attach();
+  send({ type: "protocol", message: { type: "hello", can_write: false } });
+  expect((el("rename-terminal") as HTMLButtonElement).disabled).toBe(true);
+  click("rename-terminal");
+  expect((el("rename-session") as HTMLDialogElement).open).toBe(false);
+  send({ type: "protocol", message: { type: "hello", can_write: true } });
+  click("rename-terminal");
+  state("mac", false);
+  submit("rename-form");
+  expect(ops("rename")).toHaveLength(0);
+});
+test("pending rename locks dismissal until response; disconnect releases another Home", () => {
+  info();
+  info("vps");
+  attach();
+  click("rename-terminal");
+  submit("rename-form");
+  send({
+    type: "submitted",
+    request_id: "pending",
+    operation: ops("rename")[0].operation,
+  });
+  click("cancel-rename");
+  const escape = new Event("cancel", { cancelable: true });
+  el("rename-session").dispatchEvent(escape);
+  expect(escape.defaultPrevented).toBe(true);
+  expect((el("rename-name") as HTMLInputElement).disabled).toBe(true);
+  send({ type: "error", message: "unrelated" });
+  submit("rename-form");
+  expect(ops("rename")).toHaveLength(1);
+  state("mac", false);
+  expect((el("rename-session") as HTMLDialogElement).open).toBe(false);
+  attach("vps");
+  click("rename-terminal");
+  expect((el("rename-session") as HTMLDialogElement).open).toBe(true);
+  expect((el("rename-name") as HTMLInputElement).disabled).toBe(false);
+});
+test("successful rename schedules fresh details after an already pending response", () => {
+  info();
+  attach();
+  click("rename-terminal");
+  submit("rename-form");
+  send({
+    type: "submitted",
+    request_id: "rename",
+    operation: ops("rename")[0].operation,
+  });
+  actions = [];
+  response({ status: "ok" }, "mac", "rename");
+  expect(ops("list_details")).toHaveLength(0);
+  info();
+  expect(ops("list_details")).toHaveLength(1);
+  info();
+  expect(ops("list_details")).toHaveLength(1);
+});
+
+test("rename selects the complete existing name without changing it", () => {
+  info();
+  attach();
+  click("rename-terminal");
+  const input = el("rename-name") as HTMLInputElement;
+  expect(input.value).toBe("日常开发");
+  expect(input.selectionStart).toBe(0);
+  expect(input.selectionEnd).toBe(input.value.length);
+  expect(document.activeElement).toBe(input);
+  expect(ops("rename")).toHaveLength(0);
+});
