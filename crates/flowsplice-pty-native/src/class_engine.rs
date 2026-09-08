@@ -143,6 +143,37 @@ impl HomeTask {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Forwarded {
+    Sent,
+    Unavailable,
+    Interrupted,
+}
+
+async fn forward_home_action(
+    actions: &mpsc::Sender<Operation>,
+    operation: Operation,
+    mut cancel: watch::Receiver<bool>,
+    mut overflow: watch::Receiver<bool>,
+) -> Forwarded {
+    // A short input burst can fill this bounded queue before its consumer is
+    // scheduled. Wait for admission instead of disconnecting a healthy Home.
+    // Cancellation drops only the operation that has not entered the queue;
+    // already-admitted terminal input is never retried.
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|value| *value) => Forwarded::Interrupted,
+        _ = overflow.wait_for(|value| *value) => Forwarded::Interrupted,
+        result = tokio::time::timeout(Duration::from_millis(250), actions.send(operation)) => {
+            if matches!(result, Ok(Ok(()))) { Forwarded::Sent } else { Forwarded::Unavailable }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "class_queue_tests.rs"]
+mod queue_tests;
+
 type RuntimeBinding = (TravelCore, ApprovedServiceClass);
 enum Job {
     Enrolled(Result<()>),
@@ -298,7 +329,8 @@ async fn actor(
                     },
                     Action::OperationHome { home_id, operation } => {
                         if let Some(home) = homes.get(&home_id) {
-                            if home.actions.try_send(operation).is_err() {
+                            let forwarded = forward_home_action(&home.actions, operation, cancel.clone(), overflow.clone()).await;
+                            if forwarded == Forwarded::Unavailable {
                                 if let Some(home) = homes.remove(&home_id) { home.shutdown().await; }
                                 outbox.scoped(&home_id,json!({"type":"error","message":"Home action queue unavailable; reconnect"}));
                                 disconnected(&outbox, &home_id);

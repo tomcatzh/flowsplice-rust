@@ -521,3 +521,138 @@ async fn metadata_survives_reconstruction_and_counts_attachments() -> Result<()>
     assert_eq!(recovered.details()?.connection_count, 0);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_tmux_session_deletion_notifies_all_connections_and_preserves_other_io()
+-> Result<()> {
+    let fixture = DomainFixture::new().await?;
+    let deleted = fixture.session().await?;
+    let unrelated = fixture.session().await?;
+    let (writer, mut writer_events, _writer_guard) = connection("writer", unix_time_secs()? + 60);
+    let (observer, mut observer_events, _observer_guard) =
+        connection("observer", unix_time_secs()? + 60);
+    let (other, mut other_events, _other_guard) = connection("unrelated", unix_time_secs()? + 60);
+    let (writer_id, _, epoch) = attached(deleted.attach(&writer, Mode::ReadWrite, 80, 24).await?)?;
+    let (observer_id, mode, _) =
+        attached(deleted.attach(&observer, Mode::ReadOnly, 80, 24).await?)?;
+    assert_eq!(mode, Mode::ReadOnly);
+    let (other_id, _, other_epoch) =
+        attached(unrelated.attach(&other, Mode::ReadWrite, 80, 24).await?)?;
+    deleted.start_output(writer_id)?;
+    deleted.start_output(observer_id)?;
+    unrelated.start_output(other_id)?;
+    deleted
+        .input(
+            &writer,
+            writer_id,
+            epoch,
+            b"printf '\\144\\145\\154-ready\\n'\r",
+        )
+        .await?;
+    output_contains(&mut writer_events, "del-ready").await?;
+    output_contains(&mut observer_events, "del-ready").await?;
+    unrelated
+        .input(
+            &other,
+            other_id,
+            other_epoch,
+            b"printf '\\157\\164\\150-before\\n'\r",
+        )
+        .await?;
+    output_contains(&mut other_events, "oth-before").await?;
+    let killed = tokio::process::Command::new(&fixture.binary)
+        .arg("-S")
+        .arg(&fixture.socket)
+        .args(["kill-session", "-t"])
+        .arg(format!("=fs-{}", deleted.id))
+        .output()
+        .await?;
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    for events in [&mut writer_events, &mut observer_events] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                if let ServerMessage::SessionEnded { session_id } = event {
+                    assert_eq!(session_id, deleted.id);
+                    return Ok(());
+                }
+            }
+            bail!("connection closed without SessionEnded")
+        })
+        .await
+        .context("deleted session did not notify every connection")??;
+    }
+    assert!(!deleted.owns(writer.id, writer_id)?);
+    assert!(!deleted.owns(observer.id, observer_id)?);
+    assert!(writer.active() && observer.active() && other.active());
+    // A stale restoration request must not implicitly recreate the deleted UUID.
+    assert!(
+        deleted
+            .attach(&writer, Mode::ReadWrite, 80, 24)
+            .await
+            .is_err()
+    );
+    unrelated
+        .input(
+            &other,
+            other_id,
+            other_epoch,
+            b"printf '\\157\\164\\150-after\\n'\r",
+        )
+        .await?;
+    output_contains(&mut other_events, "oth-after").await?;
+    let remaining = fixture.tmux.list().await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].0, unrelated.id);
+    unrelated.detach(other.id, other_id)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_attach_respects_existing_writer_and_original_read_only_mode() -> Result<()> {
+    let fixture = DomainFixture::new().await?;
+    let session = fixture.session().await?;
+    let (original, _original_events, _original_guard) =
+        connection("original", unix_time_secs()? + 60);
+    let (original_id, _, _) = attached(session.attach(&original, Mode::ReadWrite, 80, 24).await?)?;
+    session.detach(original.id, original_id)?;
+    let (writer, _writer_events, _writer_guard) = connection("new-writer", unix_time_secs()? + 60);
+    let (writer_id, _, _) = attached(session.attach(&writer, Mode::ReadWrite, 80, 24).await?)?;
+    let (restored, mode, epoch) =
+        attached(session.attach(&original, Mode::ReadWrite, 80, 24).await?)?;
+    assert_eq!(mode, Mode::ReadOnly);
+    assert_eq!(
+        session
+            .snapshot()?
+            .writer
+            .context("writer missing")?
+            .attachment_id,
+        writer_id
+    );
+    assert!(
+        session
+            .input(&original, restored, epoch, b"blocked\r")
+            .await
+            .is_err()
+    );
+    session.detach(original.id, restored)?;
+    session.detach(writer.id, writer_id)?;
+    let (read_only, mode, _) = attached(session.attach(&original, Mode::ReadOnly, 80, 24).await?)?;
+    assert_eq!(mode, Mode::ReadOnly);
+    session.detach(original.id, read_only)?;
+    let (restored_read_only, mode, epoch) =
+        attached(session.attach(&original, Mode::ReadOnly, 80, 24).await?)?;
+    assert_eq!(mode, Mode::ReadOnly);
+    assert!(session.snapshot()?.writer.is_none());
+    assert!(
+        session
+            .input(&original, restored_read_only, epoch, b"blocked\r")
+            .await
+            .is_err()
+    );
+    session.detach(original.id, restored_read_only)?;
+    Ok(())
+}

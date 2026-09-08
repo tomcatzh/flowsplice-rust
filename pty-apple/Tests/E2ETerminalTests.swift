@@ -389,26 +389,56 @@ final class E2ETerminalTests: XCTestCase {
         XCUIDevice.shared.press(.home)
 #endif
         wait(NSPredicate(format:"state == %d", XCUIApplication.State.runningBackground.rawValue), object:app!)
+        let shortBackground = expectation(description:"short background grace")
+        DispatchQueue.main.asyncAfter(deadline:.now() + 1.5) { shortBackground.fulfill() }
+        wait(for:[shortBackground], timeout:3)
         app.activate()
-        _ = waitForText(containing:"未连接", timeout:20)
-        XCTAssertFalse(web.buttons["关闭标签"].exists)
-        let staysDisconnected = XCTNSPredicateExpectation(predicate:NSPredicate { [unowned self] _, _ in
-            self.visibleTextSnapshot().contains { $0.contains("已连接") }
-        }, object:app)
-        staysDisconnected.isInverted = true
-        XCTAssertEqual(XCTWaiter.wait(for:[staysDisconnected], timeout:2), .completed)
-        if isClass {
-            tap(web.buttons["连接服务目录"])
-            _ = waitForText(containing:"服务目录已连接", timeout:180)
-            XCTAssertFalse(web.buttons["关闭标签"].exists, "Shared connect must not join any Home")
-            home(secondHome)
-        } else { tap(web.buttons["连接"]) }
-        waitForHome()
-        XCTAssertEqual(web.buttons.matching(identifier:"打开").count, 1, "Reconnect must list the existing shell only")
-        XCTAssertFalse(web.buttons["关闭标签"].exists, "Reconnect must not join automatically")
-        tap(web.buttons["打开"])
-        waitForRenderedOutput(marker + "SECONDAGAIN")
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
+        output(marker + "SHORT")
+        switchTerminal(firstHome); output(marker + "FIRSTKEPT")
+        switchTerminal(secondHome)
+#if !os(macOS)
+        XCUIDevice.shared.press(.home)
+        let longBackground = expectation(description:"system suspension beyond grace")
+        DispatchQueue.main.asyncAfter(deadline:.now() + 35) { longBackground.fulfill() }
+        wait(for:[longBackground], timeout:40)
+        app.activate()
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:180), "Foreground must reconnect the saved tab automatically")
+        output(marker + "LONG")
+#endif
+        tap(web.buttons["切换只读"])
+        XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout:20))
+        // A real app process restart must restore navigation and read-only mode.
+        // The setup namespace stays fixed for this test, including this relaunch.
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout:180), "Relaunch must restore the original read-only tab")
+        switchTerminal(firstHome)
+        // A terminated process can leave its old writer lease alive during carrier
+        // recovery. Automatic restoration must accept RO rather than force takeover.
+        wait(NSPredicate { _, _ in web.buttons["切换只读"].exists || web.buttons["申请读写"].exists }, object:app!, timeout:180)
+        if web.buttons["申请读写"].exists {
+            tap(web.buttons["申请读写"])
+            wait(NSPredicate { _, _ in web.buttons["切换只读"].exists || web.buttons["确认接管"].exists }, object:app!, timeout:30)
+            if web.buttons["确认接管"].exists { tap(web.buttons["确认接管"]) }
+        }
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
+        output(marker + "RELAUNCHED")
+        switchTerminal(secondHome)
+        XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout:30))
+        tap(web.buttons["申请读写"])
+        XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
         output(marker + "RESUMED")
+        // The external fixture runner kills only this test-owned Home's session.
+        print("PTY_E2E_DELETE_SECOND_SESSION")
+        XCTAssertTrue(web.buttons["已删除"].waitForExistence(timeout:30))
+        XCTAssertFalse(web.buttons["已删除"].isEnabled)
+        // The phone's compact close button uses a generated × label. Verify the
+        // retained tab through navigation instead of depending on that label.
+        switchTerminal(secondHome)
+        XCTAssertTrue(web.buttons["已删除"].waitForExistence(timeout:20), "Deleted remote session retains a tombstone tab")
+        XCTAssertFalse(web.buttons["已删除"].isEnabled)
+        switchTerminal(firstHome); output(marker + "AFTERDELETE")
         management(); tap(web.buttons["断开连接"])
     }
 }

@@ -11,6 +11,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONObject
+import org.json.JSONArray
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -174,12 +175,21 @@ class PrivateTerminalE2ETest {
         val secondId = if (isClass) targetArg("ptySecondHomeId") else "secondary"
         val firstName = if (isClass) targetArg("ptyFirstHomeName") else "测试 Mac"
         val secondName = if (isClass) targetArg("ptySecondHomeName") else "测试 VPS"
-        val relay = args.getString("ptyRelay") ?: error("External ptyRelay argument required")
-        val passwordPath = args.getString("ptyPasswordFile") ?: error("External ptyPasswordFile argument required")
-        assertTrue("Password fixture path must be absolute", File(passwordPath).isAbsolute)
-        val password = File(passwordPath).readText().trimEnd('\r', '\n')
-        assertTrue("Password fixture must be nonempty", password.isNotEmpty())
-        assertFalse("Requires a fresh isolated installation", context.filesDir.resolve(if (isClass) "service-class/travelagent.toml" else "installation/travelagent.toml").exists())
+        val phase = args.getString("ptyPhase") ?: error("Explicit ptyPhase prepare/restore required")
+        require(phase in listOf("prepare", "restore"))
+        val metadataFile = context.filesDir.resolve("e2e-process-restart.json")
+        val workspaceFile = context.filesDir.resolve(if (isClass) "pty-workspace-class-v1.json" else "pty-workspace-legacy-v1.json")
+        val relay = args.getString("ptyRelay").orEmpty()
+        val password = if (phase == "prepare") {
+            val passwordPath = args.getString("ptyPasswordFile") ?: error("External ptyPasswordFile argument required")
+            assertTrue("Password fixture path must be absolute", File(passwordPath).isAbsolute)
+            assertFalse("Requires a fresh isolated installation", context.filesDir.resolve(if (isClass) "service-class/travelagent.toml" else "installation/travelagent.toml").exists())
+            File(passwordPath).readText().trimEnd('\r', '\n').also { assertTrue("Password fixture must be nonempty", it.isNotEmpty()) }
+        } else {
+            assertTrue("Restart metadata required from successful prepare phase", metadataFile.isFile)
+            assertFalse("Restore must not have access to the fixture password", context.filesDir.resolve("fixture-password").exists())
+            ""
+        }
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             fun management() { click(scenario, "terminal-back") }
             fun select(id: String) {
@@ -252,6 +262,7 @@ class PrivateTerminalE2ETest {
                 click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E renamed")});if(!b)return false;b.click();return true})()"))
             }
+            if (phase == "prepare") {
             if (isClass) {
                 enrollClass()
                 waitFor(scenario, "[${JSONObject.quote(firstId)},${JSONObject.quote(secondId)}].every(id=>Array.from(document.querySelectorAll('#home-cards [data-home-id]')).some(e=>e.dataset.homeId===id))", "two discovered Home targets")
@@ -285,26 +296,73 @@ class PrivateTerminalE2ETest {
             assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
             waitFor(scenario, "document.querySelectorAll('#tabs button').length===2", "two joined Homes before background")
             scenario.moveToState(Lifecycle.State.CREATED)
+            Thread.sleep(1500)
             scenario.moveToState(Lifecycle.State.RESUMED)
-            waitFor(scenario, "document.querySelectorAll('#tabs button').length===0", "background disconnects all Homes")
-            repeat(20) {
-                assertEquals("No automatic foreground reconnect", "true", evaluate(scenario, "!document.getElementById('status').textContent.includes('已连接')"))
-                Thread.sleep(100)
-            }
-            if (isClass) {
-                click(scenario, "identity-enter")
-                waitFor(scenario, "document.getElementById('identity-status').textContent==='服务目录已连接'", "foreground shared reconnect", 180)
-                assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
-                connectHome(secondId)
-            } else click(scenario, "enter")
-            waitFor(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.querySelectorAll('#list .session').length===1", "foreground explicit reconnect", 180)
-            assertEquals(second, evaluate(scenario, "document.querySelector('#list .session').dataset.sessionId"))
-            assertEquals("0", evaluate(scenario, "document.querySelectorAll('#tabs button').length"))
-            assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#list button')).find(e=>e.textContent==='打开');if(!b)return false;b.click();return true})()"))
-            waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows')).some(e=>e.textContent.includes(${JSONObject.quote(marker + "SECONDAGAIN")}))", "tmux restores prior output")
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===2", "short background retains both tabs")
             output(marker + "RESUMED", "second-home-foreground-resumed")
+            scenario.moveToState(Lifecycle.State.CREATED)
+            Thread.sleep(35_000)
+            scenario.moveToState(Lifecycle.State.RESUMED)
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===2&&document.getElementById('mode-label').textContent==='读写'", "automatic restoration beyond background grace", 180)
+            output(marker + "LONG", "second-home-long-background")
+            click(scenario, "mode")
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "readonly before recreation")
+            scenario.recreate()
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===2&&document.getElementById('mode-label').textContent==='只读'", "workspace and readonly restored", 180)
+            assertEquals("true", evaluate(scenario, "Array.from(document.querySelectorAll('#tabs button')).some(e=>e.dataset.sessionId===" + second + ")"))
+            val firstSession = JSONArray("[$first]").getString(0)
+            val secondSession = JSONArray("[$second]").getString(0)
+            UUID.fromString(firstSession); UUID.fromString(secondSession)
+            val savedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            var saved = false
+            while (System.nanoTime() < savedDeadline && !saved) {
+                saved = runCatching {
+                    val value = JSONObject(workspaceFile.readText())
+                    val tabs = value.getJSONArray("tabs")
+                    tabs.length() == 2 && (0 until tabs.length()).all { index ->
+                        val tab = tabs.getJSONObject(index)
+                        (tab.getString("home") == firstId && tab.getString("session") == firstSession && tab.getString("mode") == "read_write") ||
+                            (tab.getString("home") == secondId && tab.getString("session") == secondSession && tab.getString("mode") == "read_only")
+                    } && value.getJSONObject("active").getString("session") == secondSession && value.getString("selected") == secondId
+                }.getOrDefault(false)
+                if (!saved) Thread.sleep(100)
+            }
+            assertTrue("Expected two-tab RO workspace was not durably saved", saved)
+            metadataFile.writeText(JSONObject().put("version", 1).put("first", firstSession).put("second", secondSession)
+                .put("firstHome", firstId).put("secondHome", secondId).put("marker", marker).toString())
+            return@use
+            }
+            val metadata = JSONObject(metadataFile.readText())
+            assertEquals(1, metadata.getInt("version"))
+            assertEquals(firstId, metadata.getString("firstHome")); assertEquals(secondId, metadata.getString("secondHome"))
+            val firstSession = UUID.fromString(metadata.getString("first")).toString()
+            val secondSession = UUID.fromString(metadata.getString("second")).toString()
+            val marker = metadata.getString("marker")
+            waitFor(scenario, "document.querySelectorAll('#tabs button').length===2&&Array.from(document.querySelectorAll('#tabs button')).every(e=>e.dataset.state==='attached')&&document.getElementById('mode-label').textContent==='只读'&&document.querySelector('#tabs button[aria-selected=true]')?.dataset.sessionId===${JSONObject.quote(secondSession)}&&document.querySelector('#tabs button[aria-selected=true]')?.dataset.homeId===${JSONObject.quote(secondId)}", "automatic process restart restores selected readonly tab", 180)
+            assertEquals("true", evaluate(scenario, "Array.from(document.querySelectorAll('#tabs button')).some(e=>e.dataset.sessionId===${JSONObject.quote(firstSession)}&&e.dataset.homeId===${JSONObject.quote(firstId)})"))
+            switch(firstName)
+            waitFor(scenario, "['只读','读写'].includes(document.getElementById('mode-label').textContent)", "first Home attached after process restore")
+            if (evaluate(scenario, "document.getElementById('mode-label').textContent==='只读'") == "true") {
+                // A surviving writer lease may legitimately degrade automatic RW restore to RO.
+                // Request and, only when prompted, explicitly confirm write takeover through UI.
+                click(scenario, "mode")
+                waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'||document.getElementById('takeover').open", "first Home explicit writer request")
+                if (evaluate(scenario, "document.getElementById('takeover').open") == "true") click(scenario, "confirm-takeover")
+                waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "first Home explicit writer reacquired")
+            }
+            output(marker + "PROCESSFIRST", "first-home-process-restored")
+            switch(secondName)
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "second Home readonly mode retained")
+            click(scenario, "mode")
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "writer after process restart")
+            output(marker + "PROCESS", "second-home-process-restored")
+            scenario.onActivity { activity -> activity.openFileOutput("e2e-delete-second", android.content.Context.MODE_PRIVATE).use { it.write("delete".toByteArray()) } }
+            waitFor(scenario, "document.getElementById('mode-label').textContent==='已删除'&&document.getElementById('mode').disabled&&document.querySelectorAll('#tabs button').length===2", "externally deleted session keeps tombstone tab")
+            switch(firstName); output(marker + "AFTERDELETE", "other-home-survives-deletion")
             screenshot(scenario)
             management(); click(scenario, "disconnect")
+            context.filesDir.resolve("e2e-process-restored.json").writeText(JSONObject().put("version", 1)
+                .put("first", firstSession).put("second", secondSession).put("restored", true).put("externalDeletion", true).toString())
         }
     }
 }

@@ -10,6 +10,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebViewClient
 import android.widget.TextView
 import org.json.JSONObject
@@ -26,11 +27,55 @@ class MainActivity : Activity() {
     private var foreground = false
     private var ready = false
     private var rendering = false
+    private var generation = 0
+    private var batchToken = 0
+    private var resumePending = false
+    private val disconnecting = mutableSetOf<String>()
+    private val disconnectRequested = mutableSetOf<String>()
+    private var inFlightBytes = 0
+    private val snapshots = linkedMapOf<String, JSONObject>()
+    private data class Retained(val homes: List<Home>, val classMode: Boolean, val snapshots: Map<String, JSONObject>, val disconnecting: Set<String>, val requested: Set<String>)
+    private val queued = java.util.ArrayDeque<JSONObject>()
+    private var queuedBytes = 0
+    private var backgroundExpired = false
+    private val expiry = Runnable { backgroundExpired = true; suspendTransport() }
+    private val renderTimeout = Runnable { recoverRenderer() }
+
+    private fun suspendTransport() {
+        if (disconnecting.isNotEmpty()) return
+        disconnecting.addAll(homes.values.filter { it.handle != 0L }.map { it.id })
+        disconnectRequested.clear()
+        homes.values.forEach { it.pendingPassword = null }
+        // Never deliver pre-reset output or manufacture a disconnected acknowledgement.
+        queued.clear(); queuedBytes = 0
+        if (ready) dispatch(JSONObject().put("type", "lifecycle").put("active", false))
+        resumePending = foreground
+    }
+
+    private fun recoverRenderer() {
+        if (!foreground) backgroundExpired = true
+        suspendTransport()
+        ready = false; rendering = false; inFlightBytes = 0; generation++
+        handler.removeCallbacks(renderTimeout)
+        queued.clear(); queuedBytes = 0
+        web?.removeJavascriptInterface("FlowSpliceNative"); web?.destroy(); web = null
+        if (foreground) createWebView()
+    }
     private val origin = "https://appassets.androidplatform.net"
     private val page get() = "$origin/assets/pty/index.html"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val retained = lastNonConfigurationInstance as? Retained
+        if (retained != null) {
+            classMode = retained.classMode
+            retained.homes.forEach { homes[it.id] = it }
+            snapshots.putAll(retained.snapshots)
+            disconnecting.addAll(retained.disconnecting)
+            disconnectRequested.addAll(retained.requested)
+            createWebView()
+            return
+        }
         try {
             val root = assets.open("bootstrap/deployment-root.pub").bufferedReader().use { it.readText() }.trim()
             val configurations = assets.list("bootstrap").orEmpty().filter { it in listOf("service-class.json", "homes.json", "business.json") }
@@ -70,6 +115,7 @@ class MainActivity : Activity() {
     }
 
     private fun createWebView() {
+        val currentGeneration = ++generation
         val view = WebView(this)
         web = view
         with(view.settings) {
@@ -86,9 +132,13 @@ class MainActivity : Activity() {
             domStorageEnabled = false
         }
         view.addJavascriptInterface(object {
-            @JavascriptInterface fun rendered() { handler.post { if (view.url == page) rendering = false } }
+            @JavascriptInterface fun rendered(token: Int) { handler.post {
+                if (web === view && generation == currentGeneration && token == batchToken) {
+                    rendering = false; inFlightBytes = 0; handler.removeCallbacks(renderTimeout); flushEvents()
+                }
+            } }
             @JavascriptInterface fun send(json: String) {
-                handler.post { if (foreground && view.url == page) action(json) }
+                handler.post { if (web === view && generation == currentGeneration && view.url == page) action(json) }
             }
         }, "FlowSpliceNative")
         view.webViewClient = object : WebViewClient() {
@@ -102,6 +152,10 @@ class MainActivity : Activity() {
                     val mime = when { path.endsWith(".html") -> "text/html"; path.endsWith(".js") -> "application/javascript"; path.endsWith(".css") -> "text/css"; path.endsWith(".woff2") -> "font/woff2"; else -> return blocked() }
                     WebResourceResponse(mime, "UTF-8", 200, "OK", mapOf("Content-Security-Policy" to "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'", "Cache-Control" to "no-store"), assets.open(relative))
                 } catch (_: Exception) { blocked() }
+            }
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                if (web === view) recoverRenderer()
+                return true
             }
             override fun onPageFinished(view: WebView, url: String) {
                 if (url != page) ready = false
@@ -121,15 +175,22 @@ class MainActivity : Activity() {
         var home: Home? = null
         try {
             val action = JSONObject(json)
+            if (action.optString("op") == "save_workspace" && action.length() == 2) {
+                WorkspaceStore.save(this, classMode, action.getJSONObject("value")); return
+            }
             if (action.optString("op") == "ready" && action.length() == 1) {
                 ready = true
+                resumePending = foreground
+                dispatch(JSONObject().put("type", "workspace").put("value", WorkspaceStore.load(this, classMode) ?: JSONObject.NULL))
+                dispatch(JSONObject().put("type", "lifecycle").put("active", false))
                 dispatch(JSONObject().put("type", "platform").put("platform", "android"))
                 if (!classMode) dispatch(JSONObject().put("type", "homes").put("platform", "android").put("homes", JSONArray(homes.values.map { it.info })))
+                if (disconnecting.isEmpty()) snapshots.values.forEach { dispatch(it) }
                 homes.values.forEach { h -> h.error?.let { dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else h.id).put("message", it)) } }
                 handler.removeCallbacks(poll); handler.post(poll)
                 return
             }
-            if (!ready) return
+            if (!ready || !foreground || resumePending) return
             home = if (classMode) homes.values.firstOrNull() else homes[action.optString("home_id")]
             if (home == null) return
             if (home.handle == 0L) return
@@ -157,8 +218,7 @@ class MainActivity : Activity() {
     }
     private val poll = object : Runnable {
         override fun run() {
-            if (!foreground || !ready) return
-            if (rendering) { handler.postDelayed(this, 25); return }
+            if (homes.isEmpty()) return
             val batch = JSONArray()
             // One shared class queue or up to eight legacy queues; one awaited JS batch.
             for (home in homes.values.filter { it.handle != 0L }) {
@@ -166,8 +226,20 @@ class MainActivity : Activity() {
                     val result = JSONObject(NativePty.poll(home.handle))
                     check(result.optBoolean("ok"))
                     val events = result.getJSONArray("data")
+                    if (home.id in disconnecting && home.id !in disconnectRequested) {
+                        // Discard the drained old events and enqueue the disconnect now;
+                        // continuous output must not starve this lifecycle operation.
+                        val sent = JSONObject(NativePty.send(home.handle, "{\"op\":\"disconnect\"}"))
+                        if (sent.optBoolean("ok")) disconnectRequested.add(home.id)
+                        continue
+                    }
                     for (index in 0 until events.length()) {
                         val event = events.getJSONObject(index)
+                        if (home.id in disconnecting) {
+                            val terminal = event.optString("type") == (if (classMode) "identity" else "state") && !event.optBoolean("connected") && !event.optBoolean("busy")
+                            if (!terminal) continue
+                            disconnecting.remove(home.id); disconnectRequested.remove(home.id)
+                        }
                         if (event.optString("type") == (if (classMode) "identity" else "state") && event.optBoolean("connected")) {
                             home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id, classMode) }; home.pendingPassword = null
                         }
@@ -176,14 +248,24 @@ class MainActivity : Activity() {
                     }
                 } catch (_: Exception) {
                     home.pendingPassword = null
+                    if (home.id in disconnecting) {
+                        continue
+                    }
                     batch.put(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("message", "本机事件读取失败"))
                 }
             }
-            if (batch.length() > 0) {
-                rendering = true
-                web?.evaluateJavascript("window.flowsplice.receiveBatch(JSON.parse(${JSONObject.quote(batch.toString())})).finally(() => window.FlowSpliceNative.rendered());", null)
+            for (index in 0 until batch.length()) {
+                val event = batch.getJSONObject(index)
+                if (event.optString("type") in listOf("identity", "homes", "state")) snapshots[event.optString("type") + ":" + event.optString("home_id")] = JSONObject(event.toString())
+                val size = event.toString().toByteArray(Charsets.UTF_8).size
+                if (queuedBytes + inFlightBytes + size > 2 * 1024 * 1024) {
+                    recoverRenderer()
+                    break
+                }
+                queued.add(event); queuedBytes += size
             }
-            handler.postDelayed(this, 25)
+            flushEvents()
+            if (foreground || !backgroundExpired || disconnecting.isNotEmpty()) handler.postDelayed(this, 25)
         }
     }
     companion object {
@@ -225,16 +307,49 @@ class MainActivity : Activity() {
             }
         }
     }
-    override fun onResume() { super.onResume(); foreground = true; if (ready) handler.post(poll) }
+    private fun flushEvents() {
+        if (!foreground || !ready || rendering) return
+        if (queued.isNotEmpty()) {
+            val batch = JSONArray()
+            repeat(minOf(64, queued.size)) {
+                val event = queued.removeFirst()
+                queuedBytes -= event.toString().toByteArray(Charsets.UTF_8).size
+                batch.put(event)
+            }
+            rendering = true
+            inFlightBytes = batch.toString().toByteArray(Charsets.UTF_8).size
+            val token = ++batchToken
+            web?.evaluateJavascript("window.flowsplice.receiveBatch(JSON.parse(${JSONObject.quote(batch.toString())})).finally(() => window.FlowSpliceNative.rendered($token));", null)
+            handler.removeCallbacks(renderTimeout); handler.postDelayed(renderTimeout, 10_000)
+        } else if (resumePending && disconnecting.isEmpty()) {
+            resumePending = false
+            dispatch(JSONObject().put("type", "lifecycle").put("active", true))
+        }
+    }
+    override fun onResume() {
+        super.onResume(); foreground = true; resumePending = true; backgroundExpired = false
+        handler.removeCallbacks(expiry)
+        if (rendering) handler.postDelayed(renderTimeout, 10_000)
+        if (web == null && homes.isNotEmpty()) createWebView()
+        handler.removeCallbacks(poll); handler.post(poll)
+    }
     override fun onStop() {
-        foreground = false
-        homes.values.forEach { if (it.handle != 0L) NativePty.send(it.handle, "{\"op\":\"disconnect\"}"); it.pendingPassword = null }
-        handler.removeCallbacks(poll)
+        foreground = false; resumePending = false
+        handler.removeCallbacks(renderTimeout)
+        if (ready) dispatch(JSONObject().put("type", "lifecycle").put("active", false))
+        handler.removeCallbacks(expiry); handler.postDelayed(expiry, 30_000)
         super.onStop()
     }
+    override fun onRetainNonConfigurationInstance(): Any {
+        suspendTransport()
+        return Retained(homes.values.toList(), classMode, snapshots.toMap(), disconnecting.toSet(), disconnectRequested.toSet())
+    }
     override fun onDestroy() {
-        foreground = false; ready = false; handler.removeCallbacks(poll)
-        homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }; homes.clear()
+        foreground = false; ready = false; generation++
+        handler.removeCallbacksAndMessages(null)
+        if (!isChangingConfigurations) homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }
+        homes.clear()
+        queued.clear(); queuedBytes = 0
         web?.removeJavascriptInterface("FlowSpliceNative"); web?.destroy(); web = null
         super.onDestroy()
     }

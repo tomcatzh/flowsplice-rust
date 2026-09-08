@@ -2,6 +2,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
+import { readWorkspace, type Workspace } from "./workspace";
 type Operation = {
   op: string;
   [key: string]: any;
@@ -33,6 +34,15 @@ type Home = {
   connectAfterEnroll: boolean;
   detailsPending: boolean;
   detailsAgain?: boolean;
+  wanted?: boolean;
+  available?: boolean;
+  manualDisconnected?: boolean;
+  hello?: boolean;
+  listed?: boolean;
+  retryAt?: number;
+  retries?: number;
+  credentialBlocked?: boolean;
+  cancelledJoins?: Set<string>;
 };
 type Tab = {
   key: string;
@@ -45,6 +55,8 @@ type Tab = {
   fit: FitAddon;
   pane: HTMLElement;
   notice: string;
+  state: "attached" | "reconnecting" | "deleted";
+  name: string;
 };
 type Event = {
   type: string;
@@ -255,6 +267,103 @@ let identity = {
   connectAfterEnroll: false,
 };
 let classRecovery = false;
+let foreground = true, workspaceReady = false, nativeScopeReady = false, lastWorkspace = "";
+let identityWanted = false, identityManuallyDisconnected = false;
+let identityRetryAt = 0, identityRetries = 0, identityCredentialBlocked = false;
+const attachment = (home: string, id: string) => [...tabs.values()].find(t => t.home.id === home && t.id === id && t.state === "attached");
+function saveWorkspace() {
+  // A fresh installation receives platform information before its identity/catalog.
+  // Wait for the native scope before persisting an empty class or legacy workspace.
+  if (!workspaceReady || !nativeScopeReady) return;
+  const currentTab = activeTab();
+  const value: Workspace = {
+    version: 1, classMode, identityWanted,
+    homes: [...homes.values()].map(h => ({id:h.id, name:h.name, platform:h.platform, relay:h.relay || "", wanted:!!h.wanted})),
+    tabs: [...tabs.values()].map(t => ({home:t.home.id, session:t.session, name:title(t), mode:t.mode === "read_write" ? "read_write" : "read_only", deleted:t.state === "deleted"})),
+    active: currentTab ? {home:currentTab.home.id, session:currentTab.session} : null,
+    selected, page: page as Workspace["page"],
+  };
+  const encoded = JSON.stringify(value);
+  if (encoded !== lastWorkspace && readWorkspace(value)) {
+    lastWorkspace = encoded;
+    send({op:"save_workspace", value});
+  }
+}
+function restoreWorkspace(value: unknown) {
+  const saved = readWorkspace(value);
+  workspaceReady = true;
+  if (!saved) return;
+  classMode = saved.classMode;
+  identityWanted = saved.identityWanted;
+  identityManuallyDisconnected = !saved.identityWanted;
+  for (const h of saved.homes) homes.set(h.id, makeHome({...h, installed:false, available:false, manualDisconnected:!h.wanted}));
+  for (const savedTab of saved.tabs) {
+    const h = homes.get(savedTab.home)!;
+    createTab(h, savedTab.session, savedTab.name, savedTab.mode, savedTab.deleted ? "deleted" : "reconnecting");
+  }
+  active = saved.active ? key(saved.active.home, saved.active.session) : null;
+  selected = saved.selected;
+  page = saved.page === "terminal" && !active ? "manage" : saved.page;
+  lastWorkspace = JSON.stringify(saved);
+  render();
+}
+function makeHome(item: any): Home {
+  return {installed:classMode, connected:false, busy:false, canWrite:false, notice:"", code:"", sessions:new Map(), requests:new Map(), joining:new Set(), pendingNew:null, pendingNewId:null, connectAfterEnroll:false, detailsPending:false, available:true, ...item};
+}
+function wantHome(h: Home) {
+  h.wanted = true;
+  h.manualDisconnected = false;
+  h.credentialBlocked = false;
+}
+function retryDelay(attempt: number) { return Math.min(30000, 1000 * 2 ** Math.min(attempt, 5)); }
+function reconnect() {
+  if (!foreground || !workspaceReady) return;
+  const now = Date.now();
+  if (classMode && identityWanted && identity.installed && !identity.connected && !identity.busy && !identityCredentialBlocked && now >= identityRetryAt) {
+    identity.busy = true;
+    identityRetryAt = now + retryDelay(identityRetries++);
+    send({op:"connect", password:""});
+    render();
+  }
+  for (const h of homes.values()) {
+    if (!h.wanted || !h.available || !h.installed || h.credentialBlocked || (classMode && !identity.connected)) continue;
+    if (!h.connected && !h.busy && now >= (h.retryAt || 0)) {
+      h.busy = true;
+      h.retryAt = now + retryDelay(h.retries || 0);
+      h.retries = (h.retries || 0) + 1;
+      action(h, {op:"connect", password:""});
+      render();
+    } else if (h.connected && h.hello && h.listed) restoreTabs(h);
+  }
+}
+function restoreTabs(h: Home) {
+  if (!foreground || !h.wanted || !h.connected || !h.hello || !h.listed || Date.now() < (h.retryAt || 0)) return;
+  for (const t of tabs.values()) {
+    if (t.home !== h || t.state !== "reconnecting" || h.joining.has(t.session)) continue;
+    if (!h.sessions.has(t.session)) { deleted(t); continue; }
+    h.joining.add(t.session);
+    operation(h, {op:"join", session_id:t.session, mode:t.mode, columns:80, rows:24});
+  }
+}
+function deleted(t: Tab) {
+  t.name = title(t);
+  t.state = "deleted";
+  t.id = "";
+  t.notice = "远端 tmux 会话已删除。";
+  t.home.joining.delete(t.session);
+  if (warning?.home === t.home.id && warning.session === t.session) closeWarning();
+}
+function suspend(home: Home) {
+  resetOperations(home);
+  for (const t of tabs.values()) if (t.home === home && t.state !== "deleted") {
+    t.name = title(t);
+    t.state = "reconnecting";
+    t.id = "";
+    t.notice = "连接中断，正在恢复原会话…";
+  }
+  home.hello = false;
+  home.listed = false;
+}
 let warning: {
   home: string;
   attachment: string;
@@ -312,7 +421,7 @@ function button(label: string, fn: () => void, cls = "") {
 function title(tab: Tab) {
   return (
     tab.home.sessions.get(tab.session)?.name ||
-    `会话 ${tab.session.slice(0, 8)}`
+    tab.name || `会话 ${tab.session.slice(0, 8)}`
   );
 }
 function date(value: number | null | undefined) {
@@ -327,7 +436,9 @@ function date(value: number | null | undefined) {
     : "尚未连接";
 }
 function status(h: Home) {
-  return h.connected
+  return h.available === false
+    ? "等待 Home 上线"
+    : h.connected
     ? "已连接"
     : h.busy
       ? "正在连接 / 等待批准"
@@ -349,6 +460,7 @@ function selectHome(id: string, connect = true) {
       !h.busy &&
       (!classMode || identity.connected)
     ) {
+      wantHome(h);
       h.busy = true;
       action(h, { op: "connect", password: "" });
     }
@@ -488,6 +600,9 @@ function render() {
     }
     updateText(b, `${t.home.name} / ${title(t)}`);
     b.title = b.textContent!;
+    b.dataset.state = t.state;
+    b.dataset.sessionId = t.session;
+    b.dataset.homeId = t.home.id;
     b.setAttribute(
       "aria-selected",
       String(active === t.key && page === "terminal"),
@@ -496,11 +611,12 @@ function render() {
     const card = text("div", "", "opened-card");
     card.append(
       button(`${t.home.name} / ${title(t)}`, () => focus(t)),
-      text("span", t.mode === "read_write" ? "读写" : "只读", "mode-badge"),
+      text("span", t.state === "deleted" ? "已删除" : t.state === "reconnecting" ? "正在恢复" : t.mode === "read_write" ? "读写" : "只读", "mode-badge"),
       button("×", () => detach(t), "close-tab"),
     );
     el("opened-list").append(card);
     t.pane.hidden = page !== "terminal" || active !== t.key;
+    t.pane.dataset.state = t.state;
   }
   reconcileChildren(tabParent, desiredTabs);
   if (!tabs.size)
@@ -553,6 +669,7 @@ function render() {
   }
   if (tab) {
     el<HTMLButtonElement>("rename-terminal").disabled =
+      tab.state !== "attached" ||
       !tab.home.connected ||
       !tab.home.canWrite ||
       !tab.home.sessions.has(tab.session);
@@ -570,18 +687,20 @@ function render() {
       text("strong", title(tab)),
       text("small", tab.home.name),
     );
-    el("mode-label").textContent = tab.mode === "read_write" ? "读写" : "只读";
+    el("mode-label").textContent = tab.state === "deleted" ? "已删除" : tab.state === "reconnecting" ? "正在恢复" : tab.mode === "read_write" ? "读写" : "只读";
+    el("mode").dataset.state = tab.state;
     el("mode").title =
       tab.mode === "read_write" ? "切换为只读" : "申请读写权限";
     el("mode").setAttribute(
       "aria-label",
-      tab.mode === "read_write" ? "切换只读" : "申请读写",
+      tab.state === "deleted" ? "已删除" : tab.state === "reconnecting" ? "正在恢复" : tab.mode === "read_write" ? "切换只读" : "申请读写",
     );
-    el<HTMLButtonElement>("mode").disabled = !tab.home.canWrite;
+    el<HTMLButtonElement>("mode").disabled = tab.state !== "attached" || !tab.home.connected || !tab.home.canWrite;
     const count = tab.home.sessions.get(tab.session)?.connection_count;
     el("terminal-connections").textContent =
       count === undefined ? "" : `${count} 个连接`;
   }
+  saveWorkspace();
 }
 function renderList(h: Home) {
   el("list").replaceChildren();
@@ -671,11 +790,12 @@ function remove(tab: Tab) {
   render();
 }
 function detach(tab: Tab) {
-  operation(tab.home, { op: "detach", attachment_id: tab.id });
+  if (tab.home.joining.has(tab.session)) (tab.home.cancelledJoins ??= new Set()).add(tab.session);
+  if (tab.state === "attached") operation(tab.home, { op: "detach", attachment_id: tab.id });
   remove(tab);
   details(tab.home);
 }
-function clear(home: Home) {
+function resetOperations(home: Home) {
   if (renaming?.home === home.id) {
     renaming.pending = false;
     renaming.request = undefined;
@@ -687,18 +807,22 @@ function clear(home: Home) {
     newHome = null;
     el<HTMLDialogElement>("new-session").close();
   }
-  for (const tab of [...tabs.values()]) if (tab.home === home) remove(tab);
   home.requests.clear();
   home.joining.clear();
+  home.cancelledJoins?.clear();
   home.detailsAgain = false;
   home.pendingNew = null;
   home.pendingNewId = null;
   home.canWrite = false;
-  home.sessions.clear();
   if (warning?.home === home.id) closeWarning();
 }
+function clear(home: Home) {
+  resetOperations(home);
+  for (const tab of [...tabs.values()]) if (tab.home === home) remove(tab);
+  home.sessions.clear();
+}
 function input(tab: Tab, value: string) {
-  if (!tab.home.connected || tab.mode !== "read_write") return;
+  if (!foreground || tab.state !== "attached" || !tab.home.connected || tab.mode !== "read_write") return;
   const data = new TextEncoder().encode(value),
     writer_epoch = tab.epoch;
   for (let i = 0; i < data.length; i += 16384)
@@ -710,7 +834,12 @@ function input(tab: Tab, value: string) {
     });
 }
 function attach(h: Home, result: any, name?: string) {
+  if (!h.connected) return;
   h.joining.delete(result.session.id);
+  if (h.cancelledJoins?.delete(result.session.id)) {
+    operation(h, {op:"detach", attachment_id:result.attachment_id});
+    return;
+  }
   const old = h.sessions.get(result.session.id);
   h.sessions.set(result.session.id, {
     ...old,
@@ -721,16 +850,33 @@ function attach(h: Home, result: any, name?: string) {
     (t) => t.home === h && t.session === result.session.id,
   );
   if (existing) {
-    if (existing.id !== result.attachment_id)
-      operation(h, { op: "detach", attachment_id: result.attachment_id });
-    focus(existing);
+    if (existing.state === "deleted" || existing.state === "attached") {
+      if (existing.id !== result.attachment_id) operation(h, {op:"detach", attachment_id:result.attachment_id});
+      return;
+    }
+    existing.id = result.attachment_id;
+    existing.epoch = result.writer_epoch;
+    existing.mode = result.mode;
+    existing.state = "attached";
+    existing.name = name || old?.name || existing.name;
+    existing.notice = "";
+    existing.terminal.reset();
+    render();
+    fit(existing);
+    details(h);
     return;
   }
+  const tab = createTab(h, result.session.id, name || old?.name || "", result.mode, "attached");
+  tab.id = result.attachment_id;
+  tab.epoch = result.writer_epoch;
+  focus(tab);
+  details(h);
+}
+function createTab(h: Home, session: string, name: string, mode: string, state: Tab["state"]): Tab {
   const pane = text("div", "", "terminal");
   el("panes").append(pane);
   const terminal = new Terminal({
-    scrollback: 0,
-    fontSize: 14,
+    scrollback: 0, fontSize: 14,
     theme: { background: "#101416", foreground: "#e4e9e7", cursor: "#61d69d" },
     linkHandler: { activate: () => {}, allowNonHttpProtocols: false },
   });
@@ -738,29 +884,18 @@ function attach(h: Home, result: any, name?: string) {
   terminal.loadAddon(addon);
   terminal.open(pane);
   terminal.parser.registerOscHandler(52, () => true);
-  const tab: Tab = {
-    key: key(h.id, result.attachment_id),
-    home: h,
-    session: result.session.id,
-    id: result.attachment_id,
-    mode: result.mode,
-    epoch: result.writer_epoch,
-    terminal,
-    fit: addon,
-    pane,
-    notice: "",
-  };
+  const tab: Tab = {key:key(h.id, session), home:h, session, name, id:"", mode, epoch:0, terminal, fit:addon, pane, notice:"", state};
   tabs.set(tab.key, tab);
-  terminal.onData((data) => input(tab, data));
-  terminal.onResize(({ cols, rows }) =>
-    operation(h, { op: "resize", attachment_id: tab.id, columns: cols, rows }),
-  );
-  focus(tab);
-  details(h);
+  terminal.onData(data => input(tab, data));
+  terminal.onResize(({cols, rows}) => {
+    if (foreground && tab.state === "attached") operation(h, {op:"resize", attachment_id:tab.id, columns:cols, rows});
+  });
+  return tab;
 }
 function protocol(h: Home, m: any) {
   if (m.type === "hello") {
     h.canWrite = m.can_write;
+    h.hello = true;
     details(h);
   } else if (m.type === "response") {
     const req = h.requests.get(m.request_id);
@@ -797,12 +932,22 @@ function protocol(h: Home, m: any) {
       for (const s of r.sessions)
         next.set(s.id, { ...h.sessions.get(s.id), ...s });
       h.sessions = next;
+      h.listed = true;
+      for (const t of tabs.values()) if (t.home === h && t.state === "reconnecting" && !next.has(t.session)) deleted(t);
+      restoreTabs(h);
       if (r.status === "session_details" && h.detailsAgain) {
         h.detailsAgain = false;
         details(h);
       }
     } else if (r.status === "attached") attach(h, r, name);
-    else if (r.status === "error") h.notice = r.message;
+    else if (r.status === "error") {
+      h.notice = r.message;
+      if (req?.op === "join") {
+        h.retryAt = Date.now() + 1000;
+        h.listed = false;
+        details(h);
+      }
+    }
     else if (r.status === "takeover_required" && req?.op === "set_mode") {
       warning = {
         home: h.id,
@@ -816,13 +961,11 @@ function protocol(h: Home, m: any) {
       el<HTMLDialogElement>("takeover").showModal();
     }
   } else if (m.type === "output") {
-    tabs
-      .get(key(h.id, m.attachment_id))
-      ?.terminal.write(new Uint8Array(m.data));
+    attachment(h.id, m.attachment_id)?.terminal.write(new Uint8Array(m.data));
     return;
   } else if (m.type === "ownership") {
     for (const t of tabs.values())
-      if (t.home === h && t.session === m.session_id) {
+      if (t.home === h && t.session === m.session_id && t.state === "attached") {
         const wasWriter = t.mode === "read_write";
         t.epoch = m.epoch;
         t.mode = m.writer?.attachment_id === t.id ? "read_write" : "read_only";
@@ -841,12 +984,13 @@ function protocol(h: Home, m: any) {
     }
     details(h);
   } else if (m.type === "detached") {
-    const t = tabs.get(key(h.id, m.attachment_id));
-    if (t) remove(t);
+    const t = attachment(h.id, m.attachment_id);
+    if (t) { t.state = "reconnecting"; t.id = ""; t.notice = "连接中断，正在恢复原会话…"; }
+    h.listed = false;
     details(h);
   } else if (m.type === "session_ended") {
     for (const t of [...tabs.values()])
-      if (t.home === h && t.session === m.session_id) remove(t);
+      if (t.home === h && t.session === m.session_id) deleted(t);
     h.sessions.delete(m.session_id);
     details(h);
   }
@@ -881,7 +1025,7 @@ window.flowsplice = {
   async receiveBatch(events) {
     for (const e of events) {
       if (e.type === "protocol" && e.message?.type === "output") {
-        const t = tabs.get(key(e.home_id, e.message.attachment_id));
+        const t = attachment(e.home_id, e.message.attachment_id);
         if (t)
           await new Promise<void>((resolve) =>
             t.terminal.write(new Uint8Array(e.message.data), resolve),
@@ -890,11 +1034,23 @@ window.flowsplice = {
     }
   },
   receive(e) {
+    if (e.type === "workspace") { restoreWorkspace(e.value); return; }
+    if (e.type === "lifecycle") {
+      foreground = e.active === true;
+      if (foreground) { reconnect(); for (const h of homes.values()) if (h.connected) details(h); }
+      saveWorkspace();
+      return;
+    }
     if (e.type === "platform") {
       platform(e.platform);
       return;
     }
     if (e.type === "identity") {
+      nativeScopeReady = true;
+      if (!classMode) {
+        for (const home of homes.values()) clear(home);
+        homes.clear(); selected = null;
+      }
       classMode = true;
       const wasBusy = identity.busy;
       identity = {
@@ -908,8 +1064,11 @@ window.flowsplice = {
         for (const home of homes.values()) {
           home.connected = false;
           home.busy = false;
-          clear(home);
+          suspend(home);
         }
+      } else {
+        identityRetries = 0; identityRetryAt = 0;
+        if (!identityManuallyDisconnected) identityWanted = true;
       }
       if (!identity.installed && !identity.busy && wasBusy)
         identity.connectAfterEnroll = false;
@@ -927,14 +1086,18 @@ window.flowsplice = {
       return;
     }
     if (e.type === "homes") {
+      nativeScopeReady = true;
       if (e.platform) platform(e.platform);
       if (classMode) {
         const retained = new Set(e.homes.map((home: any) => home.id));
         for (const [id, home] of homes)
           if (!retained.has(id)) {
-            clear(home);
-            homes.delete(id);
-            if (selected === id) selected = null;
+            home.connected = false; home.busy = false; home.available = false;
+            suspend(home);
+            if (!home.wanted && ![...tabs.values()].some(t => t.home === home)) {
+              homes.delete(id);
+              if (selected === id) selected = null;
+            }
           }
       }
       for (const item of e.homes) {
@@ -943,25 +1106,12 @@ window.flowsplice = {
           Object.assign(old, {
             name: item.name,
             platform: item.platform,
-            relay: item.relay,
+            relay: item.relay || "",
+            available: true,
+            installed: classMode || old.installed,
           });
         else
-          homes.set(item.id, {
-            ...item,
-            installed: classMode,
-            connected: false,
-            busy: false,
-            canWrite: false,
-            notice: "",
-            code: "",
-            sessions: new Map(),
-            requests: new Map(),
-            joining: new Set(),
-            pendingNew: null,
-            pendingNewId: null,
-            connectAfterEnroll: false,
-            detailsPending: false,
-          });
+          homes.set(item.id, makeHome(item));
       }
       render();
       return;
@@ -975,6 +1125,7 @@ window.flowsplice = {
       identity.busy = false;
       identity.connectAfterEnroll = false;
       if (e.code === "credential_required") {
+        identityCredentialBlocked = true;
         classRecovery = true;
         recoveryHome = null;
         el("recovery-message").textContent = e.message;
@@ -1001,10 +1152,12 @@ window.flowsplice = {
       h.installed = e.installed;
       h.connected = e.connected;
       h.busy = e.busy;
-      if (!h.connected) clear(h);
+      if (!h.connected) suspend(h);
+      else if (!h.manualDisconnected) h.wanted = true;
       if (!h.installed && !h.busy && wasBusy) h.connectAfterEnroll = false;
       if (h.connected && !was) {
         h.notice = "";
+        h.retries = 0; h.retryAt = 0;
         details(h);
       }
       if (h.connectAfterEnroll && h.installed && !h.connected && !h.busy) {
@@ -1043,6 +1196,7 @@ window.flowsplice = {
       }
       h.busy = false;
       if (e.code === "credential_required") {
+        h.credentialBlocked = true;
         classRecovery = false;
         recoveryHome = h.id;
         el("recovery-message").textContent = e.message;
@@ -1056,6 +1210,7 @@ window.flowsplice = {
 el("identity-access").onsubmit = (e) => {
   e.preventDefault();
   if (identity.busy) return;
+  identityWanted = true; identityManuallyDisconnected = false; identityCredentialBlocked = false;
   identity.busy = true;
   el("global-notice").hidden = true;
   if (identity.installed) send({ op: "connect", password: "" });
@@ -1071,10 +1226,14 @@ el("identity-access").onsubmit = (e) => {
   render();
 };
 el("identity-disconnect").onclick = () => {
+  identityWanted = false; identityManuallyDisconnected = true;
+  for (const h of homes.values()) { h.wanted = false; h.manualDisconnected = true; clear(h); }
   identity.connectAfterEnroll = false;
+  saveWorkspace();
   send({ op: "disconnect" });
 };
 el("identity-cancel").onclick = () => {
+  identityWanted = false; identityManuallyDisconnected = true;
   identity.connectAfterEnroll = false;
   identity.busy = false;
   identity.code = "";
@@ -1117,6 +1276,7 @@ el("access").onsubmit = (e) => {
   e.preventDefault();
   const h = current();
   if (!h || h.busy) return;
+  wantHome(h);
   h.busy = true;
   h.notice = "";
   if (h.installed) action(h, { op: "connect", password: "" });
@@ -1134,6 +1294,7 @@ el("access").onsubmit = (e) => {
 el("disconnect").onclick = () => {
   const h = current();
   if (h) {
+    h.wanted = false; h.manualDisconnected = true;
     action(h, { op: "disconnect" });
     h.connected = false;
     h.busy = false;
@@ -1145,6 +1306,7 @@ el("disconnect").onclick = () => {
 el("cancel-enroll").onclick = () => {
   const h = current();
   if (h) {
+    h.wanted = false; h.manualDisconnected = true;
     action(h, { op: "disconnect" });
     h.busy = false;
     h.code = "";
@@ -1252,7 +1414,7 @@ el("new-form").onsubmit = (e) => {
 };
 el("mode").onclick = () => {
   const t = activeTab();
-  if (t)
+  if (t?.state === "attached")
     operation(t.home, {
       op: "set_mode",
       attachment_id: t.id,
@@ -1283,16 +1445,21 @@ el("confirm-takeover").onclick = () => {
 el("recovery-form").onsubmit = (e) => {
   e.preventDefault();
   const h = homes.get(recoveryHome || "");
-  if (classRecovery)
+  if (classRecovery) {
+    identityCredentialBlocked = false;
+    identityWanted = true; identityManuallyDisconnected = false;
+    identity.busy = true;
     send({
       op: "connect",
       password: el<HTMLInputElement>("recovery-password").value,
     });
-  else if (h)
+  } else if (h) {
+    wantHome(h); h.busy = true;
     action(h, {
       op: "connect",
       password: el<HTMLInputElement>("recovery-password").value,
     });
+  }
   el<HTMLInputElement>("recovery-password").value = "";
   el<HTMLDialogElement>("recovery").close();
 };
@@ -1311,7 +1478,9 @@ function viewport() {
 }
 window.visualViewport?.addEventListener("resize", viewport);
 window.addEventListener("resize", viewport);
+setInterval(reconnect, 1000);
 setInterval(() => {
+  if (!foreground) return;
   for (const h of homes.values())
     if (
       h.connected &&

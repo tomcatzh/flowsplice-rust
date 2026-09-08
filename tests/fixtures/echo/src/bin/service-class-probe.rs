@@ -412,6 +412,10 @@ async fn access_end(
     .await
     .context("class authorization loss did not close both sockets")?;
     for (probe, id, epoch) in [(first, aid, ae), (second, bid, be)] {
+        // Event EOF precedes publication of worker completion. send() reports
+        // local queue admission, not remote execution; join teardown before
+        // asserting that a completed connection rejects further operations.
+        probe.client.shutdown().await;
         ensure!(
             probe
                 .client

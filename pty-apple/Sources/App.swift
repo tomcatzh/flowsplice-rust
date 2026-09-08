@@ -8,14 +8,17 @@ struct FlowSplicePTYApp: App {
 #if os(macOS)
         Window("FlowSplice PTY", id: "terminal") {
             TerminalView(host: host).frame(minWidth: 640, minHeight: 480)
-                .onChange(of: phase) { _, value in host.setVisible(value != .background) }
         }
         .defaultSize(width: 1000, height: 850)
 #else
         WindowGroup {
             TerminalView(host: host)
-                .onAppear { host.setVisible(phase == .active) }
-                .onChange(of: phase) { _, value in host.setVisible(value == .active) }
+                .onAppear { host.setVisible(phase != .background) }
+                .onChange(of: phase) { _, value in
+                    if value == .inactive { host.prepareForInactive() }
+                    else if value == .active { host.becameActive() }
+                    else { host.setVisible(false) }
+                }
         }
 #endif
     }

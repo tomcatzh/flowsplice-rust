@@ -5,7 +5,10 @@ side opens no local TCP, UDP, HTTP or WebSocket listener. The primary service-cl
 mode has one identity and one foreground Travel runtime shared by up to eight
 simultaneously connected PTY Home targets. Switching Home pages or terminal tabs
 preserves other connections; disconnecting one Home releases only its PTY connection.
-Backgrounding the app disconnects all Home targets and then the shared runtime.
+Android and iOS preserve connections during a finite background grace period of up
+to 30 seconds (iOS may expire it earlier). macOS hiding, occlusion and minimization
+preserve connections. After suspension or application restart, saved connection
+intent restores the selected Homes and original terminal tabs automatically.
 The generic Travel applications retain their existing forwarding and background behavior.
 
 ## Provisioning
@@ -124,8 +127,16 @@ Android and iOS retain their on-screen terminal keys.
 
 Closing a tab detaches its client. Disconnecting, application backgrounding, Home
 process shutdown or loss of authorization does not intentionally terminate the shell.
-Reconnection returns to the list, and an explicit join obtains a fresh screen. No input
-or uncertain New request is automatically replayed. Exit the outermost shell normally
+Reconnection refreshes each connected Home's session list and rejoins saved session
+IDs with a fresh screen. Original read-only tabs stay read-only; original writers
+request write access but fall back to read-only when another writer occupies the
+session. Restoration never forces takeover, creates a shell or replays terminal input.
+Explicitly closing a tab or disconnecting a Home removes its restoration intent.
+An externally deleted tmux session remains as a disabled gray tab labeled “已删除”;
+unavailable Homes remain pending until their authoritative session list is available.
+Only bounded workspace metadata is persisted; passwords remain in native secure
+storage and terminal input/output is never stored in the workspace file.
+No uncertain New request is automatically replayed. Exit the outermost shell normally
 to end the tmux session; there is no remove/kill-session application command.
 Orderly disconnect sends application EOF before shutting down the recoverable
 transport, allowing Home to release the old writer. If the network is already

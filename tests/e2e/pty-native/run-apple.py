@@ -116,6 +116,7 @@ if log.exists():
     log.rename(build / (args.platform + "-private-ui-e2e-previous-" + str(time.time_ns()) + ".log"))
 result = build / (args.platform + "-private-ui-" + str(time.time_ns()) + ".xcresult")
 approvals = {}
+deletion = None
 with log.open("wb") as output:
     process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(configured),
         "-destination", destination, "-parallel-testing-enabled", "NO", "-resultBundlePath", str(result)],
@@ -126,6 +127,8 @@ with log.open("wb") as output:
             if time.monotonic() > deadline:
                 raise RuntimeError("Apple PTY UI test exceeded its deadline")
             rendered_log = log.read_text(errors="replace")
+            if deletion is None and "PTY_E2E_DELETE_SECOND_SESSION" in rendered_log:
+                deletion = fixture.delete_second_session()
             labels = re.findall(r"PTY_E2E_IDENTITY ([^\r\n]+)", rendered_log)
             client_label = labels[-1] if labels else None
             for notice in re.findall(r"PTY_E2E_VERIFICATION ([^\r\n]+)", rendered_log):
@@ -133,12 +136,12 @@ with log.open("wb") as output:
                     approved = fixture.approve_notice(notice, client_label)
                     if approved is not None: approvals[notice] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or len(approvals) != fixture.expected_approvals:
+        if process.returncode != 0 or len(approvals) != fixture.expected_approvals or deletion is None:
             raise RuntimeError("Apple private PTY UI acceptance failed; inspect the xcresult")
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=10)
 acceptance.write_text(json.dumps({"platform":args.platform,"passed":True,
-    "result":str(result),"completed_at_unix_ns":time.time_ns(),"approvals":list(approvals.values())}, indent=2))
+    "result":str(result),"completed_at_unix_ns":time.time_ns(),"approvals":list(approvals.values()),"external_deletion":deletion}, indent=2))
 print(json.dumps({"checkpoint":"private-apple-pty-ui-passed","platform":args.platform,"result":str(result)}))

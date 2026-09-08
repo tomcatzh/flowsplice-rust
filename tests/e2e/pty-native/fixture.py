@@ -125,3 +125,15 @@ class Fixture:
             subprocess.run(["docker", "exec", container, "/usr/bin/tmux",
                             "-S", "/tmp/fs-pty/alpha/tmux.sock", "kill-server"],
                            check=False, capture_output=True, timeout=15)
+
+    def delete_second_session(self):
+        """External deletion test; accept one test-owned UUID session only."""
+        if len(self.containers) != 2:
+            raise RuntimeError("Deletion requires the isolated two-Home fixture")
+        container = self.containers[1]
+        base = ["docker", "exec", container, "/usr/bin/tmux", "-S", "/tmp/fs-pty/alpha/tmux.sock"]
+        names = command(base + ["list-sessions", "-F", "#{session_name}"]).stdout.decode().splitlines()
+        if len(names) != 1 or re.fullmatch(r"fs-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", names[0]) is None:
+            raise RuntimeError("Refusing deletion outside the single fixture UUID session")
+        command(base + ["kill-session", "-t", "=" + names[0]])
+        return {"container":container, "session":names[0], "deleted":True}

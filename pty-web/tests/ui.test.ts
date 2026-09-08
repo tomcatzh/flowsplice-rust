@@ -18,6 +18,7 @@ vi.mock("@xterm/xterm", () => ({
     resize() {}
     focus() {}
     dispose = vi.fn();
+    reset = vi.fn();
     write = vi.fn((_data: any, callback?: () => void) => callback?.());
   },
 }));
@@ -613,7 +614,7 @@ test("class targets use scoped actions without enrollment or passwords", () => {
     false,
   );
 });
-test("class catalog refresh preserves connections and discovers or removes only exact target", () => {
+test("class catalog refresh preserves open tabs while a target is unavailable", () => {
   classIdentity(true, true);
   classCatalog();
   const one = JSON.stringify(["one", "pty"]),
@@ -627,9 +628,10 @@ test("class catalog refresh preserves connections and discovers or removes only 
   expect(document.querySelectorAll("#home-cards button")).toHaveLength(3);
   expect(el("tabs").children).toHaveLength(2);
   classCatalog(["two", "three"]);
-  expect(terminals[0].dispose).toHaveBeenCalledOnce();
+  expect(terminals[0].dispose).not.toHaveBeenCalled();
   expect(terminals[1].dispose).not.toHaveBeenCalled();
-  expect(el("tabs").children).toHaveLength(1);
+  expect(el("tabs").children).toHaveLength(2);
+  expect((el("tabs").firstElementChild as HTMLElement).dataset.state).toBe("reconnecting");
   terminals[1].onInput("still connected");
   expect(actions.at(-1)).toMatchObject({ op: "operation_home", home_id: two });
 });
@@ -654,6 +656,7 @@ test("class global disconnect closes all tabs without any automatic rejoin", () 
   state(one);
   attach(one);
   actions = [];
+  click("identity-disconnect");
   classIdentity(false, true);
   expect(terminals[0].dispose).toHaveBeenCalledOnce();
   classIdentity(true, true);
@@ -739,12 +742,13 @@ test("catalog changes update retained controls and remove only absent target nod
       },
     ],
   });
-  expect(first.isConnected).toBe(false);
-  expect(document.querySelector("#home-cards button")).toBe(second);
+  expect(first.isConnected).toBe(true);
+  expect(document.querySelectorAll("#home-cards button")[1]).toBe(second);
   expect(second.getAttribute("aria-label")).toBe("Renamed VPS");
-  expect(el("tabs").children).toHaveLength(1);
-  expect(el("tabs").firstElementChild).toBe(tabsBefore[1]);
-  expect(tabsBefore[0].isConnected).toBe(false);
+  expect(el("tabs").children).toHaveLength(2);
+  expect(el("tabs").children[1]).toBe(tabsBefore[1]);
+  expect(tabsBefore[0].isConnected).toBe(true);
+  expect((tabsBefore[0] as HTMLElement).dataset.state).toBe("reconnecting");
   second.click();
   expect(el("home-name").textContent).toBe("Renamed VPS");
   (tabsBefore[1] as HTMLButtonElement).click();
