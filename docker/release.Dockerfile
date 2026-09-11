@@ -20,7 +20,7 @@ RUN npm run build
 FROM rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS build
 ARG RUST_TARGET
 ENV RUSTUP_TOOLCHAIN=1.97.1
-RUN apk add --no-cache clang cmake make musl-dev perl file
+RUN apk add --no-cache clang cmake make musl-dev perl file g++
 ARG TARGETARCH
 ARG RUST_MIRROR_URL
 ARG RUSTUP_DIST_SERVER

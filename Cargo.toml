@@ -6,6 +6,7 @@ members = [
     "crates/flowsplice-storage",
     "crates/flowsplice-transport",
     "crates/flowsplice-home-core",
+    "crates/flowsplice-pty-codec",
     "crates/flowsplice-pty-protocol",
     "crates/flowsplice-pty-home",
     "crates/flowsplice-pty-client",
@@ -38,6 +39,7 @@ flowsplice-enrollment = { path = "crates/flowsplice-enrollment", default-feature
 flowsplice-storage = { path = "crates/flowsplice-storage" }
 flowsplice-transport = { path = "crates/flowsplice-transport" }
 flowsplice-home-core = { path = "crates/flowsplice-home-core" }
+flowsplice-pty-codec = { path = "crates/flowsplice-pty-codec", default-features = false }
 flowsplice-pty-protocol = { path = "crates/flowsplice-pty-protocol" }
 flowsplice-pty-home = { path = "crates/flowsplice-pty-home" }
 flowsplice-pty-client = { path = "crates/flowsplice-pty-client" }

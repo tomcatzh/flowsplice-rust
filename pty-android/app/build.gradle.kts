@@ -28,7 +28,7 @@ if (privateBuild) {
 android {
     namespace = "io.zxf.flowsplice.pty"
     compileSdk { version = release(37) }
-    defaultConfig { testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"; applicationId = "io.zxf.flowsplice.pty"; minSdk = 34; targetSdk = 37; versionCode = 1; versionName = "0.4.0" }
+    defaultConfig { testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"; applicationId = "io.zxf.flowsplice.pty"; minSdk = 34; targetSdk = 37; versionCode = 2; versionName = "0.4.0" }
     ndkVersion = "29.0.14206865"
     compileOptions { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
     if (privateBuild && System.getenv("FLOWSPLICE_PTY_DEBUG_KEYSTORE") != null) {

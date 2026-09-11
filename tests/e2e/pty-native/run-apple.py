@@ -121,7 +121,9 @@ with log.open("wb") as output:
     process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(configured),
         "-destination", destination, "-parallel-testing-enabled", "NO", "-resultBundlePath", str(result)],
         stdout=output, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + 900
+    # Full history gestures/OCR plus continuity can exceed fifteen minutes on a
+    # loaded simulator. Keep one supervisor alive for the entire bounded run.
+    deadline = time.monotonic() + 1800
     try:
         while process.poll() is None:
             if time.monotonic() > deadline:

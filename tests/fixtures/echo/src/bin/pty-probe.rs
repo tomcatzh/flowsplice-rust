@@ -1,4 +1,6 @@
 //! Real encrypted PTY acceptance against disposable, separately enrolled Travels.
+#[path = "pty-probe/compression.rs"]
+mod compression;
 use anyhow::{Context, Result, bail, ensure};
 use flowsplice_enrollment::load_json;
 use flowsplice_pty_client::{ConnectOptions, PtyClient};
@@ -120,7 +122,13 @@ impl Probe {
         })
         .await
         .with_context(|| format!("terminal marker timed out: {marker}"))?;
-        result.with_context(|| format!("waiting for terminal marker: {marker}"))
+        result.with_context(|| {
+            let tail = &self.output[self.output.len().saturating_sub(4096)..];
+            format!(
+                "waiting for terminal marker: {marker}; output tail: {:?}",
+                String::from_utf8_lossy(tail)
+            )
+        })
     }
     async fn writer(&mut self, session: Uuid, attachment: Uuid) -> Result<u64> {
         loop {
@@ -341,9 +349,17 @@ async fn exercise(args: &[String]) -> Result<()> {
         .await?,
     )?;
     ensure!(mode == Mode::ReadWrite, "new session was not writable");
+    compression::exercise(args, &mut a, sid, aid, epoch).await?;
+    // The wire scenario fills the display. Reset only the visible screen before
+    // the following raw-text assertion: tmux may otherwise split a correctly
+    // rendered Unicode marker across cursor-positioned redraw fragments.
+    // History remains intact; all 600 row numbers were checked in order above.
+    a.input(aid, epoch, "printf '\\033[2J\\033[H'\r").await?;
     let marker = format!("PTY-中文-{}", Uuid::new_v4());
     a.input(aid, epoch, &print_command(&marker)).await?;
-    a.text(&marker).await?;
+    a.text(&marker)
+        .await
+        .context("writer live output after Snappy exercise")?;
     let mut b = Probe::connect(&args[1], &args[2], &args[3], &args[4], "second").await?;
     ensure!(
         b.initial.len() == 1 && b.initial[0].id == sid,
@@ -362,7 +378,9 @@ async fn exercise(args: &[String]) -> Result<()> {
         mode == Mode::ReadOnly,
         "occupied session admitted a second writer"
     );
-    b.text(&marker).await?;
+    b.text(&marker)
+        .await
+        .context("observer initial screen after Snappy exercise")?;
     history_exercise(&mut a, &mut b, aid, bid, epoch).await?;
     ensure!(
         matches!(

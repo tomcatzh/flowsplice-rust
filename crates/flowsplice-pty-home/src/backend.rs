@@ -9,7 +9,7 @@ use flowsplice_core::{
 };
 use flowsplice_pty_protocol::{
     APPLICATION_PROTOCOL, ClientMessage, Operation, PROTOCOL_VERSION, Reply, ServerMessage,
-    read_message, write_message,
+    read_message, write_server_message,
 };
 use flowsplice_transport::{BoxStream, DatagramIo, IoFuture, ServicePeer, ServiceProvider};
 use serde::Deserialize;
@@ -465,7 +465,7 @@ async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Res
     };
     let responses = async {
         while let Some(message) = outgoing.recv().await {
-            write_message(&mut writer, &message).await?;
+            write_server_message(&mut writer, &message).await?;
         }
         Ok::<(), anyhow::Error>(())
     };

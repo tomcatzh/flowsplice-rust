@@ -1,4 +1,5 @@
 use super::*;
+use flowsplice_pty_protocol::read_message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 async fn pair() -> Result<(PtyClient, mpsc::Receiver<ServerMessage>, DuplexStream)> {

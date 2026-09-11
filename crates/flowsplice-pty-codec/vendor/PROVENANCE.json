@@ -1,0 +1,23 @@
+{
+  "upstream": "https://github.com/google/snappy",
+  "version": "1.2.2",
+  "archive_url": "https://codeload.github.com/google/snappy/tar.gz/refs/tags/1.2.2",
+  "archive_sha256": "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc",
+  "modifications": "None; subset needed for library build with tests/benchmarks disabled.",
+  "files": {
+    "CMakeLists.txt": "12c5c9a0cd918a6f1fc82008926403576d93be01e149657cb7328a4c0db5aa6e",
+    "COPYING": "55172044f7e241207117448a4d9d6ba1d0925c8ad66b5d4c08c70adfa9cc3de6",
+    "snappy.h": "b4c51fd24a03d09dc17a6ba517a243a06a83c71ce7841955972a83576318b315",
+    "snappy.cc": "614766218acd35f7cee9f2e91b56a0890cb218045044ebf026010ffc883cf344",
+    "snappy-c.cc": "bd06ca0e8243940aaee6c42cf13aa212870b9b1b7d036727fc636f02c37e797d",
+    "snappy-c.h": "205e85257ab386f547b024bfec7ab57fcdac95c34874c787c72b50a3d95debf4",
+    "snappy-internal.h": "a0337b8596cf7f49caa85dfdcc592261621a3007c800d6d66d95f076b7e1f505",
+    "snappy-sinksource.cc": "52c609f0fa9bea1dbb5dd1151b2536ee849b3e1e7fdb1380de8b08c4c74b748f",
+    "snappy-sinksource.h": "ba6308f8d64d670fbb068284096e2f4685e3919ed213a6de1a185aa3680203bb",
+    "snappy-stubs-internal.cc": "3652c4fe3d8606f6a444af65bd9e0521290dac17a8889d19aaa9f8c212978a24",
+    "snappy-stubs-internal.h": "016d3acd6d07890fc50347f04dcbe8dd7c2e281e15541f055f2f27b4868d7a8c",
+    "snappy-stubs-public.h.in": "67da16666a5cf54ddb57786871d100c2bc83cc908d0ef211a15c8c3c0b592a05",
+    "cmake/config.h.in": "b8ccb7c909eff63b37469a3348dd1cb474f45cc13efa458c31b9d94d0693cbfc",
+    "cmake/SnappyConfig.cmake.in": "62e8f0b89f28944dea8fdecd1e44547790b7b1f7d83127072c056f842b0c6300"
+  }
+}

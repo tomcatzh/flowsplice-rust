@@ -11,7 +11,7 @@ clap.workspace = true
 flowsplice-core.workspace = true
 flowsplice-home-core.workspace = true
 flowsplice-transport.workspace = true
-flowsplice-pty-protocol.workspace = true
+flowsplice-pty-protocol = { workspace = true, features = ["snappy-encode"] }
 portable-pty = "=0.9.0"
 filedescriptor = "=0.8.3"
 rustix.workspace = true

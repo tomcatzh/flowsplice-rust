@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+snappy-encode = ["flowsplice-pty-codec/encode"]
+
 [dependencies]
 anyhow.workspace = true
+flowsplice-pty-codec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

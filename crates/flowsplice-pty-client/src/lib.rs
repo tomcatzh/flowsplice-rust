@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use flowsplice_core::{business::BusinessDescriptor, protocol::ServiceProtocol};
 use flowsplice_pty_protocol::{
     APPLICATION_PROTOCOL, ClientMessage, Operation, PROTOCOL_VERSION, Reply, ServerMessage,
-    read_message, write_message,
+    read_server_message, write_message,
 };
 use flowsplice_travel_core::{ServiceBinding, TravelCore};
 use std::{
@@ -114,13 +114,13 @@ impl PtyClient {
             let hello = ClientMessage::Hello { version: PROTOCOL_VERSION, label };
             hello.validate()?;
             write_message(&mut stream, &hello).await?;
-            let hello: ServerMessage = read_message(&mut stream).await?.context("EOF before server Hello")?;
+            let hello = read_server_message(&mut stream).await?.context("EOF before server Hello")?;
             hello.validate()?;
             if !matches!(hello, ServerMessage::Hello { version: PROTOCOL_VERSION, .. }) { bail!("expected server Hello"); }
             events.try_send(hello)?;
             let request_id = Uuid::new_v4();
             write_message(&mut stream, &ClientMessage::Request { request_id, operation: Operation::List }).await?;
-            let response: ServerMessage = read_message(&mut stream).await?.context("EOF before session list")?;
+            let response = read_server_message(&mut stream).await?.context("EOF before session list")?;
             response.validate()?;
             if !matches!(&response, ServerMessage::Response { request_id: id, result: Reply::Sessions { .. } } if *id == request_id) { bail!("expected matching session list response"); }
             events.try_send(response)?;
@@ -229,7 +229,7 @@ async fn run<S>(
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let receive = async {
-        while let Some(message) = read_message::<ServerMessage>(&mut reader).await? {
+        while let Some(message) = read_server_message(&mut reader).await? {
             message.validate()?;
             if let ServerMessage::Response { request_id, .. } = &message {
                 let mut pending = pending

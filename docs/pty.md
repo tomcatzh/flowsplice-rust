@@ -11,6 +11,30 @@ preserve connections. After suspension or application restart, saved connection
 intent restores the selected Homes and original terminal tabs automatically.
 The generic Travel applications retain their existing forwarding and background behavior.
 
+## Snappy compression
+
+Home compresses terminal output and history pages with official Snappy 1.2.2
+Level 1. Each serialized message is independent: bodies below 512 bytes bypass
+the encoder, and larger bodies retain Snappy only when it produces fewer bytes.
+Client input, enrollment and session-control messages remain uncompressed.
+There are no algorithm selectors, dictionaries or extra user configuration.
+Mobile and desktop clients share the bounded decoder; only Home enables encoding.
+Compression policy lives in the PTY crates, outside the generic encrypted socket
+transport. The upstream license ships in each native package's third-party notices.
+
+The PTY Hello/framing version is now 2, requiring a coordinated Home/client update.
+There is no old-frame fallback. The signed service identifier `flowsplice.pty.v1`
+is retained independently of the Hello version, so this codec update does not
+require new service grants, certificates or configuration formats.
+
+An application frame contains a four-byte big-endian length, one encoding byte
+(0 for raw JSON, 1 for raw Snappy-compressed JSON), and the body. The length counts
+the encoding byte and body and is capped at 128 KiB + 1. Decoded JSON remains
+capped at 128 KiB. Unknown encodings, compressed upstream/control messages,
+truncation and malformed or oversized compressed blocks fail the connection.
+The Snappy declared output length is checked before allocation. Every independent
+block is inside the authenticated business stream; Snappy adds no authentication.
+
 ## Terminal scrollback
 
 Scroll upward with the mouse/trackpad, drag downward on a touch screen, or use

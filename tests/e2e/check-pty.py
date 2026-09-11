@@ -85,6 +85,9 @@ def execute(run, business_home, alpha, root, scope):
     def probe(label, arguments):
         result = run.finish(run.start(label, "flowsplice-pty-probe", arguments))
         require("encrypted-pty" in result or arguments[0] == "empty", "PTY checkpoint missing")
+        if arguments[0] == "exercise":
+            require("encrypted-pty-snappy-wire-complete" in result, "compressed PTY wire proof missing")
+            run.passed.append("pty-snappy-output-history-wire")
     home_start()
     base = ["/business/travel/travelagent.toml", "/business/password.txt", root, alpha]
     try:

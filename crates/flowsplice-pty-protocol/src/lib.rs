@@ -1,12 +1,19 @@
 //! Bounded application framing and schemas for `FlowSplice` PTY sessions.
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod framing;
+#[cfg(feature = "snappy-encode")]
+pub use framing::write_server_message;
+pub use framing::{MIN_SNAPPY_BYTES, read_message, read_server_message, write_message};
+
+// This is the stable signed business-service identifier, independent of the
+// framing/Hello version below. Compression does not reissue business grants.
 pub const APPLICATION_PROTOCOL: &str = "flowsplice.pty.v1";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
+pub const MAX_WIRE_FRAME_BYTES: usize = MAX_FRAME_BYTES + 1;
 pub const MAX_HISTORY_LINES: u32 = 50_256;
 pub const MAX_HISTORY_PAGE_LINES: usize = 256;
 pub const MAX_HISTORY_PAGE_BYTES: usize = 96 * 1024;
@@ -574,47 +581,6 @@ impl ServerMessage {
     }
 }
 
-/// Read one JSON frame; only EOF before the first header byte is a clean end.
-/// This function does not invoke schema-specific validation.
-///
-/// # Errors
-/// Returns truncated header/body, invalid length, I/O or JSON errors.
-pub async fn read_message<T: DeserializeOwned>(
-    reader: &mut (impl AsyncRead + Unpin),
-) -> Result<Option<T>> {
-    let mut header = [0_u8; 4];
-    if reader.read(&mut header[..1]).await? == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut header[1..]).await?;
-    let length = usize::try_from(u32::from_be_bytes(header))?;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        bail!("invalid PTY frame length");
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).await?;
-    Ok(Some(serde_json::from_slice(&body)?))
-}
-/// Serialize and flush one bounded JSON frame, without schema-specific validation.
-///
-/// # Errors
-/// Returns serialization, invalid length or I/O errors.
-pub async fn write_message<T: Serialize>(
-    writer: &mut (impl AsyncWrite + Unpin),
-    message: &T,
-) -> Result<()> {
-    let body = serde_json::to_vec(message)?;
-    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
-        bail!("invalid PTY frame length");
-    }
-    writer
-        .write_all(&u32::try_from(body.len())?.to_be_bytes())
-        .await?;
-    writer.write_all(&body).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,7 +624,7 @@ mod tests {
             data: (0..=255).collect(),
         };
         let next = ServerMessage::Hello {
-            version: 1,
+            version: PROTOCOL_VERSION,
             can_write: false,
         };
         let mut wire = Vec::new();
@@ -711,21 +677,21 @@ mod tests {
     #[test]
     fn client_validation_bounds() -> Result<()> {
         ClientMessage::Hello {
-            version: 1,
+            version: PROTOCOL_VERSION,
             label: "é".repeat(32),
         }
         .validate()?;
         for message in [
             ClientMessage::Hello {
-                version: 2,
+                version: PROTOCOL_VERSION + 1,
                 label: String::new(),
             },
             ClientMessage::Hello {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 label: "é".repeat(33),
             },
             ClientMessage::Hello {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 label: "line\n".into(),
             },
             ClientMessage::Request {

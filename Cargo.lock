@@ -706,6 +706,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowsplice-pty-codec"
+version = "0.4.0"
+dependencies = [
+ "cc",
+ "cmake",
+]
+
+[[package]]
 name = "flowsplice-pty-home"
 version = "0.4.0"
 dependencies = [
@@ -749,6 +757,7 @@ name = "flowsplice-pty-protocol"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "flowsplice-pty-codec",
  "serde",
  "serde_json",
  "tokio",

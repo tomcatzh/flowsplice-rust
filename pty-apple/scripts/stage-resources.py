@@ -54,6 +54,9 @@ ui = output / 'pty-ui'
 if ui.exists():
     shutil.rmtree(ui)
 shutil.copytree(repo / 'pty-web/dist', ui)
+notices = output / 'ThirdPartyNotices'
+notices.mkdir(exist_ok=True)
+shutil.copyfile(repo / 'crates/flowsplice-pty-codec/vendor/snappy/COPYING', notices / 'Snappy.txt')
 bootstrap = output / 'bootstrap'
 if bootstrap.exists():
     shutil.rmtree(bootstrap)

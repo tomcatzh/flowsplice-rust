@@ -82,7 +82,7 @@ xcodebuild -project "${project}" -scheme FlowSplicePTY-iOSUITests \
   CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- build-for-testing >"${output_dir}/ios-build.log" 2>&1
 # Ad hoc signatures are authorized for isolated tests only; distribution remains notarized.
 xcodebuild -project "${project}" -scheme FlowSplicePTY-macOSUITests \
-  -configuration Debug -sdk macosx -destination 'platform=macOS,arch=arm64' \
+  -configuration Release -sdk macosx -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "${output_dir}/macos-derived-data" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
   CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- build-for-testing >"${output_dir}/macos-build.log" 2>&1
 python3 - "${fixture_dir}" "${output_dir}" <<'PY'
@@ -103,7 +103,7 @@ if re.fullmatch(r'io\.zxf\.flowsplice\.pty\.macos\.e2e\.[0-9a-f]{32}', macos_ide
 manifest = {'version': 1, 'bootstrap': configuration, 'platforms': {}}
 for platform, build_configuration, identifier in [
     ('ios', 'Debug-iphonesimulator', 'io.zxf.flowsplice.pty'),
-    ('macos', 'Debug', macos_identifier),
+    ('macos', 'Release', macos_identifier),
 ]:
     products = output / f'{platform}-derived-data/Build/Products'
     app = products / build_configuration / 'FlowSplicePTY.app'
