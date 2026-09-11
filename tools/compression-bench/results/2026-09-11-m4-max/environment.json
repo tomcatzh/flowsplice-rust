@@ -1,0 +1,151 @@
+{
+  "before": {
+    "machine": "arm64",
+    "system": "Darwin",
+    "release": "25.6.0",
+    "logical_cpu_count": 16,
+    "load_averages": [
+      4.2099609375,
+      4.98876953125,
+      4.46728515625
+    ],
+    "rustc": {
+      "command": [
+        "rustc",
+        "-Vv"
+      ],
+      "exit_code": 0,
+      "stdout": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6",
+      "stderr": ""
+    },
+    "clang": {
+      "command": [
+        "clang",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stdout": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+      "stderr": ""
+    },
+    "macos": {
+      "command": [
+        "sw_vers"
+      ],
+      "exit_code": 0,
+      "stdout": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+      "stderr": ""
+    },
+    "cpu": {
+      "command": [
+        "sysctl",
+        "-n",
+        "machdep.cpu.brand_string"
+      ],
+      "exit_code": 0,
+      "stdout": "Apple M4 Max",
+      "stderr": ""
+    },
+    "memory_bytes": {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.memsize"
+      ],
+      "exit_code": 0,
+      "stdout": "137438953472",
+      "stderr": ""
+    },
+    "power": {
+      "command": [
+        "pmset",
+        "-g",
+        "batt"
+      ],
+      "exit_code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t78%; AC attached; not charging present: true",
+      "stderr": ""
+    }
+  },
+  "after": {
+    "machine": "arm64",
+    "system": "Darwin",
+    "release": "25.6.0",
+    "logical_cpu_count": 16,
+    "load_averages": [
+      4.8525390625,
+      5.42822265625,
+      4.84716796875
+    ],
+    "rustc": {
+      "command": [
+        "rustc",
+        "-Vv"
+      ],
+      "exit_code": 0,
+      "stdout": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6",
+      "stderr": ""
+    },
+    "clang": {
+      "command": [
+        "clang",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stdout": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+      "stderr": ""
+    },
+    "macos": {
+      "command": [
+        "sw_vers"
+      ],
+      "exit_code": 0,
+      "stdout": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+      "stderr": ""
+    },
+    "cpu": {
+      "command": [
+        "sysctl",
+        "-n",
+        "machdep.cpu.brand_string"
+      ],
+      "exit_code": 0,
+      "stdout": "Apple M4 Max",
+      "stderr": ""
+    },
+    "memory_bytes": {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.memsize"
+      ],
+      "exit_code": 0,
+      "stdout": "137438953472",
+      "stderr": ""
+    },
+    "power": {
+      "command": [
+        "pmset",
+        "-g",
+        "batt"
+      ],
+      "exit_code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t78%; AC attached; not charging present: true",
+      "stderr": ""
+    }
+  },
+  "git_revision": "165c1338408277e00ecd5ee17d941ce972a21dd5",
+  "source_sha256": {
+    "Cargo.toml": "fd58930ab16aac78028b11e1d660d87422ced188a3c6be757302a00eb3d6139d",
+    "Cargo.lock": "8d326adae4a2cd144b01ca3de9d0e20c07e0166c5b2cda83edddc4fcd66ed5a5",
+    "build.rs": "f093a6003bc9346877e1925b66796d24efd86513441d2dafc9f06420c430f583",
+    "native.cc": "08fb612fa341e646c5335bd424e5317d64c8a77a58e56b0d339821f1eed1b46c",
+    "src/main.rs": "58f2f70fa8929a94b7f5a68d4e1191889f43347afe2797a49c69ba7b4ac66288",
+    "src/corpus.rs": "3cf892522343c59cdfe002bd0932302c6162904de54d71688af5ec2c747425ed",
+    "prepare_native.py": "db131f6b682031fb1a8910916a64181464c57d1d5488596a2b607f3a4c892787"
+  },
+  "binary_sha256": "30218d659f3d608cbf5cd447f27e9b396f6dfddd548aa3408b75b6757efc4c10",
+  "started_unix_seconds": 1789111181.360162,
+  "completed": true,
+  "exit_code": 0,
+  "finished_unix_seconds": 1789111431.157652
+}

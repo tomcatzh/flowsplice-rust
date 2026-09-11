@@ -1,0 +1,121 @@
+{
+  "sources": [
+    {
+      "name": "snappy",
+      "version": "1.2.2",
+      "url": "https://codeload.github.com/google/snappy/tar.gz/refs/tags/1.2.2",
+      "sha256": "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc"
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.7",
+      "url": "https://codeload.github.com/facebook/zstd/tar.gz/refs/tags/v1.5.7",
+      "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3"
+    },
+    {
+      "name": "lz4",
+      "version": "1.10.0",
+      "url": "https://codeload.github.com/lz4/lz4/tar.gz/refs/tags/v1.10.0",
+      "sha256": "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b"
+    }
+  ],
+  "commands": [
+    [
+      "cmake",
+      "-S",
+      "/private/tmp/flowsplice-compression-bench/native/snappy-1.2.2",
+      "-B",
+      "/private/tmp/flowsplice-compression-bench/native/snappy-build",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DSNAPPY_BUILD_TESTS=OFF",
+      "-DSNAPPY_BUILD_BENCHMARKS=OFF",
+      "-DBUILD_SHARED_LIBS=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/private/tmp/flowsplice-compression-bench/native/snappy-build",
+      "--parallel",
+      "4"
+    ],
+    [
+      "cmake",
+      "-S",
+      "/private/tmp/flowsplice-compression-bench/native/zstd-1.5.7/build/cmake",
+      "-B",
+      "/private/tmp/flowsplice-compression-bench/native/zstd-build",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DZSTD_BUILD_PROGRAMS=OFF",
+      "-DZSTD_BUILD_TESTS=OFF",
+      "-DZSTD_BUILD_SHARED=OFF",
+      "-DZSTD_MULTITHREAD_SUPPORT=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/private/tmp/flowsplice-compression-bench/native/zstd-build",
+      "--target",
+      "libzstd_static",
+      "--parallel",
+      "4"
+    ],
+    [
+      "cc",
+      "-O3",
+      "-DNDEBUG",
+      "-c",
+      "/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib/lz4.c",
+      "-o",
+      "/private/tmp/flowsplice-compression-bench/native/lz4.o"
+    ],
+    [
+      "cc",
+      "-O3",
+      "-DNDEBUG",
+      "-c",
+      "/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib/lz4hc.c",
+      "-o",
+      "/private/tmp/flowsplice-compression-bench/native/lz4hc.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/private/tmp/flowsplice-compression-bench/native/lib/liblz4.a",
+      "/private/tmp/flowsplice-compression-bench/native/lz4.o",
+      "/private/tmp/flowsplice-compression-bench/native/lz4hc.o"
+    ],
+    [
+      "c++",
+      "-std=c++17",
+      "-O3",
+      "-DNDEBUG",
+      "-I/private/tmp/flowsplice-compression-bench/native/snappy-1.2.2",
+      "-I/private/tmp/flowsplice-compression-bench/native/snappy-build",
+      "-I/private/tmp/flowsplice-compression-bench/native/zstd-1.5.7/lib",
+      "-I/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib",
+      "-c",
+      "/Users/tomcat/my-apps/flowsplice-rust/.worktrees/0.4.0/tools/compression-bench/native.cc",
+      "-o",
+      "/private/tmp/flowsplice-compression-bench/native/bench_native.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/private/tmp/flowsplice-compression-bench/native/lib/libbench_native.a",
+      "/private/tmp/flowsplice-compression-bench/native/bench_native.o"
+    ]
+  ],
+  "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+  "archives": {
+    "libsnappy.a": "9e13b20be815c0605381a7df132e69dc5030bdf7e656778df55d5b53d87d0f85",
+    "libbench_native.a": "7b12d65253d72c1226cd2113b5e004d8f1848d2df1e99388de8e69ed007c9809",
+    "liblz4.a": "4ebbb1feb343abde2774fd221f36558a310f0642a4a7933e1b2e95f42fde5103",
+    "libzstd.a": "d5137bbd54e6cb0526679f141667b6feea022ffc78287295a8d0fd78ee9890a1"
+  }
+}

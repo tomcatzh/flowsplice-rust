@@ -1,0 +1,445 @@
+{
+  "xcode": "Xcode 26.6\nBuild version 17F113",
+  "sdks": "DriverKit SDKs:\n\tDriverKit 25.5                \t-sdk driverkit25.5\n\niOS SDKs:\n\tiOS 26.5                      \t-sdk iphoneos26.5\n\niOS Simulator SDKs:\n\tSimulator - iOS 26.5          \t-sdk iphonesimulator26.5\n\nmacOS SDKs:\n\tmacOS 26.5                    \t-sdk macosx26.5\n\tmacOS 26.5                    \t-sdk macosx26.5\n\ntvOS SDKs:\n\ttvOS 26.5                     \t-sdk appletvos26.5\n\ntvOS Simulator SDKs:\n\tSimulator - tvOS 26.5         \t-sdk appletvsimulator26.5\n\nvisionOS SDKs:\n\tvisionOS 26.5                 \t-sdk xros26.5\n\nvisionOS Simulator SDKs:\n\tSimulator - visionOS 26.5     \t-sdk xrsimulator26.5\n\nwatchOS SDKs:\n\twatchOS 26.5                  \t-sdk watchos26.5\n\nwatchOS Simulator SDKs:\n\tSimulator - watchOS 26.5      \t-sdk watchsimulator26.5",
+  "ndk": "Pkg.Desc = Android NDK\nPkg.Revision = 29.0.14206865\nPkg.BaseRevision = 29.0.14206865\nPkg.ReleaseName = r29\n",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6",
+  "installed_rust_targets": [
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "aarch64-linux-android",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-linux-android",
+    "x86_64-unknown-linux-musl"
+  ],
+  "targets": [
+    {
+      "name": "ios-arm64",
+      "rust_target": "aarch64-apple-ios",
+      "sdk": "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk",
+      "sdk_version": "26.5",
+      "deployment_target": "17.0",
+      "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+      "archives": {
+        "libbench_native.a": {
+          "sha256": "9caff530b8d504a4b42fb03bb87da2c33e64807a4f99b638058cf356b53753de",
+          "architecture": "arm64"
+        },
+        "libsnappy.a": {
+          "sha256": "04fca907d64dbf4e2717af4ab71a2bab695fdc17dab45b1d05c1a3cb4d327799",
+          "architecture": "arm64"
+        },
+        "libzstd.a": {
+          "sha256": "124fb28aaf4a71ab84d17ed18d7d04183cac2569254a5ead6dd0e7b6c9150535",
+          "architecture": "arm64"
+        },
+        "liblz4.a": {
+          "sha256": "7ed164bfd4f7ee48f031ef1cee1c7bde61254f094161c01d5f055a0e0ae2dc01",
+          "architecture": "arm64"
+        }
+      },
+      "linked_binary": "/private/tmp/flowsplice-compression-cross/ios-arm64/link-probe: Mach-O 64-bit executable arm64",
+      "load_commands": "/private/tmp/flowsplice-compression-cross/ios-arm64/link-probe:\nLoad command 0\n      cmd LC_SEGMENT_64\n  cmdsize 72\n  segname __PAGEZERO\n   vmaddr 0x0000000000000000\n   vmsize 0x0000000100000000\n  fileoff 0\n filesize 0\n  maxprot 0x00000000\n initprot 0x00000000\n   nsects 0\n    flags 0x0\nLoad command 1\n      cmd LC_SEGMENT_64\n  cmdsize 472\n  segname __TEXT\n   vmaddr 0x0000000100000000\n   vmsize 0x0000000000028000\n  fileoff 0\n filesize 163840\n  maxprot 0x00000005\n initprot 0x00000005\n   nsects 5\n    flags 0x0\nSection\n  sectname __text\n   segname __TEXT\n      addr 0x0000000100004000\n      size 0x0000000000020664\n    offset 16384\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x80000400\n reserved1 0\n reserved2 0\nSection\n  sectname __stubs\n   segname __TEXT\n      addr 0x0000000100024664\n      size 0x000000000000006c\n    offset 149092\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x80000408\n reserved1 0 (index into indirect symbol table)\n reserved2 12 (size of stubs)\nSection\n  sectname __cstring\n   segname __TEXT\n      addr 0x00000001000246d0\n      size 0x0000000000000023\n    offset 149200\n     align 2^0 (1)\n    reloff 0\n    nreloc 0\n     flags 0x00000002\n reserved1 0\n reserved2 0\nSection\n  sectname __const\n   segname __TEXT\n      addr 0x0000000100024700\n      size 0x0000000000002060\n    offset 149248\n     align 2^6 (64)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nSection\n  sectname __unwind_info\n   segname __TEXT\n      addr 0x0000000100026760\n      size 0x0000000000000228\n    offset 157536\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nLoad command 2\n      cmd LC_SEGMENT_64\n  cmdsize 232\n  segname __DATA_CONST\n   vmaddr 0x0000000100028000\n   vmsize 0x0000000000004000\n  fileoff 163840\n filesize 16384\n  maxprot 0x00000003\n initprot 0x00000003\n   nsects 2\n    flags 0x10\nSection\n  sectname __got\n   segname __DATA_CONST\n      addr 0x0000000100028000\n      size 0x0000000000000058\n    offset 163840\n     align 2^3 (8)\n    reloff 0\n    nreloc 0\n     flags 0x00000006\n reserved1 9 (index into indirect symbol table)\n reserved2 0\nSection\n  sectname __const\n   segname __DATA_CONST\n      addr 0x0000000100028058\n      size 0x0000000000000080\n    offset 163928\n     align 2^3 (8)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nLoad command 3\n      cmd LC_SEGMENT_64\n  cmdsize 72\n  segname __LINKEDIT\n   vmaddr 0x000000010002c000\n   vmsize 0x0000000000004000\n  fileoff 180224\n filesize 12352\n  maxprot 0x00000001\n initprot 0x00000001\n   nsects 0\n    flags 0x0\nLoad command 4\n      cmd LC_DYLD_CHAINED_FIXUPS\n  cmdsize 16\n  dataoff 180224\n datasize 256\nLoad command 5\n      cmd LC_DYLD_EXPORTS_TRIE\n  cmdsize 16\n  dataoff 180480\n datasize 2464\nLoad command 6\n     cmd LC_SYMTAB\n cmdsize 24\n  symoff 183200\n   nsyms 228\n  stroff 186928\n strsize 5648\nLoad command 7\n            cmd LC_DYSYMTAB\n        cmdsize 80\n      ilocalsym 0\n      nlocalsym 118\n     iextdefsym 118\n     nextdefsym 99\n      iundefsym 217\n      nundefsym 11\n         tocoff 0\n           ntoc 0\n      modtaboff 0\n        nmodtab 0\n   extrefsymoff 0\n    nextrefsyms 0\n indirectsymoff 186848\n  nindirectsyms 20\n      extreloff 0\n        nextrel 0\n      locreloff 0\n        nlocrel 0\nLoad command 8\n          cmd LC_LOAD_DYLINKER\n      cmdsize 32\n         name /usr/lib/dyld (offset 12)\nLoad command 9\n     cmd LC_UUID\n cmdsize 24\n    uuid 388A6DD1-EE61-3D27-A6CA-A398CCB887C6\nLoad command 10\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform 2\n    minos 17.0\n      sdk 26.5\n   ntools 1\n     tool 3\n  version 1267.0\nLoad command 11\n      cmd LC_SOURCE_VERSION\n  cmdsize 16\n  version 0.0\nLoad command 12\n       cmd LC_MAIN\n   cmdsize 24\n  entryoff 16384\n stacksize 0\nLoad command 13\n          cmd LC_ENCRYPTION_INFO_64\n      cmdsize 24\n     cryptoff 16384\n    cryptsize 147456\n      cryptid 0\n          pad 0\nLoad command 14\n          cmd LC_LOAD_DYLIB\n      cmdsize 48\n         name /usr/lib/libc++.1.dylib (offset 24)\n   time stamp 2 Thu Jan  1 08:00:02 1970\n      current version 2100.43.0\ncompatibility version 1.0.0\nLoad command 15\n          cmd LC_LOAD_DYLIB\n      cmdsize 56\n         name /usr/lib/libSystem.B.dylib (offset 24)\n   time stamp 2 Thu Jan  1 08:00:02 1970\n      current version 1356.0.0\ncompatibility version 1.0.0\nLoad command 16\n      cmd LC_FUNCTION_STARTS\n  cmdsize 16\n  dataoff 182944\n datasize 256\nLoad command 17\n      cmd LC_DATA_IN_CODE\n  cmdsize 16\n  dataoff 183200\n datasize 0",
+      "status": "compiled and linked; not executed"
+    },
+    {
+      "name": "ios-simulator-arm64",
+      "rust_target": "aarch64-apple-ios-sim",
+      "sdk": "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk",
+      "sdk_version": "26.5",
+      "deployment_target": "17.0",
+      "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+      "archives": {
+        "libbench_native.a": {
+          "sha256": "dae705713b323c4fb48ea20862602d3ea90510317cd97db102341538bfbf1b26",
+          "architecture": "arm64"
+        },
+        "libsnappy.a": {
+          "sha256": "556b1d65f568e7069fa4c64a23871cf5c455af6491782e80fc7074f137048715",
+          "architecture": "arm64"
+        },
+        "libzstd.a": {
+          "sha256": "4e4d8d7585042739a0ad0059b9ec653ebe84261f8e78707a191f8b194473c431",
+          "architecture": "arm64"
+        },
+        "liblz4.a": {
+          "sha256": "b0793bcf8597466b67d5bcc811e12d18ab9bdf03a6a61745869cce66a21865b7",
+          "architecture": "arm64"
+        }
+      },
+      "linked_binary": "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/link-probe: Mach-O 64-bit executable arm64",
+      "load_commands": "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/link-probe:\nLoad command 0\n      cmd LC_SEGMENT_64\n  cmdsize 72\n  segname __PAGEZERO\n   vmaddr 0x0000000000000000\n   vmsize 0x0000000100000000\n  fileoff 0\n filesize 0\n  maxprot 0x00000000\n initprot 0x00000000\n   nsects 0\n    flags 0x0\nLoad command 1\n      cmd LC_SEGMENT_64\n  cmdsize 472\n  segname __TEXT\n   vmaddr 0x0000000100000000\n   vmsize 0x0000000000024000\n  fileoff 0\n filesize 147456\n  maxprot 0x00000005\n initprot 0x00000005\n   nsects 5\n    flags 0x0\nSection\n  sectname __text\n   segname __TEXT\n      addr 0x0000000100000548\n      size 0x0000000000020c90\n    offset 1352\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x80000400\n reserved1 0\n reserved2 0\nSection\n  sectname __stubs\n   segname __TEXT\n      addr 0x00000001000211d8\n      size 0x000000000000006c\n    offset 135640\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x80000408\n reserved1 0 (index into indirect symbol table)\n reserved2 12 (size of stubs)\nSection\n  sectname __cstring\n   segname __TEXT\n      addr 0x0000000100021244\n      size 0x0000000000000023\n    offset 135748\n     align 2^0 (1)\n    reloff 0\n    nreloc 0\n     flags 0x00000002\n reserved1 0\n reserved2 0\nSection\n  sectname __const\n   segname __TEXT\n      addr 0x0000000100021280\n      size 0x0000000000002060\n    offset 135808\n     align 2^6 (64)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nSection\n  sectname __unwind_info\n   segname __TEXT\n      addr 0x00000001000232e0\n      size 0x0000000000000228\n    offset 144096\n     align 2^2 (4)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nLoad command 2\n      cmd LC_SEGMENT_64\n  cmdsize 232\n  segname __DATA_CONST\n   vmaddr 0x0000000100024000\n   vmsize 0x0000000000004000\n  fileoff 147456\n filesize 16384\n  maxprot 0x00000003\n initprot 0x00000003\n   nsects 2\n    flags 0x10\nSection\n  sectname __got\n   segname __DATA_CONST\n      addr 0x0000000100024000\n      size 0x0000000000000050\n    offset 147456\n     align 2^3 (8)\n    reloff 0\n    nreloc 0\n     flags 0x00000006\n reserved1 9 (index into indirect symbol table)\n reserved2 0\nSection\n  sectname __const\n   segname __DATA_CONST\n      addr 0x0000000100024050\n      size 0x0000000000000080\n    offset 147536\n     align 2^3 (8)\n    reloff 0\n    nreloc 0\n     flags 0x00000000\n reserved1 0\n reserved2 0\nLoad command 3\n      cmd LC_SEGMENT_64\n  cmdsize 72\n  segname __LINKEDIT\n   vmaddr 0x0000000100028000\n   vmsize 0x0000000000004000\n  fileoff 163840\n filesize 13848\n  maxprot 0x00000001\n initprot 0x00000001\n   nsects 0\n    flags 0x0\nLoad command 4\n      cmd LC_DYLD_CHAINED_FIXUPS\n  cmdsize 16\n  dataoff 163840\n datasize 232\nLoad command 5\n      cmd LC_DYLD_EXPORTS_TRIE\n  cmdsize 16\n  dataoff 164072\n datasize 2440\nLoad command 6\n     cmd LC_SYMTAB\n cmdsize 24\n  symoff 166768\n   nsyms 228\n  stroff 170496\n strsize 5656\nLoad command 7\n            cmd LC_DYSYMTAB\n        cmdsize 80\n      ilocalsym 0\n      nlocalsym 119\n     iextdefsym 119\n     nextdefsym 99\n      iundefsym 218\n      nundefsym 10\n         tocoff 0\n           ntoc 0\n      modtaboff 0\n        nmodtab 0\n   extrefsymoff 0\n    nextrefsyms 0\n indirectsymoff 170416\n  nindirectsyms 19\n      extreloff 0\n        nextrel 0\n      locreloff 0\n        nlocrel 0\nLoad command 8\n          cmd LC_LOAD_DYLINKER\n      cmdsize 32\n         name /usr/lib/dyld (offset 12)\nLoad command 9\n     cmd LC_UUID\n cmdsize 24\n    uuid 3CDB2108-B126-3E83-89CD-A215187DC446\nLoad command 10\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform 7\n    minos 17.0\n      sdk 26.5\n   ntools 1\n     tool 3\n  version 1267.0\nLoad command 11\n      cmd LC_SOURCE_VERSION\n  cmdsize 16\n  version 0.0\nLoad command 12\n       cmd LC_MAIN\n   cmdsize 24\n  entryoff 1352\n stacksize 0\nLoad command 13\n          cmd LC_LOAD_DYLIB\n      cmdsize 48\n         name /usr/lib/libc++.1.dylib (offset 24)\n   time stamp 2 Thu Jan  1 08:00:02 1970\n      current version 2100.43.0\ncompatibility version 1.0.0\nLoad command 14\n          cmd LC_LOAD_DYLIB\n      cmdsize 56\n         name /usr/lib/libSystem.B.dylib (offset 24)\n   time stamp 2 Thu Jan  1 08:00:02 1970\n      current version 1356.0.0\ncompatibility version 1.0.0\nLoad command 15\n      cmd LC_FUNCTION_STARTS\n  cmdsize 16\n  dataoff 166512\n datasize 256\nLoad command 16\n      cmd LC_DATA_IN_CODE\n  cmdsize 16\n  dataoff 166768\n datasize 0\nLoad command 17\n      cmd LC_CODE_SIGNATURE\n  cmdsize 16\n  dataoff 176160\n datasize 1528",
+      "status": "compiled and linked; not executed"
+    },
+    {
+      "name": "android-arm64-v8a",
+      "rust_target": "aarch64-linux-android",
+      "api": 34,
+      "abi": "arm64-v8a",
+      "compiler": "Android (13989888, +pgo, -bolt, +lto, -mlgo, based on r563880c) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f06077099aa41290cdb4c5e6fa0f59349)\nTarget: aarch64-unknown-linux-android34\nThread model: posix\nInstalledDir: /Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin",
+      "archives": {
+        "libbench_native.a": {
+          "sha256": "94a202996c95a84d0ea18aa6d67332f564a74d9726cf28b39552cea361d2bf82",
+          "architecture": "File: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/libbench_native.a(native.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x1180\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 10\n  StringTableSectionIndex: 1\n}"
+        },
+        "libsnappy.a": {
+          "sha256": "ba90521dfc6f7885cb1a0ed178b6fc7796754820ade94cb221bce79581c55e91",
+          "architecture": "File: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a(snappy-c.cc.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x9200\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 28\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a(snappy-sinksource.cc.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x54E0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 46\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a(snappy-stubs-internal.cc.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x8190\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 17\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a(snappy.cc.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x71FD8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 158\n  StringTableSectionIndex: 1\n}"
+        },
+        "libzstd.a": {
+          "sha256": "7f112ee9dcab1bdb224c27df4d19fe7c020cff9f8ae5fac67b8ac9ce87bde70a",
+          "architecture": "File: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(debug.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x598\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 12\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(entropy_common.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x8098\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 33\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(error_private.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x2930\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 19\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(fse_decompress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0xFE40\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 28\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(pool.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x1DE8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 29\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(threading.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x5C8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 12\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(xxhash.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0xD4D0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 47\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_common.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x2058\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 28\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(fse_compress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x10C28\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 35\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(hist.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x86E8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 32\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(huf_compress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x2C3D0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 50\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_compress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0xD2FF8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 300\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_compress_literals.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x5228\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 23\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_compress_sequences.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x13B08\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 31\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_compress_superblock.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x15098\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 28\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_double_fast.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x7A170\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 29\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_fast.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x85CD8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 29\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_lazy.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x28DD00\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 189\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_ldm.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x15E38\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 32\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_opt.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x89578\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 78\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_preSplit.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x64D0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 31\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstdmt_compress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x26C50\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 40\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(huf_decompress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x54788\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 49\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_ddict.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x8AE0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 34\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_decompress.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x39E90\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 147\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_decompress_block.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x56970\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 61\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(cover.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x1BF88\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 57\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(divsufsort.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x28648\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 31\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(fastcover.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x10CC8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 31\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zdict.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x231D0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 40\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v01.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x30730\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 42\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v02.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x542D8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 58\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v03.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x41618\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 52\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v04.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x49278\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 68\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v05.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x56AF8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 117\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v06.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x5A3E0\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 123\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a(zstd_v07.c.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x69F18\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 171\n  StringTableSectionIndex: 1\n}"
+        },
+        "liblz4.a": {
+          "sha256": "f1c74f83444c769a8c3cd6d0d823c5442877eab1d0ca6dba037459fd7d1b38ae",
+          "architecture": "File: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/liblz4.a(lz4.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0x117E8\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 11\n  StringTableSectionIndex: 1\n}\n\nFile: /private/tmp/flowsplice-compression-cross/android-arm64-v8a/liblz4.a(lz4hc.o)\nFormat: elf64-littleaarch64\nArch: aarch64\nAddressSize: 64bit\nLoadName: <Not found>\nElfHeader {\n  Ident {\n    Magic: (7F 45 4C 46)\n    Class: 64-bit (0x2)\n    DataEncoding: LittleEndian (0x1)\n    FileVersion: 1\n    OS/ABI: SystemV (0x0)\n    ABIVersion: 0\n    Unused: (00 00 00 00 00 00 00)\n  }\n  Type: Relocatable (0x1)\n  Machine: EM_AARCH64 (0xB7)\n  Version: 1\n  Entry: 0x0\n  ProgramHeaderOffset: 0x0\n  SectionHeaderOffset: 0xFC78\n  Flags [ (0x0)\n  ]\n  HeaderSize: 64\n  ProgramHeaderEntrySize: 0\n  ProgramHeaderCount: 0\n  SectionHeaderEntrySize: 64\n  SectionHeaderCount: 12\n  StringTableSectionIndex: 1\n}"
+        }
+      },
+      "linked_binary": "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/link-probe: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /system/bin/linker64, with debug_info, not stripped",
+      "load_commands": "ELF Header:\n  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00\n  Class:                             ELF64\n  Data:                              2's complement, little endian\n  Version:                           1 (current)\n  OS/ABI:                            UNIX - System V\n  ABI Version:                       0\n  Type:                              DYN (Shared object file)\n  Machine:                           AArch64\n  Version:                           0x1\n  Entry point address:               0x130B8\n  Start of program headers:          64 (bytes into file)\n  Start of section headers:          3794744 (bytes into file)\n  Flags:                             0x0\n  Size of this header:               64 (bytes)\n  Size of program headers:           56 (bytes)\n  Number of program headers:         12\n  Size of section headers:           64 (bytes)\n  Number of section headers:         38\n  Section header string table index: 36\nDynamic section at offset 0x60b28 contains 27 entries:\n  Tag                Type              Name/Value\n  0x0000000000000001 (NEEDED)          Shared library: [libdl.so]\n  0x0000000000000001 (NEEDED)          Shared library: [libm.so]\n  0x0000000000000001 (NEEDED)          Shared library: [libc.so]\n  0x000000000000001e (FLAGS)           BIND_NOW \n  0x000000006ffffffb (FLAGS_1)         NOW PIE \n  0x0000000000000015 (DEBUG)           0x0\n  0x0000000000000007 (RELA)            0xaf0\n  0x0000000000000008 (RELASZ)          72 (bytes)\n  0x0000000000000009 (RELAENT)         24 (bytes)\n  0x000000006fffe000 (ANDROID_RELR)    0xb38\n  0x000000006fffe001 (ANDROID_RELRSZ)  0xe8\n  0x000000006fffe003 (ANDROID_RELRENT) 0x8\n  0x0000000000000017 (JMPREL)          0xc20\n  0x0000000000000002 (PLTRELSZ)        1056 (bytes)\n  0x0000000000000003 (PLTGOT)          0x68d38\n  0x0000000000000014 (PLTREL)          RELA\n  0x0000000000000006 (SYMTAB)          0x390\n  0x000000000000000b (SYMENT)          24 (bytes)\n  0x0000000000000005 (STRTAB)          0x89c\n  0x000000000000000a (STRSZ)           589 (bytes)\n  0x000000006ffffef5 (GNU_HASH)        0x880\n  0x0000000000000019 (INIT_ARRAY)      0x68b18\n  0x000000000000001b (INIT_ARRAYSZ)    16 (bytes)\n  0x000000006ffffff0 (VERSYM)          0x7e0\n  0x000000006ffffffe (VERNEED)         0x83c\n  0x000000006fffffff (VERNEEDNUM)      2\n  0x0000000000000000 (NULL)            0x0",
+      "status": "compiled and linked; not executed"
+    }
+  ],
+  "commands": [
+    [
+      "rustup",
+      "target",
+      "list",
+      "--installed"
+    ],
+    [
+      "xcodebuild",
+      "-version"
+    ],
+    [
+      "xcodebuild",
+      "-showsdks"
+    ],
+    [
+      "rustc",
+      "-Vv"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphoneos",
+      "--show-sdk-path"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphoneos",
+      "--find",
+      "clang"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphoneos",
+      "--find",
+      "clang++"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphoneos",
+      "--find",
+      "ar"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphoneos",
+      "--show-sdk-version"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "--version"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/libbench_native.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/snappy/libsnappy.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/zstd/lib/libzstd.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/liblz4.a"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "-target",
+      "arm64-apple-ios17.0",
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk",
+      "-std=c++17",
+      "-O2",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-I/private/tmp/flowsplice-compression-bench/native/snappy-1.2.2",
+      "-I/private/tmp/flowsplice-compression-cross/ios-arm64/snappy",
+      "-I/private/tmp/flowsplice-compression-bench/native/zstd-1.5.7/lib",
+      "-I/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib",
+      "-c",
+      "/private/tmp/flowsplice-compression-cross/decoder.cc",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/decoder.o"
+    ],
+    [
+      "rustc",
+      "--edition=2024",
+      "--crate-type=staticlib",
+      "-C",
+      "panic=abort",
+      "-C",
+      "opt-level=2",
+      "--target",
+      "aarch64-apple-ios",
+      "/private/tmp/flowsplice-compression-cross/probe.rs",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/librust_probe.a"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "-target",
+      "arm64-apple-ios17.0",
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk",
+      "-O2",
+      "/private/tmp/flowsplice-compression-cross/main.cc",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/librust_probe.a",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/decoder.o",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/snappy/libsnappy.a",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/zstd/lib/libzstd.a",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/liblz4.a",
+      "-Wl,-dead_strip",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/link-probe"
+    ],
+    [
+      "file",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/link-probe"
+    ],
+    [
+      "xcrun",
+      "otool",
+      "-l",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/link-probe"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphonesimulator",
+      "--show-sdk-path"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphonesimulator",
+      "--find",
+      "clang"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphonesimulator",
+      "--find",
+      "clang++"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphonesimulator",
+      "--find",
+      "ar"
+    ],
+    [
+      "xcrun",
+      "--sdk",
+      "iphonesimulator",
+      "--show-sdk-version"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "--version"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/libbench_native.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/snappy/libsnappy.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/zstd/lib/libzstd.a"
+    ],
+    [
+      "xcrun",
+      "lipo",
+      "-archs",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/liblz4.a"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "-target",
+      "arm64-apple-ios17.0-simulator",
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk",
+      "-std=c++17",
+      "-O2",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-I/private/tmp/flowsplice-compression-bench/native/snappy-1.2.2",
+      "-I/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/snappy",
+      "-I/private/tmp/flowsplice-compression-bench/native/zstd-1.5.7/lib",
+      "-I/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib",
+      "-c",
+      "/private/tmp/flowsplice-compression-cross/decoder.cc",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/decoder.o"
+    ],
+    [
+      "rustc",
+      "--edition=2024",
+      "--crate-type=staticlib",
+      "-C",
+      "panic=abort",
+      "-C",
+      "opt-level=2",
+      "--target",
+      "aarch64-apple-ios-sim",
+      "/private/tmp/flowsplice-compression-cross/probe.rs",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/librust_probe.a"
+    ],
+    [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++",
+      "-target",
+      "arm64-apple-ios17.0-simulator",
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk",
+      "-O2",
+      "/private/tmp/flowsplice-compression-cross/main.cc",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/librust_probe.a",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/decoder.o",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/snappy/libsnappy.a",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/zstd/lib/libzstd.a",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/liblz4.a",
+      "-Wl,-dead_strip",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/link-probe"
+    ],
+    [
+      "file",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/link-probe"
+    ],
+    [
+      "xcrun",
+      "otool",
+      "-l",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/link-probe"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang++",
+      "--version"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readobj",
+      "--file-headers",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/libbench_native.a"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readobj",
+      "--file-headers",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readobj",
+      "--file-headers",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readobj",
+      "--file-headers",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/liblz4.a"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang++",
+      "-std=c++17",
+      "-O2",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-I/private/tmp/flowsplice-compression-bench/native/snappy-1.2.2",
+      "-I/private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy",
+      "-I/private/tmp/flowsplice-compression-bench/native/zstd-1.5.7/lib",
+      "-I/private/tmp/flowsplice-compression-bench/native/lz4-1.10.0/lib",
+      "-c",
+      "/private/tmp/flowsplice-compression-cross/decoder.cc",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/decoder.o"
+    ],
+    [
+      "rustc",
+      "--edition=2024",
+      "--crate-type=staticlib",
+      "-C",
+      "panic=abort",
+      "-C",
+      "opt-level=2",
+      "--target",
+      "aarch64-linux-android",
+      "/private/tmp/flowsplice-compression-cross/probe.rs",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/librust_probe.a"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang++",
+      "-O2",
+      "/private/tmp/flowsplice-compression-cross/main.cc",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/librust_probe.a",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/decoder.o",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/snappy/libsnappy.a",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/zstd/lib/libzstd.a",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/liblz4.a",
+      "-Wl,--gc-sections",
+      "-static-libstdc++",
+      "-ldl",
+      "-lm",
+      "-o",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/link-probe"
+    ],
+    [
+      "file",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/link-probe"
+    ],
+    [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf",
+      "-h",
+      "-d",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/link-probe"
+    ]
+  ]
+}

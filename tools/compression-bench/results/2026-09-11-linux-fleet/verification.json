@@ -1,0 +1,74 @@
+{
+  "date": "2026-09-11",
+  "product_revision": "165c1338408277e00ecd5ee17d941ce972a21dd5",
+  "benchmark_scope": "standalone codec experiment; no product changes or deployment",
+  "hosts": [
+    {
+      "label": "vps-a",
+      "cases": 200,
+      "rounds": 5,
+      "timed_stages": 2000,
+      "remote_exit_code": 0,
+      "results_sha256": "91c12542e84eeee90a3c170be45b39c585c6c437016a44716c8f1d613222ee89",
+      "payload_verified": true,
+      "dataset_hashes_match_mac_baseline": true,
+      "all_compressed_sizes_match_mac_baseline": true,
+      "service_snapshots_unchanged": true,
+      "temporary_directory_absent_after_cleanup": true
+    },
+    {
+      "label": "vps-b",
+      "cases": 200,
+      "rounds": 5,
+      "timed_stages": 2000,
+      "remote_exit_code": 0,
+      "results_sha256": "15497927076183398c35bff4d46ea2ae16f865a9a70d338020f72e40a55cf86b",
+      "payload_verified": true,
+      "dataset_hashes_match_mac_baseline": true,
+      "all_compressed_sizes_match_mac_baseline": true,
+      "service_snapshots_unchanged": true,
+      "temporary_directory_absent_after_cleanup": true
+    },
+    {
+      "label": "vps-c",
+      "cases": 200,
+      "rounds": 5,
+      "timed_stages": 2000,
+      "remote_exit_code": 0,
+      "results_sha256": "5d0766a2e390ad93994087d567c0fc321f0e2af3b3afae077a2f90b607bb4b89",
+      "payload_verified": true,
+      "dataset_hashes_match_mac_baseline": true,
+      "all_compressed_sizes_match_mac_baseline": true,
+      "service_snapshots_unchanged": true,
+      "temporary_directory_absent_after_cleanup": true,
+      "controller_note": "Original SSH controller exited 255 after remote completion; an independent connection retrieved and verified remote exit 0 and the full result archive before cleanup."
+    },
+    {
+      "label": "openwrt",
+      "cases": 200,
+      "rounds": 5,
+      "timed_stages": 2000,
+      "remote_exit_code": 0,
+      "results_sha256": "0378b931d5c53e01d4b473c31bfeee5443b684db679c58a3f5ad5f1262d4dc19",
+      "payload_verified": true,
+      "dataset_hashes_match_mac_baseline": true,
+      "all_compressed_sizes_match_mac_baseline": true,
+      "service_snapshots_unchanged": true,
+      "temporary_directory_absent_after_cleanup": true
+    }
+  ],
+  "builds": {
+    "amd64": {
+      "source_hashes_match_working_files": true,
+      "static_no_interpreter_or_needed": true,
+      "smoke_cases": 200,
+      "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+    },
+    "arm64": {
+      "source_hashes_match_working_files": true,
+      "static_no_interpreter_or_needed": true,
+      "smoke_cases": 200,
+      "binary_sha256": "45a51cff479cc3d9b8353264aced82318988e9b9fa72209d76e07d7594bd4c34"
+    }
+  }
+}

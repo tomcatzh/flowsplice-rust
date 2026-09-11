@@ -1,0 +1,182 @@
+[
+  {
+    "label": "vps-a",
+    "cpu_model_reported": "Intel(R) Xeon(R) Platinum 8269CY CPU @ 2.50GHz",
+    "board_model": null,
+    "logical_cpu_count": 1,
+    "os": "Ubuntu 22.04.5 LTS",
+    "kernel_arch": "Linux 5.15.0-190-generic x86_64",
+    "memory_total_kib": 929640,
+    "memory_available_before_kib": 453092,
+    "memory_available_after_kib": 416732,
+    "load_before": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "load_after": [
+      0.99,
+      0.6,
+      0.26
+    ],
+    "governor": null,
+    "maximum_frequency_khz": null,
+    "duration_seconds": 265,
+    "peak_rss_kib": 97484,
+    "process_niceness": 10,
+    "address_space_limit_mib": 256,
+    "global_cpu_steal_percent": 0.0,
+    "global_cpu_busy_excluding_iowait_percent": 99.98110783646943,
+    "speed_relative_mad_percent": {
+      "median": 0.47167087707734123,
+      "p95": 3.6500653760084365,
+      "max": 11.15976498870887
+    },
+    "all_samples_cpu_percent": {
+      "min": 46.33733126341315,
+      "median": 99.77496389794594,
+      "max": 99.89330975374435
+    },
+    "service_observations": {
+      "before_count": 31,
+      "after_count": 31,
+      "unchanged": true
+    },
+    "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+  },
+  {
+    "label": "vps-b",
+    "cpu_model_reported": "AMD EPYC 9655P 96-Core Processor",
+    "board_model": null,
+    "logical_cpu_count": 1,
+    "os": "Ubuntu 22.04.5 LTS",
+    "kernel_arch": "Linux 5.15.0-191-generic x86_64",
+    "memory_total_kib": 979252,
+    "memory_available_before_kib": 611188,
+    "memory_available_after_kib": 579012,
+    "load_before": [
+      0.05,
+      0.01,
+      0.0
+    ],
+    "load_after": [
+      0.99,
+      0.6,
+      0.26
+    ],
+    "governor": null,
+    "maximum_frequency_khz": null,
+    "duration_seconds": 252,
+    "peak_rss_kib": 97388,
+    "process_niceness": 10,
+    "address_space_limit_mib": 256,
+    "global_cpu_steal_percent": 0.011919898283534647,
+    "global_cpu_busy_excluding_iowait_percent": 99.99602670057216,
+    "speed_relative_mad_percent": {
+      "median": 0.6332455443502565,
+      "p95": 2.062807469090118,
+      "max": 4.39536808821062
+    },
+    "all_samples_cpu_percent": {
+      "min": 17.85178439445971,
+      "median": 99.89446001899805,
+      "max": 99.99424106900189
+    },
+    "service_observations": {
+      "before_count": 27,
+      "after_count": 27,
+      "unchanged": true
+    },
+    "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+  },
+  {
+    "label": "vps-c",
+    "cpu_model_reported": "AMD EPYC-Milan Processor",
+    "board_model": null,
+    "logical_cpu_count": 1,
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel_arch": "Linux 7.0.0-31-generic x86_64",
+    "memory_total_kib": 1960312,
+    "memory_available_before_kib": 1339148,
+    "memory_available_after_kib": 1329080,
+    "load_before": [
+      0.06,
+      0.1,
+      0.09
+    ],
+    "load_after": [
+      1.25,
+      0.73,
+      0.36
+    ],
+    "governor": null,
+    "maximum_frequency_khz": null,
+    "duration_seconds": 260,
+    "peak_rss_kib": 97500,
+    "process_niceness": 10,
+    "address_space_limit_mib": 256,
+    "global_cpu_steal_percent": 0.007693195368696388,
+    "global_cpu_busy_excluding_iowait_percent": 99.9923068046313,
+    "speed_relative_mad_percent": {
+      "median": 1.4169609152359652,
+      "p95": 3.848499725708628,
+      "max": 13.990952366253156
+    },
+    "all_samples_cpu_percent": {
+      "min": 49.160963018252765,
+      "median": 99.59676799115677,
+      "max": 99.98509335576884
+    },
+    "service_observations": {
+      "before_count": 26,
+      "after_count": 26,
+      "unchanged": true
+    },
+    "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+  },
+  {
+    "label": "openwrt",
+    "cpu_model_reported": "ARM64, CPU part 0xd05",
+    "board_model": "FriendlyElec NanoPi R5C",
+    "logical_cpu_count": 4,
+    "os": "OpenWrt 24.10.2",
+    "kernel_arch": "Linux 6.1.118 aarch64",
+    "memory_total_kib": 3998672,
+    "memory_available_before_kib": 3452316,
+    "memory_available_after_kib": 3453084,
+    "load_before": [
+      0.29,
+      0.31,
+      0.24
+    ],
+    "load_after": [
+      1.2,
+      0.97,
+      0.58
+    ],
+    "governor": "conservative",
+    "maximum_frequency_khz": 1992000,
+    "duration_seconds": 355,
+    "peak_rss_kib": 97248,
+    "process_niceness": 10,
+    "address_space_limit_mib": 256,
+    "global_cpu_steal_percent": 0.0,
+    "global_cpu_busy_excluding_iowait_percent": 30.5093203365848,
+    "speed_relative_mad_percent": {
+      "median": 0.35310993564974513,
+      "p95": 2.2495072154279994,
+      "max": 9.14784966358718
+    },
+    "all_samples_cpu_percent": {
+      "min": 97.85631059793113,
+      "median": 99.95650867396247,
+      "max": 99.99756782033027
+    },
+    "service_observations": {
+      "before_count": 11,
+      "after_count": 11,
+      "unchanged": true
+    },
+    "binary_sha256": "45a51cff479cc3d9b8353264aced82318988e9b9fa72209d76e07d7594bd4c34"
+  }
+]

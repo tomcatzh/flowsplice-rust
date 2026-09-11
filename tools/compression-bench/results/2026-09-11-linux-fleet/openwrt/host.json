@@ -1,0 +1,45 @@
+{
+  "label": "openwrt",
+  "cpu_model_reported": "ARM64, CPU part 0xd05",
+  "board_model": "FriendlyElec NanoPi R5C",
+  "logical_cpu_count": 4,
+  "os": "OpenWrt 24.10.2",
+  "kernel_arch": "Linux 6.1.118 aarch64",
+  "memory_total_kib": 3998672,
+  "memory_available_before_kib": 3452316,
+  "memory_available_after_kib": 3453084,
+  "load_before": [
+    0.29,
+    0.31,
+    0.24
+  ],
+  "load_after": [
+    1.2,
+    0.97,
+    0.58
+  ],
+  "governor": "conservative",
+  "maximum_frequency_khz": 1992000,
+  "duration_seconds": 355,
+  "peak_rss_kib": 97248,
+  "process_niceness": 10,
+  "address_space_limit_mib": 256,
+  "global_cpu_steal_percent": 0.0,
+  "global_cpu_busy_excluding_iowait_percent": 30.5093203365848,
+  "speed_relative_mad_percent": {
+    "median": 0.35310993564974513,
+    "p95": 2.2495072154279994,
+    "max": 9.14784966358718
+  },
+  "all_samples_cpu_percent": {
+    "min": 97.85631059793113,
+    "median": 99.95650867396247,
+    "max": 99.99756782033027
+  },
+  "service_observations": {
+    "before_count": 11,
+    "after_count": 11,
+    "unchanged": true
+  },
+  "binary_sha256": "45a51cff479cc3d9b8353264aced82318988e9b9fa72209d76e07d7594bd4c34"
+}

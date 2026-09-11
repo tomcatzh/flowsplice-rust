@@ -1,0 +1,45 @@
+{
+  "label": "vps-c",
+  "cpu_model_reported": "AMD EPYC-Milan Processor",
+  "board_model": null,
+  "logical_cpu_count": 1,
+  "os": "Ubuntu 26.04.1 LTS",
+  "kernel_arch": "Linux 7.0.0-31-generic x86_64",
+  "memory_total_kib": 1960312,
+  "memory_available_before_kib": 1339148,
+  "memory_available_after_kib": 1329080,
+  "load_before": [
+    0.06,
+    0.1,
+    0.09
+  ],
+  "load_after": [
+    1.25,
+    0.73,
+    0.36
+  ],
+  "governor": null,
+  "maximum_frequency_khz": null,
+  "duration_seconds": 260,
+  "peak_rss_kib": 97500,
+  "process_niceness": 10,
+  "address_space_limit_mib": 256,
+  "global_cpu_steal_percent": 0.007693195368696388,
+  "global_cpu_busy_excluding_iowait_percent": 99.9923068046313,
+  "speed_relative_mad_percent": {
+    "median": 1.4169609152359652,
+    "p95": 3.848499725708628,
+    "max": 13.990952366253156
+  },
+  "all_samples_cpu_percent": {
+    "min": 49.160963018252765,
+    "median": 99.59676799115677,
+    "max": 99.98509335576884
+  },
+  "service_observations": {
+    "before_count": 26,
+    "after_count": 26,
+    "unchanged": true
+  },
+  "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+}

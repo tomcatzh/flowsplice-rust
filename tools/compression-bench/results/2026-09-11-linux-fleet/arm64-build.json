@@ -1,0 +1,403 @@
+{
+  "image": "rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900",
+  "arch": "arm64",
+  "commands": [
+    [
+      "rustc",
+      "-Vv"
+    ],
+    [
+      "g++",
+      "--version"
+    ],
+    [
+      "apk",
+      "info",
+      "-v"
+    ],
+    [
+      "cmake",
+      "-S",
+      "/out/arm64/native/snappy-1.2.2",
+      "-B",
+      "/out/arm64/native/snappy-build",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DSNAPPY_BUILD_TESTS=OFF",
+      "-DSNAPPY_BUILD_BENCHMARKS=OFF",
+      "-DBUILD_SHARED_LIBS=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/out/arm64/native/snappy-build",
+      "--parallel",
+      "4"
+    ],
+    [
+      "cmake",
+      "-S",
+      "/out/arm64/native/zstd-1.5.7/build/cmake",
+      "-B",
+      "/out/arm64/native/zstd-build",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DZSTD_BUILD_PROGRAMS=OFF",
+      "-DZSTD_BUILD_TESTS=OFF",
+      "-DZSTD_BUILD_SHARED=OFF",
+      "-DZSTD_MULTITHREAD_SUPPORT=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/out/arm64/native/zstd-build",
+      "--target",
+      "libzstd_static",
+      "--parallel",
+      "4"
+    ],
+    [
+      "gcc",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-c",
+      "/out/arm64/native/lz4-1.10.0/lib/lz4.c",
+      "-o",
+      "/out/arm64/native/lz4.o"
+    ],
+    [
+      "gcc",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-c",
+      "/out/arm64/native/lz4-1.10.0/lib/lz4hc.c",
+      "-o",
+      "/out/arm64/native/lz4hc.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/out/arm64/native/lib/liblz4.a",
+      "/out/arm64/native/lz4.o",
+      "/out/arm64/native/lz4hc.o"
+    ],
+    [
+      "g++",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-std=c++17",
+      "-I/out/arm64/native/snappy-1.2.2",
+      "-I/out/arm64/native/snappy-build",
+      "-I/out/arm64/native/zstd-1.5.7/lib",
+      "-I/out/arm64/native/lz4-1.10.0/lib",
+      "-c",
+      "/repo/tools/compression-bench/native.cc",
+      "-o",
+      "/out/arm64/native/bench_native.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/out/arm64/native/lib/libbench_native.a",
+      "/out/arm64/native/bench_native.o"
+    ],
+    [
+      "rustc",
+      "-Vv"
+    ],
+    [
+      "g++",
+      "--version"
+    ],
+    [
+      "apk",
+      "info",
+      "-v"
+    ],
+    [
+      "cmake",
+      "-S",
+      "/out/arm64/native/snappy-1.2.2",
+      "-B",
+      "/out/arm64/native/snappy-build",
+      "-DCMAKE_C_FLAGS=-march=armv8-a+crc",
+      "-DCMAKE_CXX_FLAGS=-march=armv8-a+crc",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DSNAPPY_BUILD_TESTS=OFF",
+      "-DSNAPPY_BUILD_BENCHMARKS=OFF",
+      "-DBUILD_SHARED_LIBS=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/out/arm64/native/snappy-build",
+      "--parallel",
+      "4"
+    ],
+    [
+      "cmake",
+      "-S",
+      "/out/arm64/native/zstd-1.5.7/build/cmake",
+      "-B",
+      "/out/arm64/native/zstd-build",
+      "-DCMAKE_C_FLAGS=-march=armv8-a+crc",
+      "-DCMAKE_CXX_FLAGS=-march=armv8-a+crc",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+      "-DZSTD_BUILD_PROGRAMS=OFF",
+      "-DZSTD_BUILD_TESTS=OFF",
+      "-DZSTD_BUILD_SHARED=OFF",
+      "-DZSTD_MULTITHREAD_SUPPORT=OFF"
+    ],
+    [
+      "cmake",
+      "--build",
+      "/out/arm64/native/zstd-build",
+      "--target",
+      "libzstd_static",
+      "--parallel",
+      "4"
+    ],
+    [
+      "gcc",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-c",
+      "/out/arm64/native/lz4-1.10.0/lib/lz4.c",
+      "-o",
+      "/out/arm64/native/lz4.o"
+    ],
+    [
+      "gcc",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-c",
+      "/out/arm64/native/lz4-1.10.0/lib/lz4hc.c",
+      "-o",
+      "/out/arm64/native/lz4hc.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/out/arm64/native/lib/liblz4.a",
+      "/out/arm64/native/lz4.o",
+      "/out/arm64/native/lz4hc.o"
+    ],
+    [
+      "g++",
+      "-O3",
+      "-DNDEBUG",
+      "-march=armv8-a+crc",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-std=c++17",
+      "-I/out/arm64/native/snappy-1.2.2",
+      "-I/out/arm64/native/snappy-build",
+      "-I/out/arm64/native/zstd-1.5.7/lib",
+      "-I/out/arm64/native/lz4-1.10.0/lib",
+      "-c",
+      "/repo/tools/compression-bench/native.cc",
+      "-o",
+      "/out/arm64/native/bench_native.o"
+    ],
+    [
+      "ar",
+      "rcs",
+      "/out/arm64/native/lib/libbench_native.a",
+      "/out/arm64/native/bench_native.o"
+    ],
+    [
+      "rustc",
+      "-Vv"
+    ],
+    [
+      "g++",
+      "--version"
+    ],
+    [
+      "apk",
+      "info",
+      "-v"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "--release",
+      "--manifest-path",
+      "/out/arm64/checkout/tools/compression-bench/Cargo.toml",
+      "--target",
+      "aarch64-unknown-linux-musl"
+    ],
+    [
+      "cargo",
+      "build",
+      "--locked",
+      "--release",
+      "--manifest-path",
+      "/out/arm64/checkout/tools/compression-bench/Cargo.toml",
+      "--target",
+      "aarch64-unknown-linux-musl"
+    ],
+    [
+      "file",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-h",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-l",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-d",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "rustc",
+      "-Vv"
+    ],
+    [
+      "g++",
+      "--version"
+    ],
+    [
+      "apk",
+      "info",
+      "-v"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "--release",
+      "--manifest-path",
+      "/out/arm64/checkout/tools/compression-bench/Cargo.toml",
+      "--target",
+      "aarch64-unknown-linux-musl"
+    ],
+    [
+      "cargo",
+      "build",
+      "--locked",
+      "--release",
+      "--manifest-path",
+      "/out/arm64/checkout/tools/compression-bench/Cargo.toml",
+      "--target",
+      "aarch64-unknown-linux-musl"
+    ],
+    [
+      "file",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-h",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-l",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "readelf",
+      "-d",
+      "/out/arm64/flowsplice-compression-bench"
+    ],
+    [
+      "/out/arm64/flowsplice-compression-bench",
+      "--bundle",
+      "/out/frozen-corpus.bin",
+      "/out/arm64/smoke.json",
+      "1",
+      "5"
+    ]
+  ],
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-musl\nrelease: 1.97.1\nLLVM version: 22.1.6",
+  "target": "aarch64-unknown-linux-musl",
+  "cflags": "-O3 -DNDEBUG -march=armv8-a+crc -ffunction-sections -fdata-sections",
+  "compiler": "g++ (Alpine 15.2.0) 15.2.0\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "packages": "WARNING: opening from cache https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/APKINDEX.tar.gz: No such file or directory\nWARNING: opening from cache https://dl-cdn.alpinelinux.org/alpine/v3.24/community/aarch64/APKINDEX.tar.gz: No such file or directory\nacl-libs-2.3.2-r1\nalpine-baselayout-3.7.2-r1\nalpine-baselayout-data-3.7.2-r1\nalpine-keys-2.6-r0\nalpine-release-3.24.1-r0\napk-tools-3.0.6-r0\nbinutils-2.45.1-r1\nbusybox-1.37.0-r31\nbusybox-binsh-1.37.0-r31\nca-certificates-20260611-r0\nca-certificates-bundle-20260611-r0\ncmake-4.2.3-r0\nfile-5.47-r2\ng++-15.2.0-r5\ngcc-15.2.0-r5\ngdbm-1.26-r0\ngmp-6.3.0-r4\nisl26-0.26-r2\njansson-2.15.0-r0\nlibapk-3.0.6-r0\nlibarchive-3.8.7-r0\nlibatomic-15.2.0-r5\nlibbz2-1.0.8-r6\nlibcrypto3-3.5.7-r0\nlibexpat-2.8.4-r0\nlibffi-3.5.2-r1\nlibgcc-15.2.0-r5\nlibgcc-static-15.2.0-r5\nlibgomp-15.2.0-r5\nlibmagic-5.47-r2\nlibncursesw-6.6_p20260516-r0\nlibpanelw-6.6_p20260516-r0\nlibssl3-3.5.7-r0\nlibstdc++-15.2.0-r5\nlibstdc++-dev-15.2.0-r5\nlibuv-1.52.1-r0\nlz4-libs-1.10.0-r1\nmake-4.4.1-r4\nmpc1-1.3.1-r1\nmpdecimal-4.0.1-r0\nmpfr4-4.2.2-r0\nmusl-1.2.6-r2\nmusl-dev-1.2.6-r2\nmusl-utils-1.2.6-r2\nncurses-terminfo-base-6.6_p20260516-r0\npyc-3.14.7-r1\npython3-3.14.7-r1\npython3-pyc-3.14.7-r1\npython3-pycache-pyc0-3.14.7-r1\nreadline-8.3.3-r1\nrhash-libs-1.4.6-r0\nscanelf-1.3.9-r1\nsqlite-libs-3.53.4-r0\nssl_client-1.37.0-r31\nxz-libs-5.8.4-r0\nzlib-1.3.2-r0\nzstd-libs-1.5.7-r2",
+  "sources": [
+    {
+      "name": "snappy",
+      "version": "1.2.2",
+      "url": "https://codeload.github.com/google/snappy/tar.gz/refs/tags/1.2.2",
+      "sha256": "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc"
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.7",
+      "url": "https://codeload.github.com/facebook/zstd/tar.gz/refs/tags/v1.5.7",
+      "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3"
+    },
+    {
+      "name": "lz4",
+      "version": "1.10.0",
+      "url": "https://codeload.github.com/lz4/lz4/tar.gz/refs/tags/v1.10.0",
+      "sha256": "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b"
+    }
+  ],
+  "snappy_config": "#ifndef THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_\n#define THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_\n\n/* Define to 1 if the compiler supports __attribute__((always_inline)). */\n#define HAVE_ATTRIBUTE_ALWAYS_INLINE 1\n\n/* Define to 1 if the compiler supports __builtin_ctz and friends. */\n#define HAVE_BUILTIN_CTZ 1\n\n/* Define to 1 if the compiler supports __builtin_expect. */\n#define HAVE_BUILTIN_EXPECT 1\n\n/* Define to 1 if the compiler supports __builtin_prefetch. */\n#define HAVE_BUILTIN_PREFETCH 1\n\n/* Define to 1 if you have a definition for mmap() in <sys/mman.h>. */\n#define HAVE_FUNC_MMAP 1\n\n/* Define to 1 if you have a definition for sysconf() in <unistd.h>. */\n#define HAVE_FUNC_SYSCONF 1\n\n/* Define to 1 if you have the `lzo2' library (-llzo2). */\n#define HAVE_LIBLZO2 0\n\n/* Define to 1 if you have the `z' library (-lz). */\n#define HAVE_LIBZ 0\n\n/* Define to 1 if you have the `lz4' library (-llz4). */\n#define HAVE_LIBLZ4 0\n\n/* Define to 1 if you have the <sys/mman.h> header file. */\n#define HAVE_SYS_MMAN_H 1\n\n/* Define to 1 if you have the <sys/resource.h> header file. */\n#define HAVE_SYS_RESOURCE_H 1\n\n/* Define to 1 if you have the <sys/time.h> header file. */\n#define HAVE_SYS_TIME_H 1\n\n/* Define to 1 if you have the <sys/uio.h> header file. */\n#define HAVE_SYS_UIO_H 1\n\n/* Define to 1 if you have the <unistd.h> header file. */\n#define HAVE_UNISTD_H 1\n\n/* Define to 1 if you have the <windows.h> header file. */\n#define HAVE_WINDOWS_H 0\n\n/* Define to 1 if you target processors with SSSE3+ and have <tmmintrin.h>. */\n#define SNAPPY_HAVE_SSSE3 0\n\n/* Define to 1 if you target processors with SSE4.2 and have <crc32intrin.h>. */\n#define SNAPPY_HAVE_X86_CRC32 0\n\n/* Define to 1 if you target processors with BMI2+ and have <bmi2intrin.h>. */\n#define SNAPPY_HAVE_BMI2 0\n\n/* Define to 1 if you target processors with NEON and have <arm_neon.h>. */\n#define SNAPPY_HAVE_NEON 1\n\n/* Define to 1 if you have <arm_neon.h> and <arm_acle.h> and want to optimize\n   compression speed by using __crc32cw from <arm_acle.h>. */\n#define SNAPPY_HAVE_NEON_CRC32 1\n\n/* Define to 1 if your processor stores words with the most significant byte\n   first (like Motorola and SPARC, unlike Intel and VAX). */\n#define SNAPPY_IS_BIG_ENDIAN 0\n\n#endif  // THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_\n",
+  "native_shim_sha256": "08fb612fa341e646c5335bd424e5317d64c8a77a58e56b0d339821f1eed1b46c",
+  "archives": {
+    "libsnappy.a": "b0eeca98c6ffb7fbed909cf4400fe2e90977f34fb6b3dd5a5e8b27de8cbd3b6e",
+    "libbench_native.a": "2614a735d5adbd962f8ba32a1029baf445258c030698049e9d47227879731100",
+    "liblz4.a": "d3f7298c85411e7e0d285caf65cbd87fccaa404d673050622a2182d25f0be0bd",
+    "libzstd.a": "e7ee370811b6f78e3b48ef19b188fbf2c8c932cd86a9203ede7bb18e459ee685"
+  },
+  "native_ready": true,
+  "rustflags": "-C target-feature=+crt-static -C link-arg=-static -C link-arg=-static-libstdc++ -C link-arg=-static-libgcc",
+  "benchmark_sources": {
+    "Cargo.lock": "8d326adae4a2cd144b01ca3de9d0e20c07e0166c5b2cda83edddc4fcd66ed5a5",
+    "Cargo.toml": "fd58930ab16aac78028b11e1d660d87422ced188a3c6be757302a00eb3d6139d",
+    "build.rs": "f093a6003bc9346877e1925b66796d24efd86513441d2dafc9f06420c430f583",
+    "native.cc": "08fb612fa341e646c5335bd424e5317d64c8a77a58e56b0d339821f1eed1b46c",
+    "src/corpus.rs": "3cf892522343c59cdfe002bd0932302c6162904de54d71688af5ec2c747425ed",
+    "src/frozen.rs": "51ad3123a77f0dfd38f0d9e2673c70c4d3b10a4834341b2fa449cfdb9d9abda2",
+    "src/main.rs": "84de23e772de12728b9cdcf736ab0d4a6c5d5f8f3544ed085a4d9ff3c0d32609"
+  },
+  "file": "/out/arm64/flowsplice-compression-bench: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]=6b2bf7b6683a3b8d912d425de9ac4d127984ecad, not stripped",
+  "elf_header": "ELF Header:\n  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00 \n  Class:                             ELF64\n  Data:                              2's complement, little endian\n  Version:                           1 (current)\n  OS/ABI:                            UNIX - System V\n  ABI Version:                       0\n  Type:                              EXEC (Executable file)\n  Machine:                           AArch64\n  Version:                           0x1\n  Entry point address:               0x406270\n  Start of program headers:          64 (bytes into file)\n  Start of section headers:          1852368 (bytes into file)\n  Flags:                             0x0\n  Size of this header:               64 (bytes)\n  Size of program headers:           56 (bytes)\n  Number of program headers:         7\n  Size of section headers:           64 (bytes)\n  Number of section headers:         21\n  Section header string table index: 20",
+  "program_headers": "Elf file type is EXEC (Executable file)\nEntry point 0x406270\nThere are 7 program headers, starting at offset 64\n\nProgram Headers:\n  Type           Offset             VirtAddr           PhysAddr\n                 FileSiz            MemSiz              Flags  Align\n  LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000\n                 0x000000000017a0a8 0x000000000017a0a8  R E    0x10000\n  LOAD           0x000000000017b7c8 0x000000000058b7c8 0x000000000058b7c8\n                 0x0000000000005384 0x0000000000006ba8  RW     0x10000\n  NOTE           0x00000000000001c8 0x00000000004001c8 0x00000000004001c8\n                 0x0000000000000024 0x0000000000000024  R      0x4\n  TLS            0x000000000017b7c8 0x000000000058b7c8 0x000000000058b7c8\n                 0x0000000000000020 0x0000000000000060  R      0x8\n  GNU_EH_FRAME   0x0000000000160e38 0x0000000000560e38 0x0000000000560e38\n                 0x0000000000002b94 0x0000000000002b94  R      0x4\n  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000\n                 0x0000000000000000 0x0000000000000000  RW     0x10\n  GNU_RELRO      0x000000000017b7c8 0x000000000058b7c8 0x000000000058b7c8\n                 0x0000000000004838 0x0000000000004838  R      0x1\n\n Section to Segment mapping:\n  Segment Sections...\n   00     .note.gnu.build-id .init .text .fini .rodata .eh_frame_hdr .eh_frame .gcc_except_table \n   01     .tdata .init_array .fini_array .data.rel.ro .got .data .bss \n   02     .note.gnu.build-id \n   03     .tdata .tbss \n   04     .eh_frame_hdr \n   05     \n   06     .tdata .init_array .fini_array .data.rel.ro .got",
+  "dynamic_section": "There is no dynamic section in this file.",
+  "binary_sha256": "45a51cff479cc3d9b8353264aced82318988e9b9fa72209d76e07d7594bd4c34",
+  "binary_bytes": 1853712,
+  "smoke_label": "Correctness-only smoke; local container/emulator timings are not remote performance results",
+  "bundle_sha256": "53c6eb5099319708aaf8dd87a3b931d09244f1831b890d1dca3d2c48c2f7d384",
+  "smoke_peak_rss_kib": 101504,
+  "smoke_cases": 200,
+  "final_ready": true,
+  "smoke_result_path": "smoke/results.json",
+  "evidence_note": "All four Release tests and static ELF checks passed; 200-case smoke executed successfully. Builder initially treated output directory as a JSON file; corrected script path and reconciled existing successful smoke without rerunning timings."
+}

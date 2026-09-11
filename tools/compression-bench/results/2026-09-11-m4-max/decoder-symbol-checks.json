@@ -1,0 +1,29 @@
+{
+  "ios-arm64": {
+    "command": [
+      "nm",
+      "-u",
+      "/private/tmp/flowsplice-compression-cross/ios-arm64/decoder.o"
+    ],
+    "undefined_symbols": "_LZ4_decompress_safe\n_ZSTD_decompress\n_ZSTD_isError\n__ZN6snappy13RawUncompressEPKcmPc\n__ZN6snappy21GetUncompressedLengthEPKcmPm\n",
+    "decoder_object_sha256": "bc93ed5d29ea85352f23f2322ad576d9e12cf7e7b50e81d4bc589a0a17811913"
+  },
+  "ios-simulator-arm64": {
+    "command": [
+      "nm",
+      "-u",
+      "/private/tmp/flowsplice-compression-cross/ios-simulator-arm64/decoder.o"
+    ],
+    "undefined_symbols": "_LZ4_decompress_safe\n_ZSTD_decompress\n_ZSTD_isError\n__ZN6snappy13RawUncompressEPKcmPc\n__ZN6snappy21GetUncompressedLengthEPKcmPm\n",
+    "decoder_object_sha256": "43fe9c65ac8d07255a4f5e68d8e284a6a4bcc5c9ebce2786f4bc619da4c9fc8b"
+  },
+  "android-arm64-v8a": {
+    "command": [
+      "/Users/tomcat/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-nm",
+      "-u",
+      "/private/tmp/flowsplice-compression-cross/android-arm64-v8a/decoder.o"
+    ],
+    "undefined_symbols": "                 U LZ4_decompress_safe\n                 U ZSTD_decompress\n                 U ZSTD_isError\n                 U _ZN6snappy13RawUncompressEPKcmPc\n                 U _ZN6snappy21GetUncompressedLengthEPKcmPm\n",
+    "decoder_object_sha256": "5c95c928016c857b2116f3862aca61447afa14d632302a96b6758ce523b3e3f7"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "label": "vps-b",
+  "cpu_model_reported": "AMD EPYC 9655P 96-Core Processor",
+  "board_model": null,
+  "logical_cpu_count": 1,
+  "os": "Ubuntu 22.04.5 LTS",
+  "kernel_arch": "Linux 5.15.0-191-generic x86_64",
+  "memory_total_kib": 979252,
+  "memory_available_before_kib": 611188,
+  "memory_available_after_kib": 579012,
+  "load_before": [
+    0.05,
+    0.01,
+    0.0
+  ],
+  "load_after": [
+    0.99,
+    0.6,
+    0.26
+  ],
+  "governor": null,
+  "maximum_frequency_khz": null,
+  "duration_seconds": 252,
+  "peak_rss_kib": 97388,
+  "process_niceness": 10,
+  "address_space_limit_mib": 256,
+  "global_cpu_steal_percent": 0.011919898283534647,
+  "global_cpu_busy_excluding_iowait_percent": 99.99602670057216,
+  "speed_relative_mad_percent": {
+    "median": 0.6332455443502565,
+    "p95": 2.062807469090118,
+    "max": 4.39536808821062
+  },
+  "all_samples_cpu_percent": {
+    "min": 17.85178439445971,
+    "median": 99.89446001899805,
+    "max": 99.99424106900189
+  },
+  "service_observations": {
+    "before_count": 27,
+    "after_count": 27,
+    "unchanged": true
+  },
+  "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+}

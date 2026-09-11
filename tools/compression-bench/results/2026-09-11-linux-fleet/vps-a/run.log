@@ -1,0 +1,27 @@
+Validated 20 datasets × 10 algorithms = 200 cases. snappy=1.2.2;zstd=1.5.7;lz4=1.10.0
+Round 1/5: 100/400 stages
+Round 1/5: 200/400 stages
+Round 1/5: 300/400 stages
+Round 1/5: 400/400 stages
+Round 1/5 complete
+Round 2/5: 100/400 stages
+Round 2/5: 200/400 stages
+Round 2/5: 300/400 stages
+Round 2/5: 400/400 stages
+Round 2/5 complete
+Round 3/5: 100/400 stages
+Round 3/5: 200/400 stages
+Round 3/5: 300/400 stages
+Round 3/5: 400/400 stages
+Round 3/5 complete
+Round 4/5: 100/400 stages
+Round 4/5: 200/400 stages
+Round 4/5: 300/400 stages
+Round 4/5: 400/400 stages
+Round 4/5 complete
+Round 5/5: 100/400 stages
+Round 5/5: 200/400 stages
+Round 5/5: 300/400 stages
+Round 5/5: 400/400 stages
+Round 5/5 complete
+Finished and revalidated all blocks: result/results.json

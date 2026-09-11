@@ -1,0 +1,45 @@
+{
+  "label": "vps-a",
+  "cpu_model_reported": "Intel(R) Xeon(R) Platinum 8269CY CPU @ 2.50GHz",
+  "board_model": null,
+  "logical_cpu_count": 1,
+  "os": "Ubuntu 22.04.5 LTS",
+  "kernel_arch": "Linux 5.15.0-190-generic x86_64",
+  "memory_total_kib": 929640,
+  "memory_available_before_kib": 453092,
+  "memory_available_after_kib": 416732,
+  "load_before": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "load_after": [
+    0.99,
+    0.6,
+    0.26
+  ],
+  "governor": null,
+  "maximum_frequency_khz": null,
+  "duration_seconds": 265,
+  "peak_rss_kib": 97484,
+  "process_niceness": 10,
+  "address_space_limit_mib": 256,
+  "global_cpu_steal_percent": 0.0,
+  "global_cpu_busy_excluding_iowait_percent": 99.98110783646943,
+  "speed_relative_mad_percent": {
+    "median": 0.47167087707734123,
+    "p95": 3.6500653760084365,
+    "max": 11.15976498870887
+  },
+  "all_samples_cpu_percent": {
+    "min": 46.33733126341315,
+    "median": 99.77496389794594,
+    "max": 99.89330975374435
+  },
+  "service_observations": {
+    "before_count": 31,
+    "after_count": 31,
+    "unchanged": true
+  },
+  "binary_sha256": "9e48556fc64ef35c56765e4b95ea50881e5db8f37e27561764e54c557bddad8d"
+}
