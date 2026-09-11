@@ -77,7 +77,7 @@ impl Tmux {
         let config_file = directory.join("flowsplice-tmux.conf");
         fs::write(
             &config_file,
-            "set -s exit-unattached off\nset -s exit-empty on\nset -g status off\nset -g update-environment ''\nset -g remain-on-exit off\n",
+            "set -s exit-unattached off\nset -s exit-empty on\nset -g status off\nset -g update-environment ''\nset -g remain-on-exit off\nset -g history-limit 50000\n",
         )?;
         fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600))?;
         let this = Self {
@@ -106,6 +106,18 @@ impl Tmux {
         if !output.status.success() || major < 3 || (major == 3 && minor < 3) {
             bail!("tmux 3.3 or newer is required");
         }
+        // A surviving tmux server does not reread -f when Home restarts. Apply
+        // the policy explicitly; tmux >=3.7 also updates existing pane grids.
+        // Older tmux retains each existing grid's limit until a new pane exists.
+        if this.config.socket.exists() {
+            let sessions = this.list().await?;
+            if !sessions.is_empty() {
+                this.set_history_limit(None).await?;
+                for (id, _) in sessions {
+                    this.set_history_limit(Some(id)).await?;
+                }
+            }
+        }
         Ok(this)
     }
     fn command(&self) -> Command {
@@ -126,6 +138,67 @@ impl Tmux {
             .await
             .context("tmux command timed out")?
             .context("tmux command failed")
+    }
+    async fn set_history_limit(&self, session: Option<Uuid>) -> Result<()> {
+        let mut args = vec!["set-option".into()];
+        match session {
+            Some(id) => args.extend(["-t".into(), Self::name(id)]),
+            None => args.push("-g".into()),
+        }
+        args.extend(["history-limit".into(), "50000".into()]);
+        let output = self.execute(&args).await?;
+        if !output.status.success() && self.config.socket.exists() {
+            bail!("could not set tmux history limit");
+        }
+        Ok(())
+    }
+    pub(crate) async fn capture_history(&self, id: Uuid) -> Result<String> {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        let target = format!("={}:", Self::name(id));
+        // One non-waiting command queue: dimensions and rows refer to the same
+        // grid. Capturing is read-only, including when a full-screen program is
+        // active. Never enter copy mode or send keys on behalf of the viewer.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut child = self
+                .command()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &target,
+                    "#{pane_width}",
+                    ";",
+                    "capture-pane",
+                    "-p",
+                    "-e",
+                    "-N",
+                    "-t",
+                    &target,
+                    "-S",
+                    "-50000",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("missing history output")?
+                .take((crate::history::MAX_CAPTURE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > crate::history::MAX_CAPTURE_BYTES {
+                bail!("tmux history exceeds capture budget");
+            }
+            if !child.wait().await?.success() {
+                bail!("tmux session is no longer available for history");
+            }
+            String::from_utf8(bytes).context("tmux history is not UTF-8")
+        })
+        .await
+        .context("tmux history capture timed out")?
     }
     pub async fn list(&self) -> Result<Vec<(Uuid, u64)>> {
         if !self.config.socket.exists() {

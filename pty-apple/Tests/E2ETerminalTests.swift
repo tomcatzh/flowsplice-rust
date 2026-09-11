@@ -227,6 +227,25 @@ final class E2ETerminalTests: XCTestCase {
         XCTAssertEqual(result, .completed, "Remote output marker is absent from the rendered terminal")
     }
 
+    private func renderedHistoryRows() -> Set<String> {
+        // History overlay text is not consistently exposed in WebKit's AX tree.
+        // Read the actual pixels, using row numbers to distinguish older content.
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US"]
+        request.usesLanguageCorrection = false
+        do {
+            let screenshot = app.windows.firstMatch.screenshot()
+            try VNImageRequestHandler(data:screenshot.pngRepresentation, options:[:]).perform([request])
+            let rendered = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                .joined().filter { $0.isLetter || $0.isNumber }.uppercased()
+            let expression = try NSRegularExpression(pattern:"NATIVEHIST[0-9]{4}")
+            let text = rendered as NSString
+            return Set(expression.matches(in:rendered, range:NSRange(location:0, length:text.length))
+                .map { text.substring(with:$0.range) })
+        } catch { return [] }
+    }
+
     func testEnrollmentSessionAndForegroundLifecycle() throws {
         let environment = ProcessInfo.processInfo.environment
         let relay = try XCTUnwrap(environment["FLOWSPLICE_PTY_E2E_RELAY"], "External fixture Relay is required")
@@ -353,6 +372,58 @@ final class E2ETerminalTests: XCTestCase {
             terminal.typeText("printf '\\n" + octal + "\\n'\n")
             waitForRenderedOutput(marker)
         }
+        func historyRegression() {
+            let terminal = web.textViews.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? web.textViews.firstMatch
+            tap(terminal)
+            // A loop avoids a large UI input payload; the completion marker is octal
+            // encoded so the echoed command cannot satisfy the rendered-output check.
+            let done = "HISTORYCOMPLETE"
+            let octal = done.utf8.map { String(format:"\\%03o", Int($0)) }.joined()
+            terminal.typeText("i=0; while [ $i -lt 600 ]; do printf 'NATIVEHIST%04d\\n' \"$i\"; i=$((i+1)); done; printf '" + octal + "\\n'\n")
+            waitForRenderedOutput(done)
+            tap(web.buttons["切换只读"])
+            XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout:20))
+            func older() {
+#if os(macOS)
+                web.typeKey(XCUIKeyboardKey.pageUp, modifierFlags: .shift)
+#else
+                let start = web.coordinate(withNormalizedOffset: CGVector(dx:0.5, dy:0.30))
+                let end = web.coordinate(withNormalizedOffset: CGVector(dx:0.5, dy:0.60))
+                start.press(forDuration:0.05, thenDragTo:end)
+#endif
+            }
+#if os(macOS)
+            // Restore focus to the terminal after the mode button, without input.
+            tap(terminal)
+            let point = web.coordinate(withNormalizedOffset: CGVector(dx:0.5, dy:0.5))
+            // Exercise real wheel input without changing the host's natural-scroll
+            // preference. One direction is a no-op at the live bottom.
+            point.scroll(byDeltaX:0, deltaY:180)
+            if !web.buttons["回到底部"].waitForExistence(timeout:2) {
+                point.scroll(byDeltaX:0, deltaY:-180)
+            }
+#else
+            older()
+#endif
+            let bottom = web.buttons["回到底部"]
+            XCTAssertTrue(bottom.waitForExistence(timeout:20), "Upward history navigation must expose return-to-live")
+            waitForRenderedOutput("NATIVEHIST")
+            let initialRows = renderedHistoryRows()
+            XCTAssertFalse(initialRows.isEmpty, "Initial history rows must be rendered")
+            // Traverse beyond one 256-row page. Every gesture remains in the
+            // real WebView; no production debug or JavaScript hook is required.
+            for _ in 0..<18 { older() }
+            waitForRenderedOutput("NATIVEHIST")
+            let olderRows = renderedHistoryRows()
+            XCTAssertFalse(olderRows.isEmpty)
+            XCTAssertFalse(olderRows.subtracting(initialRows).isEmpty, "Scrolling must reveal older captured rows")
+            XCTAssertTrue(web.buttons["申请读写"].exists, "History navigation must preserve read-only mode")
+            tap(bottom)
+            wait(NSPredicate(format:"exists == false"), object:bottom)
+            tap(web.buttons["申请读写"])
+            XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
+            output("HISTORYLIVEAGAIN")
+        }
         if isClass { enrollClass(); home(firstHome); waitForHome() }
         else { enroll(firstHome) }
         create()
@@ -367,6 +438,7 @@ final class E2ETerminalTests: XCTestCase {
         let random = UUID().uuidString.replacingOccurrences(of:"-", with:"").prefix(8)
         let marker = "PTYCHECK" + String(random.map { alphabet[$0.hexDigitValue!] })
         output(marker)
+        historyRegression()
         tap(web.buttons["切换只读"])
         tap(web.buttons["申请读写"])
         XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))

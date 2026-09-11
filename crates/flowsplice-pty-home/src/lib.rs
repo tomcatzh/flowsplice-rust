@@ -4,6 +4,9 @@ pub mod pty;
 mod tmux;
 pub use tmux::TmuxConfig;
 mod backend;
+mod history;
+#[cfg(test)]
+mod history_tests;
 mod session;
 pub use backend::{PtyBackend, PtyDomainConfig};
 #[cfg(test)]

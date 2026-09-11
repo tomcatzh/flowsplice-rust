@@ -11,6 +11,36 @@ preserve connections. After suspension or application restart, saved connection
 intent restores the selected Homes and original terminal tabs automatically.
 The generic Travel applications retain their existing forwarding and background behavior.
 
+## Terminal scrollback
+
+Scroll upward with the mouse/trackpad, drag downward on a touch screen, or use
+Shift–Page Up to browse tmux output. Older rows load on demand without moving the
+current reading position. A floating down arrow appears while browsing; it returns
+to the latest live terminal output. Shift–Page Down and Shift–End also navigate
+back toward live output. Read-only clients can browse the same history.
+
+Home configures tmux to retain up to 50,000 physical history rows per pane. This is
+tmux's bounded in-memory history, not an audit log or permanent recording. Already
+discarded output cannot be recovered. On tmux 3.7 and newer the limit also updates
+existing panes; older supported tmux versions apply it to newly created panes.
+Existing shells are preserved during an upgrade.
+
+Each browsing pass captures a stable snapshot of retained history and the visible
+screen. Pages contain at most 256 rows and stay within the application frame limit.
+New output continues in the live terminal without pulling the history view to the
+bottom. Loaded rows are cached in the current tab's memory; returning to history
+reuses the cache when there has been no new output. A fresh browsing pass after new
+output refreshes the snapshot. Reattachment, deletion and tab closure discard the
+cache. Terminal bytes are never replayed as input or persisted to the workspace.
+History capture never enters tmux copy mode, changes writer ownership or resizes
+another client's terminal.
+
+Captures are bounded to 64 MiB each and 256 MiB of retained cache across a Home
+process, with one capture at a time. An unusually large history or exhausted cache
+returns a retryable error without disconnecting the terminal. Text, Unicode and
+SGR styling are rendered as inert history; links and terminal control actions are
+not executed by the history viewer.
+
 ## Provisioning
 
 Use the generic Home setup command to request a serving-only business Home. The
@@ -191,5 +221,5 @@ check. Do not enable xterm's screen-reader mode just to expose text to a test:
 that mode changes its software-keyboard input handling. Input-method composition
 and physical-device acceptance require their own explicit evidence.
 
-History, audit, OAuth Web verification and durable recording are deferred. Terminal
-rendering and attachment recovery do not constitute an audit log.
+Audit, OAuth Web verification and durable history recording are deferred. The
+in-memory terminal scrollback and attachment recovery do not constitute an audit log.

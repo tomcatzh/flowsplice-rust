@@ -220,6 +220,114 @@ fn no_listeners() -> Result<()> {
     }
     Ok(())
 }
+// Exercise lazy pages on the same encrypted business connections as terminal I/O.
+async fn history_exercise(
+    a: &mut Probe,
+    b: &mut Probe,
+    aid: Uuid,
+    bid: Uuid,
+    epoch: u64,
+) -> Result<()> {
+    let done = format!("HISTORY-DONE-{}", Uuid::new_v4());
+    let command = format!(
+        "i=0; while [ $i -lt 600 ]; do printf 'HIST-%04d-中文\\n' \"$i\"; i=$((i+1)); done; {}",
+        print_command(&done)
+    );
+    a.input(aid, epoch, &command).await?;
+    a.text(&done).await?;
+    b.text(&done).await?;
+    let ownership = b.ownership.clone();
+    let capture_id = Uuid::new_v4();
+    let operation = Operation::History {
+        attachment_id: bid,
+        capture_id,
+        before: None,
+    };
+    let first = b.request(operation.clone()).await?;
+    ensure!(
+        b.request(operation).await? == first,
+        "history capture was not cached"
+    );
+    let Reply::History {
+        total_lines,
+        start,
+        lines,
+        ..
+    } = first
+    else {
+        bail!("observer history failed")
+    };
+    ensure!(
+        start + u32::try_from(lines.len())? == total_lines,
+        "latest history page cursor invalid"
+    );
+    let mut all = lines;
+    let mut before = start;
+    while before > 0 {
+        let Reply::History {
+            total_lines: total,
+            start,
+            lines,
+            ..
+        } = b
+            .request(Operation::History {
+                attachment_id: bid,
+                capture_id,
+                before: Some(before),
+            })
+            .await?
+        else {
+            bail!("history paging failed")
+        };
+        ensure!(
+            total == total_lines
+                && start < before
+                && start + u32::try_from(lines.len())? == before
+                && lines.len() <= 256,
+            "history pages overlap or skip rows"
+        );
+        all.splice(0..0, lines);
+        before = start;
+    }
+    let numbers: Vec<u32> = all
+        .iter()
+        .filter_map(|line| line.split("HIST-").nth(1)?.get(..4)?.parse().ok())
+        .collect();
+    ensure!(
+        numbers == (0..600).collect::<Vec<_>>(),
+        "encrypted history omitted or duplicated numbered rows"
+    );
+    ensure!(b.ownership == ownership, "history changed writer ownership");
+    ensure!(
+        matches!(
+            a.request(Operation::History {
+                attachment_id: bid,
+                capture_id,
+                before: None
+            })
+            .await?,
+            Reply::Error { .. }
+        ),
+        "cross-connection history accepted"
+    );
+    ensure!(
+        matches!(
+            b.request(Operation::History {
+                attachment_id: bid,
+                capture_id: Uuid::new_v4(),
+                before: Some(start)
+            })
+            .await?,
+            Reply::Error { .. }
+        ),
+        "unknown capture continuation accepted"
+    );
+    a.input(aid, epoch, &print_command("HISTORY-WRITER-STILL-ACTIVE"))
+        .await?;
+    a.text("HISTORY-WRITER-STILL-ACTIVE").await?;
+    Ok(())
+}
+
 // Keep this ordered E2E scenario readable as one acceptance sequence.
 #[allow(clippy::too_many_lines)]
 async fn exercise(args: &[String]) -> Result<()> {
@@ -255,6 +363,7 @@ async fn exercise(args: &[String]) -> Result<()> {
         "occupied session admitted a second writer"
     );
     b.text(&marker).await?;
+    history_exercise(&mut a, &mut b, aid, bid, epoch).await?;
     ensure!(
         matches!(
             b.request(Operation::Input {
@@ -388,7 +497,7 @@ async fn exercise(args: &[String]) -> Result<()> {
     no_listeners()?;
     c.client.shutdown().await;
     println!(
-        "{{\"checkpoint\":\"encrypted-pty-exercise-complete\",\"checks\":[\"list-before-new\",\"utf8-output\",\"single-writer\",\"observer-size\",\"warned-takeover\",\"stale-epoch-rejected\",\"rw-ro-rw\",\"detach-rejoin-screen\",\"shutdown-releases-writer\",\"natural-shell-exit\",\"no-local-listeners\"]}}"
+        "{{\"checkpoint\":\"encrypted-pty-exercise-complete\",\"checks\":[\"lazy-history-pages\",\"history-observer-permissions\",\"list-before-new\",\"utf8-output\",\"single-writer\",\"observer-size\",\"warned-takeover\",\"stale-epoch-rejected\",\"rw-ro-rw\",\"detach-rejoin-screen\",\"shutdown-releases-writer\",\"natural-shell-exit\",\"no-local-listeners\"]}}"
     );
     Ok(())
 }

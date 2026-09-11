@@ -1,3 +1,4 @@
+import { HistoryView } from "./history";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -54,6 +55,7 @@ type Tab = {
   terminal: Terminal;
   fit: FitAddon;
   pane: HTMLElement;
+  history: HistoryView;
   notice: string;
   state: "attached" | "reconnecting" | "deleted";
   name: string;
@@ -346,6 +348,7 @@ function restoreTabs(h: Home) {
   }
 }
 function deleted(t: Tab) {
+  t.history.reset();
   t.name = title(t);
   t.state = "deleted";
   t.id = "";
@@ -356,6 +359,7 @@ function deleted(t: Tab) {
 function suspend(home: Home) {
   resetOperations(home);
   for (const t of tabs.values()) if (t.home === home && t.state !== "deleted") {
+    t.history.reset();
     t.name = title(t);
     t.state = "reconnecting";
     t.id = "";
@@ -480,6 +484,7 @@ function fit(tab: Tab) {
       Math.max(2, Math.min(512, size.cols)),
       Math.max(1, Math.min(256, size.rows)),
     );
+  tab.history.measure();
 }
 function focus(tab: Tab) {
   active = tab.key;
@@ -487,7 +492,7 @@ function focus(tab: Tab) {
   page = "terminal";
   render();
   fit(tab);
-  tab.terminal.focus();
+  tab.history.focus();
 }
 // Native pointer down/up can straddle a catalog or protocol event batch.
 function reconcileChildren(parent: HTMLElement, desired: HTMLElement[]) {
@@ -777,6 +782,7 @@ function closeWarning() {
   el<HTMLDialogElement>("takeover").close();
 }
 function remove(tab: Tab) {
+  tab.history.dispose();
   tab.terminal.dispose();
   tab.pane.remove();
   tabs.delete(tab.key);
@@ -822,7 +828,7 @@ function clear(home: Home) {
   home.sessions.clear();
 }
 function input(tab: Tab, value: string) {
-  if (!foreground || tab.state !== "attached" || !tab.home.connected || tab.mode !== "read_write") return;
+  if (tab.history.browsing || !foreground || tab.state !== "attached" || !tab.home.connected || tab.mode !== "read_write") return;
   const data = new TextEncoder().encode(value),
     writer_epoch = tab.epoch;
   for (let i = 0; i < data.length; i += 16384)
@@ -884,7 +890,8 @@ function createTab(h: Home, session: string, name: string, mode: string, state: 
   terminal.loadAddon(addon);
   terminal.open(pane);
   terminal.parser.registerOscHandler(52, () => true);
-  const tab: Tab = {key:key(h.id, session), home:h, session, name, id:"", mode, epoch:0, terminal, fit:addon, pane, notice:"", state};
+  const history = new HistoryView(pane, () => tab.state === "attached" && h.connected ? tab.id : "", op => operation(h, op as Operation), () => terminal.focus(), () => ({rows:terminal.rows, cols:terminal.cols, font:terminal.options.fontFamily, size:terminal.options.fontSize}));
+  const tab: Tab = {history, key:key(h.id, session), home:h, session, name, id:"", mode, epoch:0, terminal, fit:addon, pane, notice:"", state};
   tabs.set(tab.key, tab);
   terminal.onData(data => input(tab, data));
   terminal.onResize(({cols, rows}) => {
@@ -901,6 +908,8 @@ function protocol(h: Home, m: any) {
     const req = h.requests.get(m.request_id);
     h.requests.delete(m.request_id);
     const r = m.result;
+    if (r.status === "history") { attachment(h.id, r.attachment_id)?.history.accept(r); return; }
+    if (req?.op === "history") { attachment(h.id, req.attachment_id)?.history.fail(req.capture_id); return; }
     if (req?.op === "list_details" || r.status === "session_details")
       h.detailsPending = false;
     if (req?.op === "rename") {
@@ -961,7 +970,8 @@ function protocol(h: Home, m: any) {
       el<HTMLDialogElement>("takeover").showModal();
     }
   } else if (m.type === "output") {
-    attachment(h.id, m.attachment_id)?.terminal.write(new Uint8Array(m.data));
+    const t = attachment(h.id, m.attachment_id);
+    if (t) { t.history.output(); t.terminal.write(new Uint8Array(m.data)); }
     return;
   } else if (m.type === "ownership") {
     for (const t of tabs.values())
@@ -985,7 +995,7 @@ function protocol(h: Home, m: any) {
     details(h);
   } else if (m.type === "detached") {
     const t = attachment(h.id, m.attachment_id);
-    if (t) { t.state = "reconnecting"; t.id = ""; t.notice = "连接中断，正在恢复原会话…"; }
+    if (t) { t.history.reset(); t.state = "reconnecting"; t.id = ""; t.notice = "连接中断，正在恢复原会话…"; }
     h.listed = false;
     details(h);
   } else if (m.type === "session_ended") {
@@ -1026,10 +1036,12 @@ window.flowsplice = {
     for (const e of events) {
       if (e.type === "protocol" && e.message?.type === "output") {
         const t = attachment(e.home_id, e.message.attachment_id);
-        if (t)
+        if (t) {
+          t.history.output();
           await new Promise<void>((resolve) =>
             t.terminal.write(new Uint8Array(e.message.data), resolve),
           );
+        }
       } else window.flowsplice.receive(e);
     }
   },
@@ -1184,6 +1196,7 @@ window.flowsplice = {
       h.notice = e.progress.verification_code ? "" : e.progress.phase;
       render();
     } else if (e.type === "error") {
+      for (const t of tabs.values()) if (t.home === h) t.history.fail();
       h.detailsPending = false;
       h.connectAfterEnroll = false;
       h.pendingNew = null;

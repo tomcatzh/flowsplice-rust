@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub const APPLICATION_PROTOCOL: &str = "flowsplice.pty.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
+pub const MAX_HISTORY_LINES: u32 = 50_256;
+pub const MAX_HISTORY_PAGE_LINES: usize = 256;
+pub const MAX_HISTORY_PAGE_BYTES: usize = 96 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +114,11 @@ pub enum Operation {
     Detach {
         attachment_id: Uuid,
     },
+    History {
+        attachment_id: Uuid,
+        capture_id: Uuid,
+        before: Option<u32>,
+    },
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -143,6 +151,14 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
+    History {
+        attachment_id: Uuid,
+        capture_id: Uuid,
+        total_lines: u32,
+        start: u32,
+        columns: u16,
+        lines: Vec<String>,
+    },
     Sessions {
         sessions: Vec<Session>,
     },
@@ -215,6 +231,11 @@ enum OperationWire {
     Detach {
         attachment_id: Uuid,
     },
+    History {
+        attachment_id: Uuid,
+        capture_id: Uuid,
+        before: Option<u32>,
+    },
 }
 impl<'de> Deserialize<'de> for Operation {
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -241,6 +262,14 @@ impl<'de> Deserialize<'de> for Operation {
     deny_unknown_fields
 )]
 enum ReplyWire {
+    History {
+        attachment_id: Uuid,
+        capture_id: Uuid,
+        total_lines: u32,
+        start: u32,
+        columns: u16,
+        lines: Vec<String>,
+    },
     Sessions {
         sessions: Vec<Session>,
     },
@@ -393,6 +422,18 @@ impl Operation {
                 data(bytes)
             }
             Self::Detach { attachment_id } => identifier(*attachment_id),
+            Self::History {
+                attachment_id,
+                capture_id,
+                before,
+            } => {
+                identifier(*attachment_id)?;
+                identifier(*capture_id)?;
+                if before.is_some_and(|value| value > MAX_HISTORY_LINES) {
+                    bail!("history cursor out of range");
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -423,6 +464,29 @@ impl ClientMessage {
 impl Reply {
     fn validate(&self) -> Result<()> {
         match self {
+            Self::History {
+                attachment_id,
+                capture_id,
+                total_lines,
+                start,
+                columns,
+                lines,
+            } => {
+                identifier(*attachment_id)?;
+                identifier(*capture_id)?;
+                if *total_lines > MAX_HISTORY_LINES
+                    || *start > *total_lines
+                    || lines.len() > MAX_HISTORY_PAGE_LINES
+                    || lines.len() > (*total_lines - *start) as usize
+                    || !(1..=512).contains(columns)
+                    || (lines.is_empty() && *start != 0)
+                    || lines.iter().any(|line| line.contains(['\n', '\r']))
+                    || serde_json::to_vec(lines)?.len() > MAX_HISTORY_PAGE_BYTES
+                {
+                    bail!("invalid history page bounds");
+                }
+                Ok(())
+            }
             Self::SessionDetails { sessions } => {
                 if sessions.len() > 128 {
                     bail!("too many sessions");

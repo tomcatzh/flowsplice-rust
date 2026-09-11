@@ -2,6 +2,8 @@ package io.zxf.flowsplice.pty
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.KeyEvent
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -84,6 +86,37 @@ class PrivateTerminalE2ETest {
         val quoted = JSONObject.quote(id)
         assertEquals("Required UI control unavailable: $id", "true", evaluate(scenario,
             "(()=>{const e=document.getElementById($quoted);if(!e||e.hidden||e.disabled)return false;e.click();return true})()"))
+    }
+
+    private fun swipeTerminalToOlder(scenario: ActivityScenario<MainActivity>) {
+        val coordinates = JSONArray(evaluate(scenario, """
+            (()=>{const r=document.querySelector('#panes > .terminal:not([hidden])').getBoundingClientRect();return [r.x+r.width*.5,r.y+r.height*.25,r.y+r.height*.75,innerWidth]})()
+        """.trimIndent()))
+        var x = 0f
+        var startY = 0f
+        var endY = 0f
+        scenario.onActivity { activity ->
+            val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+            val origin = IntArray(2)
+            web.getLocationOnScreen(origin)
+            val scale = web.width / coordinates.getDouble(3)
+            x = (origin[0] + coordinates.getDouble(0) * scale).toFloat()
+            startY = (origin[1] + coordinates.getDouble(1) * scale).toFloat()
+            endY = (origin[1] + coordinates.getDouble(2) * scale).toFloat()
+        }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val down = SystemClock.uptimeMillis()
+        fun send(action: Int, y: Float) {
+            val event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0)
+            try { instrumentation.sendPointerSync(event) } finally { event.recycle() }
+        }
+        send(MotionEvent.ACTION_DOWN, startY)
+        for (step in 1..12) {
+            SystemClock.sleep(16)
+            send(MotionEvent.ACTION_MOVE, startY + (endY - startY) * step / 12)
+        }
+        send(MotionEvent.ACTION_UP, endY)
+        instrumentation.waitForIdleSync()
     }
 
     private fun imeDiagnostic(scenario: ActivityScenario<MainActivity>, stage: String, phase: String, connectionAvailable: Boolean? = null) {
@@ -258,6 +291,34 @@ class PrivateTerminalE2ETest {
                 typeTerminal(scenario, "printf '\\n${octal}\\n'", stage)
                 waitFor(scenario, "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility')).some(e=>e.textContent.includes(${JSONObject.quote(marker)}))", "remote rendered output $marker", 30)
             }
+            fun historyRegression() {
+                typeTerminal(scenario, "i=0; while [ \$i -lt 600 ]; do printf 'NATIVEHIST%04d\\n' \"\$i\"; i=\$((i+1)); done", "history-seed")
+                output("HISTORYCOMPLETE", "history-complete")
+                click(scenario, "mode")
+                waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "history observer")
+                val pane = "document.querySelector('#panes > .terminal:not([hidden])')"
+                val viewport = "$pane.querySelector('[aria-label=\"终端历史\"]')"
+                val bottom = "$pane.querySelector('[aria-label=\"回到底部\"]')"
+                swipeTerminalToOlder(scenario)
+                waitFor(scenario, "!$viewport.hidden&&!$bottom.hidden&&$viewport.textContent.includes('NATIVEHIST')", "native swipe reveals history")
+                // Select a fractional anchor near the loaded page boundary, then
+                // verify prepend keeps the same physical row at the same offset.
+                val anchor = JSONObject(evaluate(scenario, """
+                    (()=>{const v=$viewport;v.scrollTop=60.5;v.dispatchEvent(new Event('scroll'));const top=v.getBoundingClientRect().top;const row=Array.from(v.querySelectorAll('.history-row')).find(e=>e.getBoundingClientRect().bottom>top);return {line:row.dataset.line,text:row.textContent,offset:row.getBoundingClientRect().top-top,height:v.scrollHeight}})()
+                """.trimIndent()))
+                val line = JSONObject.quote(anchor.getString("line"))
+                val text = JSONObject.quote(anchor.getString("text"))
+                waitFor(scenario, "$viewport.scrollHeight>${anchor.getInt("height")}", "older history page prepended")
+                assertEquals("true", evaluate(scenario, """
+                    (()=>{const v=$viewport,row=Array.from(v.querySelectorAll('.history-row')).find(e=>e.dataset.line===$line);return !!row&&row.textContent===$text&&Math.abs(row.getBoundingClientRect().top-v.getBoundingClientRect().top-(${anchor.getDouble("offset")}))<2})()
+                """.trimIndent()))
+                assertEquals("true", evaluate(scenario, "document.getElementById('mode-label').textContent==='只读'"))
+                assertEquals("true", evaluate(scenario, "(()=>{const b=$bottom;if(b.hidden)return false;b.click();return true})()"))
+                waitFor(scenario, "$viewport.hidden&&$bottom.hidden", "return-to-live hides history controls")
+                click(scenario, "mode")
+                waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "writer restored after history")
+                output("HISTORYLIVEAGAIN", "history-live-input")
+            }
             fun switch(name: String) {
                 click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E renamed")});if(!b)return false;b.click();return true})()"))
@@ -275,6 +336,7 @@ class PrivateTerminalE2ETest {
             assertEquals("7", evaluate(scenario, "document.querySelectorAll('#keys button').length"))
             val marker = "PTY_E2E_" + UUID.randomUUID().toString().replace("-", "").take(8)
             output(marker, "first-home-initial")
+            historyRegression()
             click(scenario, "mode")
             waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "readonly")
             click(scenario, "mode")

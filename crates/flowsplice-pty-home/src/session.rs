@@ -48,6 +48,7 @@ struct Attachment {
     columns: u16,
     rows: u16,
     started: watch::Sender<bool>,
+    history: Option<Arc<crate::history::Snapshot>>,
 }
 struct Ownership {
     name: String,
@@ -213,6 +214,7 @@ impl SessionState {
                     columns,
                     rows,
                     started,
+                    history: None,
                 },
             );
         }
@@ -489,6 +491,66 @@ impl SessionState {
             .attachments
             .get(&id)
             .is_some_and(|a| a.connection.id == connection))
+    }
+    pub async fn history(
+        &self,
+        connection: &Connection,
+        id: Uuid,
+        capture_id: Uuid,
+        before: Option<u32>,
+    ) -> Result<Reply> {
+        {
+            let state = self.lock()?;
+            let attachment = state.attachments.get(&id).context("attachment ended")?;
+            if attachment.connection.id != connection.id || !connection.active() {
+                bail!("history requires an active attachment owned by this connection");
+            }
+            if let Some(snapshot) = &attachment.history
+                && snapshot.id == capture_id
+            {
+                return snapshot.page(id, before);
+            }
+            if before.is_some() {
+                bail!("history snapshot expired; start a new capture");
+            }
+        }
+        let _slot = tokio::select! {
+            biased;
+            () = connection.ended() => bail!("connection ended"),
+            permit = crate::history::CAPTURE_SLOT.acquire() => permit?,
+        };
+        {
+            let mut state = self.lock()?;
+            let attachment = state.attachments.get_mut(&id).context("attachment ended")?;
+            if attachment.connection.id != connection.id || !connection.active() {
+                bail!("connection ended");
+            }
+            if let Some(snapshot) = &attachment.history
+                && snapshot.id == capture_id
+            {
+                return snapshot.page(id, before);
+            }
+            // Release the prior cache budget before replacing it. Failure remains
+            // retryable and never changes the PTY attachment or writer ownership.
+            attachment.history = None;
+        }
+        let captured = tokio::select! {
+            biased;
+            () = connection.ended() => bail!("connection ended"),
+            result = self.tmux.capture_history(self.id) => result?,
+        };
+        let snapshot = Arc::new(crate::history::Snapshot::parse(capture_id, &captured)?);
+        let mut state = self.lock()?;
+        let attachment = state
+            .attachments
+            .get_mut(&id)
+            .context("attachment ended during history capture")?;
+        if attachment.connection.id != connection.id || !connection.active() {
+            bail!("connection ended");
+        }
+        let result = snapshot.page(id, before)?;
+        attachment.history = Some(snapshot);
+        Ok(result)
     }
 }
 fn close_process(process: Arc<PtyProcess>) {

@@ -128,6 +128,7 @@ impl Domain {
             )
             .await
     }
+    #[allow(clippy::too_many_lines)] // Dispatch stays exhaustive over the wire operations.
     async fn operation(&self, connection: &Connection, operation: Operation) -> Result<Reply> {
         if !connection.active() {
             bail!("business connection ended");
@@ -221,6 +222,15 @@ impl Domain {
                 self.attachment(connection.id, attachment_id)?
                     .detach(connection.id, attachment_id)?;
                 Ok(Reply::Ok)
+            }
+            Operation::History {
+                attachment_id,
+                capture_id,
+                before,
+            } => {
+                self.attachment(connection.id, attachment_id)?
+                    .history(connection, attachment_id, capture_id, before)
+                    .await
             }
         }
     }

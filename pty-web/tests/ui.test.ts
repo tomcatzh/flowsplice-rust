@@ -890,3 +890,33 @@ test("rename selects the complete existing name without changing it", () => {
   expect(document.activeElement).toBe(input);
   expect(ops("rename")).toHaveLength(0);
 });
+
+test('history is attachment-local, suppresses writer input, and both output paths dirty only next browse', async () => {
+  attach();
+  const pane=document.querySelector<HTMLElement>('.terminal')!;
+  const enter=()=>pane.dispatchEvent(new WheelEvent('wheel',{deltaY:-40,bubbles:true,cancelable:true}));
+  const live=()=>pane.querySelector<HTMLButtonElement>('.history-bottom')!.click();
+  const answer=()=>{const op=ops('history').at(-1).operation;response({status:'history',attachment_id:'attachment',capture_id:op.capture_id,total_lines:1000,start:744,columns:80,lines:Array.from({length:256},(_,i)=>String(i))});};
+  enter();answer();expect(terminals).toHaveLength(1);
+  const viewport=pane.querySelector<HTMLElement>('.history-viewport')!, top=viewport.scrollTop;
+  terminals[0].onInput('blocked');expect(ops('input')).toHaveLength(0);
+  await window.flowsplice.receiveBatch([{type:'protocol',home_id:'mac',message:{type:'output',attachment_id:'attachment',data:[65]}}]);
+  expect(terminals[0].write).toHaveBeenCalled();expect(viewport.scrollTop).toBe(top);
+  live();enter();expect(ops('history')).toHaveLength(2);answer();live();enter();expect(ops('history')).toHaveLength(2);
+  send({type:'protocol',message:{type:'output',attachment_id:'attachment',data:[66]}});expect(viewport.scrollTop).toBe(top);
+  live();enter();expect(ops('history')).toHaveLength(3);
+  state('mac',false);expect(viewport.hidden).toBe(true);expect(pane.querySelector('.history-content')!.textContent).toBe('');
+});
+
+test('read-only history stays local and identical attachment IDs on different homes do not share captures',()=>{
+  attach('mac','read_only');attach('vps','read_only');
+  const panes=Array.from(document.querySelectorAll<HTMLElement>('.terminal'));
+  for(const pane of panes)pane.dispatchEvent(new WheelEvent('wheel',{deltaY:-30,bubbles:true,cancelable:true}));
+  expect(ops('history')).toHaveLength(2);expect(ops('history')[0].home_id).not.toBe(ops('history')[1].home_id);
+  expect(ops('history')[0].operation.capture_id).not.toBe(ops('history')[1].operation.capture_id);
+  terminals.forEach(t=>t.onInput('blocked'));expect(ops('input')).toHaveLength(0);
+  const op=ops('history')[0].operation;send({type:'submitted',request_id:'hist',operation:op});response({status:'error',message:'capture unavailable'},'mac','hist');
+  expect(panes[0].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(false);expect(panes[1].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(true);
+  send({type:'error',message:'queue full'},'vps');expect(panes[1].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(false);
+  send({type:'protocol',message:{type:'session_ended',session_id:'session'}},'mac');expect(panes[0].querySelector<HTMLElement>('.history-viewport')!.hidden).toBe(true);
+});
