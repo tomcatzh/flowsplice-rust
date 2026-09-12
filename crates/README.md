@@ -1,39 +1,39 @@
-# 用 FlowSplice 接入自己的业务
+# Build your own business with FlowSplice
 
-FlowSplice 0.4.0 提供两个业务 SDK 入口：
+FlowSplice provides two supported SDK entry points:
 
-| 依赖 | 用途 |
+| Dependency | Purpose |
 | --- | --- |
-| `flowsplice-home-core` | 在业务服务端接收授权连接 |
-| `flowsplice-travel-core` | 在业务客户端完成注册、发现和连接 |
+| `flowsplice-home-core` | Accept authorized connections in your business server |
+| `flowsplice-travel-core` | Enroll, discover and connect from your business client |
 
-业务消息格式、请求处理、应用权限和界面由你的项目实现。
+Your application owns its message format, request handling, application permissions and user interface.
 
-## 添加依赖
+## Install
 
-新建自己的 Rust 项目，按角色选用下面的 Git 依赖；同时实现两端才需要两项。这里使用 `0.4.0` 标签，不是 crates.io 安装方式。
+Create an independent Rust project and select the dependency for each role. An application implementing both roles needs both entries:
 
 ```toml
 [dependencies]
-flowsplice-home-core = { git = "https://github.com/tomcatzh/flowsplice-rust", tag = "0.4.0" }
-flowsplice-travel-core = { git = "https://github.com/tomcatzh/flowsplice-rust", tag = "0.4.0", default-features = false }
+flowsplice-home-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main" }
+flowsplice-travel-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main", default-features = false }
 ```
 
-Travel 关闭默认特性后，可作为无内置 Web 界面的客户端运行。下面的 Rust 片段还使用普通依赖 `anyhow = "1"`、`serde_json = "1"` 和启用 `rt-multi-thread`、`macros`、`io-util` 的 Tokio 1。
+These are Git dependencies. Disabling Travel's default features selects a client without the built-in Web UI. The snippets below also use `anyhow = "1"`, `serde_json = "1"` and Tokio 1 with `rt-multi-thread`, `macros` and `io-util` enabled.
 
-Cargo 会获取 Git 仓库源码，再构建所选包的依赖图；无需把你的项目放入 FlowSplice workspace。两个入口仍有内部传递依赖，不代表整个构建只有两个包。应用应提交自己的 `Cargo.lock`。
+Cargo fetches the repository and builds the selected dependency graph. Your application has its own workspace. The two SDK entry points have internal transitive dependencies. Commit your application's `Cargo.lock` to retain the resolved Git revision; update it deliberately when adopting a newer revision.
 
-## 接入前准备
+## Prerequisites
 
-需要可用的 FlowSplice Server、Relay，以及管理员配置好的业务 Home。Home 使用已有的证书、私钥、部署信任、授权缓存和业务服务授权文件；`HomeRuntime::load` 不负责注册或签发它们。
+Use a running FlowSplice Server and Relay, and a business Home provisioned by an administrator. Home needs existing certificates, private keys, deployment trust, authorization state and service grants. `HomeRuntime::load` verifies and loads these materials; provisioning happens beforehand.
 
-客户端需要业务描述符、Relay 地址和通过独立可信渠道取得的部署根公钥。注册需要审批，成功安装后再启动客户端。保留安装目录和身份文件，不要每次启动重新注册。配置、私钥和真实部署材料应保存在应用自己的数据目录。
+Travel needs the matching business descriptor, a reachable Relay management IP address and port, and a deployment root public key obtained through an independently trusted channel. Enrollment requires administrator approval. Retain the installed identity between runs. Store configuration and private identity material in your application's data directory.
 
-## 业务 Home
+## Business Home
 
-从 `flowsplice_home_core` 直接取得 `HomeRuntimeConfig`、`Service`、`ServiceProtocol`、`SocketServices` 和监听器类型。配置中的服务 ID、协议必须与已获批的服务一致。
+Import `HomeRuntimeConfig`, `Service`, `ServiceProtocol`, `SocketServices` and listener types from `flowsplice_home_core`. Configured service IDs and protocols must match the approved services. Use absolute file paths when loading the provisioned Home configuration directly.
 
-下面接收一个 TCP 业务连接后关闭，展示完整运行时生命周期。`config` 由调用方读取管理员配置；业务处理回调必须自行处理消息边界、超时及授权生命周期。
+This function accepts one TCP connection and demonstrates runtime ownership. The caller supplies the configuration and a handler responsible for message boundaries, timeouts and authorization lifetime:
 
 ```rust
 use anyhow::Result;
@@ -71,20 +71,29 @@ where
 }
 ```
 
-持续服务时把接收与业务任务管理放在应用循环中，并提供停止信号。`run_serving()` 必须与接收循环并发执行；退出时调用 `shutdown().await`，再等待 serving 任务结束。
+Keep `run_serving()` running concurrently with your accept loop. For a persistent server, manage connection tasks and an application stop signal. On exit, call `shutdown().await` and await the serving task.
 
-UDP 使用 `bind_udp`；`accept()` 返回数据报接口和认证对端。`ServicePeer` 提供身份及 `lifetime`：业务操作应检查 `is_active()`，等待期间可监听 `ended()`。缓冲区里还有数据不表示授权仍然有效。
+Complete application acknowledgements and stream closure before stopping the runtime. `runtime.shutdown()` terminates active connections. The [standalone foobar example](../examples/sdk-foobar/README.md) shows a complete exchange and transport completion, including both half-close orders.
 
-## 业务 Travel Client
+UDP services use `bind_udp`; `accept()` returns datagram I/O and authenticated peer metadata. `ServicePeer` includes identity and `lifetime`: check `is_active()` before business operations and observe `ended()` while waiting. Buffered input may remain after authorization ends.
 
-两个注册入口共用 `business::BusinessEnrollmentOptions`：填写客户端 ID、安装目录、Relay IP 与端口、部署根公钥内容、私钥密码和审批等待秒数。`root` 参数也是公钥内容，不是文件路径。
+## Business Travel client
 
-选择与业务授权范围对应的一种模式：
+Both enrollment modes use `business::BusinessEnrollmentOptions`: provide a client ID, installation directory, Relay management IP address and port, trusted root key contents, private-key password and approval timeout in seconds.
 
-- 固定目标：解析 `BusinessDescriptor`，调用 `business::enroll(options, descriptor, on_progress).await`；以后用相同描述符调用 `TravelCore::start_business`，连接返回的 `approved.binding`。
-- 服务类别：解析 `ServiceClassDescriptor`，调用 `service_class::enroll(options, descriptor, label, on_progress).await`；以后调用 `TravelCore::start_service_class`，再用 `service_class_targets(&approved).await` 取得已验证目标。由应用选择目标，构造 `ServiceBinding`。发现结果可能暂时为空。
+The `root` argument contains the deployment root public key as hexadecimal text. Read the file and call `.trim()` before passing its contents to enrollment or startup:
 
-这两个异步函数展示注册调用，参数由应用提供：
+```rust
+let root = std::fs::read_to_string(root_file)?;
+let root = root.trim();
+```
+
+Select the enrollment mode matching the application's authorization:
+
+- **Exact target:** parse a `BusinessDescriptor`, call `business::enroll`, then use the same descriptor with `TravelCore::start_business`. Connect using the returned `approved.binding`.
+- **Service class:** parse a `ServiceClassDescriptor`, call `service_class::enroll`, then use `TravelCore::start_service_class`. Call `service_class_targets(&approved).await`, select a verified target in your application and construct its `ServiceBinding`. Discovery can initially return no targets.
+
+The application supplies the arguments and an enrollment progress callback when it needs to display the verification code:
 
 ```rust
 pub async fn enroll_exact(
@@ -107,7 +116,7 @@ pub async fn enroll_class(
 }
 ```
 
-以下固定目标示例要求已经完成安装，而且描述符指定 TCP 服务。回调拿到的是进程内异步流，业务结束后关闭运行时：
+After installation, an exact TCP business can open an in-process asynchronous stream:
 
 ```rust
 pub async fn use_exact<F, Fut>(
@@ -133,6 +142,6 @@ where
 }
 ```
 
-UDP 服务使用 `connect_udp`。这些连接不需要客户端物理监听端口或本地端口映射。同一运行时可以服务多个业务连接；应用退出时调用 `shutdown()`。
+The handler should complete its application exchange before returning. Applications that require graceful transport completion must keep the stream and runtime alive through that completion; see the foobar example. UDP services use `connect_udp`. Neither API requires a local client listening port or port mapping. A runtime can support multiple business connections.
 
-上述片段是接入函数，不是自带证书和部署环境的可运行服务。首次验证应在自己的测试部署中完成注册审批、业务收发和关闭；编译通过不能代替真实连接测试。
+These functions require deployment materials supplied by your application. Validate enrollment approval, actual request/response bytes and shutdown in a disposable deployment before integration.

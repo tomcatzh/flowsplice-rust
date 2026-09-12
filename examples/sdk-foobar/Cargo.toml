@@ -1,0 +1,15 @@
+[package]
+name = "flowsplice-foobar-sample"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+flowsplice-home-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main" }
+flowsplice-travel-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main", default-features = false }
+anyhow = "1"
+serde_json = "1"
+toml = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
