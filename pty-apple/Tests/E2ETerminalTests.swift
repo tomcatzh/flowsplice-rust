@@ -424,7 +424,34 @@ final class E2ETerminalTests: XCTestCase {
             XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
             output("HISTORYLIVEAGAIN")
         }
-        if isClass { enrollClass(); home(firstHome); waitForHome() }
+        if isClass {
+            enrollClass()
+            tap(web.buttons["断开全部连接"])
+            _ = waitForText(containing:"服务目录未连接", timeout:30)
+            tap(web.buttons["重新输入密码"])
+            let wrongPassword = web.secureTextFields.firstMatch
+            tap(wrongPassword); wrongPassword.typeText("incorrect-fixture-password")
+            finishFormEditing()
+            tap(web.buttons["连接"])
+            _ = waitForText(containing:"failed to", timeout:60)
+            // A local credential failure must leave recovery usable instead of
+            // racing a stored-password retry against an open password dialog.
+            tap(web.buttons["重新输入密码"])
+            let correctedPassword = web.secureTextFields.firstMatch
+            tap(correctedPassword); correctedPassword.typeText(password)
+            finishFormEditing(); tap(web.buttons["连接"])
+            _ = waitForText(containing:"服务目录已连接", timeout:60)
+            tap(web.buttons["断开全部连接"])
+            _ = waitForText(containing:"服务目录未连接", timeout:30)
+            tap(web.buttons["重试注册"])
+            XCTAssertEqual(inputField(containing:"Relay").value as? String, relay)
+            let resumedPassword = web.secureTextFields.firstMatch
+            tap(resumedPassword); resumedPassword.typeText(password)
+            finishFormEditing(); tap(web.buttons["恢复注册"])
+            _ = waitForText(containing:"服务目录已连接", timeout:60)
+            print("PTY_E2E_PASSWORD_AND_ENROLLMENT_RECOVERY_PASSED")
+            home(firstHome); waitForHome()
+        }
         else { enroll(firstHome) }
         create()
         for label in ["Ctrl+C", "Tab", "Esc", "↑", "↓", "←", "→"] {
@@ -456,15 +483,30 @@ final class E2ETerminalTests: XCTestCase {
         tap(web.buttons["打开"])
         XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:20))
 #if os(macOS)
+        let hiddenMarker = marker + "HIDDENCOMPLETE"
+        let hiddenOctal = hiddenMarker.utf8.map { String(format:"\\%03o", Int($0)) }.joined()
+        let hiddenTerminal = web.textViews.allElementsBoundByIndex.first(where:{ $0.isHittable }) ?? web.textViews.firstMatch
+        tap(hiddenTerminal)
+        // Eighty paced 64 KiB batches exceed the 4 MiB observer budget. Delay
+        // output until Cmd+H, and keep the completion text out of shell echo.
+        hiddenTerminal.typeText("sleep 2; i=0; while [ $i -lt 80 ]; do awk 'BEGIN { for (j=0; j<64; j++) printf \"%01024d\\n\", 0 }'; sleep 0.1; i=$((i+1)); done; printf '\\n" + hiddenOctal + "\\n'\n")
+        print("PTY_E2E_HIDDEN_BEGIN")
         app.typeKey("h", modifierFlags:.command)
+        wait(NSPredicate(format:"state == %d", XCUIApplication.State.runningBackground.rawValue), object:app!)
+        let hiddenOutput = expectation(description:"hidden app drains sustained terminal output")
+        DispatchQueue.main.asyncAfter(deadline:.now() + 14) { hiddenOutput.fulfill() }
+        wait(for:[hiddenOutput], timeout:17)
+        app.activate()
+        print("PTY_E2E_HIDDEN_END")
+        waitForRenderedOutput(hiddenMarker)
 #else
         XCUIDevice.shared.press(.home)
-#endif
         wait(NSPredicate(format:"state == %d", XCUIApplication.State.runningBackground.rawValue), object:app!)
         let shortBackground = expectation(description:"short background grace")
         DispatchQueue.main.asyncAfter(deadline:.now() + 1.5) { shortBackground.fulfill() }
         wait(for:[shortBackground], timeout:3)
         app.activate()
+#endif
         XCTAssertTrue(web.buttons["切换只读"].waitForExistence(timeout:30))
         output(marker + "SHORT")
         switchTerminal(firstHome); output(marker + "FIRSTKEPT")
@@ -483,6 +525,16 @@ final class E2ETerminalTests: XCTestCase {
         // A real app process restart must restore navigation and read-only mode.
         // The setup namespace stays fixed for this test, including this relaunch.
         app.terminate()
+#if !os(macOS)
+        if let signal = environment["FLOWSPLICE_PTY_E2E_RELOCATION_SIGNAL"] {
+            let namespace = try XCTUnwrap(app.launchEnvironment["FLOWSPLICE_PTY_TEST_NAMESPACE"])
+            print("PTY_E2E_RELOCATE_READY " + namespace)
+            let relocated = XCTNSPredicateExpectation(predicate:NSPredicate { _, _ in
+                FileManager.default.fileExists(atPath:signal)
+            }, object:nil)
+            XCTAssertEqual(XCTWaiter.wait(for:[relocated], timeout:90), .completed, "Simulator installation was not relocated by the external runner")
+        }
+#endif
         app.launch()
         XCTAssertTrue(web.buttons["申请读写"].waitForExistence(timeout:180), "Relaunch must restore the original read-only tab")
         switchTerminal(firstHome)

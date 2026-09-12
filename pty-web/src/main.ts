@@ -1,3 +1,4 @@
+import { InputQueue } from "./input";
 import { HistoryView } from "./history";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -34,6 +35,8 @@ type Home = {
   pendingNewId: string | null;
   connectAfterEnroll: boolean;
   detailsPending: boolean;
+  detailsTimer?: ReturnType<typeof setTimeout>;
+  inputQueue?: InputQueue;
   detailsAgain?: boolean;
   wanted?: boolean;
   available?: boolean;
@@ -53,11 +56,13 @@ type Tab = {
   mode: string;
   epoch: number;
   terminal: Terminal;
+  opened: boolean;
   fit: FitAddon;
   pane: HTMLElement;
   history: HistoryView;
   notice: string;
   state: "attached" | "reconnecting" | "deleted";
+  hasAttached: boolean;
   name: string;
 };
 type Event = {
@@ -110,6 +115,7 @@ app.innerHTML = `<header id="topbar">
 <section id="identity-panel" hidden>
 <div class="heading"><div><h2 id="identity-label"></h2><p class="muted">所有 Home 的 PTY 服务</p><p id="identity-status" role="status"></p></div><button id="identity-disconnect" hidden>断开全部连接</button></div>
 <form id="identity-access"><label id="identity-relay-label">Relay IP:端口<input id="identity-relay" autocomplete="off" required></label><label id="identity-password-label">设置私钥密码<input id="identity-password" type="password" autocomplete="new-password" minlength="12" required></label><p id="identity-password-note" class="muted">一次批准即可访问所有已授权的 Home 的 PTY 服务。私钥密码安全保存在此设备，之后无需重复输入。</p><button id="identity-enter" class="primary">注册此设备</button></form>
+<div id="identity-repair" hidden><button id="identity-unlock">重新输入密码</button><button id="identity-reenroll">重试注册</button></div>
 <div id="identity-waiting" hidden><p>等待超级 Home 批准</p><strong id="identity-code"></strong><button id="identity-cancel">取消注册</button></div>
 </section>
 <div id="overview">
@@ -145,6 +151,7 @@ app.innerHTML = `<header id="topbar">
 <label id="password-label">设置私钥密码<input id="password" type="password" autocomplete="new-password" minlength="12">
 </label>
 <button id="enter" class="primary">连接</button>
+<span id="home-repair" hidden><button id="home-unlock" type="button">重新输入密码</button><button id="home-reenroll" type="button">重试注册</button></span>
 </form>
 <div id="waiting" hidden>
 <p>等待超级 Home 批准</p>
@@ -234,12 +241,13 @@ app.innerHTML = `<header id="topbar">
 </dialog>
 <dialog id="recovery">
 <form id="recovery-form">
-<h2>解锁私钥</h2>
+<h2 id="recovery-title">解锁私钥</h2>
 <p id="recovery-message">
 </p>
+<label id="recovery-relay-label" hidden>Relay IP:端口<input id="recovery-relay" autocomplete="off"></label>
 <label>私钥密码<input id="recovery-password" type="password" autocomplete="current-password" required>
 </label>
-<button class="primary">连接</button>
+<button id="recovery-submit" class="primary">连接</button>
 <button id="cancel-recovery" type="button">取消</button>
 </form>
 </dialog>
@@ -272,6 +280,8 @@ let classRecovery = false;
 let foreground = true, workspaceReady = false, nativeScopeReady = false, lastWorkspace = "";
 let identityWanted = false, identityManuallyDisconnected = false;
 let identityRetryAt = 0, identityRetries = 0, identityCredentialBlocked = false;
+let identityStartupBlocked = false;
+let recoveryOperation: "connect" | "enroll" = "connect";
 const attachment = (home: string, id: string) => [...tabs.values()].find(t => t.home.id === home && t.id === id && t.state === "attached");
 function saveWorkspace() {
   // A fresh installation receives platform information before its identity/catalog.
@@ -318,10 +328,15 @@ function wantHome(h: Home) {
   h.credentialBlocked = false;
 }
 function retryDelay(attempt: number) { return Math.min(30000, 1000 * 2 ** Math.min(attempt, 5)); }
+function tabStatus(t: Tab) {
+  if (t.state === "deleted") return "已删除";
+  if (t.state === "reconnecting") return t.hasAttached ? "正在恢复" : "连接中";
+  return t.mode === "read_write" ? "读写" : "只读";
+}
 function reconnect() {
-  if (!foreground || !workspaceReady) return;
+  if (!foreground || !workspaceReady || el<HTMLDialogElement>("recovery").open) return;
   const now = Date.now();
-  if (classMode && identityWanted && identity.installed && !identity.connected && !identity.busy && !identityCredentialBlocked && now >= identityRetryAt) {
+  if (classMode && identityWanted && identity.installed && !identity.connected && !identity.busy && !identityCredentialBlocked && !identityStartupBlocked && now >= identityRetryAt) {
     identity.busy = true;
     identityRetryAt = now + retryDelay(identityRetries++);
     send({op:"connect", password:""});
@@ -348,6 +363,7 @@ function restoreTabs(h: Home) {
   }
 }
 function deleted(t: Tab) {
+  t.home.inputQueue?.invalidate(t.id);
   t.history.reset();
   t.name = title(t);
   t.state = "deleted";
@@ -363,7 +379,7 @@ function suspend(home: Home) {
     t.name = title(t);
     t.state = "reconnecting";
     t.id = "";
-    t.notice = "连接中断，正在恢复原会话…";
+    t.notice = t.hasAttached ? "连接中断，正在恢复原会话…" : "";
   }
   home.hello = false;
   home.listed = false;
@@ -396,6 +412,7 @@ function action(home: Home, value: object) {
         op: "operation_home",
         home_id: home.id,
         operation: request.operation,
+        ...(request.input_id ? { input_id: request.input_id } : {}),
       });
     return;
   }
@@ -407,6 +424,12 @@ function operation(home: Home, value: Operation) {
 function details(home: Home) {
   if (!home.connected || home.detailsPending) return;
   home.detailsPending = true;
+  clearTimeout(home.detailsTimer);
+  home.detailsTimer = setTimeout(() => {
+    home.detailsPending = false;
+    for (const [id, request] of home.requests) if (request.op === "list_details") home.requests.delete(id);
+    if (home.detailsAgain) { home.detailsAgain = false; details(home); }
+  }, 10000);
   operation(home, { op: "list_details" });
 }
 function text(tag: string, value: string, cls = "") {
@@ -477,22 +500,34 @@ function manage() {
   if (current()?.connected) details(current()!);
 }
 function fit(tab: Tab) {
-  if (active !== tab.key || page !== "terminal") return;
+  // Native batches defer DOM changes. Never open or measure a terminal against
+  // the previous page's hidden layout, including viewport callbacks mid-batch.
+  if (renderDepth || !foreground || active !== tab.key || page !== "terminal" ||
+      tab.pane.hidden || !tab.pane.clientWidth || !tab.pane.clientHeight) return;
+  if (!tab.opened) {
+    tab.terminal.open(tab.pane);
+    tab.opened = true;
+  }
   const size = tab.fit.proposeDimensions();
-  if (size)
+  if (size && Number.isInteger(size.cols) && Number.isInteger(size.rows) &&
+      size.cols > 0 && size.rows > 0)
     tab.terminal.resize(
       Math.max(2, Math.min(512, size.cols)),
       Math.max(1, Math.min(256, size.rows)),
     );
   tab.history.measure();
+  if (pendingTerminalFocus === tab.key) {
+    pendingTerminalFocus = null;
+    tab.history.focus();
+  }
 }
+let pendingTerminalFocus: string | null = null;
 function focus(tab: Tab) {
   active = tab.key;
   selected = tab.home.id;
   page = "terminal";
+  pendingTerminalFocus = tab.key;
   render();
-  fit(tab);
-  tab.history.focus();
 }
 // Native pointer down/up can straddle a catalog or protocol event batch.
 function reconcileChildren(parent: HTMLElement, desired: HTMLElement[]) {
@@ -507,7 +542,10 @@ function reconcileChildren(parent: HTMLElement, desired: HTMLElement[]) {
 function updateText(node: HTMLElement, value: string) {
   if (node.textContent !== value) node.textContent = value;
 }
+let renderDepth = 0;
+let renderDeferred = false;
 function render() {
+  if (renderDepth) { renderDeferred = true; return; }
   const h = current(),
     tab = activeTab();
   app.dataset.page = page;
@@ -520,6 +558,7 @@ function render() {
         ? "正在连接 / 等待批准"
         : "服务目录未连接";
     el("identity-disconnect").hidden = !identity.connected;
+    el("identity-repair").hidden = !identity.installed || identity.connected || identity.busy;
     el("identity-access").hidden =
       identity.connected || (identity.busy && !identity.installed);
     el("identity-waiting").hidden = identity.installed || !identity.busy;
@@ -616,7 +655,7 @@ function render() {
     const card = text("div", "", "opened-card");
     card.append(
       button(`${t.home.name} / ${title(t)}`, () => focus(t)),
-      text("span", t.state === "deleted" ? "已删除" : t.state === "reconnecting" ? "正在恢复" : t.mode === "read_write" ? "读写" : "只读", "mode-badge"),
+      text("span", tabStatus(t), "mode-badge"),
       button("×", () => detach(t), "close-tab"),
     );
     el("opened-list").append(card);
@@ -638,19 +677,22 @@ function render() {
     el("disconnect").hidden = !h.connected;
     el("sessions").hidden = !h.connected;
     el("access-panel").hidden = h.connected;
-    el("access-title").textContent = h.installed ? "连接到 Home" : "注册此设备";
-    el("access-description").textContent = h.installed
+    el("access-title").textContent = classMode || h.installed ? "连接到 Home" : "注册此设备";
+    el("access-description").textContent = classMode && !identity.connected
+      ? "请先连接服务目录，再恢复此 Home 的终端。"
+      : classMode || h.installed
       ? "使用此设备已保存的凭据连接。"
       : "私钥以密码加密并安全保存，之后连接无需再次输入。";
     el("relay-label").hidden = classMode || h.installed;
     el("password-label").hidden = classMode || h.installed;
+    el("home-repair").hidden = classMode || !h.installed || h.connected || h.busy;
     el<HTMLInputElement>("password").required = !classMode && !h.installed;
     el("access").hidden = h.busy && !h.installed;
     el("waiting").hidden = !(h.busy && !h.installed);
     el("verification-code").textContent = h.code || "正在获取校验码…";
     el<HTMLButtonElement>("enter").disabled =
       h.busy || (classMode && !identity.connected);
-    el("enter").textContent = h.installed
+    el("enter").textContent = classMode || h.installed
       ? h.busy
         ? "连接中…"
         : "连接"
@@ -686,19 +728,21 @@ function render() {
     ]
       .filter(Boolean)
       .join(" · ");
-    el("terminal-notice").textContent = terminalNotice;
-    el("terminal-notice").hidden = !terminalNotice;
+    const connecting = tab.state === "reconnecting" && !tab.hasAttached;
+    el("terminal-notice").textContent = terminalNotice || (connecting ? "连接中…" : "");
+    el("terminal-notice").dataset.tone = terminalNotice ? "warning" : "status";
+    el("terminal-notice").hidden = !terminalNotice && !connecting;
     el("terminal-title").replaceChildren(
       text("strong", title(tab)),
       text("small", tab.home.name),
     );
-    el("mode-label").textContent = tab.state === "deleted" ? "已删除" : tab.state === "reconnecting" ? "正在恢复" : tab.mode === "read_write" ? "读写" : "只读";
+    el("mode-label").textContent = tabStatus(tab);
     el("mode").dataset.state = tab.state;
     el("mode").title =
-      tab.mode === "read_write" ? "切换为只读" : "申请读写权限";
+      tab.state !== "attached" ? tabStatus(tab) : tab.mode === "read_write" ? "切换为只读" : "申请读写权限";
     el("mode").setAttribute(
       "aria-label",
-      tab.state === "deleted" ? "已删除" : tab.state === "reconnecting" ? "正在恢复" : tab.mode === "read_write" ? "切换只读" : "申请读写",
+      tab.state !== "attached" ? tabStatus(tab) : tab.mode === "read_write" ? "切换只读" : "申请读写",
     );
     el<HTMLButtonElement>("mode").disabled = tab.state !== "attached" || !tab.home.connected || !tab.home.canWrite;
     const count = tab.home.sessions.get(tab.session)?.connection_count;
@@ -706,6 +750,10 @@ function render() {
       count === undefined ? "" : `${count} 个连接`;
   }
   saveWorkspace();
+  // Open/focus only the final active pane after all batched visibility and
+  // chrome changes. Inactive terminals can still parse output before opening.
+  if (tab && page === "terminal") fit(tab);
+  else pendingTerminalFocus = null;
 }
 function renderList(h: Home) {
   el("list").replaceChildren();
@@ -782,6 +830,7 @@ function closeWarning() {
   el<HTMLDialogElement>("takeover").close();
 }
 function remove(tab: Tab) {
+  tab.home.inputQueue?.invalidate(tab.id);
   tab.history.dispose();
   tab.terminal.dispose();
   tab.pane.remove();
@@ -802,6 +851,8 @@ function detach(tab: Tab) {
   details(tab.home);
 }
 function resetOperations(home: Home) {
+  home.inputQueue?.clear();
+  clearTimeout(home.detailsTimer);
   if (renaming?.home === home.id) {
     renaming.pending = false;
     renaming.request = undefined;
@@ -827,17 +878,22 @@ function clear(home: Home) {
   for (const tab of [...tabs.values()]) if (tab.home === home) remove(tab);
   home.sessions.clear();
 }
+function recoverHome(h: Home) {
+  h.connected = false;
+  suspend(h);
+  h.retryAt = Date.now() + 1000;
+  action(h, { op: "disconnect" });
+  render();
+}
 function input(tab: Tab, value: string) {
   if (tab.history.browsing || !foreground || tab.state !== "attached" || !tab.home.connected || tab.mode !== "read_write") return;
-  const data = new TextEncoder().encode(value),
-    writer_epoch = tab.epoch;
-  for (let i = 0; i < data.length; i += 16384)
-    operation(tab.home, {
-      op: "input",
-      attachment_id: tab.id,
-      writer_epoch,
-      data: Array.from(data.subarray(i, i + 16384)),
-    });
+  const h = tab.home;
+  h.inputQueue ??= new InputQueue(
+    (target, data, input_id) => action(h, { op: "operation", input_id, operation: { op: "input", attachment_id: target.attachment_id, writer_epoch: target.writer_epoch, data } }),
+    message => { h.notice = message; for (const t of tabs.values()) if (t.home === h) t.notice = message; render(); },
+    () => recoverHome(h),
+  );
+  h.inputQueue.enqueue({ attachment_id: tab.id, writer_epoch: tab.epoch }, new TextEncoder().encode(value));
 }
 function attach(h: Home, result: any, name?: string) {
   if (!h.connected) return;
@@ -864,11 +920,11 @@ function attach(h: Home, result: any, name?: string) {
     existing.epoch = result.writer_epoch;
     existing.mode = result.mode;
     existing.state = "attached";
+    existing.hasAttached = true;
     existing.name = name || old?.name || existing.name;
     existing.notice = "";
     existing.terminal.reset();
     render();
-    fit(existing);
     details(h);
     return;
   }
@@ -880,6 +936,7 @@ function attach(h: Home, result: any, name?: string) {
 }
 function createTab(h: Home, session: string, name: string, mode: string, state: Tab["state"]): Tab {
   const pane = text("div", "", "terminal");
+  pane.hidden = true;
   el("panes").append(pane);
   const terminal = new Terminal({
     scrollback: 0, fontSize: 14,
@@ -888,10 +945,10 @@ function createTab(h: Home, session: string, name: string, mode: string, state: 
   });
   const addon = new FitAddon();
   terminal.loadAddon(addon);
-  terminal.open(pane);
   terminal.parser.registerOscHandler(52, () => true);
   const history = new HistoryView(pane, () => tab.state === "attached" && h.connected ? tab.id : "", op => operation(h, op as Operation), () => terminal.focus(), () => ({rows:terminal.rows, cols:terminal.cols, font:terminal.options.fontFamily, size:terminal.options.fontSize}));
-  const tab: Tab = {history, key:key(h.id, session), home:h, session, name, id:"", mode, epoch:0, terminal, fit:addon, pane, notice:"", state};
+  // Restoring a saved tab starts a fresh connection; it is not a live disconnect.
+  const tab: Tab = {history, key:key(h.id, session), home:h, session, name, id:"", mode, epoch:0, terminal, opened:false, fit:addon, pane, notice:"", state, hasAttached:state === "attached"};
   tabs.set(tab.key, tab);
   terminal.onData(data => input(tab, data));
   terminal.onResize(({cols, rows}) => {
@@ -908,10 +965,11 @@ function protocol(h: Home, m: any) {
     const req = h.requests.get(m.request_id);
     h.requests.delete(m.request_id);
     const r = m.result;
+    if (h.inputQueue?.response(m.request_id, r.status === "ok", r.message)) return;
     if (r.status === "history") { attachment(h.id, r.attachment_id)?.history.accept(r); return; }
-    if (req?.op === "history") { attachment(h.id, req.attachment_id)?.history.fail(req.capture_id); return; }
+    if (req?.op === "history") { attachment(h.id, req.attachment_id)?.history.fail(req.capture_id, r.message, r.code); return; }
     if (req?.op === "list_details" || r.status === "session_details")
-      h.detailsPending = false;
+      { h.detailsPending = false; clearTimeout(h.detailsTimer); }
     if (req?.op === "rename") {
       if (renaming?.home === h.id && renaming.request === m.request_id) {
         renaming.pending = false;
@@ -935,7 +993,7 @@ function protocol(h: Home, m: any) {
       h.pendingNew = null;
       h.pendingNewId = null;
     }
-    if (req?.op === "join") h.joining.delete(String(req.session_id));
+    if (req?.op === "join") { h.joining.delete(String(req.session_id)); if (r.status !== "attached") h.cancelledJoins?.delete(String(req.session_id)); }
     if (r.status === "sessions" || r.status === "session_details") {
       const next = new Map<string, Session>();
       for (const s of r.sessions)
@@ -977,6 +1035,7 @@ function protocol(h: Home, m: any) {
     for (const t of tabs.values())
       if (t.home === h && t.session === m.session_id && t.state === "attached") {
         const wasWriter = t.mode === "read_write";
+        if (t.epoch !== m.epoch || m.writer?.attachment_id !== t.id) h.inputQueue?.invalidate(t.id);
         t.epoch = m.epoch;
         t.mode = m.writer?.attachment_id === t.id ? "read_write" : "read_only";
         if (wasWriter && t.mode === "read_only" && m.writer)
@@ -995,7 +1054,7 @@ function protocol(h: Home, m: any) {
     details(h);
   } else if (m.type === "detached") {
     const t = attachment(h.id, m.attachment_id);
-    if (t) { t.history.reset(); t.state = "reconnecting"; t.id = ""; t.notice = "连接中断，正在恢复原会话…"; }
+    if (t) { h.inputQueue?.invalidate(t.id); t.history.reset(); t.state = "reconnecting"; t.id = ""; t.notice = "连接中断，正在恢复原会话…"; }
     h.listed = false;
     details(h);
   } else if (m.type === "session_ended") {
@@ -1033,23 +1092,44 @@ function platform(value: string | undefined) {
 }
 window.flowsplice = {
   async receiveBatch(events) {
-    for (const e of events) {
-      if (e.type === "protocol" && e.message?.type === "output") {
-        const t = attachment(e.home_id, e.message.attachment_id);
-        if (t) {
-          t.history.output();
-          await new Promise<void>((resolve) =>
-            t.terminal.write(new Uint8Array(e.message.data), resolve),
-          );
+    renderDepth++;
+    const failedHomes = new Set<string>();
+    try {
+      for (const e of events) {
+        try {
+          if (!e || typeof e !== "object") continue;
+          if (failedHomes.has(e.home_id)) continue;
+          if (e.type === "protocol" && e.message?.type === "output") {
+            const t = attachment(e.home_id, e.message.attachment_id);
+            if (t) {
+              t.history.output();
+              await new Promise<void>((resolve) => t.terminal.write(new Uint8Array(e.message.data), resolve));
+            }
+          } else window.flowsplice.receive(e);
+        } catch {
+          console.error("FlowSplice event failed");
+          const h = homes.get(e?.home_id);
+          if (h) {
+            failedHomes.add(h.id);
+            h.notice = "终端事件处理失败，正在恢复连接。";
+            try { recoverHome(h); } catch { console.error("FlowSplice recovery failed"); }
+          }
         }
-      } else window.flowsplice.receive(e);
+      }
+    } finally {
+      renderDepth--;
+      if (!renderDepth && renderDeferred) { renderDeferred = false; render(); }
     }
   },
   receive(e) {
     if (e.type === "workspace") { restoreWorkspace(e.value); return; }
     if (e.type === "lifecycle") {
+      // File protection can temporarily block identity reads while the device
+      // locks. A new foreground transition earns one fresh startup attempt.
+      if (e.active === true && !foreground) identityStartupBlocked = false;
       foreground = e.active === true;
-      if (foreground) { reconnect(); for (const h of homes.values()) if (h.connected) details(h); }
+      if (!foreground) for (const h of homes.values()) h.inputQueue?.clear();
+      if (foreground) { reconnect(); for (const h of homes.values()) if (h.connected) details(h); render(); }
       saveWorkspace();
       return;
     }
@@ -1079,6 +1159,7 @@ window.flowsplice = {
           suspend(home);
         }
       } else {
+        identityStartupBlocked = false;
         identityRetries = 0; identityRetryAt = 0;
         if (!identityManuallyDisconnected) identityWanted = true;
       }
@@ -1136,13 +1217,10 @@ window.flowsplice = {
     if (classMode && !e.home_id && e.type === "error") {
       identity.busy = false;
       identity.connectAfterEnroll = false;
+      if (e.code === "identity_unavailable") identityStartupBlocked = true;
       if (e.code === "credential_required") {
         identityCredentialBlocked = true;
-        classRecovery = true;
-        recoveryHome = null;
-        el("recovery-message").textContent = e.message;
-        el<HTMLInputElement>("recovery-password").value = "";
-        el<HTMLDialogElement>("recovery").showModal();
+        openRecovery(null, "connect", e.message);
       }
       el("global-notice").textContent = e.message;
       el("global-notice").hidden = false;
@@ -1180,6 +1258,11 @@ window.flowsplice = {
       render();
     } else if (e.type === "protocol") protocol(h, e.message);
     else if (e.type === "submitted") {
+      if (e.operation.op === "input") {
+        h.inputQueue?.submitted(e.input_id, e.request_id);
+        return;
+      }
+      if (e.operation.op === "list_details" && !h.detailsPending) return;
       h.requests.set(e.request_id, e.operation);
       if (
         e.operation.op === "rename" &&
@@ -1196,6 +1279,10 @@ window.flowsplice = {
       h.notice = e.progress.verification_code ? "" : e.progress.phase;
       render();
     } else if (e.type === "error") {
+      if (e.input_id) { h.inputQueue?.rejected(e.input_id, e.message); return; }
+      h.inputQueue?.clear();
+      clearTimeout(h.detailsTimer);
+      h.cancelledJoins?.clear();
       for (const t of tabs.values()) if (t.home === h) t.history.fail();
       h.detailsPending = false;
       h.connectAfterEnroll = false;
@@ -1210,11 +1297,7 @@ window.flowsplice = {
       h.busy = false;
       if (e.code === "credential_required") {
         h.credentialBlocked = true;
-        classRecovery = false;
-        recoveryHome = h.id;
-        el("recovery-message").textContent = e.message;
-        el<HTMLInputElement>("recovery-password").value = "";
-        el<HTMLDialogElement>("recovery").showModal();
+        openRecovery(h, "connect", e.message);
       }
       render();
     }
@@ -1224,6 +1307,7 @@ el("identity-access").onsubmit = (e) => {
   e.preventDefault();
   if (identity.busy) return;
   identityWanted = true; identityManuallyDisconnected = false; identityCredentialBlocked = false;
+  identityStartupBlocked = false;
   identity.busy = true;
   el("global-notice").hidden = true;
   if (identity.installed) send({ op: "connect", password: "" });
@@ -1455,26 +1539,52 @@ el("confirm-takeover").onclick = () => {
       expected_epoch: w.stale ? null : w.epoch,
     });
 };
+function openRecovery(h: Home | null, op: "connect" | "enroll", message?: string) {
+  classRecovery = !h;
+  recoveryHome = h?.id ?? null;
+  recoveryOperation = op;
+  el("recovery-title").textContent = op === "enroll" ? "重试注册" : "解锁私钥";
+  el("recovery-message").textContent = message || (op === "enroll"
+    ? "使用原私钥密码恢复已有注册或继续未完成的申请。原有身份与终端记录会保留。"
+    : "输入原私钥密码；连接成功后会安全保存，之后无需重复输入。");
+  el("recovery-relay-label").hidden = op !== "enroll";
+  el<HTMLInputElement>("recovery-relay").required = op === "enroll";
+  el<HTMLInputElement>("recovery-relay").value = h?.relay || el<HTMLInputElement>("identity-relay").value;
+  el<HTMLInputElement>("recovery-password").value = "";
+  el("recovery-submit").textContent = op === "enroll" ? "恢复注册" : "连接";
+  el<HTMLDialogElement>("recovery").showModal();
+}
+el("identity-unlock").onclick = () => { if (!identity.busy && !identity.connected) openRecovery(null, "connect"); };
+el("identity-reenroll").onclick = () => { if (!identity.busy && !identity.connected) openRecovery(null, "enroll"); };
+el("home-unlock").onclick = () => { const h = current(); if (h && !h.busy && !h.connected) openRecovery(h, "connect"); };
+el("home-reenroll").onclick = () => { const h = current(); if (h && !h.busy && !h.connected) openRecovery(h, "enroll"); };
 el("recovery-form").onsubmit = (e) => {
   e.preventDefault();
   const h = homes.get(recoveryHome || "");
+  const request = {
+    op: recoveryOperation,
+    password: el<HTMLInputElement>("recovery-password").value,
+    ...(recoveryOperation === "enroll" ? { relay: el<HTMLInputElement>("recovery-relay").value.trim() } : {}),
+  };
   if (classRecovery) {
+    if (identity.busy || identity.connected) return;
     identityCredentialBlocked = false;
+    identityStartupBlocked = false;
     identityWanted = true; identityManuallyDisconnected = false;
     identity.busy = true;
-    send({
-      op: "connect",
-      password: el<HTMLInputElement>("recovery-password").value,
-    });
+    identity.connectAfterEnroll = recoveryOperation === "enroll";
+    el("global-notice").hidden = true;
+    send(request);
   } else if (h) {
+    if (h.busy || h.connected) return;
     wantHome(h); h.busy = true;
-    action(h, {
-      op: "connect",
-      password: el<HTMLInputElement>("recovery-password").value,
-    });
+    h.connectAfterEnroll = recoveryOperation === "enroll";
+    h.notice = "";
+    action(h, request);
   }
   el<HTMLInputElement>("recovery-password").value = "";
   el<HTMLDialogElement>("recovery").close();
+  render();
 };
 el("cancel-recovery").onclick = () => {
   el<HTMLInputElement>("recovery-password").value = "";

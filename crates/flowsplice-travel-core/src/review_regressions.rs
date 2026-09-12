@@ -912,3 +912,103 @@ async fn r11_cancel_pending_in_process_connect_releases_runtime_resources() -> R
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "run tests/check-travel-review-regressions.sh"]
+async fn r12_in_process_relative_installation_survives_directory_move() -> Result<()> {
+    let fixture = Fixture::load("legit")?;
+    let rogue = Fixture::load("rogue")?;
+    let temporary = tempfile::tempdir()?;
+    let original = temporary.path().join("original installation");
+    fs::create_dir_all(&original)?;
+    let identity = install_fixture_identity(&original, &fixture, "review-travel")?;
+    let reservation = TcpListener::bind("127.0.0.1:0").await?;
+    let bind = reservation.local_addr()?.to_string();
+    drop(reservation);
+    let mapping = Mapping {
+        home_id: "home-1".to_owned(),
+        service_id: "legacy".to_owned(),
+        protocol: ServiceProtocol::Tcp,
+        bind: bind.clone(),
+    };
+    let (config_path, _) = write_runtime_config(
+        &original,
+        &fixture,
+        &identity,
+        std::slice::from_ref(&mapping),
+    )?;
+    let mut config: toml::Table = toml::from_str(&fs::read_to_string(&config_path)?)?;
+    fs::create_dir_all(original.join("cert"))?;
+    let mut preserved = Vec::new();
+    for (field, filename) in [
+        ("deployment_root_public_key", "deployment-root.pub"),
+        ("deployment_trust", "deployment-trust.json"),
+        ("management_cert", MANAGEMENT_CERT_FILE),
+        ("management_key", MANAGEMENT_KEY_FILE),
+        ("management_ca", MANAGEMENT_CA_FILE),
+        ("business_cert", BUSINESS_CERT_FILE),
+        ("business_key", BUSINESS_KEY_FILE),
+        ("business_ca", BUSINESS_CA_FILE),
+    ] {
+        let source = config
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .with_context(|| format!("missing fixture path {field}"))?;
+        let relative = format!("cert/{filename}");
+        let bytes = fs::read(source)?;
+        fs::copy(source, original.join(&relative))?;
+        preserved.push((relative.clone(), bytes));
+        config.insert(field.to_owned(), relative.into());
+    }
+    config.insert("state_store".to_owned(), "state/travel-state.redb".into());
+    config.insert("enrollment_work_dir".to_owned(), "state/enrollment".into());
+    let config_bytes = toml::to_string(&config)?.into_bytes();
+    fs::write(&config_path, &config_bytes)?;
+    preserved.push(("travelagent.toml".to_owned(), config_bytes));
+    let moved = temporary.path().join("relocated installation with spaces");
+    fs::rename(&original, &moved)?;
+    let config_path = moved.join("travelagent.toml");
+    let state_path = moved.join("state/travel-state.redb");
+    let error = TravelCore::start_in_process(
+        &config_path,
+        PRIVATE_KEY_PASSWORD,
+        &rogue.deployment_root()?,
+    )
+    .await
+    .err()
+    .context("wrong external root unexpectedly started relocated installation")?;
+    assert!(format!("{error:#}").contains("deployment trust mismatch"));
+    assert!(
+        !moved.join("state").exists(),
+        "root rejection mutated state"
+    );
+    for (relative, bytes) in &preserved {
+        assert_eq!(fs::read(moved.join(relative))?, *bytes);
+    }
+    let core = TravelCore::start_in_process(
+        &config_path,
+        PRIVATE_KEY_PASSWORD,
+        &fixture.deployment_root()?,
+    )
+    .await?;
+    assert_eq!(core.state.config.state_store, state_path);
+    assert_eq!(
+        core.state.config.enrollment_work_dir,
+        moved.join("state/enrollment")
+    );
+    assert!(state_path.is_file());
+    assert!(!original.exists());
+    let listener = TcpListener::bind(&bind)
+        .await
+        .context("relocated runtime opened a local mapping listener")?;
+    assert!(core.state.ready_mapping_listeners.read().await.is_empty());
+    assert!(core.state.mapping_tasks.lock().await.is_empty());
+    shutdown_with_timeout(&core, "r12 relocated in-process runtime").await?;
+    drop(core);
+    drop(listener);
+    drop(StateStore::open(&state_path)?);
+    for (relative, bytes) in preserved {
+        assert_eq!(fs::read(moved.join(relative))?, bytes);
+    }
+    Ok(())
+}

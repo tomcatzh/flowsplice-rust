@@ -59,8 +59,10 @@ cache. Terminal bytes are never replayed as input or persisted to the workspace.
 History capture never enters tmux copy mode, changes writer ownership or resizes
 another client's terminal.
 
-Captures are bounded to 64 MiB each and 256 MiB of retained cache across a Home
-process, with one capture at a time. An unusually large history or exhausted cache
+Captures are bounded to 64 MiB each, 64 MiB retained per connection, and 256 MiB
+of retained cache across a Home process, with one capture at a time and a bounded
+10-second queue wait. Server snapshots expire after three idle minutes (reclaimed
+within a further 30 seconds), without discarding rows already cached by the client. An unusually large history or exhausted cache
 returns a retryable error without disconnecting the terminal. Text, Unicode and
 SGR styling are rendered as inert history; links and terminal control actions are
 not executed by the history viewer.
@@ -122,6 +124,16 @@ there is no per-Home enrollment or password prompt. The class installation and n
 secure-store namespace are separate from existing installations. The enrollment password
 is saved securely before enrollment starts so interrupted enrollment can resume. Daily
 connections reuse it without a login prompt; a missing credential opens recovery.
+An installed, disconnected identity also exposes manual password recovery and an
+idempotent enrollment retry. These retain the existing identity and workspace;
+they never silently delete credentials or widen authorization.
+
+Private installations write paths relative to `travelagent.toml`. Older generated
+private configurations are resolved against their current installation directory
+when all ten paths match the canonical generated layout. This covers mobile app
+container moves after installation or restore without rewriting configuration,
+binding digests, certificates or keys. Mixed/custom paths are not guessed or rebased,
+and signed binding and trust checks still run before startup.
 
 Upgrade all Server, Relay and Home authorization consumers before issuing the first
 service-class grant. Older infrastructure cannot parse the new credential-scope enum.
@@ -238,6 +250,12 @@ identity, avoiding sandbox containers owned by older signing identities. This
 authorization is for tests only. Final macOS distribution
 packages require Apple notarization after the complete test suite passes.
 
+On a business E2E failure, the evidence directory retains `failed-fixture` with
+disposable private keys, certificates and `password.txt`. Keep that directory private
+and out of shared reports. After investigation, remove that exact `failed-fixture`
+directory and any separately exported native fixture; retain only redacted logs and
+test receipts. The fixture directory uses mode 0700 but still contains secrets.
+
 Use dedicated simulators with an English keyboard for deterministic shell-command
 input. Apple UI acceptance reads the rendered terminal with local Vision OCR; the
 submitted command encodes its expected output, so echoed input cannot satisfy the
@@ -247,3 +265,24 @@ and physical-device acceptance require their own explicit evidence.
 
 Audit, OAuth Web verification and durable history recording are deferred. The
 in-memory terminal scrollback and attachment recovery do not constitute an audit log.
+
+## Review regression gates
+
+`make pty-web-browser-check` also runs the production UI with real xterm and FitAddon in Chromium and WebKit. On Linux, install their system dependencies with `cd pty-web && npx playwright install --with-deps chromium webkit` first. CI runs this gate after the shared UI build. It covers management-page Open/New, native event batching, multiple Homes/tabs, hidden output, viewport/lifecycle changes and read-only input. Any console error, unhandled page error or unexpected Home disconnect fails the run even if a later retry succeeds. Keep this gate alongside the mocked state/edge-case tests: fixed dimensions in a mock cannot establish real layout correctness.
+
+`make check` and `make test` build and test the shared PTY web UI. CI explicitly
+installs tmux and enables `FLOWSPLICE_PTY_E2E=1` for the Docker suite. Apple staging
+reinstalls locked frontend dependencies and rebuilds the current sources, rather
+than trusting an ignored dist directory. The Apple E2E build also runs the real
+LocalOrigin/WorkspaceStore tests with both debug and optimized Swift compilation.
+PTY Apple native Release archives use an unwind-enabled profile so the FFI panic
+boundary remains effective; macOS delivery still requires notarization after tests.
+
+Terminal input is bounded and paced by matching request acknowledgements. A full
+admission queue rejects the new operation without closing healthy transports.
+Non-input admission errors reset that Home's pending UI operations and show an
+error; they do not directly disconnect its attached terminals. Home-level recovery
+is reserved for a broken stream, input timeout, or an event-processing exception.
+A blocked PTY write fails within five seconds; bytes already written are never
+replayed. Native render/disconnect watchdogs recover discontinuous streams through
+the existing workspace restoration path. Idle, disconnected handles stop polling.

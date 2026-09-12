@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Execute built Apple UI tests with external fixture approval and isolated app state."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import subprocess
 import time
+import uuid
 from fixture import Fixture, command
 
 parser = argparse.ArgumentParser()
@@ -84,6 +87,9 @@ environment = {
     "FLOWSPLICE_PTY_E2E_RELAY": "127.0.0.1:18446",
     "FLOWSPLICE_PTY_E2E_PASSWORD_FILE": str(fixture.directory / "password.txt"),
 }
+relocation_signal = build / ("ipad-relocation-" + uuid.uuid4().hex + ".ready")
+if args.platform == "ipad":
+    environment["FLOWSPLICE_PTY_E2E_RELOCATION_SIGNAL"] = str(relocation_signal)
 if fixture.service_class:
     environment.update({
         "FLOWSPLICE_PTY_E2E_SERVICE_CLASS":"1",
@@ -117,6 +123,59 @@ if log.exists():
 result = build / (args.platform + "-private-ui-" + str(time.time_ns()) + ".xcresult")
 approvals = {}
 deletion = None
+relocation = None
+hidden_clients = None
+hidden_samples = 0
+hidden_started = None
+hidden_verified = False
+
+def attachment_clients():
+    result = {}
+    for container in fixture.containers:
+        clients = command(["docker", "exec", container, "/usr/bin/tmux", "-S",
+                           "/tmp/fs-pty/alpha/tmux.sock", "list-clients", "-F",
+                           "#{client_pid}|#{session_name}|#{client_tty}"]).stdout.decode().splitlines()
+        if not clients:
+            raise RuntimeError("Hidden-output acceptance lost a fixture attachment")
+        result[container] = sorted(clients)
+    return result
+
+def relocate_simulator_installation(namespace):
+    if args.platform != "ipad" or str(uuid.UUID(namespace)).lower() != namespace.lower():
+        raise RuntimeError("Unexpected simulator relocation request")
+    bundle = manifest["platforms"]["ios"]["bundle_id"]
+    if bundle != "io.zxf.flowsplice.pty":
+        raise RuntimeError("Unexpected dedicated simulator test bundle")
+    def container():
+        return Path(command(["xcrun", "simctl", "get_app_container", args.device, bundle, "data"]).stdout.decode().strip())
+    def hashes(directory):
+        return {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in directory.rglob("*") if p.is_file()}
+    old = container()
+    relative = Path("Library/Application Support/io.zxf.flowsplice.pty/tests") / namespace.lower()
+    before = old / relative
+    backup = build / ("ipad-relocation-backup-" + uuid.uuid4().hex)
+    shutil.copytree(before, backup)
+    backup.chmod(0o700)
+    original_hashes = hashes(backup)
+    if "service-class/travelagent.toml" not in original_hashes:
+        raise RuntimeError("Relocation requires an enrolled class test identity")
+    command(["xcrun", "simctl", "uninstall", args.device, bundle])
+    command(["xcrun", "simctl", "install", args.device, manifest["platforms"]["ios"]["app"]])
+    current = container()
+    if current == old:
+        raise RuntimeError("Simulator installation did not move")
+    restored = current / relative
+    restored.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shutil.copytree(backup, restored)
+    if hashes(restored) != original_hashes:
+        raise RuntimeError("Simulator reinstall changed restored installation bytes")
+    receipt = {"old_container":str(old), "new_container":str(current), "namespace":namespace,
+               "backup":str(backup), "restored":str(restored), "file_hashes":original_hashes}
+    (build / "ipad-relocation.json").write_text(json.dumps(receipt, indent=2))
+    relocation_signal.write_text("ready\n")
+    return receipt
+
 with log.open("wb") as output:
     process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(configured),
         "-destination", destination, "-parallel-testing-enabled", "NO", "-resultBundlePath", str(result)],
@@ -129,6 +188,22 @@ with log.open("wb") as output:
             if time.monotonic() > deadline:
                 raise RuntimeError("Apple PTY UI test exceeded its deadline")
             rendered_log = log.read_text(errors="replace")
+            if relocation is None and args.platform == "ipad":
+                ready = re.search(r"PTY_E2E_RELOCATE_READY ([0-9A-Fa-f-]{36})", rendered_log)
+                if ready:
+                    relocation = relocate_simulator_installation(ready[1])
+            if args.platform == "macos" and "PTY_E2E_HIDDEN_BEGIN" in rendered_log and not hidden_verified:
+                current = attachment_clients()
+                if hidden_clients is None:
+                    hidden_clients = current
+                    hidden_started = time.monotonic()
+                if current != hidden_clients:
+                    raise RuntimeError("Cmd+H output caused an attachment to disconnect or reconnect")
+                hidden_samples += 1
+                if "PTY_E2E_HIDDEN_END" in rendered_log:
+                    if hidden_samples < 5 or time.monotonic() - hidden_started < 8:
+                        raise RuntimeError("Insufficient live hidden-output continuity observations")
+                    hidden_verified = True
             if deletion is None and "PTY_E2E_DELETE_SECOND_SESSION" in rendered_log:
                 deletion = fixture.delete_second_session()
             labels = re.findall(r"PTY_E2E_IDENTITY ([^\r\n]+)", rendered_log)
@@ -138,12 +213,17 @@ with log.open("wb") as output:
                     approved = fixture.approve_notice(notice, client_label)
                     if approved is not None: approvals[notice] = approved
             time.sleep(0.5)
-        if process.returncode != 0 or len(approvals) != fixture.expected_approvals or deletion is None:
+        if (process.returncode != 0 or len(approvals) != fixture.expected_approvals or deletion is None
+                or (args.platform == "ipad" and relocation is None)
+                or (args.platform == "macos" and not hidden_verified)
+                or (fixture.service_class and "PTY_E2E_PASSWORD_AND_ENROLLMENT_RECOVERY_PASSED" not in log.read_text(errors="replace"))):
             raise RuntimeError("Apple private PTY UI acceptance failed; inspect the xcresult")
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=10)
 acceptance.write_text(json.dumps({"platform":args.platform,"passed":True,
-    "result":str(result),"completed_at_unix_ns":time.time_ns(),"approvals":list(approvals.values()),"external_deletion":deletion}, indent=2))
+    "result":str(result),"completed_at_unix_ns":time.time_ns(),"approvals":list(approvals.values()),"external_deletion":deletion,
+    "simulator_relocated":relocation is not None, "hidden_attachment_samples":hidden_samples,
+    "hidden_attachments_unchanged":hidden_verified}, indent=2))
 print(json.dumps({"checkpoint":"private-apple-pty-ui-passed","platform":args.platform,"result":str(result)}))

@@ -71,6 +71,80 @@ struct FlowSpliceTravelTests {
         #expect(backupValues.isExcludedFromBackup == true)
     }
 
+    @Test("An already protected installation survives a real directory relocation")
+    func protectedInstallationRelocation() throws {
+        let files = FileManager.default
+        let fixture = files.temporaryDirectory.appending(path: "travel-relocation-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let old = fixture.appending(path: "old installation", directoryHint: .isDirectory)
+        let current = fixture.appending(path: "new container with spaces", directoryHint: .isDirectory)
+        defer { try? files.removeItem(at: fixture) }
+        let paths = [
+            ("deployment_root_public_key", "cert/deployment-root.pub"),
+            ("deployment_trust", "cert/deployment-trust.json"),
+            ("management_cert", "cert/travel-management.crt"),
+            ("management_key", "cert/travel-management.key"),
+            ("management_ca", "cert/management-ca.crt"),
+            ("business_cert", "cert/travel-business.crt"),
+            ("business_key", "cert/travel-business.key"),
+            ("business_ca", "cert/business-ca.crt"),
+            ("state_store", "state/travel-state.redb"),
+            ("enrollment_work_dir", "state/enrollment"),
+        ]
+        var preserved: [String: Data] = [:]
+        for (_, relative) in paths where relative != "state/enrollment" {
+            let url = old.appending(path: relative)
+            try files.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let bytes = Data("immutable dummy fixture: \(relative)\n".utf8)
+            try bytes.write(to: url)
+            preserved[relative] = bytes
+        }
+        let enrollmentMarker = "state/enrollment/pending-marker"
+        try files.createDirectory(at: old.appending(path: "state/enrollment"), withIntermediateDirectories: true)
+        preserved[enrollmentMarker] = Data("pending-state-preserved\n".utf8)
+        try preserved[enrollmentMarker]!.write(to: old.appending(path: enrollmentMarker))
+        let unchanged = """
+        ui_listen = "127.0.0.1:9080"
+
+        [[homes]]
+        id = "fixture-home"
+
+        [[seed_relays]]
+        management_addr = "127.0.0.1:18446"
+        """
+        let source = (["id = \"relocation-test\""] + paths.map {
+            "\($0.0) = \"\(old.appending(path: $0.1).path)\""
+        }).joined(separator: "\n") + "\n" + unchanged + "\n"
+        try source.write(to: old.appending(path: "travelagent.toml"), atomically: true, encoding: .utf8)
+        try TravelFiles.prepareRuntimeStorage(at: old)
+        let marker = ".flowsplice-protection-v1"
+        #expect(files.fileExists(atPath: old.appending(path: marker).path))
+        preserved[marker] = try Data(contentsOf: old.appending(path: marker))
+
+        try files.moveItem(at: old, to: current)
+        #expect(!files.fileExists(atPath: old.path))
+        #expect(files.fileExists(atPath: current.appending(path: marker).path))
+        try TravelFiles.prepareRuntimeStorage(at: current)
+        let config = current.appending(path: "travelagent.toml")
+        let migrated = try String(contentsOf: config, encoding: .utf8)
+        #expect(!migrated.contains(old.path))
+        for (key, relative) in paths {
+            #expect(migrated.contains("\(key) = \"\(current.appending(path: relative).path)\""))
+        }
+        let rootLine = try #require(migrated.split(separator: "\n").first { $0.hasPrefix("deployment_root_public_key = ") })
+        let rootPath = String(rootLine.dropFirst("deployment_root_public_key = ".count).dropFirst().dropLast())
+        #expect(try Data(contentsOf: URL(fileURLWithPath: rootPath)) == preserved["cert/deployment-root.pub"])
+        #expect(migrated.contains("id = \"relocation-test\""))
+        #expect(migrated.contains(unchanged))
+        for (relative, bytes) in preserved {
+            #expect(try Data(contentsOf: current.appending(path: relative)) == bytes)
+        }
+        let first = try Data(contentsOf: config)
+        try TravelFiles.prepareRuntimeStorage(at: current)
+        #expect(try Data(contentsOf: config) == first)
+        let attributes = try files.attributesOfItem(atPath: config.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    }
+
     @Test("Runtime storage excludes a newly created installation directory from backup")
     func runtimeStorageCreationExcludesBackup() throws {
         let fileManager = FileManager.default

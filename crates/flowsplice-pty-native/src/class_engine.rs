@@ -45,9 +45,10 @@ impl NativeSession {
             || options.travel_id.len() > 128
             || options.label.is_empty()
             || options.label.len() > 64
-            || options.label.chars().any(|c| {
-                c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
+            || options
+                .label
+                .chars()
+                .any(flowsplice_pty_protocol::is_display_control)
             || options.service_class.application_protocol != APPLICATION_PROTOCOL
             || options.service_class.protocol != ServiceProtocol::Tcp
         {
@@ -133,7 +134,7 @@ impl Outbox {
 
 struct HomeTask {
     stop: watch::Sender<bool>,
-    actions: mpsc::Sender<Operation>,
+    actions: mpsc::Sender<(Operation, Option<uuid::Uuid>)>,
     task: JoinHandle<()>,
 }
 impl HomeTask {
@@ -150,9 +151,9 @@ enum Forwarded {
     Interrupted,
 }
 
-async fn forward_home_action(
-    actions: &mpsc::Sender<Operation>,
-    operation: Operation,
+async fn forward_home_action<T>(
+    actions: &mpsc::Sender<T>,
+    operation: T,
     mut cancel: watch::Receiver<bool>,
     mut overflow: watch::Receiver<bool>,
 ) -> Forwarded {
@@ -251,7 +252,10 @@ async fn actor(
                     Ok(Job::Enrolled(result)) => if let Err(error) = result { outbox.error(&error); },
                     Ok(Job::Connected(result)) => match *result {
                         Ok((core, approved)) => { runtime = Some((Arc::new(core), approved)); refresh.reset_immediately(); },
-                        Err(error) => outbox.error(&error),
+                        // Local identity initialization failed before the runtime
+                        // started. Retry requires repaired files or a new password;
+                        // a timer using the same stored password cannot fix it.
+                        Err(error) => outbox.emit(json!({"type":"error","code":"identity_unavailable","message":error.to_string().chars().take(512).collect::<String>()})),
                     },
                     Err(_) => outbox.error(&anyhow!("Class connection operation was interrupted")),
                 }
@@ -327,15 +331,13 @@ async fn actor(
                         if let Some(home) = homes.remove(&home_id) { home.shutdown().await; }
                         disconnected(&outbox, &home_id);
                     },
-                    Action::OperationHome { home_id, operation } => {
+                    Action::OperationHome { home_id, operation, input_id } => {
                         if let Some(home) = homes.get(&home_id) {
-                            let forwarded = forward_home_action(&home.actions, operation, cancel.clone(), overflow.clone()).await;
+                            let forwarded = forward_home_action(&home.actions, (operation, input_id), cancel.clone(), overflow.clone()).await;
                             if forwarded == Forwarded::Unavailable {
-                                if let Some(home) = homes.remove(&home_id) { home.shutdown().await; }
-                                outbox.scoped(&home_id,json!({"type":"error","message":"Home action queue unavailable; reconnect"}));
-                                disconnected(&outbox, &home_id);
+                                outbox.scoped(&home_id,json!({"type":"error","input_id":input_id,"message":"Home action queue busy; operation was not admitted"}));
                             }
-                        } else { outbox.scoped(&home_id,json!({"type":"error","message":"Connect this Home before opening a terminal"})); }
+                        } else { outbox.scoped(&home_id,json!({"type":"error","input_id":input_id,"message":"Connect this Home before opening a terminal"})); }
                     },
                     Action::Operation { .. } => outbox.error(&anyhow!("Service-class operations require a Home target")),
                 }
@@ -350,7 +352,7 @@ async fn home_actor(
     core: Arc<TravelCore>,
     target: ServiceClassTarget,
     label: String,
-    mut actions: mpsc::Receiver<Operation>,
+    mut actions: mpsc::Receiver<(Operation, Option<uuid::Uuid>)>,
     mut cancel: watch::Receiver<bool>,
     outbox: Arc<Outbox>,
 ) {
@@ -391,12 +393,11 @@ async fn home_actor(
             biased;
             () = async { let _ = cancel.wait_for(|value| *value).await; } => break,
             operation = actions.recv() => {
-                let Some(operation) = operation else { break; };
+                let Some((operation, input_id)) = operation else { break; };
                 let result = tokio::select! { biased; () = async { let _ = cancel.wait_for(|value| *value).await; } => break, result = client.send(operation.clone()) => result };
                 let delivered = match result {
-                    Ok(request_id) if !matches!(operation,Operation::Input {..}|Operation::Resize {..}) => outbox.scoped(&id,json!({"type":"submitted","request_id":request_id,"operation":operation})),
-                    Ok(_) => true,
-                    Err(error) => outbox.scoped(&id,json!({"type":"error","message":error.to_string()})),
+                    Ok(request_id) => crate::engine::submitted(request_id, &operation, input_id).is_none_or(|event| outbox.scoped(&id, event)),
+                    Err(error) => outbox.scoped(&id,json!({"type":"error","input_id":input_id,"message":error.to_string()})),
                 };
                 if !delivered { break; }
             },
@@ -547,5 +548,65 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn missing_class_config_reports_identity_unavailable_and_allows_retry() -> Result<()> {
+        let install_dir =
+            std::env::temp_dir().join(format!("pty-missing-class-{}", uuid::Uuid::new_v4()));
+        assert!(!install_dir.exists());
+        let options = serde_json::from_value::<ClassNativeOptions>(json!({
+            "install_dir": install_dir,
+            "root_public_key": "dummy-root-not-used-with-missing-config",
+            "travel_id": "pty-test",
+            "label": "Test PTY",
+            "service_class": {"version":1,"approving_home_id":"issuer","application_protocol":"flowsplice.pty.v1","protocol":"tcp"}
+        }))?;
+        let session = NativeSession::open_class(options)?;
+        for password in ["", "manual-retry"] {
+            session.send(Action::Connect {
+                password: password.to_owned(),
+            })?;
+            let events = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut events = Vec::new();
+                loop {
+                    events.extend(session.poll());
+                    if let Some(error) = events.iter().position(|event| event["type"] == "error")
+                        && events[error + 1..]
+                            .iter()
+                            .any(|event| event["type"] == "identity" && event["busy"] == false)
+                    {
+                        break events;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            let errors: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .collect();
+            assert_eq!(errors.len(), 1, "{events:?}");
+            assert_eq!(errors[0]["code"], "identity_unavailable");
+            assert!(
+                errors[0]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
+            let identity = events
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "identity");
+            assert!(
+                identity.is_some_and(|event| event["connected"] == false && event["busy"] == false)
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["type"] == "identity" && event["busy"] == true)
+            );
+        }
+        session.shutdown().await;
+        assert!(!install_dir.exists());
+        Ok(())
     }
 }

@@ -35,7 +35,7 @@ fn runtime() -> Result<&'static Runtime> {
 fn session(id: u64) -> Result<Arc<NativeSession>> {
     SESSIONS
         .lock()
-        .map_err(|_| anyhow!("native handle registry unavailable"))?
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&id)
         .cloned()
         .ok_or_else(|| anyhow!("native terminal handle closed"))
@@ -48,7 +48,7 @@ pub(crate) fn open(value: &str) -> Result<Value> {
     let _entered = runtime()?.enter();
     let mut sessions = SESSIONS
         .lock()
-        .map_err(|_| anyhow!("native handle registry unavailable"))?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if sessions.len() >= 8 {
         bail!("native terminal handle limit reached");
     }
@@ -77,7 +77,7 @@ pub(crate) fn poll(id: u64) -> Result<Value> {
 pub(crate) fn close(id: u64) -> Result<Value> {
     let handle = SESSIONS
         .lock()
-        .map_err(|_| anyhow!("native handle registry unavailable"))?
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&id);
     if let Some(handle) = handle {
         handle.close();
@@ -138,5 +138,27 @@ pub extern "C" fn flowsplice_pty_close(id: u64) -> *mut c_char {
 pub unsafe extern "C" fn flowsplice_pty_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caught_registry_panic_does_not_disable_other_native_operations() {
+        let failed = response(|| {
+            let _registry = SESSIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("fixture registry panic");
+        });
+        assert!(failed.contains("Native terminal operation failed"));
+        assert!(close(u64::MAX).is_ok());
+        assert!(
+            session(u64::MAX)
+                .is_err_and(|error| error.to_string() == "native terminal handle closed")
+        );
+        SESSIONS.clear_poison();
     }
 }

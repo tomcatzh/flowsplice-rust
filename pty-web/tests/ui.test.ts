@@ -360,6 +360,10 @@ test("input is bounded, readonly suppressed and captured epoch remains stable", 
     },
   });
   terminals[0].onInput("€".repeat(6000));
+  expect(ops("input")).toHaveLength(1);
+  const chunk = ops("input")[0];
+  send({ type: "submitted", input_id: chunk.input_id, request_id: "chunk", operation: { op: "input" } });
+  response({ status: "ok" }, "mac", "chunk");
   expect(ops("input")).toHaveLength(2);
   expect(
     ops("input").every(
@@ -499,13 +503,13 @@ test("output and ordinary Ok responses preserve chrome DOM identity", () => {
   response({ status: "ok" });
   expect(el("tabs").firstChild).toBe(tab);
 });
-test("details requests never accumulate while a Home is stalled", () => {
+test("details requests expire and permit bounded refresh while a Home is stalled", () => {
   info();
   actions = [];
   click("refresh");
   click("refresh");
   vi.advanceTimersByTime(30000);
-  expect(ops("list_details")).toHaveLength(1);
+  expect(ops("list_details")).toHaveLength(3);
   send({
     type: "submitted",
     request_id: "details",
@@ -513,10 +517,10 @@ test("details requests never accumulate while a Home is stalled", () => {
   });
   response({ status: "error", message: "temporary failure" }, "mac", "details");
   click("refresh");
-  expect(ops("list_details")).toHaveLength(2);
+  expect(ops("list_details")).toHaveLength(4);
   state("mac", false);
   state("mac", true);
-  expect(ops("list_details")).toHaveLength(3);
+  expect(ops("list_details")).toHaveLength(5);
 });
 test("not connected closes only its Home new dialog and clears pending create", () => {
   click("new");
@@ -554,6 +558,16 @@ function classIdentity(connected = false, installed = false, busy = false) {
     busy,
   });
 }
+test("non-input native queue rejection keeps attached terminals connected", () => {
+  attach();
+  actions = [];
+  send({type: "error", message: "Home action queue busy; operation was not admitted"});
+  expect(actions.some(a => a.op === "disconnect" || a.op === "disconnect_home")).toBe(false);
+  expect((el("tabs").firstElementChild as HTMLElement).dataset.state).toBe("attached");
+  expect(el("mode-label").textContent).toBe("读写");
+  terminals[0].onInput("after rejection");
+  expect(ops("input").at(-1).operation.attachment_id).toBe("attachment");
+});
 function classCatalog(ids = ["one", "two"]) {
   window.flowsplice.receive({
     type: "homes",
@@ -919,4 +933,264 @@ test('read-only history stays local and identical attachment IDs on different ho
   expect(panes[0].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(false);expect(panes[1].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(true);
   send({type:'error',message:'queue full'},'vps');expect(panes[1].querySelector<HTMLElement>('.history-retry')!.hidden).toBe(false);
   send({type:'protocol',message:{type:'session_ended',session_id:'session'}},'mac');expect(panes[0].querySelector<HTMLElement>('.history-viewport')!.hidden).toBe(true);
+});
+
+test("bridge drains a 512KiB+ paste only after correlated submitted and Ok", () => {
+  attach();
+  const paste = "€".repeat(180000);
+  terminals[0].onInput(paste);
+  expect(ops("input")).toHaveLength(1);
+  response({status: "ok"}, "mac", "unrelated");
+  expect(ops("input")).toHaveLength(1);
+  const bytes: number[] = [];
+  for (let i = 0; i < Math.ceil(540000 / 16384); i++) {
+    expect(ops("input")).toHaveLength(i + 1);
+    const chunk = ops("input")[i];
+    bytes.push(...chunk.operation.data);
+    send({type: "submitted", input_id: chunk.input_id, request_id: `paste${i}`, operation: {op: "input", attachment_id: "attachment", writer_epoch: 3}});
+    response({status: "ok"}, "mac", `paste${i}`);
+  }
+  expect(new TextDecoder().decode(new Uint8Array(bytes))).toBe(paste);
+  vi.advanceTimersByTime(15000);
+  expect(ops("input")).toHaveLength(33);
+});
+test("stale input submissions and errors do not cancel replacement epoch input", () => {
+  attach(); terminals[0].onInput("x".repeat(40000));
+  const old = ops("input")[0];
+  send({type: "protocol", message: {type: "ownership", session_id: "session", epoch: 4, writer: {attachment_id: "attachment"}}});
+  terminals[0].onInput("y".repeat(20000));
+  expect(ops("input")).toHaveLength(1);
+  send({type: "submitted", input_id: old.input_id, request_id: "old", operation: {op: "input"}});
+  response({status: "error", message: "old flight failed"}, "mac", "old");
+  expect(ops("input")).toHaveLength(2);
+  const current = ops("input")[1];
+  send({type: "error", input_id: old.input_id, message: "stale"});
+  response({status: "ok"}, "mac", "old");
+  expect(ops("input")).toHaveLength(2);
+  send({type: "submitted", input_id: current.input_id, request_id: "current", operation: {op: "input"}});
+  response({status: "ok"}, "mac", "current");
+  expect(ops("input")).toHaveLength(3);
+  send({type: "error", input_id: ops("input")[2].input_id, message: "failed"});
+  vi.advanceTimersByTime(20000);
+  expect(ops("input")).toHaveLength(3);
+});
+test("batch skips malformed events and recovers only the Home whose output fails", async () => {
+  attach(); attach("vps");
+  terminals[0].write.mockImplementation(() => { throw new Error("parser failure"); });
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  await window.flowsplice.receiveBatch([
+    null as any,
+    {type: "protocol", home_id: "mac", message: {type: "output", attachment_id: "attachment", data: [65]}},
+    {type: "protocol", home_id: "vps", message: {type: "output", attachment_id: "attachment", data: [66]}},
+  ]);
+  expect(actions.some(a => a.op === "disconnect" && a.home_id === "mac")).toBe(true);
+  expect(terminals[1].write).toHaveBeenCalledWith(new Uint8Array([66]), expect.any(Function));
+  const before = ops("input").length;
+  terminals[0].onInput("must not send");
+  expect(ops("input")).toHaveLength(before);
+  log.mockRestore();
+});
+test("foreground loss drops queued input and timeout forces recovery without replay", () => {
+  attach(); terminals[0].onInput("x".repeat(40000));
+  const chunk = ops("input")[0];
+  send({type: "lifecycle", active: false});
+  send({type: "submitted", input_id: chunk.input_id, request_id: "lost", operation: {op: "input"}});
+  response({status: "ok"}, "mac", "lost");
+  expect(ops("input")).toHaveLength(1);
+  send({type: "lifecycle", active: true});
+  terminals[0].onInput("y".repeat(40000));
+  vi.advanceTimersByTime(15000);
+  expect(actions.some(a => a.op === "disconnect" && a.home_id === "mac")).toBe(true);
+  expect(ops("input")).toHaveLength(2);
+  expect(document.body.textContent).toContain("输入确认超时");
+});
+
+test("installed class key error exposes manual controls without automatic password prompt", () => {
+  classIdentity(false, true); classCatalog([]); actions = [];
+  submit("identity-access");
+  expect(actions).toEqual([{op: "connect", password: ""}]);
+  expect(el("identity-password-label").hidden).toBe(true);
+  expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+  window.flowsplice.receive({type: "error", message: "installed public key mismatch"});
+  expect(el("global-notice").textContent).toContain("public key mismatch");
+  expect(el("identity-repair").hidden).toBe(false);
+  expect(el("identity-unlock").textContent).toBe("重新输入密码");
+  expect(el("identity-reenroll").textContent).toBe("重试注册");
+  expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+});
+
+test("manual class unlock clears supplied password and permits wrong-password retry", () => {
+  classIdentity(false, true); classCatalog([]); actions = [];
+  for (const password of ["wrong-password", "correct-password"]) {
+    click("identity-unlock");
+    expect((el("recovery") as HTMLDialogElement).open).toBe(true);
+    expect(el("recovery-relay-label").hidden).toBe(true);
+    (el("recovery-password") as HTMLInputElement).value = password;
+    submit("recovery-form");
+    expect(actions.at(-1)).toEqual({op: "connect", password});
+    expect((el("recovery-password") as HTMLInputElement).value).toBe("");
+    expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+    if (password === "wrong-password") {
+      window.flowsplice.receive({type: "error", message: "wrong private key password"});
+      expect(el("identity-repair").hidden).toBe(false);
+    }
+  }
+  expect(actions).toHaveLength(2);
+});
+
+test("manual class reenrollment preserves identity and auto connects after registration", () => {
+  classIdentity(false, true); classCatalog([]);
+  (el("identity-relay") as HTMLInputElement).value = "relay.example:7000";
+  actions = []; click("identity-reenroll");
+  expect(el("recovery-relay-label").hidden).toBe(false);
+  expect(el("recovery-message").textContent).toContain("原有身份与终端记录会保留");
+  expect((el("recovery-relay") as HTMLInputElement).value).toBe("relay.example:7000");
+  (el("recovery-password") as HTMLInputElement).value = "existing-key-password";
+  submit("recovery-form");
+  expect(actions).toEqual([{op: "enroll", relay: "relay.example:7000", password: "existing-key-password"}]);
+  expect((el("recovery-password") as HTMLInputElement).value).toBe("");
+  classIdentity(false, true, true); expect(actions).toHaveLength(1);
+  classIdentity(false, true, false);
+  expect(actions).toEqual([
+    {op: "enroll", relay: "relay.example:7000", password: "existing-key-password"},
+    {op: "connect", password: ""},
+  ]);
+  expect(actions.some(a => /reset|delete/.test(a.op))).toBe(false);
+});
+
+test("recovery dialog pauses automatic reconnect and cancellation sends nothing", () => {
+  classIdentity(true, true); classCatalog([]);
+  window.flowsplice.receive({type: "workspace", value: null});
+  classIdentity(false, true); actions = []; click("identity-reenroll");
+  (el("recovery-password") as HTMLInputElement).value = "cancelled-secret";
+  vi.advanceTimersByTime(60000); expect(actions).toEqual([]);
+  click("cancel-recovery"); expect(actions).toEqual([]);
+  expect((el("recovery-password") as HTMLInputElement).value).toBe("");
+  expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+  vi.advanceTimersByTime(1000);
+  expect(actions).toEqual([{op: "connect", password: ""}]);
+});
+
+test("legacy recovery remains Home scoped while class targets never enroll individually", () => {
+  state("mac", false); home("mac");
+  send({type: "error", message: "public key mismatch"});
+  expect(el("home-repair").hidden).toBe(false);
+  actions = []; click("home-unlock");
+  (el("recovery-password") as HTMLInputElement).value = "mac-secret";
+  submit("recovery-form");
+  expect(actions).toEqual([{op: "connect", home_id: "mac", password: "mac-secret"}]);
+  send({type: "error", message: "registration incomplete"});
+  click("home-reenroll");
+  expect((el("recovery-relay") as HTMLInputElement).value).toBe("127.0.0.1:7000");
+  (el("recovery-password") as HTMLInputElement).value = "original-secret";
+  submit("recovery-form"); state("mac", false, true);
+  expect(actions.slice(1)).toEqual([
+    {op: "enroll", home_id: "mac", relay: "127.0.0.1:7000", password: "original-secret"},
+    {op: "connect", home_id: "mac", password: ""},
+  ]);
+  expect(actions.every(a => a.home_id === "mac")).toBe(true);
+  classIdentity(true, true); classCatalog(); actions = [];
+  const id = JSON.stringify(["one", "pty"]);
+  (document.querySelector("#home-cards button") as HTMLButtonElement).click();
+  state(id, false, true);
+  expect(el("home-repair").hidden).toBe(true);
+  expect(el("password-label").hidden).toBe(true);
+  submit("access");
+  expect(actions.length).toBeGreaterThan(0);
+  expect(actions.every(a => a.op === "connect_home" && a.home_id === id)).toBe(true);
+  expect(actions.some(a => a.op === "enroll")).toBe(false);
+});
+
+test("server partial input detail stays visible and discarded paste never replays", () => {
+  info(); attach(); actions = [];
+  terminals[0].onInput("x".repeat(40000));
+  const chunk = ops("input")[0];
+  send({type: "submitted", input_id: chunk.input_id, request_id: "partial", operation: chunk.operation});
+  response({status: "error", message: "write failed after 17 bytes"}, "mac", "partial");
+  expect(el("terminal-notice").hidden).toBe(false);
+  for (const text of ["write failed after 17 bytes", "部分字节可能已到达远端终端", "待发送输入已丢弃", "请勿重复提交执行状态不确定的命令"])
+    expect(el("terminal-notice").textContent).toContain(text);
+  response({status: "ok"}, "mac", "partial"); vi.advanceTimersByTime(20000);
+  expect(ops("input")).toHaveLength(1);
+});
+
+test("native rejection of invalidated input preserves queued replacement without Home reset", () => {
+  attach(); actions = [];
+  terminals[0].onInput("x".repeat(40000));
+  const old = ops("input")[0];
+  send({type: "protocol", message: {type: "ownership", session_id: "session", epoch: 4, writer: {attachment_id: "attachment"}}});
+  terminals[0].onInput("replacement");
+  expect(ops("input")).toHaveLength(1);
+  send({type: "error", input_id: old.input_id, message: "native admission rejected"});
+  expect(ops("input")).toHaveLength(2);
+  const next = ops("input")[1];
+  expect(new TextDecoder().decode(new Uint8Array(next.operation.data))).toBe("replacement");
+  expect(next.operation.writer_epoch).toBe(4);
+  expect(el("terminal-notice").textContent).toContain("native admission rejected");
+  expect(actions.some(a => a.op === "disconnect")).toBe(false);
+  expect(terminals[0].dispose).not.toHaveBeenCalled();
+  send({type: "error", input_id: old.input_id, message: "stale rejection"});
+  send({type: "submitted", input_id: next.input_id, request_id: "replacement", operation: next.operation});
+  response({status: "ok"}, "mac", "replacement");
+  terminals[0].onInput("before reset");
+  const reset = ops("input").at(-1);
+  send({type: "lifecycle", active: false});
+  send({type: "lifecycle", active: true});
+  terminals[0].onInput("after reset");
+  const current = ops("input").at(-1);
+  send({type: "error", input_id: reset.input_id, message: "stale after reset"});
+  send({type: "submitted", input_id: current.input_id, request_id: "after-reset", operation: current.operation});
+  response({status: "ok"}, "mac", "after-reset");
+  vi.advanceTimersByTime(20000);
+  expect(ops("input")).toHaveLength(4);
+  expect(actions.some(a => a.op === "disconnect")).toBe(false);
+  expect(el("terminal-notice").textContent).not.toContain("stale after reset");
+});
+
+test.each(["default", "manual"])("identity unavailable stops wanted reconnect until intentional %s retry", method => {
+  classIdentity(true, true); classCatalog([]);
+  window.flowsplice.receive({type: "workspace", value: {
+    version: 1, classMode: true, identityWanted: true, homes: [], tabs: [],
+    active: null, selected: null, page: "manage",
+  }});
+  classIdentity(false, true);
+  window.flowsplice.receive({type: "error", code: "identity_unavailable", message: "local identity cannot start"});
+  actions = [];
+  vi.advanceTimersByTime(120000);
+  expect(actions).toEqual([]);
+  expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+  expect(el("identity-repair").hidden).toBe(false);
+  if (method === "default") submit("identity-access");
+  else {
+    click("identity-unlock");
+    (el("recovery-password") as HTMLInputElement).value = "repaired-password";
+    submit("recovery-form");
+  }
+  expect(actions).toEqual([{op: "connect", password: method === "default" ? "" : "repaired-password"}]);
+  window.flowsplice.receive({type: "error", message: "temporary network failure"});
+  classIdentity(false, true);
+  actions = [];
+  vi.advanceTimersByTime(1000);
+  expect(actions).toEqual([{op: "connect", password: ""}]);
+  expect((el("recovery") as HTMLDialogElement).open).toBe(false);
+});
+
+test("returning from background retries temporarily inaccessible identity once", () => {
+  classIdentity(true, true); classCatalog([]);
+  window.flowsplice.receive({type: "workspace", value: {
+    version: 1, classMode: true, identityWanted: true, homes: [], tabs: [],
+    active: null, selected: null, page: "manage",
+  }});
+  classIdentity(false, true);
+  window.flowsplice.receive({type: "error", code: "identity_unavailable", message: "protected file unavailable"});
+  actions = [];
+  vi.advanceTimersByTime(30000);
+  expect(actions).toEqual([]);
+  send({type: "lifecycle", active: false});
+  send({type: "lifecycle", active: true});
+  expect(actions.filter(a => a.op === "connect")).toEqual([{op: "connect", password: ""}]);
+  window.flowsplice.receive({type: "error", code: "identity_unavailable", message: "still unavailable"});
+  classIdentity(false, true);
+  vi.advanceTimersByTime(60000);
+  expect(actions.filter(a => a.op === "connect")).toHaveLength(1);
 });

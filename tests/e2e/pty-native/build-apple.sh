@@ -67,14 +67,11 @@ for original, isolated in [
 project.write_text(source)
 PY_ISOLATE
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+bash "${output_dir}/source/pty-apple/scripts/test-origin.sh" >"${output_dir}/origin-tests.log" 2>&1
 export CARGO_TARGET_DIR="${output_dir}/cargo-target"
 export FLOWSPLICE_PTY_BOOTSTRAP_DIR="${output_dir}/bootstrap"
 export npm_config_cache="${output_dir}/npm-cache"
-(
-  cd "${output_dir}/source/pty-web"
-  npm ci
-  npm run build
-) >"${output_dir}/pty-web-build.log" 2>&1
+# Each Xcode resource phase installs the locked UI dependencies and rebuilds.
 project="${output_dir}/source/pty-apple/FlowSplicePTY.xcodeproj"
 xcodebuild -project "${project}" -scheme FlowSplicePTY-iOSUITests \
   -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \

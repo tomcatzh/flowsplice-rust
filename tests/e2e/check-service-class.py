@@ -79,6 +79,33 @@ def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
 
     clean()
     base, persistent = enroll('shared', resume=True)
+    original = run.directory / 'class-shared'
+    relocated = run.directory / 'class shared relocated'
+    def all_hashes(path):
+        return {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in path.rglob('*') if p.is_file()}
+    before_move = all_hashes(original)
+    require(bool(before_move), 'relocation fixture is empty')
+    original.rename(relocated)
+    require(not original.exists() and all_hashes(relocated) == before_move, 'relocation changed installation bytes')
+    base[0] = '/business/' + relocated.name + '/travelagent.toml'
+    config_path = relocated / 'travelagent.toml'
+    config_bytes = config_path.read_bytes()
+    require('service-class-binding-verified' in probe('class-relocated-binding', ['check-only', base[0], root, class_path]), 'relocated class binding failed')
+    try:
+        config_path.write_bytes(config_bytes + b'\n# deliberate digest mismatch\n')
+        rejected = probe('class-relocated-digest-rejected', ['check-only', base[0], root, class_path], success=False)
+        require('class installation does not match this application and configuration' in rejected, 'altered config did not fail binding digest validation')
+    finally:
+        config_path.write_bytes(config_bytes)
+    require(all_hashes(relocated) == before_move, 'binding checks changed installation bytes')
+    require('service-class-binding-verified' in probe('class-relocated-binding-restored', ['check-only', base[0], root, class_path]), 'restored class binding failed')
+    # Runtime state/trust may legitimately refresh. Identity/config/root/key bytes may not.
+    identity_hashes = {name: digest for name, digest in before_move.items()
+                       if name in ('travelagent.toml', 'approved-service-class-binding.json', 'cert/deployment-root.pub')
+                       or Path(name).suffix in ('.crt', '.key')}
+    require('cert/deployment-root.pub' in identity_hashes and bool(key_hashes(relocated)), 'relocation fixture lacks root/certificate identity')
+    run.passed += ['class-relocation-preserves-all-files', 'class-relocation-binding-and-digest-enforcement']
     future_task = run.start('class-future', 'flowsplice-service-class-probe', ['future', *base, '/business/class-future-signal.json'])
     wait(lambda: 'service-class-future-ready' in run.logs(future_task), 'two Home shared runtime ready')
     # This Home did not exist when the application credential was issued.
@@ -99,6 +126,10 @@ def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
     (run.directory / 'class-future-signal.json').write_text(json.dumps({'home_id': home_id}))
     require('service-class-future-complete' in run.finish(future_task, timeout=300), 'future Home not automatically discovered')
     command(['docker', 'stop', future_home])
+    after_runtime = all_hashes(relocated)
+    require(all(after_runtime.get(name) == digest for name, digest in identity_hashes.items()), 'relocated runtime changed config/root/certificates/keys/identity')
+    require('service-class-binding-verified' in probe('class-relocated-after-runtime', ['check-only', base[0], root, class_path]), 'relocated runtime invalidated binding')
+    run.passed += ['class-relocation-runtime-multi-home', 'class-relocation-identity-unchanged']
     run.passed += ['class-one-identity-two-homes', 'class-future-home-different-service-id', 'class-independent-disconnect-rejoin', 'class-no-listeners', 'class-exact-scope-and-resumable-install']
     clean()
     revoked_base, revoked = enroll('revoked')

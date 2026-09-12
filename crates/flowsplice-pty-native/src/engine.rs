@@ -38,6 +38,8 @@ pub enum Action {
     Disconnect,
     Operation {
         operation: Operation,
+        #[serde(default)]
+        input_id: Option<uuid::Uuid>,
     },
     ConnectHome {
         home_id: String,
@@ -48,6 +50,8 @@ pub enum Action {
     OperationHome {
         home_id: String,
         operation: Operation,
+        #[serde(default)]
+        input_id: Option<uuid::Uuid>,
     },
 }
 pub(crate) struct Outbox {
@@ -97,7 +101,10 @@ impl NativeSession {
             || options.travel_id.is_empty()
             || options.travel_id.len() > 128
             || options.label.len() > 64
-            || options.label.chars().any(char::is_control)
+            || options
+                .label
+                .chars()
+                .any(flowsplice_pty_protocol::is_display_control)
             || options.root_public_key.is_empty()
         {
             bail!("invalid private terminal configuration");
@@ -125,10 +132,14 @@ impl NativeSession {
         if *self.outbox.cancel.borrow() {
             bail!("native terminal session closed");
         }
-        if self.actions.try_send(action).is_err() {
-            self.outbox.overflow.send_replace(true);
-            bail!("native action queue unavailable; connection closing");
-        }
+        self.actions.try_send(action).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                anyhow::anyhow!("native action queue is busy; operation was not admitted")
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                anyhow::anyhow!("native terminal session closed")
+            }
+        })?;
         Ok(())
     }
     pub fn poll(&self) -> Vec<Value> {
@@ -159,6 +170,30 @@ impl Drop for NativeSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+// Input correlation is local bridge metadata; terminal bytes are not copied back
+// across the bridge just to acknowledge admission. The remote request still has
+// its normal request ID and must reply before the UI admits the next chunk.
+pub(crate) fn submitted(
+    request_id: uuid::Uuid,
+    operation: &Operation,
+    input_id: Option<uuid::Uuid>,
+) -> Option<Value> {
+    if matches!(operation, Operation::Resize { .. }) {
+        return None;
+    }
+    let operation = match operation {
+        Operation::Input {
+            attachment_id,
+            writer_epoch,
+            ..
+        } => json!({"op":"input","attachment_id":attachment_id,"writer_epoch":writer_epoch}),
+        value => json!(value),
+    };
+    Some(
+        json!({"type":"submitted","request_id":request_id,"input_id":input_id,"operation":operation}),
+    )
 }
 
 enum JobResult {
@@ -219,17 +254,15 @@ async fn actor(
                     Action::ConnectHome { .. } | Action::DisconnectHome { .. } | Action::OperationHome { .. } => {
                         outbox.error(&anyhow::anyhow!("class actions require a service-class installation"));
                     },
-                    Action::Operation { operation } => {
+                    Action::Operation { operation, input_id } => {
                         if let Some(client) = &client {
                             match client.send(operation.clone()).await {
                                 Ok(request_id) => {
-                                    if !matches!(operation, Operation::Input { .. } | Operation::Resize { .. }) {
-                                        outbox.emit(json!({"type":"submitted","request_id":request_id,"operation":operation}));
-                                    }
+                                    if let Some(event) = submitted(request_id, &operation, input_id) { outbox.emit(event); }
                                 },
-                                Err(error) => outbox.error(&error),
+                                Err(error) => outbox.emit(json!({"type":"error","input_id":input_id,"message":error.to_string()})),
                             }
-                        } else { outbox.error(&anyhow::anyhow!("connect before opening a terminal session")); }
+                        } else { outbox.emit(json!({"type":"error","input_id":input_id,"message":"connect before opening a terminal session"})); }
                     },
                 }
             },
@@ -339,6 +372,11 @@ mod tests {
             native.send(Action::Disconnect)?;
         }
         assert!(native.send(Action::Disconnect).is_err());
+        assert!(
+            !*native.outbox.overflow.borrow(),
+            "action backpressure must not tear down any Home"
+        );
+        assert!(!*native.outbox.cancel.borrow());
         for _ in 0..1000 {
             native
                 .outbox
@@ -355,6 +393,46 @@ mod tests {
                 <= 128
         );
         tokio::time::timeout(Duration::from_secs(2), native.shutdown()).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn input_admission_ack_keeps_correlation_without_echoing_terminal_bytes() -> Result<()> {
+        let request = uuid::Uuid::new_v4();
+        let input = uuid::Uuid::new_v4();
+        let attachment = uuid::Uuid::new_v4();
+        let action: Action = serde_json::from_value(json!({
+            "op": "operation_home", "home_id": "home-a", "input_id": input,
+            "operation": {"op": "input", "attachment_id": attachment, "writer_epoch": 7, "data": [112, 97, 115, 115]}
+        }))?;
+        let Action::OperationHome {
+            operation,
+            input_id,
+            ..
+        } = action
+        else {
+            anyhow::bail!("input action changed type");
+        };
+        let ack = submitted(request, &operation, input_id)
+            .ok_or_else(|| anyhow::anyhow!("input admission acknowledgement missing"))?;
+        assert_eq!(ack["request_id"], json!(request));
+        assert_eq!(ack["input_id"], json!(input));
+        assert_eq!(ack["operation"]["attachment_id"], json!(attachment));
+        assert_eq!(ack["operation"]["writer_epoch"], 7);
+        assert!(ack["operation"].get("data").is_none());
+        assert!(serde_json::to_value(&operation)?.get("input_id").is_none());
+        assert!(
+            submitted(
+                request,
+                &Operation::Resize {
+                    attachment_id: attachment,
+                    columns: 80,
+                    rows: 24,
+                },
+                None
+            )
+            .is_none()
+        );
         Ok(())
     }
 }

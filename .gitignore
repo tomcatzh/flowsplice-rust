@@ -4,6 +4,8 @@
 /target/
 /pty-web/node_modules/
 /pty-web/dist/
+/pty-web/test-results/
+/pty-web/playwright-report/
 **/web/node_modules/
 **/web/dist/
 /.env

@@ -158,6 +158,12 @@ impl ServerAuthorization {
         request_id: Uuid,
         approving_home_id: &str,
     ) -> Result<()> {
+        // A catalog refresh may legitimately contain no active credentials. An
+        // installation acknowledgement may not: validate this exact credential,
+        // even when another credential with the same Travel key remains active.
+        if !self.verified.is_active(credential_id, unix_time_secs()?) {
+            bail!("installed Travel credential is revoked, expired, or not yet valid");
+        }
         let credential = self
             .verified
             .credential(credential_id)
@@ -636,6 +642,50 @@ mod tests {
                 business_home_grants: BTreeMap::new(),
             },
         )
+    }
+
+    #[test]
+    fn installation_ack_requires_the_exact_credential_to_be_active() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("flowsplice-ack-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("authorization.json");
+        let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| anyhow!("fixture key failed"))?;
+        let active = fixture_credential("travel-1", "11", "22");
+        let mut expired = fixture_credential("travel-1", "11", "22");
+        expired.not_after_unix_secs = unix_time_secs()? - 1;
+        let mut future = fixture_credential("travel-1", "11", "22");
+        future.not_before_unix_secs = unix_time_secs()? + 3600;
+        let revoked = fixture_credential("travel-1", "11", "22");
+        let credentials = [&active, &expired, &future, &revoked]
+            .into_iter()
+            .map(|value| signed(&key, value))
+            .collect::<Result<Vec<_>>>()?;
+        store_state_with_key(&path, &key, credentials)?;
+        let mut state = ServerAuthorization::load("deployment-1".into(), authorities(&key), path)?;
+        state.revoke_from_home(revoked.credential_id, "fixture".into(), "home-1")?;
+        state.validate_install_acknowledgement(
+            active.credential_id,
+            active.enrollment_request_id,
+            "home-1",
+        )?;
+        for credential in [&expired, &future, &revoked] {
+            let error = state
+                .validate_install_acknowledgement(
+                    credential.credential_id,
+                    credential.enrollment_request_id,
+                    "home-1",
+                )
+                .err()
+                .context("inactive credential was acknowledged")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("revoked, expired, or not yet valid")
+            );
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]

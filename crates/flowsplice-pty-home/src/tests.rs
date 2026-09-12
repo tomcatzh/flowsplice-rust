@@ -83,6 +83,7 @@ fn connection(
             events,
             stop: watch::channel(false).0,
             can_write: true,
+            history_budget: crate::history::connection_budget(),
         },
         receiver,
         guard,
@@ -519,6 +520,101 @@ async fn metadata_survives_reconstruction_and_counts_attachments() -> Result<()>
         details.last_connected_at_unix_secs
     );
     assert_eq!(recovered.details()?.connection_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_persisted_names_recover_without_losing_sessions_or_metadata() -> Result<()> {
+    let fixture = DomainFixture::new().await?;
+    let damaged = fixture.session().await?;
+    let healthy = fixture.session().await?;
+    let unicode_name = "部署 👩‍💻 فارسی‌نام"; // ZWJ and ZWNJ are ordinary name content.
+    fixture
+        .tmux
+        .set_display_name(healthy.id, unicode_name)
+        .await?;
+    fixture
+        .tmux
+        .set_last_connected(damaged.id, 123_456_789)
+        .await?;
+    let original_sessions = fixture.tmux.list().await?;
+    let target = format!("fs-{}", damaged.id);
+    let command = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new(&fixture.binary)
+            .arg("-S")
+            .arg(&fixture.socket)
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
+    };
+    let identity = || {
+        command(&[
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            "#{session_id}|#{pane_id}|#{pane_pid}",
+        ])
+    };
+    let original_identity = identity()?;
+    for encoded in [
+        "6f6c64e280ae6e616d65".to_owned(), // Bidi override.
+        "6f6c64e2808b6e616d65".to_owned(), // Zero-width space.
+        "xyz0".to_owned(),
+        "bad|hex".to_owned(),
+        "0".to_owned(),
+        "61".repeat(257),
+        "ff".to_owned(), // Invalid UTF-8.
+    ] {
+        command(&[
+            "set-option",
+            "-t",
+            &target,
+            "@flowsplice-name-hex",
+            &encoded,
+        ])?;
+        let listed = fixture.tmux.list().await?;
+        assert_eq!(listed, original_sessions);
+        for (id, created) in listed {
+            let (name, last) = fixture.tmux.metadata(id).await?;
+            let recovered =
+                SessionState::with_metadata(id, created, name, last, Arc::clone(&fixture.tmux));
+            let details = recovered.details()?;
+            if id == damaged.id {
+                assert_eq!(details.name, Tmux::fallback_name(id));
+                assert_eq!(details.last_connected_at_unix_secs, Some(123_456_789));
+            } else {
+                assert_eq!(id, healthy.id);
+                assert_eq!(details.name, unicode_name);
+            }
+        }
+        assert_eq!(
+            command(&["show-options", "-v", "-t", &target, "@flowsplice-name-hex"])?,
+            encoded
+        );
+        assert_eq!(identity()?, original_identity);
+    }
+    assert!(
+        fixture
+            .tmux
+            .set_display_name(damaged.id, "bad\u{202e}name")
+            .await
+            .is_err()
+    );
+    fixture
+        .tmux
+        .set_display_name(damaged.id, unicode_name)
+        .await?;
+    assert_eq!(
+        fixture.tmux.metadata(damaged.id).await?,
+        (unicode_name.to_owned(), Some(123_456_789))
+    );
+    assert_eq!(identity()?, original_identity);
     Ok(())
 }
 

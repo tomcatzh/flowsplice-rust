@@ -39,3 +39,31 @@ test('normalized inherited colon SGR supports color space, underline color and s
   expect(normal.style.fontWeight).toBe('');expect(normal.style.fontStyle).toBe('');expect(normal.style.opacity).toBe('');expect(normal.style.textDecoration).toBe('');expect(hidden.style.color).toBe('transparent');expect(visible.style.color).toBe('rgb(1, 2, 3)');expect(visible.style.textDecorationStyle).toBe('double');
   expect(node.textContent).toBe('继承色🙂normalhiddenvisible');
 });
+
+test('expired partial capture retains cached display until fresh retry and never mixes pages',()=>{
+  wheel(-20);reply();scroll(0);
+  const old=requests.at(-1);const cached=history.content.textContent;
+  history.fail(old.capture_id,'This human-readable message can change','history_snapshot_expired');
+  expect(history.content.textContent).toBe(cached);
+  expect(history.retry.textContent).toContain('已过期');
+  history.retry.click();const fresh=requests.at(-1);
+  expect(fresh.capture_id).not.toBe(old.capture_id);expect(fresh.before).toBeNull();
+  history.accept({attachment_id:id,capture_id:old.capture_id,total_lines:1000,start:488,columns:80,lines:Array(256).fill('stale')});
+  expect(history.pending).toBe(true);
+  history.accept({attachment_id:id,capture_id:fresh.capture_id,total_lines:1,start:0,columns:80,lines:['new']});
+  expect(history.content.textContent).toBe('new');
+});
+test('hostile bidi text is retained but each displayed row isolates its direction',()=>{
+  wheel(-20);const req=requests.at(-1);
+  history.accept({attachment_id:id,capture_id:req.capture_id,total_lines:2,start:0,columns:80,lines:['\u202eevil','safe']});
+  expect(history.content.textContent).toBe('\u202eevilsafe');
+  for(const row of Array.from(history.content.children) as HTMLElement[]){expect(row.style.unicodeBidi).toBe('isolate');expect(row.style.direction).toBe('ltr');}
+});
+
+test('expiry-like text with generic code retries the existing cursor',()=>{
+  wheel(-20);reply();scroll(0);const old=requests.at(-1);
+  history.fail(old.capture_id,'history snapshot expired; start a new capture','operation_failed');
+  expect(history.retry.textContent).not.toContain('已过期');
+  history.retry.click();expect(requests.at(-1).capture_id).toBe(old.capture_id);
+  expect(requests.at(-1).before).toBe(old.before);
+});

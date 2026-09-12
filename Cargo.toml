@@ -87,3 +87,8 @@ panic = "abort"
 [profile.android-release]
 inherits = "release"
 panic = "unwind"
+
+# Native FFI responses catch panics before crossing the C ABI on Apple, as on Android.
+[profile.apple-release]
+inherits = "release"
+panic = "unwind"

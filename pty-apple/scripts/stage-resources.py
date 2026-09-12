@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 def validate_homes(path):
@@ -49,6 +50,15 @@ if private:
     for name in names:
         policy.external_path(str(source / name), require_file=True, must_exist=True)
     if 'homes.json' in names: validate_homes(source / 'homes.json')
+# Never trust ignored dist from an earlier checkout/build. Freeze dependencies and
+# remove old output before building, so a failed build cannot be packaged.
+web = repo / 'pty-web'
+subprocess.run(['npm', 'ci'], cwd=web, check=True)
+if (web / 'dist').exists():
+    shutil.rmtree(web / 'dist')
+subprocess.run(['npm', 'run', 'build'], cwd=web, check=True)
+if not (web / 'dist/index.html').is_file():
+    raise ValueError('PTY UI build did not produce index.html')
 output.mkdir(parents=True, exist_ok=True)
 ui = output / 'pty-ui'
 if ui.exists():

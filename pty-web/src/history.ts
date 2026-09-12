@@ -140,6 +140,7 @@ export class HistoryView {
   browsing = false;
   pending = false;
   private dirty = true;
+  private expired = false;
   private capture = '';
   private lines: string[] = [];
   private start = 0;
@@ -169,7 +170,7 @@ export class HistoryView {
     this.bottom.setAttribute('aria-label', '回到底部');
     this.bottom.onclick = () => this.live();
     this.retry.className = 'history-retry';
-    this.retry.onclick = () => { this.retry.hidden = true; this.load(this.lines.length ? this.start : null); };
+    this.retry.onclick = () => { this.retry.hidden = true; if (this.expired) this.fresh(); else this.load(this.lines.length ? this.start : null); };
     this.loading.className = 'history-loading';
     this.loading.textContent = '正在加载历史…';
     this.loading.setAttribute('role', 'status');
@@ -251,7 +252,8 @@ export class HistoryView {
     this.retry.hidden = true;
     this.measure();
     this.viewport.focus({ preventScroll: true });
-    if (this.dirty && !this.pending) {
+    if ((this.dirty || this.expired) && !this.pending) {
+      this.expired = false;
       this.lines = [];
       this.start = 0;
       this.ready = false;
@@ -271,8 +273,18 @@ export class HistoryView {
         this.load(this.start);
     }
   }
+  private fresh() {
+    this.expired = false;
+    this.capture = crypto.randomUUID();
+    this.lines = [];
+    this.start = this.total = 0;
+    this.ready = false;
+    this.dirty = false;
+    this.paint();
+    this.load(null);
+  }
   private load(before: number | null) {
-    if (this.pending || !this.capture || !this.attachment() || before === 0)
+    if (this.expired || this.pending || !this.capture || !this.attachment() || before === 0)
       return;
     this.pending = true;
     this.before = before;
@@ -307,14 +319,14 @@ export class HistoryView {
     if (this.browsing && this.viewport.scrollTop < this.row * 8 && this.start > 0)
       this.load(this.start);
   }
-  fail(capture?: string) { if (capture && capture !== this.capture)
+  fail(capture?: string, _message?: string, code?: string) { if (capture && capture !== this.capture)
     return; if (!this.pending)
-    return; this.pending = false; this.loading.hidden = true; if (this.browsing) {
-    this.retry.textContent = '历史加载失败 · 重试';
+    return; this.pending = false; this.expired = code === 'history_snapshot_expired'; this.loading.hidden = true; if (this.browsing) {
+    this.retry.textContent = this.expired ? '历史快照已过期 · 重新加载' : '历史加载失败 · 重试';
     this.retry.hidden = false;
   } }
   live() { this.browsing = false; this.hide(); this.liveFocus(); }
-  reset() { this.pending = false; this.ready = false; this.total = 0; this.capture = ''; this.lines = []; this.dirty = true; this.browsing = false; this.content.replaceChildren(); this.hide(); }
+  reset() { this.expired = false; this.pending = false; this.ready = false; this.total = 0; this.capture = ''; this.lines = []; this.dirty = true; this.browsing = false; this.content.replaceChildren(); this.hide(); }
   dispose() { this.reset(); this.abort.abort(); this.viewport.remove(); this.bottom.remove(); this.retry.remove(); this.loading.remove(); }
   measure() {
     const old = this.row, screen = this.pane.querySelector<HTMLElement>('.xterm-screen'), dimensions = screen?.getBoundingClientRect(), metrics = this.metrics?.();
@@ -340,6 +352,8 @@ export class HistoryView {
   private paint() { this.content.style.height = `${this.lines.length * this.row}px`; this.content.style.minWidth = `${this.columns * this.cell}px`; const first = Math.max(0, Math.floor(this.viewport.scrollTop / this.row) - 8), last = Math.min(this.lines.length, first + Math.ceil(this.height() / this.row) + 16); const nodes = []; for (let i = first; i < last; i++) {
     const node = document.createElement('div');
     node.className = 'history-row';
+    node.style.unicodeBidi = 'isolate';
+    node.style.direction = 'ltr';
     node.style.top = `${i * this.row}px`;
     node.style.height = node.style.lineHeight = `${this.row}px`;
     node.dataset.line = String(this.start + i);

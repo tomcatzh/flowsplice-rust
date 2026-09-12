@@ -1,6 +1,6 @@
 # FlowSplice PTY Apple hosts
 
-`FlowSplicePTY.xcodeproj` is maintained directly. Shared schemes are `FlowSplicePTY-iOS` and `FlowSplicePTY-macOS`; both compile the same Swift host and Rust `flowsplice-pty-native` ABI. UI comes exclusively from `../pty-web/dist` (build it with `npm ci && npm run build` in `pty-web`). Transport connections run inside the app; there is no localhost server.
+`FlowSplicePTY.xcodeproj` is maintained directly. Shared schemes are `FlowSplicePTY-iOS` and `FlowSplicePTY-macOS`; both compile the same Swift host and Rust `flowsplice-pty-native` ABI. The resource build phase runs `npm ci`, removes stale `../pty-web/dist`, and builds the shared UI before staging it. No separate manual UI build is required for an Apple build. Transport connections run inside the app; there is no localhost server.
 
 Neutral builds omit `FLOWSPLICE_PTY_BOOTSTRAP_DIR` and display a private configuration missing message. Set `CARGO_TARGET_DIR` to choose the Rust build cache. The build phase selects Apple Silicon macOS, iOS simulator, or iOS device from the SDK.
 

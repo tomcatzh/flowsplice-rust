@@ -337,24 +337,32 @@ impl Tmux {
         let text = String::from_utf8(output.stdout)?;
         let (encoded, last) = text
             .trim_end()
-            .split_once('|')
+            .rsplit_once('|')
             .context("invalid tmux session metadata")?;
         let name = if encoded.is_empty() {
             Self::fallback_name(id)
         } else {
-            if encoded.len() > 512
-                || encoded.len() % 2 != 0
-                || !encoded.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                bail!("invalid tmux session name encoding");
-            }
-            let bytes = (0..encoded.len())
-                .step_by(2)
-                .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16))
-                .collect::<Result<Vec<_>, _>>()?;
-            let name = String::from_utf8(bytes)?;
-            flowsplice_pty_protocol::validate_session_name(&name)?;
-            name
+            let decoded = (|| -> Result<String> {
+                if encoded.len() > 512
+                    || encoded.len() % 2 != 0
+                    || !encoded.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!("invalid tmux session name encoding");
+                }
+                let bytes = (0..encoded.len())
+                    .step_by(2)
+                    .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let name = String::from_utf8(bytes)?;
+                flowsplice_pty_protocol::validate_session_name(&name)?;
+                Ok(name)
+            })();
+            decoded.unwrap_or_else(|_| {
+                // Persisted names may predate stricter validation. Do not log their
+                // bytes or rewrite metadata while recovering this session.
+                tracing::warn!(session_id = %id, "invalid persisted session name; using fallback");
+                Self::fallback_name(id)
+            })
         };
         Ok((
             name,

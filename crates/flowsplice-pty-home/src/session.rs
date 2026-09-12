@@ -19,6 +19,7 @@ pub(crate) struct Connection {
     pub events: mpsc::Sender<ServerMessage>,
     pub stop: watch::Sender<bool>,
     pub can_write: bool,
+    pub history_budget: Arc<tokio::sync::Semaphore>,
 }
 impl Connection {
     pub fn active(&self) -> bool {
@@ -385,9 +386,15 @@ impl SessionState {
         epoch: u64,
         data: &[u8],
     ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut offset = 0;
         let mut changes = self.changes.subscribe();
         while offset < data.len() {
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "terminal input stalled; some bytes may have been written, do not replay this input"
+                );
+            }
             let process = {
                 let state = self.lock()?;
                 let attachment = state.attachments.get(&id).context("attachment ended")?;
@@ -414,6 +421,7 @@ impl SessionState {
             tokio::select! {
                 biased;
                 () = connection.ended() => bail!("connection ended"),
+                () = tokio::time::sleep_until(deadline) => bail!("terminal input stalled; some bytes may have been written, do not replay this input"),
                 _ = changes.changed() => {},
                 result = process.writable() => result?,
             }
@@ -492,6 +500,20 @@ impl SessionState {
             .get(&id)
             .is_some_and(|a| a.connection.id == connection))
     }
+    pub fn expire_history(&self, connection: Uuid) {
+        if let Ok(mut state) = self.lock() {
+            for attachment in state.attachments.values_mut() {
+                if attachment.connection.id == connection
+                    && attachment
+                        .history
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.expired_at(tokio::time::Instant::now()))
+                {
+                    attachment.history = None;
+                }
+            }
+        }
+    }
     pub async fn history(
         &self,
         connection: &Connection,
@@ -507,17 +529,18 @@ impl SessionState {
             }
             if let Some(snapshot) = &attachment.history
                 && snapshot.id == capture_id
+                && !snapshot.expired_at(tokio::time::Instant::now())
             {
                 return snapshot.page(id, before);
             }
             if before.is_some() {
-                bail!("history snapshot expired; start a new capture");
+                return Err(crate::history::SnapshotExpired.into());
             }
         }
         let _slot = tokio::select! {
             biased;
             () = connection.ended() => bail!("connection ended"),
-            permit = crate::history::CAPTURE_SLOT.acquire() => permit?,
+            permit = tokio::time::timeout(std::time::Duration::from_secs(10), crate::history::CAPTURE_SLOT.acquire()) => permit.context("history capture is busy; retry shortly")??,
         };
         {
             let mut state = self.lock()?;
@@ -527,6 +550,7 @@ impl SessionState {
             }
             if let Some(snapshot) = &attachment.history
                 && snapshot.id == capture_id
+                && !snapshot.expired_at(tokio::time::Instant::now())
             {
                 return snapshot.page(id, before);
             }
@@ -539,7 +563,11 @@ impl SessionState {
             () = connection.ended() => bail!("connection ended"),
             result = self.tmux.capture_history(self.id) => result?,
         };
-        let snapshot = Arc::new(crate::history::Snapshot::parse(capture_id, &captured)?);
+        let snapshot = Arc::new(crate::history::Snapshot::parse_for_connection(
+            capture_id,
+            &captured,
+            Arc::clone(&connection.history_budget),
+        )?);
         let mut state = self.lock()?;
         let attachment = state
             .attachments
@@ -622,6 +650,7 @@ done
             events,
             stop: watch::channel(false).0,
             can_write: true,
+            history_budget: crate::history::connection_budget(),
         };
         let caller_session = Arc::clone(&session);
         let caller =
@@ -654,6 +683,86 @@ done
         expected.name = "renamed".into();
         assert_eq!(session.details()?, expected);
         assert_eq!(session.lock()?.epoch, 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod input_deadline_tests {
+    use super::*;
+    use crate::tmux::TmuxConfig;
+    use portable_pty::CommandBuilder;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn stalled_input_is_bounded_without_destroying_other_operations() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let binary = if cfg!(target_os = "macos") {
+            "/opt/homebrew/bin/tmux"
+        } else {
+            "/usr/bin/tmux"
+        };
+        let tmux = Arc::new(
+            Tmux::open(TmuxConfig {
+                binary: binary.into(),
+                socket: directory.path().join("domain/tmux.sock"),
+                shell: "/bin/sh".into(),
+                working_directory: directory.path().into(),
+            })
+            .await?,
+        );
+        // An actual raw PTY whose child never reads input, independent of tmux's
+        // automatic continuation of a stopped attached client.
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; printf READY; exec sleep 60"]);
+        let process = crate::pty::spawn(command, 80, 24)?;
+        let mut ready = [0; 32];
+        let count =
+            tokio::time::timeout(Duration::from_secs(3), process.read(&mut ready)).await??;
+        assert!(std::str::from_utf8(&ready[..count])?.contains("READY"));
+        let session = SessionState::new(Uuid::new_v4(), 0, tmux);
+        let (events, _receiver) = mpsc::channel(64);
+        let (lifetime, _guard) =
+            ServiceLifetime::new(flowsplice_core::authorization::unix_time_secs()? + 60);
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            travel_id: "blocked-fixture".into(),
+            label: "blocked".into(),
+            lifetime,
+            events,
+            stop: watch::channel(false).0,
+            can_write: true,
+            history_budget: crate::history::connection_budget(),
+        };
+        let id = Uuid::new_v4();
+        {
+            let mut state = session.lock()?;
+            state.writer = Some(id);
+            state.attachments.insert(
+                id,
+                Attachment {
+                    connection: connection.clone(),
+                    pty: process,
+                    columns: 80,
+                    rows: 24,
+                    started: watch::channel(false).0,
+                    history: None,
+                },
+            );
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            session.input(&connection, id, 1, &vec![b'x'; 512 * 1024]),
+        )
+        .await?;
+        let error = result
+            .err()
+            .context("non-reading PTY consumed unbounded input")?;
+        assert!(error.to_string().contains("terminal input stalled"));
+        assert!(connection.active());
+        assert!(session.owns(connection.id, id)?);
+        session.detach(connection.id, id)?;
+        assert!(!session.owns(connection.id, id)?);
         Ok(())
     }
 }

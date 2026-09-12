@@ -20,9 +20,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    Config, RemoteEnrollmentOptions, RemoteEnrollmentProgress, ServiceBinding, TravelCore,
-    load_toml, read_public_key, require_trusted_root, sha256_hex,
-    validate_bootstrap_trust_continuity,
+    RemoteEnrollmentOptions, RemoteEnrollmentProgress, ServiceBinding, TravelCore, read_public_key,
+    require_trusted_root, sha256_hex, validate_bootstrap_trust_continuity,
 };
 
 pub(super) const INSTALL_JOURNAL_FILE: &str = "business-installation.pending.json";
@@ -146,7 +145,7 @@ pub(super) fn validate_installed_binding(
     }
     let now = unix_time_secs()?;
     let (credential, response_trust) = completed.response.validate(root, now)?;
-    let config: Config = load_toml(config_path)?;
+    let config = super::installation_paths::load(config_path)?;
     require_trusted_root(&read_public_key(&config.deployment_root_public_key)?, root)?;
     let installed_signed: SignedDeploymentTrust = load_json(&config.deployment_trust)?;
     let installed_trust = installed_signed.verify(root, now)?;

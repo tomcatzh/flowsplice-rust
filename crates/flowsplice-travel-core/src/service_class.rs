@@ -1,8 +1,8 @@
 //! One durable application identity and verified discovery of matching Business Homes.
 use crate::{
-    Config, RemoteEnrollmentOptions, RemoteEnrollmentProgress, ServiceBinding, TravelCore,
-    business::BusinessEnrollmentOptions, load_toml, read_public_key, require_trusted_root,
-    sha256_hex, validate_bootstrap_trust_continuity,
+    RemoteEnrollmentOptions, RemoteEnrollmentProgress, ServiceBinding, TravelCore,
+    business::BusinessEnrollmentOptions, read_public_key, require_trusted_root, sha256_hex,
+    validate_bootstrap_trust_continuity,
 };
 use anyhow::{Context, Result, bail};
 use flowsplice_core::{
@@ -132,7 +132,7 @@ pub(super) fn validate_installed_binding(
     }
     let now = unix_time_secs()?;
     let (credential, response_trust) = completed.response.validate(root, now)?;
-    let config: Config = load_toml(config_path)?;
+    let config = super::installation_paths::load(config_path)?;
     require_trusted_root(&read_public_key(&config.deployment_root_public_key)?, root)?;
     let signed: SignedDeploymentTrust = load_json(&config.deployment_trust)?;
     let trust = signed.verify(root, now)?;

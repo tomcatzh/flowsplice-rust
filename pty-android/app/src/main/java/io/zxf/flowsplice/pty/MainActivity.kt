@@ -6,6 +6,7 @@ import android.os.Build
 import android.provider.Settings
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -21,7 +22,7 @@ import java.util.UUID
 class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var web: WebView? = null
-    private data class Home(val id: String, val info: JSONObject, var handle: Long = 0L, var error: String? = null, var pendingPassword: String? = null)
+    private data class Home(val id: String, val info: JSONObject, var handle: Long = 0L, var error: String? = null, var pendingPassword: String? = null, var openOptions: String? = null, var polling: Boolean = true, var actionUntil: Long = 0L, var recovered: Boolean = false, var disconnectStarted: Long? = null)
     private val homes = linkedMapOf<String, Home>()
     private var classMode = false
     private var foreground = false
@@ -35,7 +36,7 @@ class MainActivity : Activity() {
     private var inFlightBytes = 0
     private val snapshots = linkedMapOf<String, JSONObject>()
     private data class Retained(val homes: List<Home>, val classMode: Boolean, val snapshots: Map<String, JSONObject>, val disconnecting: Set<String>, val requested: Set<String>)
-    private val queued = java.util.ArrayDeque<JSONObject>()
+    private val queued = java.util.ArrayDeque<BridgeEvent>()
     private var queuedBytes = 0
     private var backgroundExpired = false
     private val expiry = Runnable { backgroundExpired = true; suspendTransport() }
@@ -45,11 +46,15 @@ class MainActivity : Activity() {
         if (disconnecting.isNotEmpty()) return
         disconnecting.addAll(homes.values.filter { it.handle != 0L }.map { it.id })
         disconnectRequested.clear()
-        homes.values.forEach { it.pendingPassword = null }
+        homes.values.forEach {
+            it.pendingPassword = null
+            if (it.id in disconnecting && it.disconnectStarted == null) it.disconnectStarted = SystemClock.elapsedRealtime()
+        }
         // Never deliver pre-reset output or manufacture a disconnected acknowledgement.
         queued.clear(); queuedBytes = 0
         if (ready) dispatch(JSONObject().put("type", "lifecycle").put("active", false))
         resumePending = foreground
+        startPolling()
     }
 
     private fun recoverRenderer() {
@@ -102,14 +107,15 @@ class MainActivity : Activity() {
                     val directory = if (classMode) filesDir.resolve("service-class") else if (id == "default") filesDir.resolve("installation") else filesDir.resolve("installation/homes/$id")
                     val options = JSONObject().put("install_dir", directory.absolutePath).put("root_public_key", root)
                         .put(if (classMode) "service_class" else "descriptor", entry.getJSONObject("descriptor")).put("travel_id", identity).put("label", deviceLabel(runCatching { Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) }.getOrNull(), Build.MODEL))
-                    val opened = JSONObject(NativePty.open(options.toString()))
+                    home.openOptions = options.toString()
+                    val opened = nativeResponse { NativePty.open(home.openOptions!!) }
                     check(opened.optBoolean("ok"))
                     home.handle = opened.getJSONObject("data").getLong("handle")
                 } catch (_: Exception) { home.error = "此 Home 的私有配置无法初始化" }
             }
             createWebView()
-        } catch (_: Throwable) {
-            homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }; homes.clear()
+        } catch (_: Exception) {
+            homes.values.forEach { if (it.handle != 0L) runCatching { NativePty.close(it.handle) } }; homes.clear()
             setContentView(TextView(this).apply { text = "FlowSplice PTY 尚未配置。请安装包含私有部署信任、业务描述和终端资源的安装包。"; setPadding(24, 48, 24, 24) })
         }
     }
@@ -130,12 +136,17 @@ class MainActivity : Activity() {
             setSupportMultipleWindows(false)
             javaScriptCanOpenWindowsAutomatically = false
             domStorageEnabled = false
+            @Suppress("DEPRECATION")
+            saveFormData = false
         }
         view.addJavascriptInterface(object {
             @JavascriptInterface fun rendered(token: Int) { handler.post {
                 if (web === view && generation == currentGeneration && token == batchToken) {
                     rendering = false; inFlightBytes = 0; handler.removeCallbacks(renderTimeout); flushEvents()
                 }
+            } }
+            @JavascriptInterface fun renderFailed(token: Int) { handler.post {
+                if (web === view && generation == currentGeneration && token == batchToken) recoverRenderer()
             } }
             @JavascriptInterface fun send(json: String) {
                 handler.post { if (web === view && generation == currentGeneration && view.url == page) action(json) }
@@ -146,7 +157,7 @@ class MainActivity : Activity() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse {
                 val uri = request.url
                 val path = uri.encodedPath.orEmpty()
-                if (uri.scheme != "https" || uri.host != "appassets.androidplatform.net" || uri.port != -1 || request.method != "GET" || !path.startsWith("/assets/pty/") || path.contains("..") || path.contains('%') || uri.query != null || uri.fragment != null) return blocked()
+                if (uri.scheme != "https" || uri.host != "appassets.androidplatform.net" || uri.port != -1 || uri.encodedUserInfo != null || request.method != "GET" || !path.startsWith("/assets/pty/") || path.contains("..") || path.contains('\\') || path.contains('%') || uri.query != null || uri.fragment != null) return blocked()
                 val relative = path.removePrefix("/assets/")
                 return try {
                     val mime = when { path.endsWith(".html") -> "text/html"; path.endsWith(".js") -> "application/javascript"; path.endsWith(".css") -> "text/css"; path.endsWith(".woff2") -> "font/woff2"; else -> return blocked() }
@@ -173,8 +184,9 @@ class MainActivity : Activity() {
     private fun action(json: String) {
         if (json.toByteArray(Charsets.UTF_8).size > 128 * 1024) return
         var home: Home? = null
+        var action: JSONObject? = null
         try {
-            val action = JSONObject(json)
+            action = JSONObject(json)
             if (action.optString("op") == "save_workspace" && action.length() == 2) {
                 WorkspaceStore.save(this, classMode, action.getJSONObject("value")); return
             }
@@ -193,7 +205,9 @@ class MainActivity : Activity() {
             if (!ready || !foreground || resumePending) return
             home = if (classMode) homes.values.firstOrNull() else homes[action.optString("home_id")]
             if (home == null) return
-            if (home.handle == 0L) return
+            if (home.handle == 0L) {
+                dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) action.opt("home_id") ?: JSONObject.NULL else home.id).put("input_id", action.opt("input_id") ?: JSONObject.NULL).put("message", home.error ?: "请重新打开应用以恢复本机终端。")); return
+            }
             if (!classMode) action.remove("home_id")
             if (action.optString("op") in listOf("enroll", "connect")) {
                 val supplied = action.optString("password")
@@ -205,74 +219,136 @@ class MainActivity : Activity() {
                 if (action.optString("op") == "enroll") PasswordStore.save(this, password, home.id, classMode)
                 else if (supplied.isNotEmpty()) home.pendingPassword = supplied
             }
-            val result = JSONObject(NativePty.send(home.handle, action.toString()))
+            val result = nativeResponse { NativePty.send(home.handle, action.toString()) }
             if (!result.optBoolean("ok")) {
                 home.pendingPassword = null
-                dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) action.opt("home_id") ?: JSONObject.NULL else home.id).put("message", result.optString("error")))
+                dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) action.opt("home_id") ?: JSONObject.NULL else home.id).put("input_id", action.opt("input_id") ?: JSONObject.NULL).put("message", result.optString("error")))
             }
+            if (result.optBoolean("ok")) { home.polling = true; home.actionUntil = SystemClock.elapsedRealtime() + 10_000; startPolling() }
             if (action.optString("op") == "disconnect") home.pendingPassword = null
         } catch (_: Exception) {
             home?.pendingPassword = null
-            dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home?.id ?: JSONObject.NULL).put("message", "本机操作失败"))
+            dispatch(JSONObject().put("type", "error").put("home_id", if (classMode) action?.opt("home_id") ?: JSONObject.NULL else home?.id ?: JSONObject.NULL).put("input_id", action?.opt("input_id") ?: JSONObject.NULL).put("message", "本机操作失败"))
         }
+    }
+    // JNI can throw linkage/native errors; confine Throwable handling to this boundary.
+    private fun nativeResponse(call: () -> String): JSONObject {
+        val json = try { call() } catch (failure: Throwable) { throw IllegalStateException("Native operation failed", failure) }
+        return JSONObject(json)
+    }
+    private fun startPolling() {
+        handler.removeCallbacks(poll)
+        if (homes.values.any { NativeLifecycle.shouldPoll(it.handle, it.polling, it.id in disconnecting, it.actionUntil, SystemClock.elapsedRealtime()) }) handler.post(poll)
+    }
+    private fun recoverHandle(home: Home, batch: JSONArray, reason: String) {
+        home.pendingPassword = null; home.polling = false; home.actionUntil = 0L
+        val closed = runCatching { nativeResponse { NativePty.close(home.handle) }.optBoolean("ok") }.getOrDefault(false)
+        home.handle = 0L
+        var message = reason
+        if (!closed) message += "; native close failed"
+        if (NativeLifecycle.shouldReopen(closed, home.recovered, home.openOptions != null)) {
+            home.recovered = true
+            try {
+                val opened = nativeResponse { NativePty.open(home.openOptions!!) }
+                check(opened.optBoolean("ok"))
+                home.handle = opened.getJSONObject("data").getLong("handle")
+                check(home.handle != 0L)
+                home.polling = true
+            } catch (_: Exception) { home.handle = 0L; message += "; native reopen failed" }
+        }
+        disconnecting.remove(home.id); disconnectRequested.remove(home.id); home.disconnectStarted = null
+        if (closed) {
+            val type = if (classMode) "identity" else "state"
+            val key = type + ":" + (if (classMode) "" else home.id)
+            val state = snapshots[key]?.let { JSONObject(it.toString()) } ?: JSONObject()
+            state.put("type", type).put("connected", false).put("busy", false)
+            if (!classMode) state.put("home_id", home.id)
+            batch.put(state)
+            if (classMode) batch.put(JSONObject().put("type", "homes").put("homes", JSONArray()))
+        }
+        if (home.handle == 0L) message += "。请重新打开应用以恢复本机终端。"
+        home.error = if (home.handle == 0L) message else null
+        batch.put(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("message", message))
     }
     private val poll = object : Runnable {
         override fun run() {
             if (homes.isEmpty()) return
             val batch = JSONArray()
             // One shared class queue or up to eight legacy queues; one awaited JS batch.
-            for (home in homes.values.filter { it.handle != 0L }) {
+            for (home in homes.values.filter { NativeLifecycle.shouldPoll(it.handle, it.polling, it.id in disconnecting, it.actionUntil, SystemClock.elapsedRealtime()) }) {
                 try {
-                    val result = JSONObject(NativePty.poll(home.handle))
+                    check(!NativeLifecycle.drainExpired(home.disconnectStarted, SystemClock.elapsedRealtime())) { "Native disconnect timed out" }
+                    val result = nativeResponse { NativePty.poll(home.handle) }
                     check(result.optBoolean("ok"))
                     val events = result.getJSONArray("data")
                     if (home.id in disconnecting && home.id !in disconnectRequested) {
                         // Discard the drained old events and enqueue the disconnect now;
                         // continuous output must not starve this lifecycle operation.
-                        val sent = JSONObject(NativePty.send(home.handle, "{\"op\":\"disconnect\"}"))
+                        val sent = nativeResponse { NativePty.send(home.handle, "{\"op\":\"disconnect\"}") }
                         if (sent.optBoolean("ok")) disconnectRequested.add(home.id)
                         continue
                     }
                     for (index in 0 until events.length()) {
                         val event = events.getJSONObject(index)
+                        if (event.optString("type") == (if (classMode) "identity" else "state")) {
+                            home.polling = event.optBoolean("connected") || event.optBoolean("busy")
+                            if (event.optBoolean("connected") && !event.optBoolean("busy")) home.recovered = false
+                        }
                         if (home.id in disconnecting) {
                             val terminal = event.optString("type") == (if (classMode) "identity" else "state") && !event.optBoolean("connected") && !event.optBoolean("busy")
                             if (!terminal) continue
-                            disconnecting.remove(home.id); disconnectRequested.remove(home.id)
+                            disconnecting.remove(home.id); disconnectRequested.remove(home.id); home.disconnectStarted = null
                         }
                         if (event.optString("type") == (if (classMode) "identity" else "state") && event.optBoolean("connected")) {
-                            home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id, classMode) }; home.pendingPassword = null
+                            try { home.pendingPassword?.let { PasswordStore.save(this@MainActivity, it, home.id, classMode) } }
+                            catch (_: Exception) { batch.put(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("message", "私钥密码保存失败")) }
+                            home.pendingPassword = null
                         }
                         if (event.optString("type") == "error") home.pendingPassword = null
                         batch.put(if (classMode) event else event.put("home_id", home.id))
                     }
                 } catch (_: Exception) {
-                    home.pendingPassword = null
-                    if (home.id in disconnecting) {
-                        continue
-                    }
-                    batch.put(JSONObject().put("type", "error").put("home_id", if (classMode) JSONObject.NULL else home.id).put("message", "本机事件读取失败"))
+                    recoverHandle(home, batch, "本机事件读取或断开失败")
                 }
             }
             for (index in 0 until batch.length()) {
                 val event = batch.getJSONObject(index)
-                if (event.optString("type") in listOf("identity", "homes", "state")) snapshots[event.optString("type") + ":" + event.optString("home_id")] = JSONObject(event.toString())
-                val size = event.toString().toByteArray(Charsets.UTF_8).size
-                if (queuedBytes + inFlightBytes + size > 2 * 1024 * 1024) {
+                val serialized = event.toString()
+                if (event.optString("type") in listOf("identity", "homes", "state")) snapshots[event.optString("type") + ":" + event.optString("home_id")] = JSONObject(serialized)
+                val fragment = BridgeEvent(serialized)
+                if (bridgeBudget(queuedBytes.toLong() + fragment.bytes, queued.size + 1, inFlightBytes) > BRIDGE_LIMIT) {
                     recoverRenderer()
                     break
                 }
-                queued.add(event); queuedBytes += size
+                queued.add(fragment); queuedBytes += fragment.bytes
             }
             flushEvents()
-            if (foreground || !backgroundExpired || disconnecting.isNotEmpty()) handler.postDelayed(this, 25)
+            handler.removeCallbacks(this)
+            if ((foreground || !backgroundExpired || disconnecting.isNotEmpty()) && homes.values.any { NativeLifecycle.shouldPoll(it.handle, it.polling, it.id in disconnecting, it.actionUntil, SystemClock.elapsedRealtime()) }) handler.postDelayed(this, 25)
         }
     }
+    internal class BridgeEvent(serialized: String) {
+        // JSONObject owns escaping; retain only the interior of its string literal.
+        val escaped = JSONObject.quote(serialized).let { it.substring(1, it.length - 1) }
+        // Reserve one comma per event (the final event's comma is conservative).
+        val bytes = escaped.toByteArray(Charsets.UTF_8).size + 1
+    }
     companion object {
+        internal const val BRIDGE_LIMIT = 2 * 1024 * 1024
+        internal const val BRIDGE_BATCH = 64
+        internal fun bridgeLiteral(events: List<BridgeEvent>): String =
+            events.joinToString(",", "\"[", "]\"") { it.escaped }
+        internal fun bridgeScript(events: List<BridgeEvent>, token: Int): String =
+            "window.flowsplice.receiveBatch(JSON.parse(${bridgeLiteral(events)})).then(() => window.FlowSpliceNative.rendered($token), () => window.FlowSpliceNative.renderFailed($token));"
+        // Includes quotes, brackets, and both longest possible signed Int tokens.
+        internal val bridgeOverhead = bridgeScript(emptyList(), Int.MIN_VALUE).toByteArray(Charsets.UTF_8).size
+        internal fun bridgeBudget(fragmentBytes: Long, count: Int, inFlight: Int): Long =
+            fragmentBytes + ((count.toLong() + BRIDGE_BATCH - 1) / BRIDGE_BATCH) * bridgeOverhead + inFlight
+
         internal fun deviceLabel(name: String?, model: String?): String {
             fun clean(value: String?): String = buildString {
                 value.orEmpty().codePoints().forEach { point ->
-                    if (!Character.isISOControl(point) && point !in 0x202A..0x202E && point !in 0x2066..0x2069) appendCodePoint(point)
+                    if (!Character.isISOControl(point) && point !in setOf(0x061C, 0x200B, 0x200E, 0x200F, 0xFEFF) && point !in 0x202A..0x202E && point !in 0x2060..0x2069) appendCodePoint(point)
                 }
             }.trim()
             val base = clean(name).ifEmpty { clean(model).ifEmpty { "Android" } }
@@ -310,16 +386,17 @@ class MainActivity : Activity() {
     private fun flushEvents() {
         if (!foreground || !ready || rendering) return
         if (queued.isNotEmpty()) {
-            val batch = JSONArray()
-            repeat(minOf(64, queued.size)) {
+            val events = ArrayList<BridgeEvent>()
+            repeat(minOf(BRIDGE_BATCH, queued.size)) {
                 val event = queued.removeFirst()
-                queuedBytes -= event.toString().toByteArray(Charsets.UTF_8).size
-                batch.put(event)
+                queuedBytes -= event.bytes
+                events.add(event)
             }
             rendering = true
-            inFlightBytes = batch.toString().toByteArray(Charsets.UTF_8).size
             val token = ++batchToken
-            web?.evaluateJavascript("window.flowsplice.receiveBatch(JSON.parse(${JSONObject.quote(batch.toString())})).finally(() => window.FlowSpliceNative.rendered($token));", null)
+            val script = bridgeScript(events, token)
+            inFlightBytes = script.toByteArray(Charsets.UTF_8).size
+            web?.evaluateJavascript(script, null)
             handler.removeCallbacks(renderTimeout); handler.postDelayed(renderTimeout, 10_000)
         } else if (resumePending && disconnecting.isEmpty()) {
             resumePending = false
@@ -347,7 +424,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         foreground = false; ready = false; generation++
         handler.removeCallbacksAndMessages(null)
-        if (!isChangingConfigurations) homes.values.forEach { if (it.handle != 0L) NativePty.close(it.handle) }
+        if (!isChangingConfigurations) homes.values.forEach { if (it.handle != 0L) runCatching { NativePty.close(it.handle) } }
         homes.clear()
         queued.clear(); queuedBytes = 0
         web?.removeJavascriptInterface("FlowSpliceNative"); web?.destroy(); web = null

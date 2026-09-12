@@ -1,18 +1,25 @@
-.PHONY: web fmt check test review-regressions e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
+.PHONY: web pty-web-check fmt check test review-regressions e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
 
 web:
 	cd travelagent/web && npm ci && npm run build
 	cd homeagent/web && npm ci && npm run build
 
+pty-web-check:
+	cd pty-web && npm ci && npm run build && npm test
+
+.PHONY: pty-web-browser-check
+pty-web-browser-check: pty-web-check
+	cd pty-web && npx playwright install chromium webkit && npm run test:browser
+
 fmt:
 	cargo fmt --all
 
-check: web openwrt-check policy-check
+check: web pty-web-check openwrt-check policy-check
 	cargo fmt --all -- --check
 	cargo check --workspace --all-targets
 	cargo clippy --workspace --all-targets -- -D warnings
 
-test: web openwrt-check policy-check
+test: web pty-web-check openwrt-check policy-check
 	cargo test --workspace --all-targets
 
 review-regressions:
@@ -45,6 +52,7 @@ policy-check:
 	bash ./tests/check-runtime-configuration-boundary.sh
 	python3 ./tests/test_package_privacy.py
 	python3 ./tests/test_private_travel_trust.py
+	python3 ./tests/test_pty_apple_staging.py
 
 openwrt-ipk:
 	python3 scripts/build-openwrt-ipk.py \

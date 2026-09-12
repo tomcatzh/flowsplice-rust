@@ -43,6 +43,14 @@ pub struct SessionDetails {
     pub writer: Option<Writer>,
 }
 
+/// Direction overrides and invisible format controls are unsafe in UI labels.
+/// Keep ordinary Unicode (including combining characters and emoji joiners).
+#[must_use]
+pub fn is_display_control(value: char) -> bool {
+    value.is_control()
+        || matches!(value, '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
 /// Validate a user-facing session name before creation or renaming.
 ///
 /// # Errors
@@ -51,7 +59,7 @@ pub fn validate_session_name(value: &str) -> Result<()> {
     if value.trim().is_empty()
         || value.len() > 256
         || value.chars().count() > 64
-        || value.chars().any(char::is_control)
+        || value.chars().any(is_display_control)
     {
         bail!("session name must contain 1 to 64 characters without controls");
     }
@@ -329,7 +337,7 @@ fn text(value: &str, max: usize) -> Result<()> {
 }
 fn label(value: &str) -> Result<()> {
     text(value, 64)?;
-    if value.chars().any(char::is_control) {
+    if value.chars().any(is_display_control) {
         bail!("label contains control characters");
     }
     Ok(())
@@ -940,5 +948,28 @@ mod metadata_tests {
         );
         reply.validate()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod display_label_tests {
+    use super::*;
+    #[test]
+    fn session_and_writer_labels_reject_direction_spoofing() {
+        for control in [
+            '\u{061c}', '\u{200b}', '\u{200e}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{feff}',
+        ] {
+            let text = format!("Mac{control}PTY");
+            assert!(validate_session_name(&text).is_err());
+            assert!(
+                ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    label: text
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(validate_session_name("部署 café 👩‍💻").is_ok());
     }
 }

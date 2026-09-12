@@ -175,10 +175,14 @@ impl PtyClient {
         if is_new && pending.is_some() {
             bail!("a New request is already pending");
         }
-        if self.requests.try_send(message).is_err() {
-            self.cancel.send_replace(true);
-            bail!("PTY request queue unavailable; connection closing");
-        }
+        self.requests
+            .try_send(message)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("PTY request queue busy; operation was not admitted")
+                }
+                mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("PTY connection closed"),
+            })?;
         if is_new {
             *pending = Some(request_id);
         }
@@ -257,6 +261,9 @@ async fn run<S>(
         _ = cancellation.wait_for(|cancelled| *cancelled) => {},
         () = events.closed() => {},
     }
+    // I/O has ended. Reject new admission before draining EOF or publishing the
+    // closed event channel; otherwise send() can report success during teardown.
+    outgoing.close();
     // A dropped Carrier is recoverable, so dropping the socket alone leaves Home's
     // application connection alive. Send application EOF and wait for Home to close
     // its half after releasing attachments. Never replay queued terminal input.

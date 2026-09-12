@@ -291,3 +291,55 @@ fn old_empty_state_serialization_omits_business_grants() -> Result<()> {
     assert!(decoded.business_home_grants.is_empty());
     Ok(())
 }
+
+#[test]
+fn invalid_business_catalog_never_falls_back_to_generic_scope() -> Result<()> {
+    use flowsplice_core::{
+        authorization::TravelCredentialScope,
+        protocol::{Catalog, HomeCatalog},
+    };
+    let f = Fixture::new()?;
+    let credential = crate::tests::travel_credential(TravelCredentialScope::Global);
+    let valid = HomeCatalog {
+        home_id: "business-home".into(),
+        home_alias: "PTY".into(),
+        endpoint_credential: Some(f.endpoint.clone()),
+        service_grant: Some(f.grant.clone()),
+        services: vec![service()],
+    };
+    let filter = |home: HomeCatalog, trust: Option<&DeploymentTrust>| {
+        crate::catalog_for_credentials(
+            &Catalog {
+                generation: 1,
+                homes: vec![home],
+            },
+            std::slice::from_ref(&credential),
+            trust,
+        )
+    };
+    assert_eq!(filter(valid.clone(), Some(&f.trust)).homes.len(), 1);
+    assert!(filter(valid.clone(), None).homes.is_empty());
+    let mut no_endpoint = valid.clone();
+    no_endpoint.endpoint_credential = None;
+    assert!(filter(no_endpoint, Some(&f.trust)).homes.is_empty());
+    let mut tampered = valid.clone();
+    tampered
+        .service_grant
+        .as_mut()
+        .context("grant")?
+        .signature_hex = "00".repeat(64);
+    assert!(filter(tampered, Some(&f.trust)).homes.is_empty());
+    let mut wrong_service = valid.clone();
+    wrong_service.services[0].id = "not-approved".into();
+    assert!(filter(wrong_service, Some(&f.trust)).homes.is_empty());
+    let mut wrong_home = valid.clone();
+    wrong_home.home_id = "other-home".into();
+    assert!(filter(wrong_home, Some(&f.trust)).homes.is_empty());
+    let mut payload: HomeServiceGrant =
+        serde_json::from_slice(&hex::decode(&f.grant.payload_hex)?)?;
+    payload.not_after_unix_secs = unix_time_secs()? - 1;
+    let mut expired = valid;
+    expired.service_grant = Some(SignedHomeServiceGrant::sign(&payload, &f.key)?);
+    assert!(filter(expired, Some(&f.trust)).homes.is_empty());
+    Ok(())
+}

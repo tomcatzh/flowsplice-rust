@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 const terminals: any[] = [];
+const fits: any[] = [];
+let holdWrites = false;
+let writes: (() => void)[] = [];
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     parser = { registerOscHandler: vi.fn() };
@@ -10,23 +13,24 @@ vi.mock("@xterm/xterm", () => ({
       terminals.push(this);
     }
     loadAddon() {}
-    open() {}
+    open = vi.fn();
     onData(fn: any) {
       this.onInput = fn;
     }
     onResize() {}
-    resize() {}
-    focus() {}
+    resize = vi.fn();
+    focus = vi.fn();
     reset = vi.fn();
     dispose = vi.fn();
-    write = vi.fn((_data: any, callback?: () => void) => callback?.());
+    write = vi.fn((_data: any, callback?: () => void) => {
+      if (callback && holdWrites) writes.push(callback); else callback?.();
+    });
   },
 }));
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
-    proposeDimensions() {
-      return { cols: 80, rows: 24 };
-    }
+    constructor() { fits.push(this); }
+    proposeDimensions = vi.fn(() => ({ cols: 80, rows: 24 }));
   },
 }));
 let actions: any[] = [];
@@ -62,6 +66,14 @@ beforeEach(async () => {
   vi.useFakeTimers();
   vi.resetModules();
   terminals.length = 0;
+  fits.length = 0;
+  holdWrites = false;
+  writes = [];
+  for (const [property, value] of [["clientWidth", 800], ["clientHeight", 480]] as const) {
+    vi.spyOn(HTMLElement.prototype, property, "get").mockImplementation(function (this: HTMLElement) {
+      return this.closest("[hidden]") ? 0 : value;
+    });
+  }
   actions = [];
   delete window.webkit;
   delete window.flowsplicePlatform;
@@ -83,6 +95,7 @@ beforeEach(async () => {
 
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllTimers();
   vi.useRealTimers();
 });
@@ -105,6 +118,76 @@ function protocol(message: any) { send({ type: "protocol", message }); }
 function details(ids = ["session"]) { response({ status: "session_details", sessions: ids.map(id => ({ id, name: id === "session" ? "Original" : id, created_at_unix_secs: 1, writer: null, connection_count: 0 })) }); }
 function ready(ids = ["session"]) { state(); protocol({ type: "hello", can_write: true }); details(ids); }
 function identity(connected: boolean) { window.flowsplice.receive({ type: "identity", installed: true, connected, busy: false }); }
+
+test.each([
+  ["read_only", "只读", "申请读写"],
+  ["read_write", "读写", "切换只读"],
+])("restored %s tab presents initial connection as status until attached", (mode, label, ariaLabel) => {
+  workspace({ classMode: true, identityWanted: true, tabs: [
+    { home: "mac", session: "session", name: "Original", mode, deleted: false },
+  ] });
+  const expectConnecting = () => {
+    expect(tab().dataset.state).toBe("reconnecting");
+    expect(el("terminal-notice").hidden).toBe(false);
+    expect(el("terminal-notice").textContent).toBe("连接中…");
+    expect(el("terminal-notice").dataset.tone).toBe("status");
+    expect(el("mode-label").textContent).toBe("连接中");
+    expect(el("mode").getAttribute("aria-label")).toBe("连接中");
+    expect(el("mode").title).toBe("连接中");
+    expect(el("opened-list").querySelector(".mode-badge")?.textContent).toBe("连接中");
+  };
+  expectConnecting();
+  for (const busy of [true, false, true, false]) {
+    identity(false); expectConnecting();
+    state("mac", false, true, busy); expectConnecting();
+    catalog([]); expectConnecting();
+  }
+  identity(true); catalog(); ready(); attach("mac", mode);
+  expect(el("terminal-notice").hidden).toBe(true);
+  expect(el("mode-label").textContent).toBe(label);
+  expect(el("mode").getAttribute("aria-label")).toBe(ariaLabel);
+  expect(el("opened-list").querySelector(".mode-badge")?.textContent).toBe(label);
+});
+
+test.each(["Home disconnect", "protocol detached"])("%s after attachment retains interruption warning across disconnected snapshots", (path) => {
+  workspace(); catalog(); ready(); attach();
+  if (path === "Home disconnect") state("mac", false);
+  else protocol({ type: "detached", attachment_id: "attachment" });
+  const expectInterrupted = () => {
+    expect(el("terminal-notice").hidden).toBe(false);
+    expect(el("terminal-notice").textContent).toContain("连接中断");
+    expect(el("terminal-notice").dataset.tone).toBe("warning");
+    expect(el("mode-label").textContent).toBe("正在恢复");
+    expect(el("mode").title).toBe("正在恢复");
+  };
+  expectInterrupted();
+  for (const busy of [true, false, false]) {
+    state("mac", false, true, busy); expectInterrupted();
+  }
+});
+
+test("initial connection error remains a warning with its message", () => {
+  workspace(); catalog(); state("mac", false);
+  send({ type: "error", message: "Home connection refused" });
+  expect(el("terminal-notice").hidden).toBe(false);
+  expect(el("terminal-notice").textContent).toContain("Home connection refused");
+  expect(el("terminal-notice").dataset.tone).toBe("warning");
+});
+
+test.each(["saved", "live"])("%s deleted tab is not relabeled as initially connecting", (path) => {
+  workspace({ tabs: [
+    { home: "mac", session: "session", name: "Original", mode: "read_write", deleted: path === "saved" },
+  ] });
+  catalog();
+  if (path === "live") { ready(); attach(); protocol({ type: "session_ended", session_id: "session" }); }
+  state("mac", false, true, true); state("mac", false);
+  expect(tab().dataset.state).toBe("deleted");
+  expect(el("mode-label").textContent).toBe("已删除");
+  expect(el("mode").getAttribute("aria-label")).toBe("已删除");
+  expect((el("mode") as HTMLButtonElement).disabled).toBe(true);
+  expect(el("opened-list").querySelector(".mode-badge")?.textContent).toBe("已删除");
+  expect(el("terminal-notice").textContent).not.toContain("连接中…");
+});
 
 test("fresh class installation waits for native identity before saving its workspace namespace", () => {
   window.flowsplice.receive({ type: "workspace", value: null });
@@ -263,4 +346,84 @@ test("closing a pending restore does not cancel a fresh explicit join after reco
   expect(ops("detach").filter(action => action.operation.attachment_id === "fresh-after-reconnect")).toHaveLength(0);
   expect(tab().dataset.state).toBe("attached");
   expect(saved().tabs).toHaveLength(1);
+});
+
+const attachedEvent = (session: string) => ({
+  type: "protocol", home_id: "mac", message: { type: "response", request_id: `join-${session}`,
+    result: { status: "attached", session: { id: session, created_at_unix_secs: 1, writer: null },
+      attachment_id: session, mode: "read_write", writer_epoch: 1 } },
+});
+const outputEvent = (session: string) => ({ type: "protocol", home_id: "mac",
+  message: { type: "output", attachment_id: session, data: [36, 32] } });
+function emptyReady() { workspace({ tabs: [], active: null, page: "manage" }); catalog(); ready(["one", "two"]); }
+
+test("async native batch opens and measures only the final visible pane after output completes", async () => {
+  emptyReady(); holdWrites = true;
+  const batch = window.flowsplice.receiveBatch([attachedEvent("one"), outputEvent("one"), attachedEvent("two")]);
+  expect(writes).toHaveLength(1);
+  window.dispatchEvent(new Event("resize"));
+  expect(terminals[0].open).not.toHaveBeenCalled();
+  expect(fits[0].proposeDimensions).not.toHaveBeenCalled();
+  expect(terminals[0].resize).not.toHaveBeenCalled();
+  writes.shift()!(); await batch;
+  expect(terminals).toHaveLength(2);
+  expect(terminals[0].open).not.toHaveBeenCalled();
+  expect(terminals[1].open).toHaveBeenCalledTimes(1);
+  expect(terminals[1].open.mock.calls[0][0].hidden).toBe(false);
+  expect(terminals[1].resize).toHaveBeenCalledWith(80, 24);
+  expect(native("disconnect_home")).toHaveLength(0);
+});
+
+test("background attachment waits for foreground before opening the terminal", async () => {
+  emptyReady(); window.flowsplice.receive({ type: "lifecycle", active: false });
+  await window.flowsplice.receiveBatch([attachedEvent("one"), outputEvent("one")]);
+  window.dispatchEvent(new Event("resize"));
+  expect(terminals[0].open).not.toHaveBeenCalled();
+  expect(fits[0].proposeDimensions).not.toHaveBeenCalled();
+  window.flowsplice.receive({ type: "lifecycle", active: true });
+  expect(terminals[0].open).toHaveBeenCalledTimes(1);
+  expect(terminals[0].resize).toHaveBeenCalledWith(80, 24);
+});
+
+test.each([
+  [NaN, 24], [80, NaN], [Infinity, 24], [80, -Infinity],
+  [80.5, 24], [80, 24.5], [0, 24], [80, 0], [-1, 24],
+])("invalid fit proposal %s x %s never reaches resize and a later layout recovers", (cols, rows) => {
+  emptyReady(); attach();
+  const terminal = terminals[0], fit = fits[0]; terminal.resize.mockClear();
+  fit.proposeDimensions.mockReturnValue({ cols, rows });
+  window.dispatchEvent(new Event("resize"));
+  expect(terminal.resize).not.toHaveBeenCalled();
+  fit.proposeDimensions.mockReturnValue({ cols: 100, rows: 40 });
+  window.dispatchEvent(new Event("resize"));
+  expect(terminal.resize).toHaveBeenCalledWith(100, 40);
+  expect(native("disconnect_home")).toHaveLength(0);
+});
+
+test("terminal focus occurs for explicit opening and switching, not unrelated renders", async () => {
+  emptyReady(); await window.flowsplice.receiveBatch([attachedEvent("one"), attachedEvent("two")]);
+  expect(terminals[0].focus).not.toHaveBeenCalled();
+  expect(terminals[1].focus).toHaveBeenCalledTimes(1);
+  details(["one", "two"]); state();
+  expect(terminals[1].focus).toHaveBeenCalledTimes(1);
+  tab("one").click();
+  expect(terminals[0].open).toHaveBeenCalledTimes(1);
+  expect(terminals[0].focus).toHaveBeenCalledTimes(1);
+  details(["one", "two"]); window.dispatchEvent(new Event("resize"));
+  expect(terminals[0].focus).toHaveBeenCalledTimes(1);
+  expect(terminals[0].open).toHaveBeenCalledTimes(1);
+});
+
+test("closing a tab while its initial output is pending never opens the disposed terminal", async () => {
+  emptyReady(); holdWrites = true;
+  const batch = window.flowsplice.receiveBatch([attachedEvent("one"), outputEvent("one")]);
+  expect(writes).toHaveLength(1);
+  // Invoke the existing close control during the native callback boundary.
+  el("detach").dispatchEvent(new MouseEvent("click"));
+  expect(terminals[0].dispose).toHaveBeenCalledTimes(1);
+  writes.shift()!(); await batch;
+  window.dispatchEvent(new Event("resize"));
+  expect(terminals[0].open).not.toHaveBeenCalled();
+  expect(terminals[0].resize).not.toHaveBeenCalled();
+  expect(native("disconnect_home")).toHaveLength(0);
 });

@@ -106,6 +106,7 @@ fn connection() -> Result<(Connection, ServiceLifetimeGuard)> {
             events,
             stop: watch::channel(false).0,
             can_write: true,
+            history_budget: crate::history::connection_budget(),
         },
         guard,
     ))
@@ -249,14 +250,29 @@ async fn history_authorization_cursor_detach_and_session_deletion() -> Result<()
     let (b, _bg) = connection()?;
     let (bid, _) = attach(&session, &b, Mode::ReadOnly).await?;
     let capture = Uuid::new_v4();
-    assert!(session.history(&a, aid, capture, Some(1)).await.is_err());
+    let expired = session
+        .history(&a, aid, capture, Some(1))
+        .await
+        .err()
+        .context("invalid history cursor unexpectedly returned a page")?;
+    assert!(expired.is::<crate::history::SnapshotExpired>());
+    let message = expired.to_string();
+    assert!(
+        matches!(crate::backend::operation_error(&expired), Reply::Error { code, message: actual } if code == "history_snapshot_expired" && actual == message)
+    );
+    assert!(
+        matches!(crate::backend::operation_error(&anyhow::anyhow!(message)), Reply::Error { code, .. } if code == "operation_failed")
+    );
     let initial = session.history(&a, aid, capture, None).await?;
     let (total, _, _) = page(&initial)?;
+    let invalid_cursor = session
+        .history(&a, aid, capture, Some(total + 1))
+        .await
+        .err()
+        .context("invalid history cursor unexpectedly returned a page")?;
+    assert!(!invalid_cursor.is::<crate::history::SnapshotExpired>());
     assert!(
-        session
-            .history(&a, aid, capture, Some(total + 1))
-            .await
-            .is_err()
+        matches!(crate::backend::operation_error(&invalid_cursor), Reply::Error { code, .. } if code == "operation_failed")
     );
     assert!(session.history(&b, aid, capture, None).await.is_err());
     assert!(session.history(&b, bid, capture, Some(1)).await.is_err());

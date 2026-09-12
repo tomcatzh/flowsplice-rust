@@ -319,6 +319,31 @@ class PrivateTerminalE2ETest {
                 waitFor(scenario, "document.getElementById('mode-label').textContent==='读写'", "writer restored after history")
                 output("HISTORYLIVEAGAIN", "history-live-input")
             }
+            fun largePasteRegression() {
+                // Native clipboard paste -> WebView -> Rust -> encrypted Home -> PTY.
+                // Raw mode avoids the shell's canonical line-length limit; the hash
+                // proves exact UTF-8 bytes arrived, rather than merely being echoed.
+                val paste = "€".repeat(180000)
+                val bytes = paste.toByteArray(Charsets.UTF_8)
+                assertEquals(540000, bytes.size)
+                val expected = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+                val ready = "PASTEREADY"
+                val octal = ready.toByteArray(Charsets.US_ASCII).joinToString("") { "\\%03o".format(it.toInt() and 255) }
+                typeTerminal(scenario, "stty raw -echo; printf '\\n${octal}\\n'; head -c 540000 | sha256sum; stty sane", "paste-reader")
+                val output = "Array.from(document.querySelectorAll('#panes > .terminal:not([hidden]) .xterm-rows,#panes > .terminal:not([hidden]) .xterm-accessibility'))"
+                waitFor(scenario, "$output.some(e=>e.textContent.includes(${JSONObject.quote(ready)}))", "raw paste reader ready", 30)
+                scenario.onActivity { activity ->
+                    val web = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as WebView
+                    val clipboard = activity.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PTY regression", paste))
+                    val connection = web.onCreateInputConnection(EditorInfo())
+                    assertNotNull("Native paste input connection unavailable", connection)
+                    assertTrue("Native clipboard paste rejected", connection!!.performContextMenuAction(android.R.id.paste))
+                }
+                waitFor(scenario, "$output.some(e=>e.textContent.includes(${JSONObject.quote(expected)}))", "540KB native paste exact remote SHA-256", 90)
+                assertEquals("true", evaluate(scenario, "document.getElementById('status').textContent.includes('已连接')&&document.getElementById('mode-label').textContent==='读写'"))
+            }
             fun switch(name: String) {
                 click(scenario, if (evaluate(scenario, "!document.getElementById('terminal-view').hidden") == "true") "terminal-switcher" else "mobile-terminals")
                 assertEquals("true", evaluate(scenario, "(()=>{const b=Array.from(document.querySelectorAll('#opened-list button')).find(e=>e.textContent===${JSONObject.quote(name + " / E2E renamed")});if(!b)return false;b.click();return true})()"))
@@ -336,6 +361,7 @@ class PrivateTerminalE2ETest {
             assertEquals("7", evaluate(scenario, "document.querySelectorAll('#keys button').length"))
             val marker = "PTY_E2E_" + UUID.randomUUID().toString().replace("-", "").take(8)
             output(marker, "first-home-initial")
+            largePasteRegression()
             historyRegression()
             click(scenario, "mode")
             waitFor(scenario, "document.getElementById('mode-label').textContent==='只读'", "readonly")

@@ -5,20 +5,22 @@ use std::sync::Arc;
 use tokio::net::{TcpStream, UdpSocket};
 
 pub struct NetworkTargets;
-struct NetworkDatagram(UdpSocket);
+struct NetworkDatagram {
+    socket: UdpSocket,
+    receive_buffer: tokio::sync::Mutex<Vec<u8>>,
+}
 impl DatagramIo for NetworkDatagram {
     fn send<'a>(&'a self, bytes: &'a [u8]) -> IoFuture<'a, ()> {
         Box::pin(async move {
-            self.0.send(bytes).await?;
+            self.socket.send(bytes).await?;
             Ok(())
         })
     }
     fn recv(&self) -> IoFuture<'_, Vec<u8>> {
         Box::pin(async move {
-            let mut bytes = vec![0; 65_507];
-            let count = self.0.recv(&mut bytes).await?;
-            bytes.truncate(count);
-            Ok(bytes)
+            let mut bytes = self.receive_buffer.lock().await;
+            let count = self.socket.recv(&mut bytes).await?;
+            Ok(bytes[..count].to_vec())
         })
     }
 }
@@ -42,7 +44,10 @@ impl ServiceProvider for NetworkTargets {
         Box::pin(async move {
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
             socket.connect(&service.target).await?;
-            Ok(Arc::new(NetworkDatagram(socket)) as Arc<dyn DatagramIo>)
+            Ok(Arc::new(NetworkDatagram {
+                socket,
+                receive_buffer: tokio::sync::Mutex::new(vec![0; 65_507]),
+            }) as Arc<dyn DatagramIo>)
         })
     }
 }

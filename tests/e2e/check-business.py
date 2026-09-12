@@ -157,6 +157,10 @@ class Run:
             except (OSError, subprocess.TimeoutExpired):
                 print(json.dumps({"checkpoint": "business-cleanup-failed", "container": name}), file=sys.stderr)
         if self.directory is not None:
+            if not getattr(self, "succeeded", False) and hasattr(self, "evidence"):
+                retained = self.evidence / "failed-fixture"
+                shutil.copytree(self.directory, retained, dirs_exist_ok=True)
+                retained.chmod(0o700)
             shutil.rmtree(self.directory, ignore_errors=True)
 
     def execute(self):
@@ -262,6 +266,7 @@ def main():
     try:
         run.__init__()
         run.execute()
+        run.succeeded = True
         return 0
     except Exception as error:
         # Do not expose subprocess output, passwords, private keys, or issuer error bodies.

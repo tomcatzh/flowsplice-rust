@@ -29,6 +29,18 @@ pub struct PtyDomainConfig {
     pub service_id: String,
     pub tmux: TmuxConfig,
 }
+pub(crate) fn operation_error(error: &anyhow::Error) -> Reply {
+    Reply::Error {
+        code: if error.is::<crate::history::SnapshotExpired>() {
+            "history_snapshot_expired"
+        } else {
+            "operation_failed"
+        }
+        .into(),
+        message: error.to_string().chars().take(512).collect(),
+    }
+}
+
 struct Domain {
     tmux: Arc<Tmux>,
     sessions: Mutex<BTreeMap<Uuid, Arc<SessionState>>>,
@@ -424,6 +436,7 @@ async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Res
         events,
         stop: watch::channel(false).0,
         can_write: domain.can_write.load(Ordering::Acquire),
+        history_budget: crate::history::connection_budget(),
     };
     let _cleanup = ConnectionCleanup {
         domain: Arc::clone(&domain),
@@ -447,10 +460,7 @@ async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Res
             let result = domain
                 .operation(&connection, operation)
                 .await
-                .unwrap_or_else(|error| Reply::Error {
-                    code: "operation_failed".into(),
-                    message: error.to_string().chars().take(512).collect(),
-                });
+                .unwrap_or_else(|error| operation_error(&error));
             let attached = if let Reply::Attached { attachment_id, .. } = &result {
                 Some(*attachment_id)
             } else {
@@ -469,7 +479,18 @@ async fn serve(domain: Arc<Domain>, stream: BoxStream, peer: ServicePeer) -> Res
         }
         Ok::<(), anyhow::Error>(())
     };
-    tokio::select! { biased; () = connection.ended() => Ok(()), result = requests => result, result = responses => result }
+    let cache_maintenance = async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            if let Ok(sessions) = domain.sessions.lock() {
+                for session in sessions.values() {
+                    session.expire_history(connection.id);
+                }
+            }
+        }
+    };
+    tokio::select! { biased; () = connection.ended() => Ok(()), result = requests => result, result = responses => result, () = cache_maintenance => Ok(()) }
 }
 
 #[cfg(test)]
@@ -513,6 +534,7 @@ mod metadata_tests {
             events,
             stop: watch::channel(false).0,
             can_write: true,
+            history_budget: crate::history::connection_budget(),
         };
         assert!(
             backend
@@ -674,6 +696,7 @@ mod metadata_tests {
                 .operation(
                     &Connection {
                         can_write: true,
+                        history_budget: crate::history::connection_budget(),
                         ..observer
                     },
                     rename("ended")

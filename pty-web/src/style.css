@@ -687,7 +687,13 @@ dialog form > button {
   font-size: 16px;
 }
 
+#terminal-notice[data-tone="status"] {
+  background: #101416;
+  color: #8c9895;
+}
+
 #tabs button[data-state="deleted"],
+#mode[data-state="reconnecting"],
 #mode[data-state="deleted"] {
   color: #858d91;
   background: #252a2e;

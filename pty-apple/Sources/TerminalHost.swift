@@ -11,7 +11,7 @@ import UIKit
 enum DeviceLabel {
     static func make(_ name: String?, fallback: String) -> String {
         let cleaned = String(String.UnicodeScalarView((name ?? "").unicodeScalars.filter {
-            !CharacterSet.controlCharacters.contains($0) && !(0x202A...0x202E).contains($0.value) && !(0x2066...0x2069).contains($0.value)
+            $0.value > 0x1F && !(0x7F...0x9F).contains($0.value) && ![0x061C, 0x200B, 0x200E, 0x200F, 0xFEFF].contains($0.value) && !(0x202A...0x202E).contains($0.value) && !(0x2060...0x2069).contains($0.value)
         })).trimmingCharacters(in:.whitespacesAndNewlines)
         let base = cleaned.isEmpty ? fallback : cleaned
         let suffix = " · PTY"
@@ -21,6 +21,16 @@ enum DeviceLabel {
             result.unicodeScalars.append(scalar)
         }
         return result.trimmingCharacters(in:.whitespacesAndNewlines) + suffix
+    }
+}
+
+enum NativeLifecycle {
+    static func shouldPoll(handle: UInt64, demand: Bool, draining: Bool, actionUntil: TimeInterval, now: TimeInterval) -> Bool {
+        handle != 0 && (demand || draining || now < actionUntil)
+    }
+    static func shouldReopen(closed: Bool, recovered: Bool, hasOptions: Bool) -> Bool { closed && !recovered && hasOptions }
+    static func drainExpired(started: TimeInterval?, now: TimeInterval) -> Bool {
+        started.map { now - $0 >= 10 } ?? false
     }
 }
 
@@ -94,12 +104,19 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
         var handle: UInt64 = 0
         var error: String?
         var pendingPassword: String?
+        var openOptions: String?
+        var polling = true
+        var actionUntil: TimeInterval = 0
+        var recovered = false
+        var disconnectStarted: TimeInterval?
+        var snapshot: [String:Any] = [:]
     }
     private var homes: [Home] = []
     private var classMode = false
     private var timer: Timer?
     private var ready = false
     private var rendering = false
+    private var renderWatchdog: Timer?
     private var visible = true
     private var configurationError: String?
     private var workspaceURL: URL?
@@ -164,6 +181,8 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
             var support = try FileManager.default.url(for:.applicationSupportDirectory, in:.userDomainMask, appropriateFor:nil, create:true)
                 .appendingPathComponent(Bundle.main.bundleIdentifier!, isDirectory:true)
             if let namespace = InstallationScope.namespace { support = support.appendingPathComponent("tests").appendingPathComponent(namespace) }
+            try FileManager.default.createDirectory(at:support, withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
+            try FileManager.default.setAttributes([.posixPermissions:0o700], ofItemAtPath:support.path)
             workspaceURL = support.appendingPathComponent(classMode ? "workspace-class.json" : "workspace-legacy.json")
             for entry in entries {
                 let id = entry["id"] as! String
@@ -171,6 +190,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 do {
                     let directory = classMode ? support.appendingPathComponent("service-class") : id == "default" ? support : support.appendingPathComponent("homes").appendingPathComponent(id)
                     try FileManager.default.createDirectory(at:directory, withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
+                    try FileManager.default.setAttributes([.posixPermissions:0o700], ofItemAtPath:directory.path)
                     let identityFile = directory.appendingPathComponent("travel-id")
                     let identity: String
                     if let existing = try? String(contentsOf:identityFile, encoding:.utf8) { identity = existing }
@@ -178,6 +198,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                         identity = "pty-" + UUID().uuidString.lowercased()
                         try Data(identity.utf8).write(to:identityFile, options:.atomic)
                     }
+                    try FileManager.default.setAttributes([.posixPermissions:0o600], ofItemAtPath:identityFile.path)
 #if os(macOS)
                     let label = DeviceLabel.make(Host.current().localizedName ?? Host.current().name, fallback:"Mac")
 #else
@@ -185,6 +206,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
 #endif
                     let options: [String:Any] = ["install_dir":directory.path,"root_public_key":root.trimmingCharacters(in:.whitespacesAndNewlines),(classMode ? "service_class" : "descriptor"):entry["descriptor"]!,"travel_id":identity,"label":label]
                     let json = String(data:try JSONSerialization.data(withJSONObject:options), encoding:.utf8)!
+                    home.openOptions = json
                     let data = try json.withCString { try response(flowsplice_pty_open($0)) }
                     guard let opened = (data as? [String:Any])?["handle"] as? NSNumber else { throw HostError.invalidResponse }
                     home.handle = opened.uint64Value
@@ -209,6 +231,10 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
     private func describe(_ error: Error) -> String {
         if case HostError.native(let message) = error { return message }
+        if case HostError.keychain(let status) = error {
+            let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Keychain access failed"
+            return "Keychain error (\(status)): \(detail)"
+        }
         return "Private terminal operation failed. Check installation and Keychain access."
     }
     private func deliver(_ event: [String:Any]) {
@@ -228,11 +254,30 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
         let batch = pending; pending = []; inFlightBytes = pendingBytes; pendingBytes = 0
         rendering = true
         let token = generation
-        web.callAsyncJavaScript("await window.flowsplice.receiveBatch(events)", arguments:["events":batch], in:nil, in:.page) { [weak self] _ in
+        armRenderWatchdog()
+        web.callAsyncJavaScript("await window.flowsplice.receiveBatch(events)", arguments:["events":batch], in:nil, in:.page) { [weak self] result in
             guard let self, self.generation == token else { return }
+            self.renderWatchdog?.invalidate(); self.renderWatchdog = nil
+            if case .failure = result { self.recoverRenderer(); return }
             self.rendering = false; self.inFlightBytes = 0
             self.flush()
         }
+    }
+    private func armRenderWatchdog() {
+        renderWatchdog?.invalidate()
+        guard visible, rendering else { return }
+        let token = generation
+        let watchdog = Timer(timeInterval:10, repeats:false) { [weak self] _ in
+            guard let self, self.generation == token, self.visible, self.rendering else { return }
+            self.recoverRenderer()
+        }
+        renderWatchdog = watchdog; RunLoop.main.add(watchdog, forMode:.common)
+    }
+    private func recoverRenderer() {
+        renderWatchdog?.invalidate(); renderWatchdog = nil
+        ready = false; generation += 1; rendering = false; inFlightBytes = 0
+        suspendTransports(); startPolling()
+        web.load(URLRequest(url:URL(string:"flowsplice-pty://app/index.html")!))
     }
     private func suspendTransports() {
         pending = []; pendingBytes = 0
@@ -241,22 +286,15 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
         for index in homes.indices where homes[index].handle != 0 {
             homes[index].pendingPassword = nil
             disconnecting.insert(homes[index].id)
+            if homes[index].disconnectStarted == nil { homes[index].disconnectStarted = ProcessInfo.processInfo.systemUptime }
         }
-        requestDisconnects()
-    }
-    private func requestDisconnects() {
-        for home in homes where disconnecting.contains(home.id) && !disconnectRequested.contains(home.id) {
-            do {
-                try send(["op":"disconnect"], handle:home.handle)
-                disconnectRequested.insert(home.id)
-            } catch {
-                // A full native action queue is transient; keep polling and retry.
-            }
-        }
+        startPolling()
     }
     private func send(_ action: [String:Any], handle:UInt64) throws {
         let text = String(data:try JSONSerialization.data(withJSONObject:action), encoding:.utf8)!
         _ = try text.withCString { try response(flowsplice_pty_send(handle,$0)) }
+        if let index = homes.firstIndex(where:{ $0.handle == handle }) { homes[index].polling = true; homes[index].actionUntil = ProcessInfo.processInfo.systemUptime + 10 }
+        startPolling()
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.frameInfo.isMainFrame, LocalOrigin.accepts(message.frameInfo.request.url),
@@ -298,7 +336,10 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
             }
             guard ready, visible, disconnecting.isEmpty else { return }
             let id = classMode ? "service-class" : action.removeValue(forKey:"home_id") as? String ?? ""
-            guard let index = homes.firstIndex(where:{ $0.id == id }), homes[index].handle != 0 else { return }
+            guard let index = homes.firstIndex(where:{ $0.id == id }) else { return }
+            guard homes[index].handle != 0 else {
+                deliver(["type":"error", "home_id":action["home_id"] ?? id, "input_id":action["input_id"] ?? NSNull(), "message":homes[index].error ?? "Please reopen the app to restore the native terminal."]); return
+            }
             do {
                 if let op = action["op"] as? String, op == "enroll" || op == "connect" {
                     let supplied = action["password"] as? String ?? ""
@@ -314,7 +355,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 if action["op"] as? String == "disconnect" { homes[index].pendingPassword = nil }
             } catch {
                 homes[index].pendingPassword = nil
-                deliver(classMode ? ["type":"error","message":describe(error)] : ["type":"error","home_id":id,"message":describe(error)])
+                deliver(["type":"error", "home_id":classMode ? action["home_id"] ?? NSNull() : id, "input_id":action["input_id"] ?? NSNull(), "message":describe(error)])
             }
         } catch { deliver(["type":"error","message":describe(error)]) }
     }
@@ -325,10 +366,12 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
 #if os(iOS)
             endBackgroundTask()
 #endif
+            armRenderWatchdog()
             poll()
             deliver(["type":"lifecycle","active":disconnecting.isEmpty])
             startPolling(); flush()
         } else {
+            renderWatchdog?.invalidate(); renderWatchdog = nil
             // Deliver the pause before WebKit is suspended; native polling continues.
             web.callAsyncJavaScript("window.flowsplice.receive(event)", arguments:["event":["type":"lifecycle","active":false]], in:nil, in:.page, completionHandler:nil)
 #if os(iOS)
@@ -356,44 +399,88 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
     func becameActive() { endBackgroundTask(); setVisible(true) }
 #endif
     private func startPolling() {
-        guard timer == nil, homes.contains(where:{ $0.handle != 0 }) else { return }
-        timer = Timer.scheduledTimer(withTimeInterval:0.025, repeats:true) { [weak self] _ in self?.poll() }
+        guard timer == nil, homes.contains(where:{ NativeLifecycle.shouldPoll(handle:$0.handle, demand:$0.polling, draining:disconnecting.contains($0.id), actionUntil:$0.actionUntil, now:ProcessInfo.processInfo.systemUptime) }) else { return }
+        let pollingTimer = Timer(timeInterval:0.025, repeats:true) { [weak self] _ in self?.poll() }
+        timer = pollingTimer; RunLoop.main.add(pollingTimer, forMode:.common)
     }
     private func poll() {
-        requestDisconnects()
         var batch: [[String:Any]] = []
         let wasDisconnecting = !disconnecting.isEmpty
         // Drain one shared class queue or up to eight legacy queues into one awaited batch.
-        for index in homes.indices where homes[index].handle != 0 {
+        for index in homes.indices where NativeLifecycle.shouldPoll(handle:homes[index].handle, demand:homes[index].polling, draining:disconnecting.contains(homes[index].id), actionUntil:homes[index].actionUntil, now:ProcessInfo.processInfo.systemUptime) {
             let id = homes[index].id
             do {
+                if NativeLifecycle.drainExpired(started:homes[index].disconnectStarted, now:ProcessInfo.processInfo.systemUptime) { throw HostError.native("Native disconnect timed out") }
                 guard let events = try response(flowsplice_pty_poll(homes[index].handle)) as? [[String:Any]] else { throw HostError.invalidResponse }
+                if disconnecting.contains(id), !disconnectRequested.contains(id) {
+                    // Only events queued after this request may acknowledge its drain.
+                    do { try send(["op":"disconnect"], handle:homes[index].handle); disconnectRequested.insert(id) }
+                    catch { /* A full action queue is retried until the bounded deadline. */ }
+                    continue
+                }
                 for var event in events {
+                    if event["type"] as? String == (classMode ? "identity" : "state") {
+                        homes[index].snapshot = event
+                        if event["connected"] as? Bool == true, event["busy"] as? Bool == false { homes[index].recovered = false }
+                        homes[index].polling = event["connected"] as? Bool == true || event["busy"] as? Bool == true
+                    }
                     if event["type"] as? String == (classMode ? "identity" : "state"), event["connected"] as? Bool == true, let password = homes[index].pendingPassword {
-                        try PasswordStore(homeID:id, serviceClass:classMode).save(password); homes[index].pendingPassword = nil
+                        do { try PasswordStore(homeID:id, serviceClass:classMode).save(password) }
+                        catch { batch.append(classMode ? ["type":"error","message":describe(error)] : ["type":"error","home_id":id,"message":describe(error)]) }
+                        homes[index].pendingPassword = nil
                     }
                     if event["type"] as? String == "error" { homes[index].pendingPassword = nil }
                     if !classMode { event["home_id"] = id }
                     let type = event["type"] as? String ?? ""
                     if disconnecting.contains(id) {
                         guard disconnectRequested.contains(id), type == (classMode ? "identity" : "state"), event["connected"] as? Bool == false, event["busy"] as? Bool == false else { continue }
-                        disconnecting.remove(id); disconnectRequested.remove(id)
+                        disconnecting.remove(id); disconnectRequested.remove(id); homes[index].disconnectStarted = nil
                         if classMode { batch.append(["type":"homes","homes":[]]) }
                     }
                     batch.append(event)
                 }
             } catch {
-                homes[index].pendingPassword = nil
-                batch.append(classMode ? ["type":"error","message":describe(error)] : ["type":"error","home_id":id,"message":describe(error)])
+                batch.append(contentsOf:recoverHandle(index, reason:describe(error)))
             }
         }
         if wasDisconnecting, disconnecting.isEmpty, visible { batch.append(["type":"lifecycle","active":true]) }
         if !batch.isEmpty { enqueue(batch) }
+        if !homes.contains(where:{ NativeLifecycle.shouldPoll(handle:$0.handle, demand:$0.polling, draining:disconnecting.contains($0.id), actionUntil:$0.actionUntil, now:ProcessInfo.processInfo.systemUptime) }) { timer?.invalidate(); timer = nil }
 #if os(iOS)
         if !visible && backgroundTask == .invalid && disconnecting.isEmpty {
             timer?.invalidate(); timer = nil
         }
 #endif
+    }
+    private func recoverHandle(_ index: Int, reason: String) -> [[String:Any]] {
+        let id = homes[index].id
+        homes[index].pendingPassword = nil; homes[index].polling = false; homes[index].actionUntil = 0
+        var message = reason
+        var closed = false
+        do { _ = try response(flowsplice_pty_close(homes[index].handle)); closed = true }
+        catch { message += "; close failed: " + describe(error) }
+        homes[index].handle = 0
+        if NativeLifecycle.shouldReopen(closed:closed, recovered:homes[index].recovered, hasOptions:homes[index].openOptions != nil), let options = homes[index].openOptions {
+            homes[index].recovered = true
+            do {
+                let value = try options.withCString { try response(flowsplice_pty_open($0)) }
+                guard let handle = (value as? [String:Any])?["handle"] as? NSNumber, handle.uint64Value != 0 else { throw HostError.invalidResponse }
+                homes[index].handle = handle.uint64Value; homes[index].polling = true
+            } catch { message += "; reopen failed: " + describe(error) }
+        }
+        disconnecting.remove(id); disconnectRequested.remove(id); homes[index].disconnectStarted = nil
+        var result: [[String:Any]] = []
+        if closed {
+            var state = homes[index].snapshot
+            state["type"] = classMode ? "identity" : "state"; state["connected"] = false; state["busy"] = false
+            if !classMode { state["home_id"] = id }
+            result.append(state)
+            if classMode { result.append(["type":"homes","homes":[]]) }
+        }
+        if homes[index].handle == 0 { message += ". Please reopen the app to restore the native terminal." }
+        homes[index].error = homes[index].handle == 0 ? message : nil
+        result.append(classMode ? ["type":"error","message":message] : ["type":"error","home_id":id,"message":message])
+        return result
     }
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         decisionHandler(LocalOrigin.accepts(action.request.url) && action.targetFrame?.isMainFrame == true && !action.shouldPerformDownload ? .allow : .cancel)
@@ -403,10 +490,7 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? { nil }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        ready = false; generation += 1; rendering = false; inFlightBytes = 0
-        suspendTransports()
-        startPolling()
-        web.load(URLRequest(url:URL(string:"flowsplice-pty://app/index.html")!))
+        recoverRenderer()
     }
 #if os(macOS)
     @objc private func windowChanged(_ note: Notification) {
@@ -419,8 +503,10 @@ final class TerminalHost: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @objc private func windowClosed(_ note: Notification) {
         guard let window = note.object as? NSWindow, window === web.window else { return }; setVisible(false); suspendTransports()
     }
-    @objc private func applicationHidden() { startPolling() }
+    // App hiding leaves the terminal alive. Continue delivering output and its
+    // acknowledgements so background commands cannot fill the bridge queue.
+    @objc private func applicationHidden() { startPolling(); flush() }
     @objc private func applicationShown() { setVisible(true) }
 #endif
-    deinit { timer?.invalidate(); for home in homes where home.handle != 0 { flowsplice_pty_string_free(flowsplice_pty_close(home.handle)) }; NotificationCenter.default.removeObserver(self) }
+    deinit { renderWatchdog?.invalidate(); timer?.invalidate(); for home in homes where home.handle != 0 { flowsplice_pty_string_free(flowsplice_pty_close(home.handle)) }; NotificationCenter.default.removeObserver(self) }
 }

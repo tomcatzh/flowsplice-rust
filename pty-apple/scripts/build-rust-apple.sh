@@ -11,7 +11,7 @@ esac
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${repo_root}/target}"
 args=(build --locked -p flowsplice-pty-native --target "${rust_target}")
 profile=debug
-if [[ "${CONFIGURATION}" == Release ]]; then args+=(--release); profile=release; fi
+if [[ "${CONFIGURATION}" == Release ]]; then args+=(--profile apple-release); profile=apple-release; fi
 python3 "${SRCROOT}/scripts/stage-resources.py"
 cd "${repo_root}"
 cargo "${args[@]}"

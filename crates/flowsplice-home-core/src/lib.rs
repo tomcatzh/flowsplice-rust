@@ -464,3 +464,6 @@ pub use control::{
 
 mod runtime;
 pub use runtime::{HomeRuntime, HomeRuntimeConfig};
+
+#[cfg(test)]
+mod admission_tests;

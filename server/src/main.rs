@@ -1317,6 +1317,9 @@ async fn handle_home(
                             let _ = state.homes.lock().await.update_catalog(home, session_id);
                         }
                         ControlMessage::Heartbeat { nonce } => {
+                            state.authorization.read().await.validate_home_services(
+                                &state.control_signer.trust, &identity.id, endpoint_credential.as_ref(), &[],
+                            )?;
                             tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
                         }
                         ControlMessage::HeartbeatAck { .. } => {}
@@ -2953,6 +2956,11 @@ async fn authorize_travel(
     let catalog = state.homes.lock().await.catalog();
     let catalog =
         catalog_for_credentials(&catalog, &credentials, Some(&state.control_signer.trust));
+    if let Some(home_id) = home_id
+        && !catalog.homes.iter().any(|home| home.home_id == home_id)
+    {
+        return Err("requested Home has no active authorized service catalog".to_owned());
+    }
     state
         .control_signer
         .sign(
@@ -2979,21 +2987,25 @@ fn catalog_for_credentials(
             {
                 return None;
             }
-            let grant = trust
-                .and_then(|trust| {
-                    home.service_grant
-                        .as_ref()?
-                        .verify(
-                            trust,
-                            home.endpoint_credential.as_ref()?,
-                            flowsplice_core::authorization::unix_time_secs().ok()?,
-                        )
-                        .ok()
-                })
-                .filter(|grant| {
-                    grant.home_id == home.home_id
-                        && grant.validate_catalog_services(&home.services).is_ok()
-                });
+            // A signed business restriction must never degrade into a generic
+            // Home when its signature, lifetime or catalog binding is invalid.
+            let grant = if let Some(signed) = &home.service_grant {
+                let grant = signed
+                    .verify(
+                        trust?,
+                        home.endpoint_credential.as_ref()?,
+                        flowsplice_core::authorization::unix_time_secs().ok()?,
+                    )
+                    .ok()?;
+                if grant.home_id != home.home_id
+                    || grant.validate_catalog_services(&home.services).is_err()
+                {
+                    return None;
+                }
+                Some(grant)
+            } else {
+                None
+            };
             let services = home
                 .services
                 .iter()
@@ -3143,7 +3155,7 @@ mod tests {
         }
     }
 
-    fn travel_credential(scope: TravelCredentialScope) -> TravelCredential {
+    pub(crate) fn travel_credential(scope: TravelCredentialScope) -> TravelCredential {
         TravelCredential {
             version: 1,
             object_type: "flowsplice.travel_credential".to_owned(),

@@ -90,6 +90,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub mod business;
+mod installation_paths;
 pub mod service_class;
 mod socket;
 mod tcp_flow;
@@ -1150,7 +1151,7 @@ fn load_app_state(config_path: &Path, supplied_password: Option<&str>) -> Result
 }
 
 fn load_app_config(config_path: &Path) -> Result<(Config, StateStore, Vec<Mapping>)> {
-    let mut config: Config = load_toml(config_path)?;
+    let mut config = installation_paths::load(config_path)?;
     validate_config(&config)?;
     let state_store = StateStore::open(&config.state_store)?;
     let mappings = load_runtime_mappings(&config, &state_store)?;
@@ -1301,7 +1302,7 @@ impl TravelCore {
         let private_key_password = Zeroizing::new(private_key_password.to_owned());
         let state = tokio::task::spawn_blocking(move || {
             if let Some(root) = trusted_root {
-                let config: Config = load_toml(&config_path)?;
+                let config = installation_paths::load(&config_path)?;
                 require_trusted_root(&read_public_key(&config.deployment_root_public_key)?, &root)?;
             }
             load_app_state(&config_path, Some(private_key_password.as_str()))
@@ -2068,18 +2069,31 @@ where
     seed_relays.dedup();
 
     let state_store_path = install_root.join("state/travel-state.redb");
+    // Private app containers can move when an app is updated or restored. Keep
+    // their signed configuration portable; filesystem writes still use the
+    // actual installation directory below.
+    let config_cert_dir = if directed {
+        PathBuf::from("cert")
+    } else {
+        enrollment_dir.clone()
+    };
+    let config_install_root = if directed {
+        PathBuf::new()
+    } else {
+        install_root.clone()
+    };
     let generated = InstalledTravelConfig {
         id: options.travel_id.clone(),
-        deployment_root_public_key: enrollment_dir.join("deployment-root.pub"),
-        deployment_trust: enrollment_dir.join(DEPLOYMENT_TRUST_FILE),
-        management_cert: enrollment_dir.join(MANAGEMENT_CERT_FILE),
-        management_key: enrollment_dir.join(MANAGEMENT_KEY_FILE),
-        management_ca: enrollment_dir.join(MANAGEMENT_CA_FILE),
-        business_cert: enrollment_dir.join(BUSINESS_CERT_FILE),
-        business_key: enrollment_dir.join(BUSINESS_KEY_FILE),
-        business_ca: enrollment_dir.join(BUSINESS_CA_FILE),
-        state_store: state_store_path.clone(),
-        enrollment_work_dir: install_root.join("state/enrollment"),
+        deployment_root_public_key: config_cert_dir.join("deployment-root.pub"),
+        deployment_trust: config_cert_dir.join(DEPLOYMENT_TRUST_FILE),
+        management_cert: config_cert_dir.join(MANAGEMENT_CERT_FILE),
+        management_key: config_cert_dir.join(MANAGEMENT_KEY_FILE),
+        management_ca: config_cert_dir.join(MANAGEMENT_CA_FILE),
+        business_cert: config_cert_dir.join(BUSINESS_CERT_FILE),
+        business_key: config_cert_dir.join(BUSINESS_KEY_FILE),
+        business_ca: config_cert_dir.join(BUSINESS_CA_FILE),
+        state_store: config_install_root.join("state/travel-state.redb"),
+        enrollment_work_dir: config_install_root.join("state/enrollment"),
         ui_listen: options.ui_listen.unwrap_or(bootstrap.ui_listen),
         #[cfg(feature = "e2e-remote-ui")]
         test_allow_remote_listen: options.test_allow_remote_listen,

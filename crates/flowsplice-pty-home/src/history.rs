@@ -3,20 +3,37 @@ use anyhow::{Context, Result, bail};
 use flowsplice_pty_protocol::{
     MAX_HISTORY_LINES, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_LINES, Reply,
 };
-use tokio::sync::{Semaphore, SemaphorePermit};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 pub(crate) const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 // Bound both the transient capture and retained snapshots across all service domains.
 pub(crate) static CAPTURE_SLOT: Semaphore = Semaphore::const_new(1);
 static CACHE_KIB: Semaphore = Semaphore::const_new(256 * 1024);
+pub(crate) const SNAPSHOT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
+pub(crate) fn connection_budget() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(64 * 1024))
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotExpired;
+impl std::fmt::Display for SnapshotExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("history snapshot expired; start a new capture")
+    }
+}
+impl std::error::Error for SnapshotExpired {}
 
 pub(crate) struct Snapshot {
     pub id: Uuid,
     columns: u16,
     lines: Vec<String>,
     sizes: Vec<usize>,
-    _budget: SemaphorePermit<'static>,
+    cache_budget: SemaphorePermit<'static>,
+    connection_budget: Option<OwnedSemaphorePermit>,
+    last_used: Mutex<Instant>,
 }
 impl Snapshot {
     pub fn parse(id: Uuid, capture: &str) -> Result<Self> {
@@ -65,10 +82,36 @@ impl Snapshot {
             columns,
             lines,
             sizes,
-            _budget: budget,
+            cache_budget: budget,
+            connection_budget: None,
+            last_used: Mutex::new(Instant::now()),
         })
     }
+    pub fn parse_for_connection(id: Uuid, capture: &str, budget: Arc<Semaphore>) -> Result<Self> {
+        let mut snapshot = Self::parse(id, capture)?;
+        let permits = u32::try_from(snapshot.cache_budget.num_permits())?;
+        snapshot.connection_budget = Some(budget.try_acquire_many_owned(permits).context(
+            "this connection's history cache is full; close unused tabs or retry later",
+        )?);
+        Ok(snapshot)
+    }
+    pub fn expired_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(
+            *self
+                .last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) >= SNAPSHOT_IDLE
+    }
     pub fn page(&self, attachment_id: Uuid, before: Option<u32>) -> Result<Reply> {
+        let now = Instant::now();
+        if self.expired_at(now) {
+            return Err(SnapshotExpired.into());
+        }
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
         let end = before.map_or(self.lines.len(), |n| n as usize);
         if end > self.lines.len() {
             bail!("history cursor outside snapshot");
@@ -239,6 +282,41 @@ mod tests {
         assert!(snapshot.lines[1].starts_with("\x1b[0;1;38;2;12;34;56m"));
         assert!(snapshot.lines[3].starts_with("\x1b[0;48:2::1:2:3m"));
         assert!(snapshot.page(Uuid::new_v4(), Some(5)).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn connection_quota_is_released_and_snapshots_have_an_idle_expiry() -> Result<()> {
+        let budget = Arc::new(Semaphore::new(1));
+        let first =
+            Snapshot::parse_for_connection(Uuid::new_v4(), "80\nrow\n", Arc::clone(&budget))?;
+        assert_eq!(budget.available_permits(), 0);
+        assert!(
+            Snapshot::parse_for_connection(Uuid::new_v4(), "80\nnext\n", Arc::clone(&budget))
+                .is_err()
+        );
+        assert!(!first.expired_at(Instant::now()));
+        assert!(first.expired_at(Instant::now() + SNAPSHOT_IDLE));
+        first.page(Uuid::new_v4(), None)?;
+        assert!(!first.expired_at(Instant::now()));
+        *first
+            .last_used
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot timestamp lock poisoned"))? =
+            Instant::now() - SNAPSHOT_IDLE;
+        let error = first
+            .page(Uuid::new_v4(), Some(1))
+            .err()
+            .context("expired snapshot unexpectedly returned a page")?;
+        assert!(error.is::<SnapshotExpired>());
+        drop(first);
+        assert_eq!(budget.available_permits(), 1);
+        assert!(Snapshot::parse_for_connection(Uuid::new_v4(), "80\nnext\n", budget).is_ok());
         Ok(())
     }
 }

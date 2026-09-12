@@ -102,14 +102,16 @@ async fn enroll_probe(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn state_store(config: &Path) -> Result<StateStore> {
-    let config: toml::Value = toml::from_str(&std::fs::read_to_string(config)?)?;
-    StateStore::open(
-        config
-            .get("state_store")
-            .and_then(toml::Value::as_str)
-            .context("missing state_store")?,
-    )
+fn state_store(config_path: &Path) -> Result<StateStore> {
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(config_path)?)?;
+    let configured = config
+        .get("state_store")
+        .and_then(toml::Value::as_str)
+        .context("missing state_store")?;
+    StateStore::open(flowsplice_core::config::resolve_path(
+        config_path,
+        Path::new(configured),
+    ))
 }
 
 async fn travel(args: &[String]) -> Result<()> {

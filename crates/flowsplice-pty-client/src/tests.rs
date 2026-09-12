@@ -139,10 +139,9 @@ async fn peer_eof_and_drop_close_connection() -> Result<()> {
 }
 
 #[tokio::test]
-async fn overflowing_requests_closes_connection_instead_of_skipping_input() -> Result<()> {
+async fn full_request_queue_rejects_unadmitted_input_without_disconnect() -> Result<()> {
     let (client, _events, mut server) = pair().await?;
-    // This current-thread test does not yield while enqueueing: the bounded queue
-    // must fail closed even if the transport writer has not yet started draining it.
+    // No yield while enqueueing: force backpressure without a broken transport.
     for _ in 0..CAPACITY {
         client.send(Operation::List).await?;
     }
@@ -156,7 +155,25 @@ async fn overflowing_requests_closes_connection_instead_of_skipping_input() -> R
             .await
             .is_err()
     );
-    assert!(client.send(Operation::List).await.is_err());
+    assert!(!*client.cancel.borrow());
+    // Drain the admitted operations; the rejected input must never appear.
+    for _ in 0..CAPACITY {
+        assert!(matches!(
+            read_message::<ClientMessage>(&mut server).await?,
+            Some(ClientMessage::Request {
+                operation: Operation::List,
+                ..
+            })
+        ));
+    }
+    let id = client.send(Operation::ListDetails).await?;
+    assert_eq!(
+        read_message::<ClientMessage>(&mut server).await?,
+        Some(ClientMessage::Request {
+            request_id: id,
+            operation: Operation::ListDetails
+        })
+    );
     let peer_close = async move {
         let mut remaining = Vec::new();
         server.read_to_end(&mut remaining).await?;
@@ -247,4 +264,139 @@ async fn named_and_legacy_create_share_one_pending_guard() -> Result<()> {
     drop(server);
     client.shutdown().await;
     Ok(())
+}
+
+/// Holds cleanup at an explicit boundary, independent of scheduler timing.
+struct ShutdownGate {
+    stream: DuplexStream,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl AsyncRead for ShutdownGate {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for ShutdownGate {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        assert!(
+            std::task::ready!(std::future::Future::poll(
+                std::pin::Pin::new(&mut self.release),
+                cx
+            ))
+            .is_ok(),
+            "shutdown gate must be explicitly released"
+        );
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn peer_eof_rejects_input_while_shutdown_cleanup_is_blocked() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (stream, mut server) = tokio::io::duplex(4096);
+        let (entered, cleanup_entered) = tokio::sync::oneshot::channel();
+        let (release, cleanup_release) = tokio::sync::oneshot::channel();
+        let stream = ShutdownGate {
+            stream,
+            entered: Some(entered),
+            release: cleanup_release,
+        };
+        let handshake = async {
+            assert!(matches!(
+                read_message::<ClientMessage>(&mut server).await?,
+                Some(ClientMessage::Hello { .. })
+            ));
+            write_message(
+                &mut server,
+                &ServerMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    can_write: true,
+                },
+            )
+            .await?;
+            let Some(ClientMessage::Request {
+                request_id,
+                operation: Operation::List,
+            }) = read_message::<ClientMessage>(&mut server).await?
+            else {
+                bail!("missing initial List");
+            };
+            write_message(
+                &mut server,
+                &ServerMessage::Response {
+                    request_id,
+                    result: Reply::Sessions { sessions: vec![] },
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (client, handshake) = tokio::join!(
+            PtyClient::from_stream(stream, "cleanup-test".to_owned()),
+            handshake
+        );
+        handshake?;
+        let (client, mut events) = client?;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerMessage::Hello { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerMessage::Response { .. })
+        ));
+        server.shutdown().await?;
+        // The receive loop has ended, but cleanup cannot finish until released.
+        cleanup_entered.await?;
+        assert!(!*client.finished.borrow());
+        assert!(
+            client
+                .send(Operation::Input {
+                    attachment_id: Uuid::new_v4(),
+                    writer_epoch: 1,
+                    data: b"must reject".to_vec(),
+                })
+                .await
+                .is_err(),
+            "closed transport accepted input during cleanup"
+        );
+        assert!(client.send(Operation::List).await.is_err());
+        assert!(!*client.finished.borrow());
+        assert!(release.send(()).is_ok(), "cleanup gate dropped early");
+        assert!(events.recv().await.is_none());
+        client.shutdown().await;
+        assert!(*client.finished.borrow());
+        assert_eq!(server.read(&mut [0]).await?, 0);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("cleanup admission test timed out")?
 }

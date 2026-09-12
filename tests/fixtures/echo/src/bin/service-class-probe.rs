@@ -255,12 +255,14 @@ fn resume_fixture(directory: &Path, backup: &Path) -> Result<()> {
     )?;
     let config_toml = std::fs::read_to_string(directory.join("travelagent.toml"))?;
     let config: toml::Value = toml::from_str(&config_toml)?;
-    let store = StateStore::open(
-        config
-            .get("state_store")
-            .and_then(toml::Value::as_str)
-            .context("missing state_store")?,
-    )?;
+    let configured = config
+        .get("state_store")
+        .and_then(toml::Value::as_str)
+        .context("missing state_store")?;
+    let store = StateStore::open(flowsplice_core::config::resolve_path(
+        &directory.join("travelagent.toml"),
+        Path::new(configured),
+    ))?;
     std::fs::write(
         directory.join("business-installation.pending.json"),
         serde_json::to_vec_pretty(

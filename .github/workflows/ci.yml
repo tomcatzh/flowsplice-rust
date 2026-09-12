@@ -35,11 +35,12 @@ jobs:
           cache-dependency-path: |
             homeagent/web/package-lock.json
             travelagent/web/package-lock.json
+            pty-web/package-lock.json
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends clang cmake make perl pkg-config python3 ripgrep
+          sudo apt-get install --no-install-recommends clang cmake make perl pkg-config python3 ripgrep tmux
 
       - name: Select the pinned Rust toolchain
         run: |
@@ -60,6 +61,12 @@ jobs:
       - name: Run policy, format, build, and lint checks
         run: make check
 
+      - name: Test native event batches with real terminal layout
+        working-directory: pty-web
+        run: |
+          npx playwright install --with-deps chromium webkit
+          npm run test:browser
+
       - name: Run the complete Rust test suite
         run: cargo test --workspace --all-targets
 
@@ -74,7 +81,7 @@ jobs:
       - name: Install E2E host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends jq openssl xxd
+          sudo apt-get install --no-install-recommends jq openssl xxd tmux
 
       - name: Show Docker environment
         run: |
@@ -85,6 +92,7 @@ jobs:
         env:
           RUST_MIRROR_URL: off
           FLOWSPLICE_DOCKER_PULL: "false"
+          FLOWSPLICE_PTY_E2E: "1"
         run: make e2e
 
       - name: Upload E2E logs after a failure
