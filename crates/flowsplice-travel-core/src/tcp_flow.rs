@@ -230,6 +230,7 @@ async fn run_inner(
             && transfer.local_fin_acked
             && transfer.unacked.is_empty()
         {
+            drain_carriers(carriers, io_tasks, events, transfer.io_timeout).await?;
             return Ok(());
         }
 
@@ -1179,6 +1180,40 @@ fn acknowledge(transfer: &mut TransferState, next_offset: u64) -> Result<()> {
     Ok(())
 }
 
+async fn drain_carriers(
+    carriers: HashMap<Uuid, CarrierHandle>,
+    tasks: &mut JoinSet<()>,
+    events: &mut mpsc::Receiver<FlowEvent>,
+    deadline: Duration,
+) -> Result<()> {
+    // Closing only the outgoing queues lets each Carrier write its final FIN ACK.
+    // Keep cancellation senders alive: dropping them would stop the Carrier before
+    // it drains that queue. Error and runtime cancellation still abort via run_io.
+    let cancellation: Vec<_> = carriers
+        .into_values()
+        .map(|carrier| carrier.shutdown)
+        .collect();
+    let result = timeout(deadline, async {
+        while !tasks.is_empty() {
+            tokio::select! {
+                biased;
+                finished = tasks.join_next() => {
+                    if let Some(finished) = finished {
+                        finished.map_err(|error| anyhow!("Carrier drain task failed: {error}"))?;
+                    }
+                }
+                // A Carrier reader must not block its writer on the bounded queue.
+                Some(_) = events.recv() => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow!("Carrier final acknowledgement drain timed out"))?;
+    drop(cancellation);
+    result
+}
+
 fn close_carrier(carriers: &mut HashMap<Uuid, CarrierHandle>, carrier_id: Uuid) {
     if let Some(carrier) = carriers.remove(&carrier_id) {
         let _ = carrier.shutdown.send(true);
@@ -1216,6 +1251,110 @@ mod tests {
     #[test]
     fn unstable_carrier_result_resets_reevaluation() {
         assert_eq!(advance_reevaluation(480, 60, 900, false), (60, 120));
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use flowsplice_core::frame::DataFrameCodec;
+
+    #[tokio::test]
+    async fn normal_close_delivers_final_ack_under_event_and_write_pressure() -> Result<()> {
+        let flow_id = Uuid::new_v4();
+        let carrier_id = Uuid::new_v4();
+        let codec = DataFrameCodec::negotiate(1);
+        let (tx, mut outgoing) = mpsc::channel(1);
+        tx.send(DataFrame::FinAck {
+            flow_id,
+            final_offset: 9,
+        })
+        .await?;
+        let (shutdown, mut cancelled) = watch::channel(false);
+        let (event_tx, mut events) = mpsc::channel(1);
+        event_tx.send(FlowEvent::LocalEof).await?;
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).acquire_owned().await?;
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _permit = permit;
+            // This blocks until normal-close handling drains the event queue.
+            assert!(event_tx.send(FlowEvent::LocalEof).await.is_ok());
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => panic!("normal close cancelled queued output"),
+                    frame = outgoing.recv() => {
+                        let Some(frame) = frame else { break; };
+                        assert!(write_data_frame(&mut writer, &frame, DATA_FRAME_LIMIT, codec).await.is_ok());
+                    }
+                }
+            }
+            assert!(writer.shutdown().await.is_ok());
+        });
+        let carriers = HashMap::from([(
+            carrier_id,
+            CarrierHandle {
+                relay_id: "test-relay".into(),
+                tx,
+                shutdown,
+            },
+        )]);
+        let receiving = async {
+            let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, codec);
+            assert!(matches!(reader.read().await?, DataFrame::FinAck {
+                flow_id: id, final_offset: 9,
+            } if id == flow_id));
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                drain_carriers(carriers, &mut tasks, &mut events, Duration::from_secs(1)),
+                receiving,
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert!(tasks.is_empty());
+        assert_eq!(permits.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_close_times_out_and_cancellation_releases_resources() -> Result<()> {
+        let (tx, _outgoing) = mpsc::channel(1);
+        let (shutdown, _cancelled) = watch::channel(false);
+        let (_event_tx, mut events) = mpsc::channel(1);
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).acquire_owned().await?;
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        let carriers = HashMap::from([(
+            Uuid::new_v4(),
+            CarrierHandle {
+                relay_id: "blocked-relay".into(),
+                tx,
+                shutdown,
+            },
+        )]);
+        let failure = drain_carriers(carriers, &mut tasks, &mut events, Duration::from_millis(20))
+            .await
+            .err()
+            .ok_or_else(|| anyhow!("blocked drain unexpectedly completed"))?;
+        assert!(
+            failure
+                .to_string()
+                .contains("final acknowledgement drain timed out")
+        );
+        // run_io retains ownership and aborts the tasks on the error/cancellation path.
+        timeout(Duration::from_secs(1), tasks.shutdown()).await?;
+        assert!(tasks.is_empty());
+        assert_eq!(permits.available_permits(), 1);
+        Ok(())
     }
 }
 
