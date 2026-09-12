@@ -58,6 +58,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-1.97.1-
 
+      - name: Verify standalone SDK consumers and README examples
+        run: make sdk-check
+
       - name: Run policy, format, build, and lint checks
         run: make check
 

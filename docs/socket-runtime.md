@@ -7,8 +7,8 @@ shapes are retained; service-category authorization adds an explicit new scope a
 - `flowsplice-home-core` owns serving identity validation, Server control, authorization
   synchronization, business TLS, Carrier recovery and TCP/UDP flow handling.
 - `flowsplice-travel-core` owns trusted discovery, device identity, encrypted connections
-  and recovery. Set `default-features = false` for an embedded/native consumer. The
-  `frontend` feature provides the existing CLI and embedded Web adapter.
+  and recovery. Default features are empty. The optional `frontend` feature provides
+  the existing CLI and embedded Web adapter and requires its separately built Web assets.
 - The generic Home adapter connects physical target sockets. The generic Travel adapter
   retains configurable local forwarding listeners and background behavior.
 
@@ -40,8 +40,9 @@ delivery or replay across a network change; a closed association requires a new 
 In-process startup ignores existing forwarding mappings and refuses mapping mutations.
 It opens no local TCP, UDP, HTTP or WebSocket listener. Root/password validation still
 applies. Multiple operations share this runtime and its device identity; do not start an
-independent runtime per terminal tab. Call `shutdown().await` when the active business
-view ends to drain connections, background work and persistent statistics. Dropping a
+independent runtime per view. Close a view's sockets when it ends; call `shutdown().await`
+when the owner of the shared runtime stops to drain connections, background work and
+persistent statistics. Dropping a
 runtime also cancels its tasks, while explicit shutdown provides the drain boundary.
 
 The destination binding contains no local bind address. Constructing one does not grant
@@ -67,10 +68,13 @@ It grants only matching approved businesses. Upgrade all Server, Relay and Home
 components consuming authorization snapshots before issuing it: older infrastructure
 cannot parse this new scope. Existing generic Travel clients keep their old credentials
 and message shapes. Legacy exact business installations are preserved and do not
-silently acquire category-wide access. See [PTY provisioning](pty.md).
+silently acquire category-wide access. See [business Home provisioning](business-home.md).
 
 ## Home
 
+First provision the business Home with `flowsplice-homeagent init --business-services`
+as described in the [setup guide](business-home.md). Load its `home-runtime.toml` into
+`HomeRuntimeConfig`; the administrative `homeagent.toml` contains unsupported fields.
 Create listeners before starting the provisioned serving runtime:
 
 ```rust,ignore
@@ -114,5 +118,7 @@ from transport lifetime.
 checks in-process identity validation, absence of legacy listeners, invalid bindings and
 connection-cancellation cleanup. The full Docker runner additionally exercises encrypted
 in-process TCP/UDP against both the old target adapter and an issuer-free embedded Home.
-Set `FLOWSPLICE_E2E_TRAVEL_IMAGE` to a separately built released image to run old generic
-Travel runtimes against the new backend; native clients use their separate platform suites.
+`tests/check-sdk-consumer.sh` builds independent default-feature and feature-disabled
+consumers without generated Web assets and checks typed business API access. Per-crate
+README examples are compiled by `cargo test --doc -p flowsplice-home-core -p flowsplice-travel-core`.
+Native clients use their separate platform suites.

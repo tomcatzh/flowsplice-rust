@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -39,15 +40,12 @@ use flowsplice_core::{
     CONTROL_FRAME_LIMIT, DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::unix_time_secs,
     config::{load_toml, resolve_path},
-    deployment::{
-        DeploymentTrust, SignedControlSnapshot, SignedDeploymentTrust, VerifiedControlSnapshot,
-        load_verified_deployment_trust,
-    },
+    deployment::{SignedControlSnapshot, VerifiedControlSnapshot, load_verified_deployment_trust},
     frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
     init_crypto,
     protocol::{
-        CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DATA_PROTOCOL_BINARY_V1, DataFrame,
-        RelayDirectory, Role, TravelConnectionPurpose, bootstrap_verification_code,
+        CONTROL_PROTOCOL_VERSION, ControlMessage, DATA_PROTOCOL_BINARY_V1, DataFrame, Role,
+        TravelConnectionPurpose, bootstrap_verification_code,
     },
     route::{RouteSide, write_preface},
     statistics::statistics_signing_key,
@@ -89,8 +87,16 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub use flowsplice_core::{
-    business::{BusinessDescriptor, BusinessService, ServiceClassDescriptor},
-    protocol::ServiceProtocol,
+    authorization::{TravelCredential, TravelCredentialScope, TrustedTravelAuthority},
+    business::{
+        BusinessDescriptor, BusinessService, HomeServiceGrant, ServiceClassDescriptor,
+        SignedHomeServiceGrant, VerifiedBusinessDescriptor,
+    },
+    deployment::{
+        DeploymentTrust, HomeEndpointCredential, HomeEndpointTrust, ServerControlKey,
+        SignedDeploymentTrust, SignedHomeEndpointCredential, TrustedHomeEnrollmentAuthority,
+    },
+    protocol::{Catalog, HomeCatalog, RelayDirectory, RelayEndpoint, Service, ServiceProtocol},
 };
 
 pub mod business;

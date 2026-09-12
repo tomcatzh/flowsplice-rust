@@ -1,4 +1,4 @@
-.PHONY: web pty-web-check fmt check test review-regressions e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
+.PHONY: web pty-web-check fmt check test sdk-check review-regressions e2e release apple-products home2-macos-package travel-macos-package openwrt-check openwrt-ipk policy-check
 
 web:
 	cd travelagent/web && npm ci && npm run build
@@ -24,6 +24,10 @@ test: web pty-web-check openwrt-check policy-check
 
 review-regressions:
 	CARGO_TARGET_DIR="$(CURDIR)/target" bash ./tests/check-travel-review-regressions.sh
+
+sdk-check:
+	CARGO_TARGET_DIR="$(CURDIR)/target" bash ./tests/check-sdk-consumer.sh
+	cargo test --locked --doc -p flowsplice-home-core -p flowsplice-travel-core --no-default-features
 
 e2e:
 	./tests/e2e/run.sh

@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "In-process Travel client for custom FlowSplice business applications"
+readme = "README.md"
 
 [features]
-default = ["frontend"]
+default = []
 frontend = ["dep:axum", "dep:clap", "dep:embedded-spa", "dep:rust-embed", "dep:rpassword", "dep:tracing-subscriber"]
 e2e-remote-ui = []
 

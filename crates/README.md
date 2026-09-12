@@ -4,8 +4,8 @@ FlowSplice provides two supported SDK entry points:
 
 | Dependency | Purpose |
 | --- | --- |
-| `flowsplice-home-core` | Accept authorized connections in your business server |
-| `flowsplice-travel-core` | Enroll, discover and connect from your business client |
+| [`flowsplice-home-core`](flowsplice-home-core/README.md) | Accept authorized connections in your business server |
+| [`flowsplice-travel-core`](flowsplice-travel-core/README.md) | Enroll, discover and connect from your business client |
 
 Your application owns its message format, request handling, application permissions and user interface.
 
@@ -16,10 +16,10 @@ Create an independent Rust project and select the dependency for each role. An a
 ```toml
 [dependencies]
 flowsplice-home-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main" }
-flowsplice-travel-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main", default-features = false }
+flowsplice-travel-core = { git = "https://github.com/tomcatzh/flowsplice-rust", branch = "main" }
 ```
 
-These are Git dependencies. Disabling Travel's default features selects a client without the built-in Web UI. The snippets below also use `anyhow = "1"`, `serde_json = "1"` and Tokio 1 with `rt-multi-thread`, `macros` and `io-util` enabled.
+These are Git dependencies. Travel's default features are empty, so an SDK consumer needs no Web assets or frontend build. The generic Travel application explicitly enables `frontend` and builds its assets separately. The snippets below also use `anyhow = "1"`, `serde_json = "1"` and Tokio 1 with `rt-multi-thread`, `macros` and `io-util` enabled.
 
 Cargo fetches the repository and builds the selected dependency graph. Your application has its own workspace. The two SDK entry points have internal transitive dependencies. Commit your application's `Cargo.lock` to retain the resolved Git revision; update it deliberately when adopting a newer revision.
 
@@ -27,11 +27,15 @@ Cargo fetches the repository and builds the selected dependency graph. Your appl
 
 Use a running FlowSplice Server and Relay, and a business Home provisioned by an administrator. Home needs existing certificates, private keys, deployment trust, authorization state and service grants. `HomeRuntime::load` verifies and loads these materials; provisioning happens beforehand.
 
+Follow [business Home provisioning](../docs/business-home.md) for the `flowsplice-homeagent init --business-services` command, approval and generated files. Load its `home-runtime.toml`; the administrative `homeagent.toml` contains fields the SDK configuration rejects.
+
 Travel needs the matching business descriptor, a reachable Relay management IP address and port, and a deployment root public key obtained through an independently trusted channel. Enrollment requires administrator approval. Retain the installed identity between runs. Store configuration and private identity material in your application's data directory.
 
 ## Business Home
 
 Import `HomeRuntimeConfig`, `Service`, `ServiceProtocol`, `SocketServices` and listener types from `flowsplice_home_core`. Configured service IDs and protocols must match the approved services. Use absolute file paths when loading the provisioned Home configuration directly.
+
+Business API types are available through the two SDK entries: Home exports grants, endpoint credentials, trust, authorization and statistics query types; Travel exports descriptors, trust, grants, `Catalog`, `HomeCatalog`, `RelayDirectory` and `RelayEndpoint`. Do not add direct internal package dependencies to name these types.
 
 This function accepts one TCP connection and demonstrates runtime ownership. The caller supplies the configuration and a handler responsible for message boundaries, timeouts and authorization lifetime:
 

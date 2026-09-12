@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Serving Home runtime for custom FlowSplice business applications"
+readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true

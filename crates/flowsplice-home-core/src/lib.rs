@@ -1,24 +1,32 @@
 #![forbid(unsafe_code)]
-//! Shared Home transport runtime, independent of issuer and user-interface adapters.
+#![doc = include_str!("../README.md")]
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use flowsplice_core::{
     DATA_FRAME_LIMIT,
-    authorization::{VerifiedAuthorization, unix_time_secs},
+    authorization::unix_time_secs,
     frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
     protocol::{DataFrame, Role},
     route::{RouteSide, write_preface},
     tls::{client_connector, peer_identity, require_peer, server_acceptor, server_name},
 };
 pub use flowsplice_core::{
-    authorization::TravelCredential,
-    business::BusinessService,
+    authorization::{
+        TravelCredential, TravelCredentialScope, TrustedTravelAuthority, VerifiedAuthorization,
+    },
+    business::{BusinessService, HomeServiceGrant, SignedHomeServiceGrant},
+    deployment::{
+        DeploymentTrust, HomeEndpointCredential, HomeEndpointTrust, ServerControlKey,
+        SignedDeploymentTrust, SignedHomeEndpointCredential, TrustedHomeEnrollmentAuthority,
+    },
     protocol::{Service, ServiceProtocol},
+    statistics::MetricValue,
 };
-use flowsplice_storage::{LocalStatistics, MetricBatch};
+use flowsplice_storage::MetricBatch;
+pub use flowsplice_storage::{LocalStatistics, MetricIdentity, MetricPoint};
 pub use flowsplice_transport::{
     AsyncStream, BoxStream, DatagramIo, HomeTcpListener, HomeUdpListener, IoFuture,
-    ServiceLifetime, ServicePeer, ServiceProvider, SocketServices,
+    ServiceLifetime, ServiceLifetimeGuard, ServicePeer, ServiceProvider, SocketServices,
 };
 use std::{
     collections::BTreeMap,

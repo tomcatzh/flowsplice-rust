@@ -6,7 +6,10 @@ The protocol is one exchange: Travel sends `foobar`, Home replies `FOOBAR`, then
 
 ## Prepare
 
-Use a disposable deployment with a running Server and Relay, and an administrator-provisioned business Home. Obtain:
+Use a disposable deployment with a running Server and Relay, and an administrator-provisioned business Home.
+
+Follow [business Home provisioning](../../docs/business-home.md) to create the installation
+and descriptor before running this sample. Obtain:
 
 - The Home's `home-runtime.toml`, identity files, deployment trust and service grant.
 - An approved TCP service ID, such as `foobar`, and its matching business descriptor JSON.
