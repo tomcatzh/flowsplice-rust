@@ -5,7 +5,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 if rg -n '\b(option_env|env)!\(' \
-  travelagent homeagent server relay crates \
+  travelagent homeagent server relay crates internal pty travel-android/rust travel-apple/rust \
   --glob '*.rs'; then
   printf 'Production Rust source contains compile-time environment access.\n' >&2
   exit 1

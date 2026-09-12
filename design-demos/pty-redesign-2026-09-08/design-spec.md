@@ -30,7 +30,7 @@
 | 当前连接数 | Home 内部跟踪 attachment，但协议未输出数量 |
 | 一个客户端同时连接多个 Home | 没有；Apple/Android 加载单份 business.json 并拥有单个 native handle，actor 只持有一个 PtyClient |
 
-核对位置：`crates/flowsplice-pty-protocol/src/lib.rs` 的 Session/New；`crates/flowsplice-pty-home/src/session.rs` 的 snapshot/attachments；`crates/flowsplice-pty-native/src/engine.rs` 的 NativeOptions/actor；`pty-apple/Sources/TerminalHost.swift` 和 `pty-android/.../MainActivity.kt` 的单个配置与句柄。不能把底层可以实例化多个对象等同于现有应用已经支持多 Home。
+核对位置：`pty/protocol/src/lib.rs` 的 Session/New；`pty/home/src/session.rs` 的 snapshot/attachments；`pty/native/src/engine.rs` 的 NativeOptions/actor；`pty-apple/Sources/TerminalHost.swift` 和 `pty-android/.../MainActivity.kt` 的单个配置与句柄。不能把底层可以实例化多个对象等同于现有应用已经支持多 Home。
 
 ## 页面地图
 

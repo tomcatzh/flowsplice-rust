@@ -576,16 +576,16 @@ Travel build, and reissuance under the replacement deployment.
 
 | Area | Primary implementation |
 | --- | --- |
-| TLS construction, URI identity, SPKI extraction/checking | [`crates/flowsplice-core/src/tls.rs`](../crates/flowsplice-core/src/tls.rs) |
-| HMAC route/work preface | [`crates/flowsplice-core/src/route.rs`](../crates/flowsplice-core/src/route.rs) |
-| Deployment trust and Server control snapshots | [`crates/flowsplice-core/src/deployment.rs`](../crates/flowsplice-core/src/deployment.rs) |
-| Scoped Travel credentials, revocations, authorization cache | [`crates/flowsplice-core/src/authorization.rs`](../crates/flowsplice-core/src/authorization.rs) |
-| Five-minute statistics payloads and signatures | [`crates/flowsplice-core/src/statistics.rs`](../crates/flowsplice-core/src/statistics.rs) |
-| redb state, statistics buckets/outboxes, history, and deduplication | [`crates/flowsplice-storage/src/lib.rs`](../crates/flowsplice-storage/src/lib.rs) |
-| Enrollment request/import and certificate validation | [`crates/flowsplice-enrollment/src/lib.rs`](../crates/flowsplice-enrollment/src/lib.rs) |
-| Private-key encryption and transactional password rotation | [`crates/flowsplice-enrollment/src/key.rs`](../crates/flowsplice-enrollment/src/key.rs) |
-| Home certificate/credential issuance | [`crates/flowsplice-enrollment/src/issuer.rs`](../crates/flowsplice-enrollment/src/issuer.rs) |
-| Offline root utility | [`crates/flowsplice-enrollment/src/bin/flowsplice-trust.rs`](../crates/flowsplice-enrollment/src/bin/flowsplice-trust.rs) |
+| TLS construction, URI identity, SPKI extraction/checking | [`internal/flowsplice-core/src/tls.rs`](../internal/flowsplice-core/src/tls.rs) |
+| HMAC route/work preface | [`internal/flowsplice-core/src/route.rs`](../internal/flowsplice-core/src/route.rs) |
+| Deployment trust and Server control snapshots | [`internal/flowsplice-core/src/deployment.rs`](../internal/flowsplice-core/src/deployment.rs) |
+| Scoped Travel credentials, revocations, authorization cache | [`internal/flowsplice-core/src/authorization.rs`](../internal/flowsplice-core/src/authorization.rs) |
+| Five-minute statistics payloads and signatures | [`internal/flowsplice-core/src/statistics.rs`](../internal/flowsplice-core/src/statistics.rs) |
+| redb state, statistics buckets/outboxes, history, and deduplication | [`internal/flowsplice-storage/src/lib.rs`](../internal/flowsplice-storage/src/lib.rs) |
+| Enrollment request/import and certificate validation | [`internal/flowsplice-enrollment/src/lib.rs`](../internal/flowsplice-enrollment/src/lib.rs) |
+| Private-key encryption and transactional password rotation | [`internal/flowsplice-enrollment/src/key.rs`](../internal/flowsplice-enrollment/src/key.rs) |
+| Home certificate/credential issuance | [`internal/flowsplice-enrollment/src/issuer.rs`](../internal/flowsplice-enrollment/src/issuer.rs) |
+| Offline root utility | [`internal/flowsplice-enrollment/src/bin/flowsplice-trust.rs`](../internal/flowsplice-enrollment/src/bin/flowsplice-trust.rs) |
 | Server credential/revocation store | [`server/src/authorization.rs`](../server/src/authorization.rs) |
 | Home single-use issuance ledger | [`homeagent/src/issuance_ledger.rs`](../homeagent/src/issuance_ledger.rs) |
 | Travel durable control state and authenticated remote enrollment | [`travelagent/src/main.rs`](../travelagent/src/main.rs) |

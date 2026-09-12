@@ -1,1 +1,1 @@
-#import "../../../crates/flowsplice-travel-apple/include/flowsplice_travel_apple.h"
+#import "../../../travel-apple/rust/include/flowsplice_travel_apple.h"

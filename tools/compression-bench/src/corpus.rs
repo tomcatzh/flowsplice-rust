@@ -136,7 +136,9 @@ pub fn build(repo: &Path) -> Result<Vec<Dataset>, Box<dyn Error>> {
         result.push(dataset(if wide { "history-256-near96k" } else { "history-256-ordinary" }, "Reply::History JSON bodies, 256 rows per page", "Synthetic log rows; current protocol fields; excludes ServerMessage::Response envelope and framing", history(wide)?));
     }
     let mut paths = Vec::new();
-    rust_paths(&repo.join("crates"), &mut paths)?;
+    for directory in ["crates", "internal", "pty", "travel-android/rust", "travel-apple/rust"] {
+        rust_paths(&repo.join(directory), &mut paths)?;
+    }
     paths.sort();
     let markdown = [
         "README.md",

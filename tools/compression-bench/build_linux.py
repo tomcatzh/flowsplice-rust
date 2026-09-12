@@ -100,7 +100,7 @@ def main():
             raise RuntimeError('Native shim changed; rebuild native stage')
         checkout = root/'checkout'
         checkout.mkdir(exist_ok=True)
-        for name in ['crates', 'docs', 'assets', 'README.md', 'pty-apple', 'pty-android', 'openwrt']:
+        for name in ['crates', 'internal', 'pty', 'travel-android', 'travel-apple', 'docs', 'assets', 'README.md', 'pty-apple', 'pty-android', 'openwrt']:
             link = checkout/name
             if not link.exists():
                 link.symlink_to(Path('/repo')/name)

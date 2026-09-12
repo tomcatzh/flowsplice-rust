@@ -9,8 +9,6 @@ shapes are retained; service-category authorization adds an explicit new scope a
 - `flowsplice-travel-core` owns trusted discovery, device identity, encrypted connections
   and recovery. Set `default-features = false` for an embedded/native consumer. The
   `frontend` feature provides the existing CLI and embedded Web adapter.
-- `flowsplice-transport` defines application I/O, verified peer context and bounded
-  in-process Home listeners. It opens no physical sockets.
 - The generic Home adapter connects physical target sockets. The generic Travel adapter
   retains configurable local forwarding listeners and background behavior.
 
@@ -19,6 +17,8 @@ shapes are retained; service-category authorization adds an explicit new scope a
 Start an active-use runtime with provisioned identity and an independently trusted root:
 
 ```rust,ignore
+use flowsplice_travel_core::{ServiceBinding, ServiceProtocol, TravelCore};
+
 let travel = TravelCore::start_in_process(config_path, password, trusted_root).await?;
 let stream = travel.connect_tcp(&ServiceBinding {
     home_id: approved_home,
@@ -74,6 +74,9 @@ silently acquire category-wide access. See [PTY provisioning](pty.md).
 Create listeners before starting the provisioned serving runtime:
 
 ```rust,ignore
+use flowsplice_home_core::{HomeRuntime, SocketServices};
+use std::sync::Arc;
+
 let services = Arc::new(SocketServices::default());
 let mut listener = services.bind_tcp(service_id, 16)?;
 let home = HomeRuntime::load(config, services)?;

@@ -4,14 +4,22 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use flowsplice_core::{
     DATA_FRAME_LIMIT,
-    authorization::{TravelCredential, VerifiedAuthorization, unix_time_secs},
+    authorization::{VerifiedAuthorization, unix_time_secs},
     frame::{DataFrameCodec, DataFrameReader, JsonFrameReader, write_data_frame, write_json},
-    protocol::{DataFrame, Role, Service, ServiceProtocol},
+    protocol::{DataFrame, Role},
     route::{RouteSide, write_preface},
     tls::{client_connector, peer_identity, require_peer, server_acceptor, server_name},
 };
+pub use flowsplice_core::{
+    authorization::TravelCredential,
+    business::BusinessService,
+    protocol::{Service, ServiceProtocol},
+};
 use flowsplice_storage::{LocalStatistics, MetricBatch};
-use flowsplice_transport::{ServicePeer, ServiceProvider};
+pub use flowsplice_transport::{
+    AsyncStream, BoxStream, DatagramIo, HomeTcpListener, HomeUdpListener, IoFuture,
+    ServiceLifetime, ServicePeer, ServiceProvider, SocketServices,
+};
 use std::{
     collections::BTreeMap,
     path::Path,

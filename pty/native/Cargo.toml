@@ -1,24 +1,29 @@
 [package]
-name = "flowsplice-travel-android"
+publish = false
+name = "flowsplice-pty-native"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-flowsplice-travel-core = { workspace = true, default-features = false }
 flowsplice-core.workspace = true
-jni = "0.22.4"
+flowsplice-travel-core.workspace = true
+flowsplice-pty-client.workspace = true
+flowsplice-pty-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22.4"
 
 [lints.rust]
-# This crate is the single audited FFI boundary. The reusable Travel Core remains `forbid`.
 unsafe_code = "allow"
 
 [lints.clippy]

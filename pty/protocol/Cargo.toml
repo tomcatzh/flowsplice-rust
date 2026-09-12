@@ -1,24 +1,22 @@
 [package]
-name = "flowsplice-storage"
+publish = false
+name = "flowsplice-pty-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [features]
-fault-injection = []
+default = []
+snappy-encode = ["flowsplice-pty-codec/encode"]
 
 [dependencies]
 anyhow.workspace = true
-aws-lc-rs.workspace = true
-flowsplice-core.workspace = true
-redb.workspace = true
+flowsplice-pty-codec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-tempfile = "3.20"
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 [package]
-name = "flowsplice-pty-client"
+publish = false
+name = "flowsplice-transport"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +9,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 flowsplice-core.workspace = true
-flowsplice-travel-core = { workspace = true, default-features = false }
-flowsplice-pty-protocol.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 

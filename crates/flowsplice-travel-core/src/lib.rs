@@ -47,8 +47,7 @@ use flowsplice_core::{
     init_crypto,
     protocol::{
         CONTROL_PROTOCOL_VERSION, Catalog, ControlMessage, DATA_PROTOCOL_BINARY_V1, DataFrame,
-        RelayDirectory, Role, ServiceProtocol, TravelConnectionPurpose,
-        bootstrap_verification_code,
+        RelayDirectory, Role, TravelConnectionPurpose, bootstrap_verification_code,
     },
     route::{RouteSide, write_preface},
     statistics::statistics_signing_key,
@@ -88,6 +87,11 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+pub use flowsplice_core::{
+    business::{BusinessDescriptor, BusinessService, ServiceClassDescriptor},
+    protocol::ServiceProtocol,
+};
 
 pub mod business;
 mod installation_paths;

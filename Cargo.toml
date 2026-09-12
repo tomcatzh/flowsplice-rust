@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/flowsplice-core",
-    "crates/flowsplice-enrollment",
-    "crates/flowsplice-storage",
-    "crates/flowsplice-transport",
+    "internal/flowsplice-core",
+    "internal/flowsplice-enrollment",
+    "internal/flowsplice-storage",
+    "internal/flowsplice-transport",
     "crates/flowsplice-home-core",
-    "crates/flowsplice-pty-codec",
-    "crates/flowsplice-pty-protocol",
-    "crates/flowsplice-pty-home",
-    "crates/flowsplice-pty-client",
-    "crates/flowsplice-pty-native",
+    "pty/codec",
+    "pty/protocol",
+    "pty/home",
+    "pty/client",
+    "pty/native",
     "crates/flowsplice-travel-core",
-    "crates/flowsplice-travel-android",
-    "crates/flowsplice-travel-apple",
+    "travel-android/rust",
+    "travel-apple/rust",
     "server",
     "relay",
     "homeagent",
@@ -34,15 +34,15 @@ anyhow = "1.0"
 aws-lc-rs = "1.17"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
-flowsplice-core = { path = "crates/flowsplice-core" }
-flowsplice-enrollment = { path = "crates/flowsplice-enrollment", default-features = false }
-flowsplice-storage = { path = "crates/flowsplice-storage" }
-flowsplice-transport = { path = "crates/flowsplice-transport" }
+flowsplice-core = { path = "internal/flowsplice-core" }
+flowsplice-enrollment = { path = "internal/flowsplice-enrollment", default-features = false }
+flowsplice-storage = { path = "internal/flowsplice-storage" }
+flowsplice-transport = { path = "internal/flowsplice-transport" }
 flowsplice-home-core = { path = "crates/flowsplice-home-core" }
-flowsplice-pty-codec = { path = "crates/flowsplice-pty-codec", default-features = false }
-flowsplice-pty-protocol = { path = "crates/flowsplice-pty-protocol" }
-flowsplice-pty-home = { path = "crates/flowsplice-pty-home" }
-flowsplice-pty-client = { path = "crates/flowsplice-pty-client" }
+flowsplice-pty-codec = { path = "pty/codec", default-features = false }
+flowsplice-pty-protocol = { path = "pty/protocol" }
+flowsplice-pty-home = { path = "pty/home" }
+flowsplice-pty-client = { path = "pty/client" }
 flowsplice-travel-core = { path = "crates/flowsplice-travel-core", default-features = false }
 futures-util = "0.3"
 hex = "0.4"

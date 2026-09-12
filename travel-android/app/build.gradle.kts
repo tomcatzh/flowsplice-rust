@@ -219,6 +219,8 @@ val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
         repositoryRoot.resolve("rust-toolchain.toml"),
     )
     inputs.dir(repositoryRoot.resolve("crates"))
+    inputs.dir(repositoryRoot.resolve("internal"))
+    inputs.dir(repositoryRoot.resolve("travel-android/rust"))
     inputs.dir(repositoryRoot.resolve("travelagent/web"))
     outputs.dir(rustJniOutput)
 }

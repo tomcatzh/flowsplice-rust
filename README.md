@@ -431,8 +431,12 @@ source and notes only; it has no binary attachments.
 
 ## Repository layout
 
+To build your own business Home or Travel client, start with the [two SDK entry points](crates/README.md).
+
 ```text
-crates/       shared core, Travel Core, JNI/Apple adapters, enrollment, and redb storage crates
+crates/       Home and Travel SDK entry points
+internal/     shared protocol, enrollment, transport I/O and runtime storage
+pty/          PTY business backend, client, protocol, codec and native bridge
 server/       Server application
 relay/        Relay application
 homeagent/    Home Agent and issuer UI

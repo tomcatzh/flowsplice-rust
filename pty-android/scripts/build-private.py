@@ -79,7 +79,7 @@ shutil.copyfile(configuration, assets / 'bootstrap' / ('service-class.json' if a
 shutil.copytree(stage / 'pty-web/dist', assets / 'pty')
 notices = assets / 'ThirdPartyNotices'
 notices.mkdir()
-shutil.copyfile(stage / 'crates/flowsplice-pty-codec/vendor/snappy/COPYING', notices / 'Snappy.txt')
+shutil.copyfile(stage / 'pty/codec/vendor/snappy/COPYING', notices / 'Snappy.txt')
 subprocess.run(['bash', str(stage / 'pty-android/scripts/build-native.sh'), args.target], cwd=stage, env=env, check=True)
 if not args.release:
     debug_key = args.output / 'debug.keystore'

@@ -34,6 +34,10 @@ RUN if [ -n "${RUSTUP_DIST_SERVER:-}" ] && [ "${RUSTUP_DIST_SERVER}" != "off" ];
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+COPY internal/ internal/
+COPY pty/ pty/
+COPY travel-android/rust/ travel-android/rust/
+COPY travel-apple/rust/ travel-apple/rust/
 COPY server/ server/
 COPY relay/ relay/
 COPY homeagent/ homeagent/

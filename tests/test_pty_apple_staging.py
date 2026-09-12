@@ -18,7 +18,7 @@ class AppleStagingTests(unittest.TestCase):
         self.web = self.repo / 'pty-web'
         self.web.mkdir()
         (self.repo / 'pty-apple').mkdir()
-        notice = self.repo / 'crates/flowsplice-pty-codec/vendor/snappy/COPYING'
+        notice = self.repo / 'pty/codec/vendor/snappy/COPYING'
         notice.parent.mkdir(parents=True)
         notice.write_text('fixture license')
         package = {'name': 'staging-fixture', 'version': '1.0.0',
