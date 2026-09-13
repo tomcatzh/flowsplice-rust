@@ -10,11 +10,11 @@ plane and never binds a business-data listener.
 > configuration, protocols, persisted state, and deployment artifacts may change without backward
 > compatibility.
 
-The current code version is 0.4.0, under development; this is not a release or deployment
-announcement. Final native end-to-end and production acceptance are not claimed here.
+[FlowSplice 0.4](docs/releases/0.4.md) is the current source release, with Cargo package
+version `0.4.0`. It publishes source code and release notes without binary attachments.
+See the release notes for the pinned revision, validation results, and remaining limitations.
 Generic native Travel clients for Android, iOS/iPadOS, and macOS remain available alongside the
-command-line applications. The historical [public 0.3.1 release](docs/releases/0.3.1.md) contains
-source and release notes only, with no binary attachments. Native installers are built privately
+command-line applications. Native installers are built privately
 for each deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
 
 Version 0.4.0 extracts the [shared encrypted socket runtimes](docs/socket-runtime.md) used by
