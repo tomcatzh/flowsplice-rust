@@ -12,7 +12,8 @@ use flowsplice_core::authorization::TravelCredential;
 use flowsplice_core::{
     DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
     authorization::{VerifiedAuthorization, unix_time_secs},
-    frame::{DataFrameCodec, DataFrameReader, write_data_frame, write_json},
+    carrier::run_data_carrier,
+    frame::{DataFrameCodec, write_json},
     protocol::{DataFrame, Service},
 };
 use flowsplice_storage::LocalStatistics;
@@ -21,7 +22,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
-    time::{Instant, interval, sleep_until, timeout},
+    time::{Instant, sleep_until, timeout},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -734,43 +735,20 @@ async fn run_carrier(
         flow_permit,
         ..
     } = carrier;
-    let _carrier_permits = (global_permit, flow_permit);
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, data_codec);
-    let mut heartbeat = interval(heartbeat_period);
-    let mut nonce = 0_u64;
-    let mut last_received = Instant::now();
-    let result: Result<()> = async {
-            loop {
-                tokio::select! {
-                    frame = outgoing.recv() => {
-                        let Some(frame) = frame else { return Ok(()); };
-                        write_data_frame(&mut writer, &frame, DATA_FRAME_LIMIT, data_codec).await?;
-                    }
-                    frame = reader.read() => {
-                        last_received = Instant::now();
-                        match frame? {
-                            DataFrame::Ping { nonce } => {
-                                write_data_frame(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
-                            }
-                            DataFrame::Pong { .. } => {}
-                            frame => {
-                                events.send(FlowEvent::CarrierFrame { carrier_id, frame }).await
-                                    .map_err(|_| anyhow!("home flow event receiver closed"))?;
-                            }
-                        }
-                    }
-                    _ = heartbeat.tick() => {
-                        if last_received.elapsed() > timeout_period {
-                            bail!("carrier heartbeat timed out");
-                        }
-                        nonce = nonce.wrapping_add(1);
-                        write_data_frame(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
-                    }
-                }
-            }
-        }
-        .await;
+    let result = run_data_carrier(
+        stream,
+        &mut outgoing,
+        &events,
+        |frame| FlowEvent::CarrierFrame { carrier_id, frame },
+        data_codec,
+        heartbeat_period,
+        timeout_period,
+    )
+    .await;
+    // The flow may be waiting for outbound capacity while its event queue is full.
+    // Release the socket, queue and admission slots before waiting to report closure.
+    drop(outgoing);
+    drop((global_permit, flow_permit));
     let reason = result
         .err()
         .map_or_else(|| "carrier closed".to_owned(), |error| error.to_string());
@@ -867,6 +845,7 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 #[cfg(test)]
 mod drain_tests {
     use super::*;
+    use flowsplice_core::frame::{DataFrameReader, write_data_frame};
 
     struct Released(Option<oneshot::Sender<()>>);
     impl Drop for Released {

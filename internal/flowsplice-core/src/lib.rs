@@ -2,6 +2,7 @@
 
 pub mod authorization;
 pub mod business;
+pub mod carrier;
 pub mod config;
 pub mod deployment;
 pub mod frame;

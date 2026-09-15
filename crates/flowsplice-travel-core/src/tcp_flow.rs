@@ -7,9 +7,9 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use flowsplice_core::{
-    DATA_FRAME_LIMIT, MAX_DATA_PAYLOAD,
+    MAX_DATA_PAYLOAD,
     authorization::unix_time_secs,
-    frame::{DataFrameReader, write_data_frame},
+    carrier::run_data_carrier,
     protocol::{DataFrame, ServiceProtocol},
 };
 use flowsplice_transport::BoxStream;
@@ -18,10 +18,16 @@ use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
-    time::{Instant, interval, sleep, sleep_until, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+#[cfg(test)]
+use flowsplice_core::{
+    DATA_FRAME_LIMIT,
+    frame::{DataFrameReader, write_data_frame},
+};
 
 use super::{
     AppState, BusinessCarrier, Mapping, jittered_retry_delay, open_business_on, relay_candidates,
@@ -1052,52 +1058,37 @@ fn spawn_carrier(
     let (tx, mut outgoing) = mpsc::channel(128);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
     tasks.spawn(async move {
-        let _carrier_permit = carrier_permit;
-        let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = DataFrameReader::new(reader, DATA_FRAME_LIMIT, data_codec);
-        let mut heartbeat = interval(heartbeat_period);
-        let mut nonce = 0_u64;
-        let mut last_received = Instant::now();
-        let result: Result<()> = async {
-            loop {
-                tokio::select! {
-                    changed = network_changes.changed() => {
-                        changed.map_err(|_| anyhow!("network change notifier stopped"))?;
-                        bail!("default network changed");
-                    }
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            return Ok(());
-                        }
-                    }
-                    frame = outgoing.recv() => {
-                        let Some(frame) = frame else { return Ok(()); };
-                        write_data_frame(&mut writer, &frame, DATA_FRAME_LIMIT, data_codec).await?;
-                    }
-                    frame = reader.read() => {
-                        last_received = Instant::now();
-                        match frame? {
-                            DataFrame::Ping { nonce } => {
-                                write_data_frame(&mut writer, &DataFrame::Pong { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
-                            }
-                            DataFrame::Pong { .. } => {}
-                            frame => {
-                                events.send(FlowEvent::CarrierFrame { carrier_id, frame }).await
-                                    .map_err(|_| anyhow!("travel flow event receiver closed"))?;
-                            }
-                        }
-                    }
-                    _ = heartbeat.tick() => {
-                        if last_received.elapsed() > timeout_period {
-                            bail!("carrier heartbeat timed out");
-                        }
-                        nonce = nonce.wrapping_add(1);
-                        write_data_frame(&mut writer, &DataFrame::Ping { nonce }, DATA_FRAME_LIMIT, data_codec).await?;
+        // Cancellation must surround the entire pump, including a blocked socket write.
+        let result = tokio::select! {
+            biased;
+            () = async {
+                while !*shutdown_rx.borrow_and_update() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
                     }
                 }
+            } => Ok(()),
+            changed = network_changes.changed() => {
+                Err(anyhow!(if changed.is_ok() {
+                    "default network changed"
+                } else {
+                    "network change notifier stopped"
+                }))
             }
-        }
-        .await;
+            result = run_data_carrier(
+                stream,
+                &mut outgoing,
+                &events,
+                |frame| FlowEvent::CarrierFrame { carrier_id, frame },
+                data_codec,
+                heartbeat_period,
+                timeout_period,
+            ) => result,
+        };
+        // The flow can be waiting for outgoing capacity while its event queue is full.
+        // Retire the socket, queue and permit before attempting to report closure.
+        drop(outgoing);
+        drop(carrier_permit);
         let reason = result
             .err()
             .map_or_else(|| "carrier closed".to_owned(), |error| error.to_string());
@@ -1471,3 +1462,7 @@ mod live_counter_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "carrier_regressions.rs"]
+mod carrier_review_regressions;
