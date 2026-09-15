@@ -278,6 +278,7 @@ struct PendingRelayGrant {
 }
 
 struct PendingEnrollment {
+    forwarding_id: Uuid,
     relay_id: String,
     travel_id: String,
     home_id: String,
@@ -288,6 +289,7 @@ struct PendingEnrollment {
 }
 
 struct PendingHomeEnrollment {
+    dispatch_id: Uuid,
     home_id: String,
     request_digest_sha256: String,
     remaining_responders: usize,
@@ -878,13 +880,7 @@ async fn handle_home_bootstrap(
     )
     .await;
     let response = match result {
-        Ok(receiver) => timeout(
-            Duration::from_secs(config.handshake_timeout_secs.saturating_mul(2)),
-            receiver,
-        )
-        .await
-        .context("timed out waiting for Home enrollment issuers")?
-        .context("Home enrollment response channel closed")?,
+        Ok(response) => response,
         Err(error) => ControlMessage::HomeBootstrapEnrollmentResult {
             request_id,
             accepted: false,
@@ -905,7 +901,10 @@ async fn dispatch_home_enrollment(
     home_id: String,
     retrieval_token: Vec<u8>,
     request_json: Vec<u8>,
-) -> Result<oneshot::Receiver<ControlMessage>> {
+) -> Result<ControlMessage> {
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(config.handshake_timeout_secs.saturating_mul(2));
+    let dispatch_id = Uuid::new_v4();
     if protocol_version != CONTROL_PROTOCOL_VERSION
         || request_id.is_nil()
         || home_id.is_empty()
@@ -946,14 +945,14 @@ async fn dispatch_home_enrollment(
         pending.insert(
             request_id,
             PendingHomeEnrollment {
+                dispatch_id,
                 home_id: home_id.clone(),
                 request_digest_sha256,
                 remaining_responders: eligible.len(),
                 any_accepted: false,
                 response: Some(response_tx),
                 last_error: None,
-                expires: Instant::now()
-                    + Duration::from_secs(config.handshake_timeout_secs.saturating_mul(2)),
+                expires: deadline.into_std(),
             },
         );
     }
@@ -963,20 +962,72 @@ async fn dispatch_home_enrollment(
         retrieval_token,
         request_json,
     };
+    // Dispatch concurrently: one saturated issuer cannot prevent a healthy issuer
+    // from receiving the request. Dropping the JoinSet cancels unfinished sends.
+    let mut dispatches = tokio::task::JoinSet::new();
     for (_issuer_home_id, sender) in eligible {
-        if sender.send(message.clone()).await.is_err() {
-            complete_home_enrollment(
-                state,
-                "disconnected-super-home",
+        let message = message.clone();
+        dispatches
+            .spawn(async move { send_control_until(&sender, message, deadline.into_std()).await });
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        tokio::pin!(response_rx);
+        loop {
+            tokio::select! {
+                response = &mut response_rx => return response.context("Home enrollment response channel closed"),
+                completed = dispatches.join_next(), if !dispatches.is_empty() => {
+                    if let Some(result) = completed
+                        && let Err(error) = result.context("Home enrollment dispatch task failed")? {
+                        fail_home_enrollment_dispatch(state, request_id, dispatch_id, &error).await;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for Home enrollment issuers")
+    .and_then(std::convert::identity);
+    dispatches.abort_all();
+    // Reused request ids must not let an older completion delete a newer dispatch.
+    let mut pending = state.pending_home_enrollments.lock().await;
+    if pending
+        .get(&request_id)
+        .is_some_and(|pending| pending.dispatch_id == dispatch_id)
+    {
+        pending.remove(&request_id);
+    }
+    result
+}
+
+async fn fail_home_enrollment_dispatch(
+    state: &State,
+    request_id: Uuid,
+    dispatch_id: Uuid,
+    error: &anyhow::Error,
+) {
+    let mut pending = state.pending_home_enrollments.lock().await;
+    let Some(record) = pending
+        .get_mut(&request_id)
+        .filter(|p| p.dispatch_id == dispatch_id)
+    else {
+        return;
+    };
+    record.remaining_responders = record.remaining_responders.saturating_sub(1);
+    record.last_error = Some(format!("global Home enrollment dispatch failed: {error:#}"));
+    if record.remaining_responders == 0 {
+        let response = record.response.take();
+        let accepted = record.any_accepted;
+        let error = (!accepted).then(|| record.last_error.clone()).flatten();
+        pending.remove(&request_id);
+        if let Some(response) = response {
+            let _ = response.send(ControlMessage::HomeBootstrapEnrollmentResult {
                 request_id,
-                false,
-                None,
-                Some("global Home disconnected during enrollment dispatch".to_owned()),
-            )
-            .await?;
+                accepted,
+                response_json: None,
+                error,
+            });
         }
     }
-    Ok(response_rx)
 }
 
 async fn handle_relay_registration(
@@ -1046,7 +1097,6 @@ async fn complete_home_enrollment(
         .await
         .global_issuer_home_ids()
         .contains(issuer_home_id)
-        && issuer_home_id != "disconnected-super-home"
     {
         bail!("non-global Home attempted to approve a Home enrollment");
     }
@@ -1054,6 +1104,10 @@ async fn complete_home_enrollment(
     let Some(record) = pending.get_mut(&request_id) else {
         return Ok(());
     };
+    if record.expires <= Instant::now() {
+        pending.remove(&request_id);
+        return Ok(());
+    }
     if let Some(response_json) = response_json {
         if !accepted || response_json.len() > 900 * 1024 {
             bail!("Home enrollment response is invalid or oversized");
@@ -1279,17 +1333,17 @@ async fn handle_home(
         }
         Ok::<_, std::io::Error>(())
     });
-    let current_snapshot = state.authorization.read().await.snapshot();
-    if current_snapshot.generation != snapshot.generation {
-        tx.send(ControlMessage::TravelAuthorizationSnapshot {
-            snapshot: current_snapshot,
-        })
-        .await?;
-    }
-
-    info!(home_id = %identity.id, "home agent connected");
     let idle_timeout = Duration::from_secs(config.handshake_timeout_secs.saturating_mul(3).max(1));
+    let queue_timeout = Duration::from_secs(config.handshake_timeout_secs);
     let result: Result<()> = async {
+        let current_snapshot = state.authorization.read().await.snapshot();
+        if current_snapshot.generation != snapshot.generation {
+            tx.send_timeout(ControlMessage::TravelAuthorizationSnapshot {
+                snapshot: current_snapshot,
+            }, queue_timeout)
+            .await?;
+        }
+        info!(home_id = %identity.id, "home agent connected");
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -1320,7 +1374,7 @@ async fn handle_home(
                             state.authorization.read().await.validate_home_services(
                                 &state.control_signer.trust, &identity.id, endpoint_credential.as_ref(), &[],
                             )?;
-                            tx.send(ControlMessage::HeartbeatAck { nonce }).await?;
+                            tx.send_timeout(ControlMessage::HeartbeatAck { nonce }, queue_timeout).await?;
                         }
                         ControlMessage::HeartbeatAck { .. } => {}
                         ControlMessage::TravelAuthorizationAck { generation } => {
@@ -1336,12 +1390,12 @@ async fn handle_home(
                                     Some(error.to_string()),
                                 ),
                             };
-                            tx.send(ControlMessage::PublishTravelCredentialResult {
+                            tx.send_timeout(ControlMessage::PublishTravelCredentialResult {
                                 request_id,
                                 accepted,
                                 generation,
                                 error,
-                            })
+                            }, queue_timeout)
                             .await?;
                         }
                         ControlMessage::RevokeTravelCredential { request_id, credential_id, reason } => {
@@ -1360,12 +1414,12 @@ async fn handle_home(
                                     Some(error.to_string()),
                                 ),
                             };
-                            tx.send(ControlMessage::RevokeTravelCredentialResult {
+                            tx.send_timeout(ControlMessage::RevokeTravelCredentialResult {
                                 request_id,
                                 accepted,
                                 generation,
                                 error,
-                            })
+                            }, queue_timeout)
                             .await?;
                         }
                         ControlMessage::StatisticsReport { report } => {
@@ -1377,11 +1431,11 @@ async fn handle_home(
                                 false,
                             )
                             .await;
-                            tx.send(ControlMessage::StatisticsReportAck {
+                            tx.send_timeout(ControlMessage::StatisticsReportAck {
                                 digest_sha256,
                                 accepted: result.is_ok(),
                                 error: result.err().map(|error| error.to_string()),
-                            })
+                            }, queue_timeout)
                             .await?;
                         }
                         ControlMessage::RemoteEnrollmentResult {
@@ -1674,11 +1728,17 @@ where
         RelayConnectionMode::Active => "active",
     };
     let result = async {
+    let mut authorization_generation = snapshot.generation;
     let current_snapshot = state.authorization.read().await.snapshot();
     if current_snapshot.generation != snapshot.generation {
-        tx.send(ControlMessage::TravelAuthorizationSnapshot {
-            snapshot: current_snapshot,
-        })
+        // This task is the only consumer of rx; never wait on our own queue.
+        write_relay_control(
+            &mut writer,
+            &ControlMessage::TravelAuthorizationSnapshot {
+                snapshot: current_snapshot,
+            },
+            &mut authorization_generation,
+        )
         .await?;
     }
     replace_relay_session_endpoint(state, relay, session_id, endpoint.clone()).await?;
@@ -1708,7 +1768,7 @@ where
             }
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { bail!("relay writer channel closed"); };
-                write_json(&mut writer, &outgoing, CONTROL_FRAME_LIMIT).await?;
+                write_relay_control(&mut writer, &outgoing, &mut authorization_generation).await?;
             }
             changed = relay_directory_rx.changed() => {
                 changed.map_err(|_| anyhow!("Relay directory publisher closed"))?;
@@ -1899,7 +1959,7 @@ where
                         home_id,
                         request_json,
                     } => {
-                        handle_remote_enrollment_submit(
+                        if let Some(response) = handle_remote_enrollment_submit(
                             state,
                             relay,
                             &tx,
@@ -1911,7 +1971,10 @@ where
                             request_json,
                             config,
                         )
-                        .await?;
+                        .await
+                        {
+                            write_json(&mut writer, &response, CONTROL_FRAME_LIMIT).await?;
+                        }
                     }
                     ControlMessage::RemoteEnrollmentInstalled {
                         request_id,
@@ -1920,7 +1983,7 @@ where
                         credential_id,
                         home_id,
                     } => {
-                        handle_remote_enrollment_installed(
+                        if let Some(response) = handle_remote_enrollment_installed(
                             state,
                             relay,
                             &tx,
@@ -1931,7 +1994,10 @@ where
                             home_id,
                             config,
                         )
-                        .await?;
+                        .await
+                        {
+                            write_json(&mut writer, &response, CONTROL_FRAME_LIMIT).await?;
+                        }
                     }
                     ControlMessage::BootstrapEnrollmentSubmit {
                         protocol_version,
@@ -1941,7 +2007,7 @@ where
                         retrieval_token,
                         request_json,
                     } => {
-                        handle_bootstrap_enrollment_submit(
+                        if let Some(response) = handle_bootstrap_enrollment_submit(
                             state,
                             relay,
                             &tx,
@@ -1953,7 +2019,10 @@ where
                             request_json,
                             config,
                         )
-                        .await?;
+                        .await
+                        {
+                            write_json(&mut writer, &response, CONTROL_FRAME_LIMIT).await?;
+                        }
                     }
                     _ => bail!("unexpected message from relay"),
                 }
@@ -2199,6 +2268,7 @@ async fn handle_route_request<W: tokio::io::AsyncWrite + Unpin>(
     let expires_at_unix_secs = unix_time_secs()?.saturating_add(config.work_ttl_secs);
     let mut pending = state.pending_grants.lock().await;
     if pending.len() >= config.max_pending_work {
+        drop(pending);
         write_json(
             writer,
             &ControlMessage::RouteDenied {
@@ -2252,14 +2322,53 @@ async fn complete_relay_work(
     work_id: Uuid,
 ) -> Result<()> {
     let mut grants = state.pending_grants.lock().await;
-    let pending =
-        take_matching_pending_grant(&mut grants, relay_id, request_id, work_id, Instant::now())?;
+    let Some(pending) =
+        take_matching_pending_grant(&mut grants, relay_id, request_id, work_id, Instant::now())?
+    else {
+        return Ok(());
+    };
     drop(grants);
-    pending
-        .home
-        .send(pending.open_message)
+    if let Err(error) =
+        send_control_until(&pending.home, pending.open_message, pending.expires).await
+    {
+        warn!(%request_id, %work_id, %error, "Home work delivery failed");
+    }
+    Ok(())
+}
+
+/// Queue admission shares the request's existing deadline. A timed-out send is cancelled,
+/// so it cannot enqueue stale work later. Callers must retire any associated pending state.
+async fn send_control_until(
+    sender: &mpsc::Sender<ControlMessage>,
+    message: ControlMessage,
+    expires: Instant,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::from_std(expires);
+    if deadline <= tokio::time::Instant::now() {
+        bail!("control request deadline expired before queue admission");
+    }
+    tokio::time::timeout_at(deadline, sender.send(message))
         .await
-        .map_err(|_| anyhow!("Home control session closed before direct work delivery"))?;
+        .context("control queue admission timed out")?
+        .map_err(|_| anyhow!("control session queue closed"))
+}
+
+async fn write_relay_control<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &ControlMessage,
+    authorization_generation: &mut u64,
+) -> Result<()> {
+    if let ControlMessage::TravelAuthorizationSnapshot { snapshot } = message
+        && snapshot.generation < *authorization_generation
+    {
+        // The initial latest snapshot bypasses this task's own queue. Concurrent
+        // broadcasts can have queued older snapshots; never put those on the wire.
+        return Ok(());
+    }
+    write_json(writer, message, CONTROL_FRAME_LIMIT).await?;
+    if let ControlMessage::TravelAuthorizationSnapshot { snapshot } = message {
+        *authorization_generation = snapshot.generation;
+    }
     Ok(())
 }
 
@@ -2269,20 +2378,17 @@ fn take_matching_pending_grant(
     request_id: Uuid,
     work_id: Uuid,
     now: Instant,
-) -> Result<PendingRelayGrant> {
-    let pending = grants
-        .get(&request_id)
-        .ok_or_else(|| anyhow!("unknown or expired Relay work readiness"))?;
-    if pending.expires <= now {
-        grants.remove(&request_id);
-        bail!("Relay work readiness expired");
-    }
+) -> Result<Option<PendingRelayGrant>> {
+    let Some(pending) = grants.get(&request_id) else {
+        // A queued readiness notification may arrive after expiry or disconnect cleanup.
+        return Ok(None);
+    };
     if pending.relay_id != relay_id || pending.work_id != work_id {
         bail!("Relay work readiness does not match the authorized Relay grant");
     }
-    grants
-        .remove(&request_id)
-        .ok_or_else(|| anyhow!("Relay work readiness vanished"))
+    let expired = pending.expires <= now;
+    let pending = grants.remove(&request_id);
+    Ok(if expired { None } else { pending })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2297,7 +2403,9 @@ async fn handle_remote_enrollment_submit(
     home_id: String,
     request_json: Vec<u8>,
     config: &Config,
-) -> Result<()> {
+) -> Option<ControlMessage> {
+    let forwarding_id = Uuid::new_v4();
+    let expires = Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15));
     let result = async {
         if request_id.is_nil() || request_json.is_empty() || request_json.len() > 512 * 1024 {
             bail!("remote enrollment request is missing or oversized");
@@ -2328,45 +2436,55 @@ async fn handle_remote_enrollment_submit(
         pending.insert(
             request_id,
             PendingEnrollment {
+                forwarding_id,
                 relay_id: relay.id.clone(),
                 travel_id: travel_id.clone(),
                 home_id: home_id.clone(),
                 relay: relay_tx.clone(),
                 bootstrap: false,
                 installed: false,
-                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+                expires,
             },
         );
         drop(pending);
-        if home
-            .send(ControlMessage::RemoteEnrollmentSubmit {
+        if let Err(error) = send_control_until(
+            &home,
+            ControlMessage::RemoteEnrollmentSubmit {
                 request_id,
                 travel_id,
                 travel_session_id,
                 credential_id,
                 home_id,
                 request_json,
-            })
-            .await
-            .is_err()
+            },
+            expires,
+        )
+        .await
         {
-            state.pending_enrollments.lock().await.remove(&request_id);
-            bail!("Home control session closed during enrollment delivery");
+            let mut requests = state.pending_enrollments.lock().await;
+            if requests
+                .get(&request_id)
+                .is_some_and(|pending| pending.forwarding_id == forwarding_id)
+            {
+                requests.remove(&request_id);
+            }
+            return Err(
+                error.context("Home control session delivery failed during enrollment delivery")
+            );
         }
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = result {
-        relay_tx
-            .send(ControlMessage::RemoteEnrollmentResult {
-                request_id,
-                accepted: false,
-                response_json: None,
-                error: Some(error.to_string()),
-            })
-            .await?;
-    }
-    Ok(())
+    // The Relay session owns its writer and is the sole consumer of relay_tx.
+    // Return an immediate failure to that writer instead of awaiting our own full queue.
+    result
+        .err()
+        .map(|error| ControlMessage::RemoteEnrollmentResult {
+            request_id,
+            accepted: false,
+            response_json: None,
+            error: Some(format!("{error:#}")),
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2381,7 +2499,9 @@ async fn handle_bootstrap_enrollment_submit(
     retrieval_token: Vec<u8>,
     request_json: Vec<u8>,
     config: &Config,
-) -> Result<()> {
+) -> Option<ControlMessage> {
+    let forwarding_id = Uuid::new_v4();
+    let expires = Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15));
     let result = async {
         if protocol_version != CONTROL_PROTOCOL_VERSION
             || request_id.is_nil()
@@ -2416,46 +2536,55 @@ async fn handle_bootstrap_enrollment_submit(
         pending.insert(
             request_id,
             PendingEnrollment {
+                forwarding_id,
                 relay_id: relay.id.clone(),
                 travel_id: travel_id.clone(),
                 home_id: home_id.clone(),
                 relay: relay_tx.clone(),
                 bootstrap: true,
                 installed: false,
-                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+                expires,
             },
         );
         drop(pending);
-        if home
-            .send(ControlMessage::BootstrapEnrollmentSubmit {
+        if let Err(error) = send_control_until(
+            &home,
+            ControlMessage::BootstrapEnrollmentSubmit {
                 protocol_version,
                 request_id,
                 travel_id,
                 home_id,
                 retrieval_token,
                 request_json,
-            })
-            .await
-            .is_err()
+            },
+            expires,
+        )
+        .await
         {
-            state.pending_enrollments.lock().await.remove(&request_id);
-            bail!("Home control session closed during first enrollment delivery");
+            let mut requests = state.pending_enrollments.lock().await;
+            if requests
+                .get(&request_id)
+                .is_some_and(|pending| pending.forwarding_id == forwarding_id)
+            {
+                requests.remove(&request_id);
+            }
+            return Err(error
+                .context("Home control session delivery failed during first enrollment delivery"));
         }
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = result {
-        relay_tx
-            .send(ControlMessage::BootstrapEnrollmentResult {
-                request_id,
-                accepted: false,
-                response_json: None,
-                seed_relays: Vec::new(),
-                error: Some(error.to_string()),
-            })
-            .await?;
-    }
-    Ok(())
+    // The Relay session owns its writer and is the sole consumer of relay_tx.
+    // Return an immediate failure to that writer instead of awaiting our own full queue.
+    result
+        .err()
+        .map(|error| ControlMessage::BootstrapEnrollmentResult {
+            request_id,
+            accepted: false,
+            response_json: None,
+            seed_relays: Vec::new(),
+            error: Some(format!("{error:#}")),
+        })
 }
 
 async fn complete_remote_enrollment(
@@ -2466,18 +2595,9 @@ async fn complete_remote_enrollment(
     response_json: Option<Vec<u8>>,
     error: Option<String>,
 ) -> Result<()> {
-    let pending = state
-        .pending_enrollments
-        .lock()
-        .await
-        .remove(&request_id)
-        .ok_or_else(|| anyhow!("unknown or expired remote enrollment request"))?;
-    if pending.home_id != home_id {
-        bail!("remote enrollment response came from the wrong Home");
-    }
-    if pending.installed {
-        bail!("Home returned an enrollment response for an install acknowledgement");
-    }
+    let Some(pending) = take_enrollment_response(state, home_id, request_id, false).await? else {
+        return Ok(());
+    };
     let message = if pending.bootstrap {
         let seed_relays = state
             .relay_directory
@@ -2503,11 +2623,12 @@ async fn complete_remote_enrollment(
             error,
         }
     };
-    pending
-        .relay
-        .send(message)
-        .await
-        .map_err(|_| anyhow!("Relay disconnected before enrollment response delivery"))?;
+    if let Err(error) = send_control_until(&pending.relay, message, pending.expires).await {
+        // The request is already retired. A slow or disconnected Relay must not tear down
+        // this healthy Home's independent control session or retain forwarding state.
+        warn!(%request_id, %error, "enrollment response delivery failed");
+        return Ok(());
+    }
     info!(
         %request_id,
         travel_id = %pending.travel_id,
@@ -2530,7 +2651,9 @@ async fn handle_remote_enrollment_installed(
     credential_id: Uuid,
     home_id: String,
     config: &Config,
-) -> Result<()> {
+) -> Option<ControlMessage> {
+    let forwarding_id = Uuid::new_v4();
+    let expires = Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15));
     let result = async {
         if request_id.is_nil() {
             bail!("remote enrollment install acknowledgement is invalid");
@@ -2565,43 +2688,53 @@ async fn handle_remote_enrollment_installed(
         pending.insert(
             request_id,
             PendingEnrollment {
+                forwarding_id,
                 relay_id: relay.id.clone(),
                 travel_id: travel_id.clone(),
                 home_id: home_id.clone(),
                 relay: relay_tx.clone(),
                 bootstrap: false,
                 installed: true,
-                expires: Instant::now() + Duration::from_secs(config.work_ttl_secs.max(15)),
+                expires,
             },
         );
         drop(pending);
-        if home
-            .send(ControlMessage::RemoteEnrollmentInstalled {
+        if let Err(error) = send_control_until(
+            &home,
+            ControlMessage::RemoteEnrollmentInstalled {
                 request_id,
                 travel_id,
                 travel_session_id,
                 credential_id,
                 home_id,
-            })
-            .await
-            .is_err()
+            },
+            expires,
+        )
+        .await
         {
-            state.pending_enrollments.lock().await.remove(&request_id);
-            bail!("Home control session closed during enrollment acknowledgement");
+            let mut requests = state.pending_enrollments.lock().await;
+            if requests
+                .get(&request_id)
+                .is_some_and(|pending| pending.forwarding_id == forwarding_id)
+            {
+                requests.remove(&request_id);
+            }
+            return Err(error.context(
+                "Home control session delivery failed during enrollment acknowledgement",
+            ));
         }
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = result {
-        relay_tx
-            .send(ControlMessage::RemoteEnrollmentInstalledAck {
-                request_id,
-                accepted: false,
-                error: Some(error.to_string()),
-            })
-            .await?;
-    }
-    Ok(())
+    // The Relay session owns its writer and is the sole consumer of relay_tx.
+    // Return an immediate failure to that writer instead of awaiting our own full queue.
+    result
+        .err()
+        .map(|error| ControlMessage::RemoteEnrollmentInstalledAck {
+            request_id,
+            accepted: false,
+            error: Some(format!("{error:#}")),
+        })
 }
 
 async fn complete_remote_enrollment_installed(
@@ -2611,25 +2744,44 @@ async fn complete_remote_enrollment_installed(
     accepted: bool,
     error: Option<String>,
 ) -> Result<()> {
-    let pending = state
-        .pending_enrollments
-        .lock()
-        .await
-        .remove(&request_id)
-        .ok_or_else(|| anyhow!("unknown or expired enrollment acknowledgement"))?;
-    if pending.home_id != home_id || !pending.installed {
-        bail!("enrollment acknowledgement came from the wrong Home or lifecycle stage");
-    }
-    pending
-        .relay
-        .send(ControlMessage::RemoteEnrollmentInstalledAck {
+    let Some(pending) = take_enrollment_response(state, home_id, request_id, true).await? else {
+        return Ok(());
+    };
+    if let Err(error) = send_control_until(
+        &pending.relay,
+        ControlMessage::RemoteEnrollmentInstalledAck {
             request_id,
             accepted,
             error,
-        })
-        .await
-        .map_err(|_| anyhow!("Relay disconnected before enrollment acknowledgement delivery"))?;
+        },
+        pending.expires,
+    )
+    .await
+    {
+        warn!(%request_id, %error, "enrollment acknowledgement delivery failed");
+    }
     Ok(())
+}
+
+async fn take_enrollment_response(
+    state: &State,
+    home_id: &str,
+    request_id: Uuid,
+    installed: bool,
+) -> Result<Option<PendingEnrollment>> {
+    let mut requests = state.pending_enrollments.lock().await;
+    let Some(pending) = requests.get(&request_id) else {
+        // Queue/response deadlines and disconnect cleanup can retire a valid request
+        // before its answer arrives. Such an answer must not disconnect the Home.
+        return Ok(None);
+    };
+    if pending.home_id != home_id || pending.installed != installed {
+        // Validate before removing so another Home cannot consume the real waiter.
+        bail!("enrollment response came from the wrong Home or lifecycle stage");
+    }
+    let expired = pending.expires <= Instant::now();
+    let pending = requests.remove(&request_id);
+    Ok(if expired { None } else { pending })
 }
 
 async fn accept_statistics_report(
@@ -3623,12 +3775,14 @@ mod tests {
                 .is_err()
         );
         assert!(grants.contains_key(&request_id));
-        assert!(
-            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,).is_ok()
-        );
-        assert!(
-            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,).is_err()
-        );
+        assert!(matches!(
+            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            take_matching_pending_grant(&mut grants, "relay-1", request_id, work_id, now,),
+            Ok(None)
+        ));
 
         let expired_request = Uuid::new_v4();
         let (home, _) = mpsc::channel(1);
@@ -3643,10 +3797,10 @@ mod tests {
                 expires: now,
             },
         );
-        assert!(
-            take_matching_pending_grant(&mut grants, "relay-1", expired_request, work_id, now,)
-                .is_err()
-        );
+        assert!(matches!(
+            take_matching_pending_grant(&mut grants, "relay-1", expired_request, work_id, now,),
+            Ok(None)
+        ));
         assert!(!grants.contains_key(&expired_request));
     }
 
@@ -3673,3 +3827,6 @@ mod tests {
 
 #[cfg(test)]
 mod service_class_tests;
+
+#[cfg(test)]
+mod backpressure_tests;

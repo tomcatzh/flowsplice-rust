@@ -21,6 +21,11 @@ use crate::{
 /// frames and heartbeat ticks remain eligible for processing, and further reads are paused.
 /// This function does not spawn tasks or emit a lifecycle event. The caller owns cancellation
 /// and must discard the socket afterward: cancellation during a write can leave a partial frame.
+/// Writes use `write_data_frame`'s bounded write timeout (currently 10 seconds). A selected
+/// write handler suspends the other select branches until it completes, so replacing it with
+/// an unbounded write would also disable heartbeat progress during a stalled write.
+/// Heartbeat checks run on ticks, and local event backpressure pauses reads; `timeout_period`
+/// is therefore a liveness threshold, not a strict upper bound on the connection lifetime.
 ///
 /// # Errors
 ///
@@ -71,6 +76,9 @@ where
             }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > timeout_period {
+                    if pending.is_some() {
+                        bail!("carrier receive timed out while flow event delivery was pending");
+                    }
                     bail!("carrier heartbeat timed out");
                 }
                 nonce = nonce.wrapping_add(1);

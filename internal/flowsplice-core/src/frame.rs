@@ -527,6 +527,45 @@ mod tests {
         assert_eq!(received.value, "hello");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn default_json_write_deadline_includes_partial_frame_and_flush() {
+        let message = Message {
+            value: "bounded".to_owned(),
+        };
+        for mut writer in [
+            Box::new(PartialThenStallWriter::default()) as Box<dyn AsyncWrite + Unpin>,
+            Box::new(FlushStallWriter::default()),
+        ] {
+            let started = tokio::time::Instant::now();
+            let error = timeout(
+                Duration::from_secs(11),
+                write_json(&mut writer, &message, 1024),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_data_write_deadline_protects_carrier_handlers() {
+        for codec in [DataFrameCodec::Json, DataFrameCodec::BinaryV1] {
+            let mut writer = PartialThenStallWriter::default();
+            let started = tokio::time::Instant::now();
+            let error = timeout(
+                Duration::from_secs(11),
+                write_data_frame(&mut writer, &DataFrame::Ping { nonce: 1 }, 1024, codec),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(10));
+        }
+    }
+
     #[tokio::test]
     async fn rejects_oversize_length_before_allocation() {
         use tokio::io::AsyncWriteExt;

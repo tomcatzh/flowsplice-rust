@@ -29,3 +29,6 @@ tokio-splice = "0.2.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

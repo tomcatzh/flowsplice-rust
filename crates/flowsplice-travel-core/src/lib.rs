@@ -4378,12 +4378,21 @@ async fn run_udp_association(
 ) -> Result<()> {
     let flow_id = Uuid::new_v4();
     state.begin_route_flow(flow_id, mapping).await;
-    let inner_shutdown = shutdown.clone();
-    let result = tokio::select! {
-        biased;
-        _ = shutdown.wait_for(|stopped| *stopped) => Ok((0, 0)),
-        result = run_udp_association_inner(state, mapping, Arc::clone(&endpoint), inner_shutdown, flow_id, &mut ready) => result,
-    };
+    let mut network_changes = state.network_generation.subscribe();
+    let mut counts = (0, 0);
+    let result = cancel_udp_association(
+        &mut shutdown,
+        &mut network_changes,
+        Box::pin(run_udp_association_inner(
+            state,
+            mapping,
+            Arc::clone(&endpoint),
+            flow_id,
+            &mut ready,
+            &mut counts,
+        )),
+    )
+    .await;
     if let Some(ready) = ready {
         let reason = result.as_ref().err().map_or_else(
             || "UDP connection cancelled".to_owned(),
@@ -4394,7 +4403,7 @@ async fn run_udp_association(
     if let (Some(failure), Err(error)) = (failure, &result) {
         failure.send_replace(Some(error.to_string()));
     }
-    let (uploaded_bytes, downloaded_bytes) = result.as_ref().copied().unwrap_or_default();
+    let (uploaded_bytes, downloaded_bytes) = counts;
     state
         .finish_route_flow(
             flow_id,
@@ -4412,26 +4421,16 @@ async fn run_udp_association_inner(
     state: &AppState,
     mapping: &Mapping,
     endpoint: Arc<dyn flowsplice_transport::DatagramIo>,
-    mut shutdown: watch::Receiver<bool>,
     flow_id: Uuid,
     ready: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
-) -> Result<(u64, u64)> {
-    let config = &state.config;
-    let mut network_changes = state.network_generation.subscribe();
+    counts: &mut (u64, u64),
+) -> Result<()> {
     let carrier = open_udp_carrier_for_association(state, mapping, flow_id).await?;
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(()));
     }
     let relay_id = carrier.relay_id.clone();
     state.select_route_relay(flow_id, &relay_id, None).await;
-    let data_codec = carrier.data_codec;
-    let business = carrier.stream;
-    let (mut reader, mut writer) = tokio::io::split(business);
-    let mut reader = DataFrameReader::new(&mut reader, DATA_FRAME_LIMIT, data_codec);
-    let mut send_sequence = 0_u64;
-    let mut receive_sequence = 0_u64;
-    let mut uploaded_bytes = 0_u64;
-    let mut downloaded_bytes = 0_u64;
     let dimensions = travel_udp_metric_dimensions(mapping, &relay_id);
     let mut upload_metrics = MetricBatch::new(
         (*state.statistics).clone(),
@@ -4443,30 +4442,82 @@ async fn run_udp_association_inner(
         "delivered_download_datagram_bytes".to_owned(),
         dimensions,
     );
+    pump_udp_association(
+        carrier.stream,
+        endpoint,
+        flow_id,
+        carrier.data_codec,
+        Duration::from_secs(state.config.udp_idle_secs),
+        counts,
+        |uploaded, downloaded, observation| {
+            if let Some((upload, count)) = observation {
+                let metrics = if upload {
+                    &mut upload_metrics
+                } else {
+                    &mut download_metrics
+                };
+                metrics.record(unix_time_secs()?, count);
+                let counter = if upload {
+                    &state.uploaded_bytes
+                } else {
+                    &state.downloaded_bytes
+                };
+                counter.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                upload_metrics.flush();
+                download_metrics.flush();
+            }
+            Ok(state.update_route_flow_counters(flow_id, uploaded, downloaded))
+        },
+    )
+    .await
+}
+
+async fn cancel_udp_association(
+    shutdown: &mut watch::Receiver<bool>,
+    network_changes: &mut watch::Receiver<u64>,
+    operation: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopped| *stopped) => Ok(()),
+        changed = network_changes.changed() => changed.context("network change notifier stopped"),
+        result = operation => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_udp_association<S, F, Fut>(
+    business: S,
+    endpoint: Arc<dyn flowsplice_transport::DatagramIo>,
+    flow_id: Uuid,
+    data_codec: DataFrameCodec,
+    idle: Duration,
+    counts: &mut (u64, u64),
+    mut observe: F,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(u64, u64, Option<(bool, u64)>) -> Result<Fut>,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (mut reader, mut writer) = tokio::io::split(business);
+    let mut reader = DataFrameReader::new(&mut reader, DATA_FRAME_LIMIT, data_codec);
+    let mut send_sequence = 0_u64;
+    let mut receive_sequence = 0_u64;
     let mut metrics_tick = interval(Duration::from_secs(5));
     metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = tokio::time::Instant::now();
-    let result: Result<()> = async {
     loop {
         tokio::select! {
-            changed = network_changes.changed() => {
-                changed.context("network change notifier stopped")?;
-                return Ok(());
-            }
-            changed = shutdown.changed() => {
-                let _ = changed;
-                return Ok(());
-            }
-            _ = metrics_tick.tick() => { upload_metrics.flush(); download_metrics.flush(); }
-            () = tokio::time::sleep_until(last_activity + Duration::from_secs(config.udp_idle_secs)) => bail!("UDP association idle timeout"),
+            _ = metrics_tick.tick() => observe(counts.0, counts.1, None)?.await,
+            () = tokio::time::sleep_until(last_activity + idle) => bail!("UDP association idle timeout"),
             datagram = endpoint.recv() => {
                 let Ok(bytes) = datagram else { return Ok(()); };
                 last_activity = tokio::time::Instant::now();
                 let count = bytes.len() as u64;
-                uploaded_bytes = uploaded_bytes.saturating_add(count);
-                upload_metrics.record(unix_time_secs()?, count);
-                state.uploaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
+                counts.0 = counts.0.saturating_add(count);
+                observe(counts.0, counts.1, Some((true, count)))?.await;
                 write_data_frame(&mut writer, &DataFrame::Datagram { flow_id, sequence: send_sequence, bytes: bytes.into() }, DATA_FRAME_LIMIT, data_codec).await?;
                 send_sequence = send_sequence.wrapping_add(1);
             }
@@ -4475,12 +4526,10 @@ async fn run_udp_association_inner(
                 match frame? {
                     DataFrame::Datagram { flow_id: id, sequence, bytes } if id == flow_id && sequence >= receive_sequence && bytes.len() <= 65_507 => {
                         if sequence == receive_sequence {
-                            endpoint.send(&bytes).await?;
+                            timeout(idle, endpoint.send(&bytes)).await.context("UDP application write timed out")??;
                             let count = bytes.len() as u64;
-                            downloaded_bytes = downloaded_bytes.saturating_add(count);
-                            download_metrics.record(unix_time_secs()?, count);
-                            state.downloaded_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                            state.update_route_flow_counters(flow_id, uploaded_bytes, downloaded_bytes).await;
+                            counts.1 = counts.1.saturating_add(count);
+                            observe(counts.0, counts.1, Some((false, count)))?.await;
                             receive_sequence = receive_sequence.wrapping_add(1);
                         }
                     }
@@ -4490,10 +4539,6 @@ async fn run_udp_association_inner(
             }
         }
     }
-    }
-    .await;
-    result?;
-    Ok((uploaded_bytes, downloaded_bytes))
 }
 
 async fn open_udp_carrier_for_association(
@@ -6022,3 +6067,6 @@ mod tests {
         assert_eq!(diagnostics.events.front().map(|event| event.id), Some(5));
     }
 }
+
+#[cfg(test)]
+mod udp_regressions;

@@ -57,14 +57,16 @@ use tokio::io::copy_bidirectional;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream, lookup_host},
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch},
-    time::{interval, timeout},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
+    time::{interval, timeout, timeout_at},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 mod openwrt;
+mod requests;
+use requests::{PendingRequests, RequestError};
 
 #[derive(Parser)]
 #[command(version)]
@@ -200,8 +202,8 @@ struct AdvertisedEndpoint {
 struct State {
     server_session: Mutex<Option<ServerSession>>,
     relay_directory: RwLock<RelayDirectory>,
-    requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<ServerGrant, String>>>>,
-    session_requests: Mutex<HashMap<Uuid, oneshot::Sender<Result<SignedControlSnapshot, String>>>>,
+    requests: PendingRequests<Uuid, Result<ServerGrant, String>>,
+    session_requests: PendingRequests<Uuid, Result<SignedControlSnapshot, String>>,
     routes: Mutex<HashMap<Uuid, PendingRoute>>,
     authorization_tx: watch::Sender<Option<Arc<VerifiedAuthorization>>>,
     authorization_cache: Mutex<AuthorizationCache>,
@@ -210,12 +212,10 @@ struct State {
     statistics: Arc<LocalStatistics>,
     statistics_signer: Arc<EcdsaKeyPair>,
     statistics_certificate_pem: Arc<String>,
-    report_requests: Mutex<HashMap<String, oneshot::Sender<std::result::Result<(), String>>>>,
-    enrollment_requests: Mutex<HashMap<Uuid, oneshot::Sender<RemoteEnrollmentResponse>>>,
-    enrollment_install_requests:
-        Mutex<HashMap<Uuid, oneshot::Sender<RemoteEnrollmentInstalledResponse>>>,
-    bootstrap_enrollment_requests:
-        Mutex<HashMap<Uuid, oneshot::Sender<BootstrapEnrollmentResponse>>>,
+    report_requests: PendingRequests<String, std::result::Result<(), String>>,
+    enrollment_requests: PendingRequests<Uuid, RemoteEnrollmentResponse>,
+    enrollment_install_requests: PendingRequests<Uuid, RemoteEnrollmentInstalledResponse>,
+    bootstrap_enrollment_requests: PendingRequests<Uuid, BootstrapEnrollmentResponse>,
     advertised_endpoint: watch::Receiver<Option<AdvertisedEndpoint>>,
 }
 
@@ -233,8 +233,8 @@ impl State {
         Self {
             server_session: Mutex::new(None),
             relay_directory: RwLock::new(RelayDirectory::default()),
-            requests: Mutex::new(HashMap::new()),
-            session_requests: Mutex::new(HashMap::new()),
+            requests: PendingRequests::new(),
+            session_requests: PendingRequests::new(),
             routes: Mutex::new(HashMap::new()),
             authorization_tx,
             authorization_cache: Mutex::new(authorization_cache),
@@ -243,10 +243,10 @@ impl State {
             statistics: Arc::new(statistics),
             statistics_signer: Arc::new(statistics_signer),
             statistics_certificate_pem: Arc::new(statistics_certificate_pem),
-            report_requests: Mutex::new(HashMap::new()),
-            enrollment_requests: Mutex::new(HashMap::new()),
-            enrollment_install_requests: Mutex::new(HashMap::new()),
-            bootstrap_enrollment_requests: Mutex::new(HashMap::new()),
+            report_requests: PendingRequests::new(),
+            enrollment_requests: PendingRequests::new(),
+            enrollment_install_requests: PendingRequests::new(),
+            bootstrap_enrollment_requests: PendingRequests::new(),
             advertised_endpoint,
         }
     }
@@ -720,6 +720,18 @@ async fn wait_for_listener_device(
     }
 }
 
+async fn accept_management(
+    listener: &TcpListener,
+    permits: &Arc<Semaphore>,
+) -> Result<(TcpStream, SocketAddr, OwnedSemaphorePermit)> {
+    let permit = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("Relay management connection budget closed"))?;
+    let (socket, peer) = listener.accept().await?;
+    Ok((socket, peer, permit))
+}
+
 async fn run_management(
     config: Config,
     state: Arc<State>,
@@ -745,13 +757,9 @@ async fn run_management(
             "relay management listener ready"
         );
         loop {
-            let permit = Arc::clone(&permits)
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("Relay management connection budget closed"))?;
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (socket, peer) = accepted?;
+                accepted = accept_management(&listener, &permits) => {
+                    let (socket, peer, permit) = accepted?;
                     let acceptor = acceptor.clone();
                     let config = config.clone();
                     let state = Arc::clone(&state);
@@ -805,7 +813,6 @@ async fn run_management(
                     });
                 }
                 changed = network_receiver.changed(), if dynamic => {
-                    drop(permit);
                     changed.map_err(|_| anyhow!("OpenWrt network monitor closed"))?;
                     let next_device = network_receiver
                         .borrow()
@@ -924,6 +931,7 @@ async fn forward_bootstrap_enrollment(
     request_json: Vec<u8>,
     request_timeout: Duration,
 ) -> Result<BootstrapEnrollmentResponse> {
+    let deadline = tokio::time::Instant::now() + request_timeout;
     if request_id.is_nil()
         || travel_id.is_empty()
         || home_id.is_empty()
@@ -933,54 +941,37 @@ async fn forward_bootstrap_enrollment(
     {
         bail!("first enrollment request is invalid or oversized");
     }
-    let server = state
-        .server_session
-        .lock()
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| anyhow!("first enrollment request timed out"))?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| anyhow!("Server is unavailable for first enrollment"))?;
-    let (response, receive) = oneshot::channel();
-    if state
+    state
         .bootstrap_enrollment_requests
-        .lock()
-        .await
-        .insert(request_id, response)
-        .is_some()
-    {
-        bail!("first enrollment request is already in flight");
-    }
-    if server
-        .send(ControlMessage::BootstrapEnrollmentSubmit {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
+        .request(
             request_id,
-            travel_id,
-            home_id,
-            retrieval_token,
-            request_json,
-        })
+            &server,
+            ControlMessage::BootstrapEnrollmentSubmit {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                request_id,
+                travel_id,
+                home_id,
+                retrieval_token,
+                request_json,
+            },
+            deadline,
+        )
         .await
-        .is_err()
-    {
-        state
-            .bootstrap_enrollment_requests
-            .lock()
-            .await
-            .remove(&request_id);
-        bail!("Server connection closed during first enrollment");
-    }
-    match timeout(request_timeout, receive).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => bail!("first enrollment response channel closed"),
-        Err(_) => {
-            state
-                .bootstrap_enrollment_requests
-                .lock()
-                .await
-                .remove(&request_id);
-            bail!("first enrollment request timed out")
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => "first enrollment request is already in flight",
+                RequestError::QueueClosed => "Server connection closed during first enrollment",
+                RequestError::ResponseClosed => "first enrollment response channel closed",
+                RequestError::TimedOut => "first enrollment request timed out",
+            };
+            anyhow!(message)
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1135,24 +1126,16 @@ where
                             apply_relay_directory(&state, directory).await?;
                         }
                         ControlMessage::ServerRelayGrant { request_id, work_id, work_secret, credential_id, home_id, expires_at_unix_secs } => {
-                            if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Ok(ServerGrant { work_id, work_secret, credential_id, home_id, expires_at_unix_secs }));
-                            }
+                            state.requests.complete(&request_id, Ok(ServerGrant { work_id, work_secret, credential_id, home_id, expires_at_unix_secs }));
                         }
                         ControlMessage::RouteDenied { request_id, reason } => {
-                            if let Some(waiter) = state.requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Err(reason));
-                            }
+                            state.requests.complete(&request_id, Err(reason));
                         }
                         ControlMessage::TravelSessionAccepted { request_id, snapshot } => {
-                            if let Some(waiter) = state.session_requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Ok(snapshot));
-                            }
+                            state.session_requests.complete(&request_id, Ok(snapshot));
                         }
                         ControlMessage::TravelSessionDenied { request_id, reason } => {
-                            if let Some(waiter) = state.session_requests.lock().await.remove(&request_id) {
-                                let _ = waiter.send(Err(reason));
-                            }
+                            state.session_requests.complete(&request_id, Err(reason));
                         }
                         ControlMessage::Heartbeat { nonce } => {
                             write_json(&mut writer, &ControlMessage::HeartbeatAck { nonce }, CONTROL_FRAME_LIMIT).await?;
@@ -1160,13 +1143,11 @@ where
                         ControlMessage::HeartbeatAck { .. }
                         | ControlMessage::RelayEndpointAccepted => {}
                         ControlMessage::StatisticsReportAck { digest_sha256, accepted, error } => {
-                            if let Some(response) = state.report_requests.lock().await.remove(&digest_sha256) {
-                                let _ = response.send(if accepted {
+                            if !state.report_requests.complete(&digest_sha256, if accepted {
                                     Ok(())
                                 } else {
                                     Err(error.unwrap_or_else(|| "Server rejected the statistics report".to_owned()))
-                                });
-                            } else if accepted
+                                }) && accepted
                                 && let Some(key) = local_report_keys.remove(&digest_sha256)
                             {
                                 let statistics = Arc::clone(&state.statistics);
@@ -1177,31 +1158,25 @@ where
                             }
                         }
                         ControlMessage::RemoteEnrollmentResult { request_id, accepted, response_json, error } => {
-                            if let Some(response) = state.enrollment_requests.lock().await.remove(&request_id) {
-                                let _ = response.send(RemoteEnrollmentResponse {
+                            state.enrollment_requests.complete(&request_id, RemoteEnrollmentResponse {
                                     accepted,
                                     response_json,
                                     error,
                                 });
-                            }
                         }
                         ControlMessage::RemoteEnrollmentInstalledAck { request_id, accepted, error } => {
-                            if let Some(response) = state.enrollment_install_requests.lock().await.remove(&request_id) {
-                                let _ = response.send(RemoteEnrollmentInstalledResponse {
+                            state.enrollment_install_requests.complete(&request_id, RemoteEnrollmentInstalledResponse {
                                     accepted,
                                     error,
                                 });
-                            }
                         }
                         ControlMessage::BootstrapEnrollmentResult { request_id, accepted, response_json, seed_relays, error } => {
-                            if let Some(response) = state.bootstrap_enrollment_requests.lock().await.remove(&request_id) {
-                                let _ = response.send(BootstrapEnrollmentResponse {
+                            state.bootstrap_enrollment_requests.complete(&request_id, BootstrapEnrollmentResponse {
                                     accepted,
                                     response_json,
                                     seed_relays,
                                     error,
                                 });
-                            }
                         }
                         _ => bail!("unexpected message from server"),
                     }
@@ -1302,6 +1277,7 @@ async fn forward_travel_statistics(
     report: SignedStatisticsReport,
     request_timeout: Duration,
 ) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + request_timeout;
     let report_identity = identity_from_certificate_pem(&report.certificate_pem)?;
     let verified = report.verify(&report_identity.signing_public_key)?;
     if report_identity.role != Role::Travel
@@ -1314,40 +1290,31 @@ async fn forward_travel_statistics(
         bail!("Travel statistics report is not bound to its authenticated session");
     }
     let digest = verified.digest_sha256;
-    let server = state
-        .server_session
-        .lock()
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| anyhow!("statistics report timed out"))?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| anyhow!("Server is unavailable for statistics reporting"))?;
-    let (response, receive) = oneshot::channel();
-    if state
+    state
         .report_requests
-        .lock()
+        .request(
+            digest,
+            &server,
+            ControlMessage::StatisticsReport { report },
+            deadline,
+        )
         .await
-        .insert(digest.clone(), response)
-        .is_some()
-    {
-        bail!("duplicate in-flight Travel statistics report");
-    }
-    if server
-        .send(ControlMessage::StatisticsReport { report })
-        .await
-        .is_err()
-    {
-        state.report_requests.lock().await.remove(&digest);
-        bail!("Server connection closed during statistics reporting");
-    }
-    match timeout(request_timeout, receive).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => bail!(error),
-        Ok(Err(_)) => bail!("statistics response channel closed"),
-        Err(_) => {
-            state.report_requests.lock().await.remove(&digest);
-            bail!("statistics report timed out")
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => "duplicate in-flight Travel statistics report",
+                RequestError::QueueClosed => "Server connection closed during statistics reporting",
+                RequestError::ResponseClosed => "statistics response channel closed",
+                RequestError::TimedOut => "statistics report timed out",
+            };
+            anyhow!(message)
+        })?
+        .map_err(|error| anyhow!(error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1361,49 +1328,41 @@ async fn forward_remote_enrollment(
     request_json: Vec<u8>,
     request_timeout: Duration,
 ) -> Result<RemoteEnrollmentResponse> {
+    let deadline = tokio::time::Instant::now() + request_timeout;
     if request_id.is_nil() || request_json.is_empty() || request_json.len() > 512 * 1024 {
         bail!("remote enrollment request is missing or oversized");
     }
-    let server = state
-        .server_session
-        .lock()
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| anyhow!("remote enrollment request timed out"))?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| anyhow!("Server is unavailable for remote enrollment"))?;
-    let (response, receive) = oneshot::channel();
-    if state
+    state
         .enrollment_requests
-        .lock()
-        .await
-        .insert(request_id, response)
-        .is_some()
-    {
-        bail!("remote enrollment request is already in flight");
-    }
-    if server
-        .send(ControlMessage::RemoteEnrollmentSubmit {
+        .request(
             request_id,
-            travel_id: travel_id.to_owned(),
-            travel_session_id,
-            credential_id,
-            home_id,
-            request_json,
-        })
+            &server,
+            ControlMessage::RemoteEnrollmentSubmit {
+                request_id,
+                travel_id: travel_id.to_owned(),
+                travel_session_id,
+                credential_id,
+                home_id,
+                request_json,
+            },
+            deadline,
+        )
         .await
-        .is_err()
-    {
-        state.enrollment_requests.lock().await.remove(&request_id);
-        bail!("Server connection closed during remote enrollment");
-    }
-    match timeout(request_timeout, receive).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => bail!("remote enrollment response channel closed"),
-        Err(_) => {
-            state.enrollment_requests.lock().await.remove(&request_id);
-            bail!("remote enrollment request timed out")
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => "remote enrollment request is already in flight",
+                RequestError::QueueClosed => "Server connection closed during remote enrollment",
+                RequestError::ResponseClosed => "remote enrollment response channel closed",
+                RequestError::TimedOut => "remote enrollment request timed out",
+            };
+            anyhow!(message)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1416,56 +1375,44 @@ async fn forward_remote_enrollment_installed(
     home_id: String,
     request_timeout: Duration,
 ) -> Result<RemoteEnrollmentInstalledResponse> {
+    let deadline = tokio::time::Instant::now() + request_timeout;
     if request_id.is_nil() {
         bail!("remote enrollment install request is invalid");
     }
-    let server = state
-        .server_session
-        .lock()
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| anyhow!("remote enrollment acknowledgement timed out"))?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| anyhow!("Server is unavailable for remote enrollment acknowledgement"))?;
-    let (response, receive) = oneshot::channel();
-    if state
+    state
         .enrollment_install_requests
-        .lock()
-        .await
-        .insert(request_id, response)
-        .is_some()
-    {
-        bail!("remote enrollment install acknowledgement is already in flight");
-    }
-    if server
-        .send(ControlMessage::RemoteEnrollmentInstalled {
+        .request(
             request_id,
-            travel_id: travel_id.to_owned(),
-            travel_session_id,
-            credential_id,
-            home_id,
-        })
+            &server,
+            ControlMessage::RemoteEnrollmentInstalled {
+                request_id,
+                travel_id: travel_id.to_owned(),
+                travel_session_id,
+                credential_id,
+                home_id,
+            },
+            deadline,
+        )
         .await
-        .is_err()
-    {
-        state
-            .enrollment_install_requests
-            .lock()
-            .await
-            .remove(&request_id);
-        bail!("Server connection closed during remote enrollment acknowledgement");
-    }
-    match timeout(request_timeout, receive).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => bail!("remote enrollment acknowledgement channel closed"),
-        Err(_) => {
-            state
-                .enrollment_install_requests
-                .lock()
-                .await
-                .remove(&request_id);
-            bail!("remote enrollment acknowledgement timed out")
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => {
+                    "remote enrollment install acknowledgement is already in flight"
+                }
+                RequestError::QueueClosed => {
+                    "Server connection closed during remote enrollment acknowledgement"
+                }
+                RequestError::ResponseClosed => "remote enrollment acknowledgement channel closed",
+                RequestError::TimedOut => "remote enrollment acknowledgement timed out",
+            };
+            anyhow!(message)
+        })
 }
 
 fn record_relay_metric(
@@ -1872,21 +1819,28 @@ async fn release_travel_session(
     travel_session_id: Uuid,
     lease_id: Uuid,
 ) {
-    let server = state
-        .server_session
-        .lock()
-        .await
-        .as_ref()
-        .map(|session| session.tx.clone());
-    if let Some(server) = server {
-        let _ = server
-            .send(ControlMessage::TravelSessionRelease {
-                travel_id: travel_id.to_owned(),
-                travel_session_id,
-                lease_id,
-            })
-            .await;
-    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let _ = timeout_at(deadline, async {
+        let server = state
+            .server_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.tx.clone());
+        if let Some(server) = server {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let _ = server
+                .send(ControlMessage::TravelSessionRelease {
+                    travel_id: travel_id.to_owned(),
+                    travel_session_id,
+                    lease_id,
+                })
+                .await;
+        }
+    })
+    .await;
 }
 
 async fn authorize_travel_session(
@@ -1897,38 +1851,40 @@ async fn authorize_travel_session(
     config: &Config,
     state: &Arc<State>,
 ) -> Result<SignedControlSnapshot, String> {
-    let server = state
-        .server_session
-        .lock()
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.handshake_timeout_secs);
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| "Travel session authorization timed out".to_owned())?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| "server is unavailable for Travel session authorization".to_owned())?;
     let request_id = Uuid::new_v4();
-    let (tx, rx) = oneshot::channel();
-    state.session_requests.lock().await.insert(request_id, tx);
-    if server
-        .send(ControlMessage::TravelSessionAuthorize {
+    state
+        .session_requests
+        .request(
             request_id,
-            travel_id: travel_id.to_owned(),
-            travel_session_id,
-            credential_id,
-            lease_id,
-        })
+            &server,
+            ControlMessage::TravelSessionAuthorize {
+                request_id,
+                travel_id: travel_id.to_owned(),
+                travel_session_id,
+                credential_id,
+                lease_id,
+            },
+            deadline,
+        )
         .await
-        .is_err()
-    {
-        state.session_requests.lock().await.remove(&request_id);
-        return Err("server connection closed during Travel session authorization".to_owned());
-    }
-    match timeout(Duration::from_secs(config.handshake_timeout_secs), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("Travel session response channel closed".to_owned()),
-        Err(_) => {
-            state.session_requests.lock().await.remove(&request_id);
-            Err("Travel session authorization timed out".to_owned())
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => "Travel session request is already in flight",
+                RequestError::QueueClosed => {
+                    "server connection closed during Travel session authorization"
+                }
+                RequestError::ResponseClosed => "Travel session response channel closed",
+                RequestError::TimedOut => "Travel session authorization timed out",
+            };
+            message.to_owned()
+        })?
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2009,6 +1965,8 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
             SystemRandom::new()
                 .fill(&mut route_secret)
                 .map_err(|_| anyhow!("AWS-LC random generation failed"))?;
+            let expires =
+                Instant::now() + Duration::from_secs(remaining.min(config.route_ttl_secs));
             state.routes.lock().await.insert(
                 route_id,
                 PendingRoute {
@@ -2019,32 +1977,44 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
                     route_secret: route_secret.clone(),
                     work_secret: grant.work_secret,
                     created: Instant::now(),
-                    expires: Instant::now()
-                        + Duration::from_secs(remaining.min(config.route_ttl_secs)),
+                    expires,
                     travel: None,
                     home: None,
                     _permit: route_permit,
                 },
             );
-            let server = state
-                .server_session
-                .lock()
-                .await
-                .as_ref()
-                .map(|session| session.tx.clone())
-                .ok_or_else(|| anyhow!("server disconnected before Relay work readiness"))?;
-            if server
-                .send(ControlMessage::RelayWorkReady {
-                    request_id: request.request,
-                    work_id: grant.work_id,
-                })
-                .await
-                .is_err()
-            {
+            let readiness_deadline = tokio::time::Instant::from_std(
+                expires.min(Instant::now() + Duration::from_secs(10)),
+            );
+            let readiness = timeout_at(readiness_deadline, async {
+                let server = state
+                    .server_session
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|session| session.tx.clone())
+                    .ok_or_else(|| anyhow!("server disconnected before Relay work readiness"))?;
+                if tokio::time::Instant::now() >= readiness_deadline {
+                    bail!("Relay work readiness timed out");
+                }
+                server
+                    .send(ControlMessage::RelayWorkReady {
+                        request_id: request.request,
+                        work_id: grant.work_id,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("server disconnected before Relay work readiness"))
+            })
+            .await;
+            let readiness = match readiness {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Relay work readiness timed out")),
+            };
+            if let Err(error) = readiness {
                 state.routes.lock().await.remove(&route_id);
-                bail!("server disconnected before Relay work readiness");
+                return Err(error);
             }
-            write_json(
+            if let Err(error) = write_json(
                 writer,
                 &ControlMessage::RouteGrant {
                     request_id: request.request,
@@ -2054,7 +2024,11 @@ async fn handle_travel_route<W: tokio::io::AsyncWrite + Unpin>(
                 },
                 CONTROL_FRAME_LIMIT,
             )
-            .await?;
+            .await
+            {
+                state.routes.lock().await.remove(&route_id);
+                return Err(error.into());
+            }
         }
         Ok(_) => {
             record_relay_metric(
@@ -2100,37 +2074,37 @@ async fn request_server_route(
     request: &TravelRouteContext,
     state: &Arc<State>,
 ) -> Result<ServerGrant, String> {
-    let server = state
-        .server_session
-        .lock()
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let server = timeout_at(deadline, state.server_session.lock())
         .await
+        .map_err(|_| "route request timed out".to_owned())?
         .as_ref()
         .map(|session| session.tx.clone())
         .ok_or_else(|| "server is unavailable".to_owned())?;
-    let (tx, rx) = oneshot::channel();
-    state.requests.lock().await.insert(request.request, tx);
-    if server
-        .send(ControlMessage::RouteRequest {
-            request_id: request.request,
-            travel_id: request.travel.clone(),
-            travel_session_id: request.travel_session,
-            credential_id: request.credential,
-            home_id: request.home.clone(),
-        })
+    state
+        .requests
+        .request(
+            request.request,
+            &server,
+            ControlMessage::RouteRequest {
+                request_id: request.request,
+                travel_id: request.travel.clone(),
+                travel_session_id: request.travel_session,
+                credential_id: request.credential,
+                home_id: request.home.clone(),
+            },
+            deadline,
+        )
         .await
-        .is_err()
-    {
-        state.requests.lock().await.remove(&request.request);
-        return Err("server connection closed".to_owned());
-    }
-    match timeout(Duration::from_secs(10), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("route response channel closed".to_owned()),
-        Err(_) => {
-            state.requests.lock().await.remove(&request.request);
-            Err("route request timed out".to_owned())
-        }
-    }
+        .map_err(|error| {
+            let message = match error {
+                RequestError::Duplicate => "route request is already in flight",
+                RequestError::QueueClosed => "server connection closed",
+                RequestError::ResponseClosed => "route response channel closed",
+                RequestError::TimedOut => "route request timed out",
+            };
+            message.to_owned()
+        })?
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2581,6 +2555,51 @@ mod tests {
     use super::*;
     use flowsplice_core::route::{RoutePreface, read_preface, write_preface};
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn management_network_change_cancels_saturated_admission_without_leak() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let occupied = Arc::clone(&permits).acquire_owned().await.unwrap();
+        let (network, mut changes) = watch::channel(0);
+        let change = async {
+            tokio::task::yield_now().await;
+            network.send(1).unwrap();
+        };
+        let admission = async {
+            tokio::select! {
+                result = accept_management(&listener, &permits) => panic!("unexpected admission: {result:?}"),
+                result = changes.changed() => result.unwrap(),
+            }
+        };
+        tokio::join!(admission, change);
+        assert_eq!(permits.available_permits(), 0);
+        drop(occupied);
+        assert_eq!(permits.available_permits(), 1);
+        drop(listener);
+        let rebound = TcpListener::bind(address).await.unwrap();
+        // Cancellation after permit acquisition but before accept also returns it.
+        {
+            let admission = accept_management(&rebound, &permits);
+            tokio::pin!(admission);
+            tokio::select! {
+                result = &mut admission => panic!("unexpected admission: {result:?}"),
+                () = tokio::task::yield_now() => {},
+            }
+            assert_eq!(permits.available_permits(), 0);
+        }
+        assert_eq!(permits.available_permits(), 1);
+        let (client, accepted) = tokio::join!(
+            TcpStream::connect(address),
+            accept_management(&rebound, &permits)
+        );
+        let _client = client.unwrap();
+        let (_, _, permit) = accepted.unwrap();
+        assert_eq!(permits.available_permits(), 0);
+        drop(permit);
+        assert_eq!(permits.available_permits(), 1);
+    }
 
     #[test]
     fn endpoint_registration_derives_exact_and_wildcard_listener_addresses() {
