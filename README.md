@@ -10,8 +10,8 @@ plane and never binds a business-data listener.
 > configuration, protocols, persisted state, and deployment artifacts may change without backward
 > compatibility.
 
-[FlowSplice 0.4](docs/releases/0.4.md) is the current source release, with Cargo package
-version `0.4.0`. It publishes source code and release notes without binary attachments.
+[FlowSplice 0.4.1](docs/releases/0.4.1.md) is the current source release, with Cargo package
+version `0.4.1`. It publishes source code and release notes without binary attachments.
 See the release notes for the pinned revision, validation results, and remaining limitations.
 Generic native Travel clients for Android, iOS/iPadOS, and macOS remain available alongside the
 command-line applications. Native installers are built privately

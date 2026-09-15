@@ -570,7 +570,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "flowsplice-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-echo"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-enrollment"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-foobar"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-home-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-homeagent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-pty-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-pty-codec"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cc",
  "cmake",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-pty-home"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-pty-native"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-pty-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-pty-codec",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-relay"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-travel-android"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-travel-apple"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-travel-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-travelagent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "flowsplice-travel-core",
