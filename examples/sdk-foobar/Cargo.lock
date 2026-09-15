@@ -308,8 +308,8 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flowsplice-core"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -330,8 +330,8 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-enrollment"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -365,8 +365,8 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-home-core"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -383,8 +383,8 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-storage"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -397,8 +397,8 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-transport"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "flowsplice-core",
@@ -408,8 +408,8 @@ dependencies = [
 
 [[package]]
 name = "flowsplice-travel-core"
-version = "0.4.0"
-source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#1b822daa2773b5ffdb66a108be3f1f4201611c37"
+version = "0.4.1"
+source = "git+https://github.com/tomcatzh/flowsplice-rust?branch=main#fe619b03cf4f6f213e5814affd4dc314194e7f0d"
 dependencies = [
  "anyhow",
  "aws-lc-rs",

@@ -234,12 +234,14 @@ async fn closing_attach_does_not_submit_partial_input_or_end_shell() -> Result<(
     let (b, mut be, _bg) = connection("second", unix_time_secs()? + 60);
     let (bid, _, epoch) = attached(session.attach(&b, Mode::ReadWrite, 80, 24).await?)?;
     session.start_output(bid)?;
+    // Clear the unfinished line without SIGINT, which can discard the command
+    // sent in the same write while the shell handles the interrupt.
     session
         .input(
             &b,
             bid,
             epoch,
-            b"\x03printf '\\162\\145\\163\\165\\155\\145-OK\\n'\r",
+            b"\x15printf '\\162\\145\\163\\165\\155\\145-OK\\n'\r",
         )
         .await?;
     output_contains(&mut be, "resume-OK").await?;
