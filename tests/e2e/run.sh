@@ -37,8 +37,30 @@ rm -rf \
   "${generated_dir}/dynamic-travel" \
   "${generated_dir}/travel"
 
+if [[ "${skip_build}" == "1" ]]; then
+  docker image inspect "${FLOWSPLICE_E2E_IMAGE}" >/dev/null
+else
+  docker build \
+    --pull="${docker_pull}" \
+    --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
+    --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
+    --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
+    -f "${repo_root}/docker/e2e.Dockerfile" \
+    -t "${FLOWSPLICE_E2E_IMAGE}" \
+    "${repo_root}"
+fi
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
-  "${repo_root}/tests/e2e/generate-certs.sh"
+  # Use the image's pinned OpenSSL: host OpenSSL builds differ, and the generator discards
+  # their errors, so keep a trace that names a failing command.
+  if ! docker run --rm \
+    --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+    -v "${repo_root}/tests/e2e:/e2e" -w /e2e \
+    "${FLOWSPLICE_E2E_IMAGE}" \
+    bash -x /e2e/generate-certs.sh >"${generated_dir}/generate-certs.trace" 2>&1; then
+    tail -n 40 "${generated_dir}/generate-certs.trace" >&2
+    printf 'Certificate generation failed; trace: %s\n' "${generated_dir}/generate-certs.trace" >&2
+    exit 1
+  fi
 else
   find "${generated_dir}/state" -maxdepth 1 -type f ! -name relay-pins.json -delete
   rm -rf "${generated_dir}/state/travel-enrollment"
@@ -62,18 +84,6 @@ for template in "${repo_root}"/tests/e2e/config/*.toml; do
   output="${generated_dir}/config/$(basename -- "${template}")"
   sed -e "s/__SERVER_PIN__/${server_pin}/g" "${template}" >"${output}"
 done
-if [[ "${skip_build}" == "1" ]]; then
-  docker image inspect "${FLOWSPLICE_E2E_IMAGE}" >/dev/null
-else
-  docker build \
-    --pull="${docker_pull}" \
-    --build-arg "RUST_MIRROR_URL=${rust_mirror_url}" \
-    --build-arg "RUSTUP_DIST_SERVER=${rustup_dist_server}" \
-    --build-arg "RUSTUP_UPDATE_ROOT=${rustup_update_root}" \
-    -f "${repo_root}/docker/e2e.Dockerfile" \
-    -t "${FLOWSPLICE_E2E_IMAGE}" \
-    "${repo_root}"
-fi
 
 expected_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${repo_root}/Cargo.toml" | head -n 1)"
 for binary in flowsplice-server flowsplice-relay flowsplice-homeagent flowsplice-travelagent; do

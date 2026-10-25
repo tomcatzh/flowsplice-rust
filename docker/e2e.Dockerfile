@@ -78,6 +78,8 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
     cp target/release/travel-login-probe /out/
 
 FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+# bash/openssl/python3 run tests/e2e/generate-certs.sh with a pinned toolchain.
+RUN apk add --no-cache bash openssl python3
 RUN addgroup -S flowsplice && adduser -S -G flowsplice flowsplice
 COPY --from=build /out/flowsplice-server /usr/local/bin/
 COPY --from=build /out/flowsplice-relay /usr/local/bin/
