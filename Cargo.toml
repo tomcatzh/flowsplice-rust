@@ -75,6 +75,12 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 
+# Build scripts and proc-macros only run on the build host. Stripping them with an
+# Xcode MACOSX_DEPLOYMENT_TARGET under the macOS 27 / Xcode 27 toolchain yields
+# dylibs that dyld rejects ("mis-aligned LINKEDIT string pool").
+[profile.release.build-override]
+strip = "none"
+
 [profile.android-release]
 inherits = "release"
 panic = "unwind"
