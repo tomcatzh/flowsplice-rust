@@ -19,7 +19,7 @@ RUN npm run build
 
 FROM rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS build
 ENV RUSTUP_TOOLCHAIN=1.97.1
-RUN apk add --no-cache clang cmake make musl-dev perl g++
+RUN apk add --no-cache clang cmake make musl-dev perl
 ARG TARGETARCH
 ARG RUST_MIRROR_URL
 ARG RUSTUP_DIST_SERVER
@@ -35,7 +35,6 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY internal/ internal/
-COPY pty/ pty/
 COPY travel-android/rust/ travel-android/rust/
 COPY travel-apple/rust/ travel-apple/rust/
 COPY server/ server/
@@ -66,7 +65,6 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
       -p flowsplice-relay \
       -p flowsplice-homeagent \
       -p flowsplice-travelagent \
-      -p flowsplice-pty-home \
       -p flowsplice-echo && \
     mkdir /out && \
     cp target/release/flowsplice-server /out/ && \
@@ -77,12 +75,9 @@ RUN --mount=type=cache,id=flowsplice-e2e-cargo-registry-${TARGETARCH},target=/us
     cp target/release/socket-probe /out/ && \
     cp target/release/business-probe /out/ && \
     cp target/release/service-class-probe /out/ && \
-    cp target/release/pty-probe /out/ && \
-    cp target/release/flowsplice-pty-home /out/ && \
     cp target/release/travel-login-probe /out/
 
 FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
-RUN apk add --no-cache tmux
 RUN addgroup -S flowsplice && adduser -S -G flowsplice flowsplice
 COPY --from=build /out/flowsplice-server /usr/local/bin/
 COPY --from=build /out/flowsplice-relay /usr/local/bin/
@@ -92,7 +87,5 @@ COPY --from=build /out/flowsplice-echo /usr/local/bin/
 COPY --from=build /out/socket-probe /usr/local/bin/flowsplice-socket-probe
 COPY --from=build /out/business-probe /usr/local/bin/flowsplice-business-probe
 COPY --from=build /out/service-class-probe /usr/local/bin/flowsplice-service-class-probe
-COPY --from=build /out/pty-probe /usr/local/bin/flowsplice-pty-probe
-COPY --from=build /out/flowsplice-pty-home /usr/local/bin/flowsplice-pty-home
 COPY --from=build /out/travel-login-probe /usr/local/bin/flowsplice-travel-login-probe
 USER flowsplice

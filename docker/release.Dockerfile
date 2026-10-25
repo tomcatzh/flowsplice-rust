@@ -20,7 +20,7 @@ RUN npm run build
 FROM rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS build
 ARG RUST_TARGET
 ENV RUSTUP_TOOLCHAIN=1.97.1
-RUN apk add --no-cache clang cmake make musl-dev perl file g++
+RUN apk add --no-cache clang cmake make musl-dev perl file
 ARG TARGETARCH
 ARG RUST_MIRROR_URL
 ARG RUSTUP_DIST_SERVER
@@ -38,7 +38,6 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY internal/ internal/
-COPY pty/ pty/
 COPY travel-android/rust/ travel-android/rust/
 COPY travel-apple/rust/ travel-apple/rust/
 COPY server/ server/
@@ -67,8 +66,7 @@ RUN --mount=type=cache,id=flowsplice-release-cargo-registry-${TARGETARCH},target
       -p flowsplice-relay \
       -p flowsplice-homeagent \
       -p flowsplice-travelagent \
-      -p flowsplice-foobar \
-      -p flowsplice-pty-home && \
+      -p flowsplice-foobar && \
     cargo build --locked --release --target "${RUST_TARGET}" \
       -p flowsplice-enrollment --bin flowsplice-trust && \
     mkdir /out && \
@@ -77,7 +75,6 @@ RUN --mount=type=cache,id=flowsplice-release-cargo-registry-${TARGETARCH},target
     cp "target/${RUST_TARGET}/release/flowsplice-homeagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-travelagent" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-foobar" /out/ && \
-    cp "target/${RUST_TARGET}/release/flowsplice-pty-home" /out/ && \
     cp "target/${RUST_TARGET}/release/flowsplice-trust" /out/ && \
     file /out/*
 

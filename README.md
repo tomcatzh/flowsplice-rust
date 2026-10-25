@@ -18,10 +18,11 @@ command-line applications. Native installers are built privately
 for each deployment; see [private Travel packaging](docs/PRIVATE_TRAVEL_PACKAGING.md).
 
 Version 0.4.0 extracts the [shared encrypted socket runtimes](docs/socket-runtime.md) used by
-both generic Home/Travel applications and embedded businesses. The separate
-[private PTY applications](docs/pty.md) target Android, iOS/iPadOS, and macOS, with a tmux backend
-for Linux arm64/amd64 and macOS arm64. PTY clients use in-process connections without local
-forwarding listeners; connecting opens the session list.
+both generic Home/Travel applications and embedded businesses. Embedded businesses depend only on
+the two [SDK crates](crates/README.md) and use in-process connections without local forwarding
+listeners. A service-class credential lets one client identity reach every authorized Home whose
+business service matches an application protocol and transport. The Vaultty terminal client is an
+independent downstream project built on these SDK crates.
 
 ## How it works
 
@@ -53,8 +54,6 @@ not interchangeable failover replicas.
 | `flowsplice-home-core` | Provides shared Home identity, authorization synchronization, encrypted serving, and flow recovery. |
 | `flowsplice-travel-core` | Provides shared Travel enrollment, trusted discovery, encrypted socket connections, mapping, and status operations. |
 | `flowsplice-transport` | Defines application I/O and bounded in-process Home listeners. |
-| `flowsplice-pty-home` | Serves private tmux sessions through the shared Home runtime. |
-| Private PTY clients | Separate Android, iOS/iPadOS, and macOS apps sharing the PTY client engine and bundled terminal UI. |
 | `flowsplice-travel-android` | Connects the Android Kotlin client to Travel Core through JNI. |
 | `flowsplice-travel-apple` | Connects the Apple native clients to Travel Core through the Apple adapter. |
 | `flowsplice-foobar` | Supplies a low-rate loopback target and a single-connection continuity probe for deployment acceptance. |
@@ -380,9 +379,7 @@ The script uses the lockfile and produces:
 - `dist/macos-arm64/` — self-contained arm64 Mach-O executables.
 
 Each directory contains `flowsplice-server`, `flowsplice-relay`, `flowsplice-homeagent`,
-`flowsplice-travelagent`, `flowsplice-foobar`, `flowsplice-trust`, and `flowsplice-pty-home`.
-The PTY backend requires an installed tmux executable; private native PTY installers use the
-separate packaging paths in [the PTY guide](docs/pty.md).
+`flowsplice-travelagent`, `flowsplice-foobar`, and `flowsplice-trust`.
 
 `make home2-macos-package` and `make travel-macos-package` build and verify deployment-neutral
 macOS CLI bundles suitable for public distribution; they do not build the native desktop app. Each bundle contains one generic binary, a Chinese Quick Start, an
@@ -436,7 +433,6 @@ To build your own business Home or Travel client, start with the [two SDK entry 
 ```text
 crates/       Home and Travel SDK entry points
 internal/     shared protocol, enrollment, transport I/O and runtime storage
-pty/          PTY business backend, client, protocol, codec and native bridge
 server/       Server application
 relay/        Relay application
 homeagent/    Home Agent and issuer UI
@@ -444,9 +440,6 @@ travelagent/  CLI Travel Agent and local Web UI
 travel-android/ Android native Travel client
 travel-apple/ iOS/iPadOS native Travel client
 travel-macos/ macOS native Travel client
-pty-web/      bundled terminal UI for private PTY apps
-pty-android/  private Android PTY host and packaging
-pty-apple/    private iOS/iPadOS and macOS PTY host and packaging
 foobar/       continuity target and probe
 openwrt/      UCI, procd, LuCI, and IPK sources
 tests/        fixtures and Docker E2E suite

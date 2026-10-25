@@ -6,11 +6,6 @@ members = [
     "internal/flowsplice-storage",
     "internal/flowsplice-transport",
     "crates/flowsplice-home-core",
-    "pty/codec",
-    "pty/protocol",
-    "pty/home",
-    "pty/client",
-    "pty/native",
     "crates/flowsplice-travel-core",
     "travel-android/rust",
     "travel-apple/rust",
@@ -39,10 +34,6 @@ flowsplice-enrollment = { path = "internal/flowsplice-enrollment", default-featu
 flowsplice-storage = { path = "internal/flowsplice-storage" }
 flowsplice-transport = { path = "internal/flowsplice-transport" }
 flowsplice-home-core = { path = "crates/flowsplice-home-core" }
-flowsplice-pty-codec = { path = "pty/codec", default-features = false }
-flowsplice-pty-protocol = { path = "pty/protocol" }
-flowsplice-pty-home = { path = "pty/home" }
-flowsplice-pty-client = { path = "pty/client" }
 flowsplice-travel-core = { path = "crates/flowsplice-travel-core", default-features = false }
 futures-util = "0.3"
 hex = "0.4"

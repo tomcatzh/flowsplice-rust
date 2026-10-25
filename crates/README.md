@@ -8,6 +8,7 @@ FlowSplice provides two supported SDK entry points:
 | [`flowsplice-travel-core`](flowsplice-travel-core/README.md) | Enroll, discover and connect from your business client |
 
 Your application owns its message format, request handling, application permissions and user interface.
+For example, the Vaultty terminal client is an independent downstream project that depends only on these two crates.
 
 ## Install
 
