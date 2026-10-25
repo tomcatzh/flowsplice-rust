@@ -17,8 +17,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHal
 use uuid::Uuid;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Admission includes signed route authorization and the first Carrier race.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Admission includes signed route authorization and Carrier races. A runtime that starts with an
+/// expired cached snapshot races before the fresh directory arrives and waits out one 10-second
+/// race timeout, so allow several races rather than the bare minimum.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Authorization loss must end every open class socket within this bound.
 const ACCESS_END_TIMEOUT: Duration = Duration::from_secs(180);
 /// Covers the Travel Carrier recovery deadline before a refused connection reports failure.
@@ -429,6 +431,11 @@ async fn exercise(mode: &str, args: &[String]) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     flowsplice_core::init_crypto();
+    // Silent unless RUST_LOG is set; the harness forwards FLOWSPLICE_E2E_PROBE_RUST_LOG.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = arguments(&args)?;
     // Access loss waits for stream teardown and then for a refused fresh connection.

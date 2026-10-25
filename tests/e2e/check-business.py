@@ -91,6 +91,9 @@ class Run:
         self.containers.append(name)
         argv = ["docker", "run", "-d", "--pull=never", "--name", name, "--network", self.network,
                 "--user", self.uid + ":" + self.gid, "--mount", f"type=bind,source={self.directory},target=/business"]
+        if os.environ.get("FLOWSPLICE_E2E_PROBE_RUST_LOG"):
+            # Opt-in diagnostics for probes and in-process business Homes.
+            argv += ["-e", "RUST_LOG=" + os.environ["FLOWSPLICE_E2E_PROBE_RUST_LOG"]]
         if setup:
             for folder in ("config", "certs"):
                 argv += ["--mount", f"type=bind,source={HERE / 'generated' / folder},target=/{folder},readonly"]
