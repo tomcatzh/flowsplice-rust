@@ -1,32 +1,61 @@
 #!/usr/bin/env python3
-"""One enrollment across current/future PTY Homes in the disposable fixture only."""
+"""One service-class enrollment across current/future echo Homes in the disposable fixture only."""
 import hashlib
 import json
 import shutil
 import tomllib
 from pathlib import Path
 
+APPLICATION_PROTOCOL = 'example.echo.v1'
 
-def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
+
+def execute(run, alpha, root, scope):
     command, require, wait, issuer = run.command, run.require, run.wait, run.issuer
     descriptor = json.loads((run.directory / alpha.removeprefix('/business/')).read_text())
     service_class = {'version': 1, 'approving_home_id': descriptor['approving_home_id'],
-                     'application_protocol': 'flowsplice.pty.v1', 'protocol': 'tcp'}
+                     'application_protocol': APPLICATION_PROTOCOL, 'protocol': 'tcp'}
     class_scope = {k: service_class[k] for k in ('application_protocol', 'protocol')} | {'kind': 'service_class'}
     (run.directory / 'service-class.json').write_text(json.dumps(service_class))
     class_path = '/business/service-class.json'
-    homes = {scope['home_id']: primary, secondary_scope['home_id']: secondary}
 
-    def probe(label, args, success=True):
-        return run.finish(run.start(label, 'flowsplice-service-class-probe', args), success=success, timeout=300)
+    def probe(label, args, success=True, timeout=300):
+        return run.finish(run.start(label, 'flowsplice-service-class-probe', args), success=success, timeout=timeout)
 
     def key_hashes(path):
         return {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in path.rglob('*') if p.is_file() and p.suffix in ('.crt', '.key')}
 
+    def state(path):
+        return json.loads((run.directory / path.removeprefix('/business/')).read_text())
+
+    def pairs(items):
+        return {(item['home_id'], item['service_id']) for item in items}
+
+    def serving_home(label, services_file, approved, install):
+        # Same serving-only provisioning as the primary business Home, then the in-process echo.
+        setup = run.start(label + '-setup', 'flowsplice-homeagent', [
+            'init', '--server', run.server, '--bootstrap-config', '/config/home-bootstrap.toml',
+            '--business-services', services_file, '--install-dir', install,
+        ], setup=True)
+        directory = run.directory / install.removeprefix('/business/')
+        wait(lambda: (directory / 'home-bootstrap.json').exists(), label + ' Home bootstrap')
+        home_id = json.loads((directory / 'home-bootstrap.json').read_text())['home_id']
+        pending = run.pending('/api/home-enrollment/pending', 'home_id', home_id)
+        wait(lambda: pending['verification_code'] in run.logs(setup), label + ' Home verification code')
+        issuer.request(19084, 'POST', '/api/home-enrollment/approve', {
+            'request_id': pending['request_id'], 'profile': 'serving_only', 'valid_days': 365,
+            'services': approved, 'password': run.password,
+        })
+        run.finish(setup)
+        config = tomllib.loads((directory / 'home-runtime.toml').read_text())
+        require('ui_listen' not in config and 'issuer' not in config, label + ' Home acquired issuer/UI configuration')
+        require({s['id'] for s in config['services']} == set(approved), label + ' Home approved service set changed')
+        container = run.start(label + '-home', 'flowsplice-socket-probe', ['home', install + '/home-runtime.toml'])
+        return home_id, container
+
     def enroll(name, validity=None, resume=False):
-        travel_id = 'pty-class-' + name + '-' + run.token
-        label = 'Class acceptance ' + name + ' · PTY'
+        travel_id = 'class-' + name + '-' + run.token
+        label = 'Class acceptance ' + name + ' · Echo'
         install = '/business/class-' + name
         args = ['enroll', run.relay, class_path, root, install, '/business/password.txt', travel_id, label]
         task = run.start('class-enroll-' + name, 'flowsplice-service-class-probe', args)
@@ -54,7 +83,7 @@ def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
             probe('class-resume-fixture', ['resume-fixture', install, '/business/' + backup.name])
             probe('class-incomplete', ['check-only', install + '/travelagent.toml', root, class_path], success=False)
             changed = list(args)
-            changed[-1] = 'Changed intent · PTY'
+            changed[-1] = 'Changed intent · Echo'
             probe('class-changed-label', changed, success=False)
             require('service-class-enrollment-installed' in probe('class-resume', args), 'class resume incomplete')
             require(key_hashes(path) == hashes, 'class resume rotated keys/certificates')
@@ -62,22 +91,30 @@ def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
             require(after == marker, 'class resume changed approval/identity')
             require(not (path / 'bootstrap-enrollment.json').exists() and not (path / 'business-installation.pending.json').exists(), 'class resume retained pending state')
             probe('class-binding', ['check-only', install + '/travelagent.toml', root, class_path])
-        return [install + '/travelagent.toml', '/business/password.txt', root, class_path, 'home-1', 'tcp-echo', '/business/class-state.json'], credential
+        # WRONG_HOME/WRONG_SERVICE name an ordinary generic service outside the class.
+        return [install + '/travelagent.toml', '/business/password.txt', root, class_path, 'home-1', 'tcp-echo',
+                '/business/class-' + name + '-state.json'], credential
 
-    def clean():
-        for container in homes.values():
-            for domain in ('alpha', 'beta'):
-                command(['docker', 'exec', container, '/usr/bin/tmux', '-S', '/tmp/fs-pty/' + domain + '/tmux.sock', 'kill-server'], success=False)
+    secondary_id, _ = serving_home('secondary', '/business/services.json', ['svc-alpha'], '/business/home-secondary')
+    require(secondary_id != scope['home_id'], 'secondary Home identity was reused')
+    homes = {scope['home_id'], secondary_id}
+    # Both approved primary services and the secondary service carry the class application protocol.
+    expected = {(scope['home_id'], 'svc-alpha'), (scope['home_id'], 'svc-beta'), (secondary_id, 'svc-alpha')}
+    run.passed.append('class-secondary-serving-only-home')
 
-    def surviving_sessions():
-        state = json.loads((run.directory / 'class-state.json').read_text())
-        require(len(state['sessions']) == 2 and len({s['home_id'] for s in state['sessions']}) == 2, 'class access did not span two Homes')
-        for session in state['sessions']:
-            domain = session['service_id'].removeprefix('svc-')
-            result = command(['docker', 'exec', homes[session['home_id']], '/usr/bin/tmux', '-S', '/tmp/fs-pty/' + domain + '/tmux.sock', 'list-sessions', '-F', '#{session_name}']).stdout
-            require(session['session_id'] in result, 'authorization loss killed tmux shell')
+    def homes_keep_serving(label, ended_state):
+        # Losing one credential closes only its sockets: a still-valid class identity reaches both Homes.
+        ended = state(ended_state)
+        require(pairs(ended['discovered']) == expected, label + ' class discovery changed')
+        ended_homes = {item['home_id'] for item in ended['connections']}
+        require(ended_homes == homes, 'class access did not span both Homes')
+        survivor_state = '/business/class-survivor-' + label + '.json'
+        survivor = [*base[:-1], survivor_state]
+        result = probe('class-' + label + '-survivor', ['exercise', *survivor])
+        require('service-class-exercise-complete' in result, 'surviving class identity could not use the Homes')
+        survivor_connections = state(survivor_state)['connections']
+        require({item['home_id'] for item in survivor_connections} == ended_homes, 'Home stopped serving after another credential lost access')
 
-    clean()
     base, persistent = enroll('shared', resume=True)
     original = run.directory / 'class-shared'
     relocated = run.directory / 'class shared relocated'
@@ -108,42 +145,33 @@ def execute(run, alpha, root, primary, secondary, scope, secondary_scope):
     run.passed += ['class-relocation-preserves-all-files', 'class-relocation-binding-and-digest-enforcement']
     future_task = run.start('class-future', 'flowsplice-service-class-probe', ['future', *base, '/business/class-future-signal.json'])
     wait(lambda: 'service-class-future-ready' in run.logs(future_task), 'two Home shared runtime ready')
+    require(pairs(state(base[-1])['discovered']) == expected, 'class discovery was not exactly the matching approved services')
     # This Home did not exist when the application credential was issued.
-    services = [{'service_id': 'terminal-future', 'protocol': 'tcp', 'application_protocol': 'flowsplice.pty.v1', 'capabilities': ['read', 'write']}]
+    services = [{'service_id': 'echo-future', 'protocol': 'tcp', 'application_protocol': APPLICATION_PROTOCOL, 'capabilities': ['read', 'write']}]
     (run.directory / 'future-services.json').write_text(json.dumps(services))
-    setup = run.start('future-setup', 'flowsplice-homeagent', ['init', '--server', run.server,
-        '--bootstrap-config', '/config/home-bootstrap.toml', '--business-services', '/business/future-services.json', '--install-dir', '/business/home-future'], setup=True)
-    directory = run.directory / 'home-future'
-    wait(lambda: (directory / 'home-bootstrap.json').exists(), 'future Home bootstrap')
-    home_id = json.loads((directory / 'home-bootstrap.json').read_text())['home_id']
-    require(home_id not in homes, 'future Home reused old identity')
-    pending = run.pending('/api/home-enrollment/pending', 'home_id', home_id)
-    wait(lambda: pending['verification_code'] in run.logs(setup), 'future Home code')
-    issuer.request(19084, 'POST', '/api/home-enrollment/approve', {'request_id': pending['request_id'], 'profile': 'serving_only', 'valid_days': 365, 'services': ['terminal-future'], 'password': run.password})
-    run.finish(setup)
-    (run.directory / 'pty-home-future.toml').write_text('home_runtime = "/business/home-future/home-runtime.toml"\n[[domains]]\nservice_id = "terminal-future"\n[domains.tmux]\nbinary = "/usr/bin/tmux"\nsocket = "/tmp/fs-pty/future/tmux.sock"\nshell = "/bin/sh"\nworking_directory = "/business"\n')
-    future_home = run.start('future-pty-home', 'flowsplice-pty-home', ['--config', '/business/pty-home-future.toml'])
-    (run.directory / 'class-future-signal.json').write_text(json.dumps({'home_id': home_id}))
-    require('service-class-future-complete' in run.finish(future_task, timeout=300), 'future Home not automatically discovered')
+    future_id, future_home = serving_home('future', '/business/future-services.json', ['echo-future'], '/business/home-future')
+    require(future_id not in homes, 'future Home reused old identity')
+    (run.directory / 'class-future-signal.json').write_text(json.dumps({'home_id': future_id}))
+    future_result = run.finish(future_task, timeout=300)
+    require('service-class-future-complete' in future_result, 'future Home not automatically discovered')
+    require('service-class-exercise-complete' in future_result, 'shared class runtime did not finish cleanly')
     command(['docker', 'stop', future_home])
     after_runtime = all_hashes(relocated)
     require(all(after_runtime.get(name) == digest for name, digest in identity_hashes.items()), 'relocated runtime changed config/root/certificates/keys/identity')
     require('service-class-binding-verified' in probe('class-relocated-after-runtime', ['check-only', base[0], root, class_path]), 'relocated runtime invalidated binding')
     run.passed += ['class-relocation-runtime-multi-home', 'class-relocation-identity-unchanged']
-    run.passed += ['class-one-identity-two-homes', 'class-future-home-different-service-id', 'class-independent-disconnect-rejoin', 'class-no-listeners', 'class-exact-scope-and-resumable-install']
-    clean()
+    run.passed += ['class-one-identity-two-homes', 'class-exact-discovery', 'class-future-home-different-service-id',
+                   'class-independent-disconnect-rejoin', 'class-no-listeners', 'class-exact-scope-and-resumable-install']
     revoked_base, revoked = enroll('revoked')
     task = run.start('class-revocation', 'flowsplice-service-class-probe', ['access-end', *revoked_base])
     wait(lambda: 'service-class-access-ready' in run.logs(task), 'two active class sockets before revocation')
     issuer.request(19084, 'POST', '/api/revoke', {'credential_id': revoked['credential_id'], 'reason': 'Disposable class acceptance', 'password': run.password})
-    require('service-class-access-ended' in run.finish(task, timeout=300), 'revoked class sockets survived')
-    surviving_sessions()
-    clean()
+    require('service-class-access-ended' in run.finish(task, timeout=480), 'revoked class sockets survived')
+    homes_keep_serving('revocation', revoked_base[-1])
     expiring_base, _ = enroll('expiring', {'valid_minutes': 1})
-    require('service-class-access-ended' in probe('class-expiry', ['access-end', *expiring_base]), 'expired class sockets survived')
-    surviving_sessions()
-    clean()
-    # Keep shared class grant active for the old generic Travel suite after this test.
-    run.passed += ['class-revocation-closes-all-preserves-shells', 'class-expiry-closes-all-preserves-shells']
+    require('service-class-access-ended' in probe('class-expiry', ['access-end', *expiring_base], timeout=480), 'expired class sockets survived')
+    homes_keep_serving('expiry', expiring_base[-1])
+    # Keep the shared class grant active; only the revoked and expired identities lost access.
+    run.passed += ['class-revocation-closes-all-homes-keep-serving', 'class-expiry-closes-all-homes-keep-serving']
     print(json.dumps({'checkpoint': 'service-class-e2e-complete', 'active_class_credential_id': persistent['credential_id']}), flush=True)
     return service_class

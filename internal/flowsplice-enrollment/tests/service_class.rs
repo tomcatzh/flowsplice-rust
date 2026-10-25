@@ -117,7 +117,7 @@ fn class_enrollment_proof_binds_label_descriptor_and_exact_scope() -> Result<()>
         descriptor: ServiceClassDescriptor {
             version: 1,
             approving_home_id: "super-home".into(),
-            application_protocol: "flowsplice.pty.v1".into(),
+            application_protocol: "example.echo.v1".into(),
             protocol: ServiceProtocol::Tcp,
         },
         label: "我的 iPad".into(),

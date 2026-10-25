@@ -51,12 +51,12 @@ impl Fixture {
         };
         Ok(HomeCatalog {
             home_id: id.into(),
-            home_alias: "PTY".into(),
+            home_alias: "Echo".into(),
             endpoint_credential: Some(endpoint),
             service_grant: Some(SignedHomeServiceGrant::sign(&grant, &self.key)?),
             services: vec![Service {
                 id: service_id.into(),
-                alias: "PTY".into(),
+                alias: "Echo".into(),
                 target: "127.0.0.1:22".into(),
                 protocol: ServiceProtocol::Tcp,
             }],
@@ -70,7 +70,7 @@ fn credential(scope: &TravelCredentialScope) -> Result<TravelCredential> {
 }
 fn class() -> Result<TravelCredential> {
     credential(&TravelCredentialScope::ServiceClass {
-        application_protocol: "flowsplice.pty.v1".into(),
+        application_protocol: "example.echo.v1".into(),
         protocol: ServiceProtocol::Tcp,
     })
 }
@@ -85,27 +85,27 @@ fn verified_class_catalog_includes_distinct_home_services_not_display_names() ->
     let f = Fixture::new()?;
     let raw = HomeCatalog {
         home_id: "raw".into(),
-        home_alias: "PTY".into(),
+        home_alias: "Echo".into(),
         endpoint_credential: None,
         service_grant: None,
         services: vec![Service {
-            id: "terminal".into(),
-            alias: "PTY".into(),
+            id: "echo".into(),
+            alias: "Echo".into(),
             protocol: ServiceProtocol::Tcp,
             target: "ignored".into(),
         }],
     };
     let c = catalog(vec![
-        f.home("mac", "terminal", "flowsplice.pty.v1")?,
-        f.home("vps", "console", "flowsplice.pty.v1")?,
-        f.home("other", "terminal", "another.protocol")?,
+        f.home("mac", "echo", "example.echo.v1")?,
+        f.home("vps", "echo-alt", "example.echo.v1")?,
+        f.home("other", "echo", "another.protocol")?,
         raw,
     ]);
     let result = catalog_for_credentials(&c, &[class()?], Some(&f.trust));
     assert_eq!(result.generation, 7);
     assert_eq!(result.homes.len(), 2);
     assert_eq!(result.homes[0].home_id, "mac");
-    assert_eq!(result.homes[1].services[0].id, "console");
+    assert_eq!(result.homes[1].services[0].id, "echo-alt");
     assert!(
         catalog_for_credentials(&c, &[class()?], None)
             .homes
@@ -116,7 +116,7 @@ fn verified_class_catalog_includes_distinct_home_services_not_display_names() ->
 #[test]
 fn invalid_signed_material_never_enters_class_catalog() -> Result<()> {
     let f = Fixture::new()?;
-    let good = f.home("mac", "pty", "flowsplice.pty.v1")?;
+    let good = f.home("mac", "echo", "example.echo.v1")?;
     let mut invalid = Vec::new();
     let mut h = good.clone();
     h.service_grant = None;
@@ -137,7 +137,7 @@ fn invalid_signed_material_never_enters_class_catalog() -> Result<()> {
         .signature_hex = "00".into();
     invalid.push(h);
     let mut h = good.clone();
-    h.service_grant = f.home("swapped", "pty", "flowsplice.pty.v1")?.service_grant;
+    h.service_grant = f.home("swapped", "echo", "example.echo.v1")?.service_grant;
     invalid.push(h);
     let mut h = good.clone();
     h.services[0].id = "unapproved".into();
@@ -186,7 +186,7 @@ fn invalid_signed_material_never_enters_class_catalog() -> Result<()> {
 #[test]
 fn mixed_credentials_preserve_exact_legacy_union_and_empty_home() -> Result<()> {
     let f = Fixture::new()?;
-    let matching = f.home("mac", "pty", "flowsplice.pty.v1")?;
+    let matching = f.home("mac", "echo", "example.echo.v1")?;
     let mut legacy = f.home("legacy", "allowed", "other.protocol")?;
     legacy.endpoint_credential = None;
     legacy.service_grant = None;

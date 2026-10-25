@@ -139,7 +139,7 @@ impl Fixture {
                 &self.dir.path().join("home"),
                 NOW,
             )?,
-            services: vec![service("pty"), service("second")],
+            services: vec![service("echo"), service("second")],
         })
     }
     fn issue(
@@ -167,7 +167,7 @@ fn service(id: &str) -> BusinessService {
     BusinessService {
         service_id: id.into(),
         protocol: ServiceProtocol::Tcp,
-        application_protocol: "pty/1".into(),
+        application_protocol: "echo/1".into(),
         capabilities: vec!["read".into(), "write".into()],
     }
 }
@@ -176,7 +176,7 @@ fn service(id: &str) -> BusinessService {
 fn real_home_issuance_binds_csr_serving_only_and_exact_service_subsets() -> Result<()> {
     let f = Fixture::new()?;
     let request = f.request()?;
-    let single = f.issue(request.clone(), vec![service("pty")])?;
+    let single = f.issue(request.clone(), vec![service("echo")])?;
     let trust = single.validate(&f.root, NOW)?;
     let endpoint = single
         .response
@@ -190,7 +190,7 @@ fn real_home_issuance_binds_csr_serving_only_and_exact_service_subsets() -> Resu
             .grant
             .verify(&trust, &single.response.signed_endpoint_credential, NOW)?
             .services,
-        vec![service("pty")]
+        vec![service("echo")]
     );
     let multiple = f.issue(request.clone(), request.services.clone())?;
     assert_eq!(
@@ -204,7 +204,7 @@ fn real_home_issuance_binds_csr_serving_only_and_exact_service_subsets() -> Resu
         f.issue(request.clone(), vec![service("unrequested")])
             .is_err()
     );
-    let mut altered = service("pty");
+    let mut altered = service("echo");
     altered.capabilities = vec!["read".into()];
     assert!(f.issue(request.clone(), vec![altered]).is_err());
     let mut changed = single.clone();
@@ -273,13 +273,13 @@ fn strict_home_wrappers(response: &BusinessHomeResponse) -> Result<()> {
 #[test]
 fn real_travel_issuance_proves_cross_home_intent_and_caps_expiry() -> Result<()> {
     let f = Fixture::new()?;
-    let home = f.issue(f.request()?, vec![service("pty")])?;
+    let home = f.issue(f.request()?, vec![service("echo")])?;
     let descriptor = BusinessDescriptor {
         version: 1,
         approving_home_id: "super-home".into(),
         endpoint: home.response.signed_endpoint_credential.clone(),
         grant: home.grant.clone(),
-        service_id: "pty".into(),
+        service_id: "echo".into(),
     };
     let request = BusinessTravelRequest {
         version: 1,
@@ -294,7 +294,7 @@ fn real_travel_issuance_proves_cross_home_intent_and_caps_expiry() -> Result<()>
     };
     let scope = TravelCredentialScope::Service {
         home_id: "business-home".into(),
-        service_id: "pty".into(),
+        service_id: "echo".into(),
         protocol: ServiceProtocol::Tcp,
     };
     let approval = prepare_enrollment_approval(
@@ -382,7 +382,7 @@ fn synthetic_request_wrappers_reject_unknown_fields_and_bad_kind_before_csr_vali
         "version": 1, "object_type": BUSINESS_HOME_REQUEST_TYPE,
         "request": {"version": 1,"request_id": uuid::Uuid::new_v4(),"nonce":"11".repeat(32),
             "home_id":"home","created_at_unix_secs":NOW,"management_csr_pem":"placeholder","business_csr_pem":"placeholder"},
-        "services": [service("pty")]
+        "services": [service("echo")]
     });
     let mut extra = request.clone();
     extra["unexpected"] = json!(true);

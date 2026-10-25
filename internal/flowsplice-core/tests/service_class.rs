@@ -2,46 +2,36 @@ use flowsplice_core::{
     authorization::TravelCredentialScope, business::BusinessService, protocol::ServiceProtocol,
 };
 
-fn pty(id: &str) -> BusinessService {
+fn echo(id: &str) -> BusinessService {
     BusinessService {
         service_id: id.into(),
         protocol: ServiceProtocol::Tcp,
-        application_protocol: "flowsplice.pty.v1".into(),
+        application_protocol: "example.echo.v1".into(),
         capabilities: vec!["read".into(), "write".into()],
     }
 }
 #[test]
 fn exact_class_matches_distinct_home_and_service_ids_only_with_business_metadata() {
     let scope = TravelCredentialScope::ServiceClass {
-        application_protocol: "flowsplice.pty.v1".into(),
+        application_protocol: "example.echo.v1".into(),
         protocol: ServiceProtocol::Tcp,
     };
-    for (home, id) in [("mac", "terminal"), ("vps", "console")] {
-        assert!(scope.allows_business_service(home, id, ServiceProtocol::Tcp, Some(&pty(id))));
+    for (home, id) in [("mac", "echo"), ("vps", "echo-alt")] {
+        assert!(scope.allows_business_service(home, id, ServiceProtocol::Tcp, Some(&echo(id))));
         assert!(!scope.allows_service(home, id, ServiceProtocol::Tcp));
         assert!(!scope.allows_business_service(home, id, ServiceProtocol::Tcp, None));
     }
-    let mut service = pty("terminal");
+    let mut service = echo("echo");
     service.application_protocol = "other.protocol".into();
-    assert!(!scope.allows_business_service(
-        "mac",
-        "terminal",
-        ServiceProtocol::Tcp,
-        Some(&service)
-    ));
-    service = pty("terminal");
+    assert!(!scope.allows_business_service("mac", "echo", ServiceProtocol::Tcp, Some(&service)));
+    service = echo("echo");
     service.protocol = ServiceProtocol::Udp;
-    assert!(!scope.allows_business_service(
-        "mac",
-        "terminal",
-        ServiceProtocol::Udp,
-        Some(&service)
-    ));
+    assert!(!scope.allows_business_service("mac", "echo", ServiceProtocol::Udp, Some(&service)));
     assert!(!scope.allows_business_service(
         "mac",
         "other",
         ServiceProtocol::Tcp,
-        Some(&pty("terminal"))
+        Some(&echo("echo"))
     ));
 }
 #[test]
@@ -67,17 +57,17 @@ fn legacy_global_home_and_service_scopes_keep_original_admission() {
         (
             TravelCredentialScope::Service {
                 home_id: "mac".into(),
-                service_id: "pty".into(),
+                service_id: "echo".into(),
                 protocol: ServiceProtocol::Tcp,
             },
             "mac",
-            "pty",
+            "echo",
             true,
         ),
         (
             TravelCredentialScope::Service {
                 home_id: "mac".into(),
-                service_id: "pty".into(),
+                service_id: "echo".into(),
                 protocol: ServiceProtocol::Tcp,
             },
             "mac",
@@ -106,7 +96,7 @@ fn class_descriptor_requires_global_issuer_not_home_authority() -> anyhow::Resul
     let descriptor = ServiceClassDescriptor {
         version: 1,
         approving_home_id: "issuer".into(),
-        application_protocol: "flowsplice.pty.v1".into(),
+        application_protocol: "example.echo.v1".into(),
         protocol: ServiceProtocol::Tcp,
     };
     let trust: DeploymentTrust = serde_json::from_value(base.clone())?;

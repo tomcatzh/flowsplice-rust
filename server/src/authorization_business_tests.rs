@@ -57,9 +57,9 @@ impl Fixture {
                 endpoint_payload_sha256: payload_digest(&endpoint.payload_hex)?,
                 enrollment_request_sha256: "55".repeat(32),
                 services: vec![BusinessService {
-                    service_id: "pty".into(),
+                    service_id: "echo".into(),
                     protocol: ServiceProtocol::Tcp,
-                    application_protocol: "pty/1".into(),
+                    application_protocol: "echo/1".into(),
                     capabilities: vec!["read".into()],
                 }],
                 not_before_unix_secs: 1,
@@ -88,8 +88,8 @@ impl Fixture {
 }
 fn service() -> Service {
     Service {
-        id: "pty".into(),
-        alias: "PTY".into(),
+        id: "echo".into(),
+        alias: "Echo".into(),
         protocol: ServiceProtocol::Tcp,
         target: "in-process".into(),
     }
@@ -233,7 +233,7 @@ fn acknowledgement_targets_issuer_and_exact_request_not_business_destination() -
         "enrollment_nonce":"66".repeat(32),"enrollment_request_sha256":"77".repeat(32),"travel_id":"travel",
         "management_spki_sha256":"88".repeat(32),"business_spki_sha256":"99".repeat(32),"management_ca_sha256":"aa".repeat(32),"business_ca_sha256":"bb".repeat(32),
         "management_certificate_sha256":"cc".repeat(32),"business_certificate_sha256":"dd".repeat(32),
-        "scope":{"kind":"service","home_id":"business-home","service_id":"pty","protocol":"tcp"},"not_before_unix_secs":1,"not_after_unix_secs":unix_time_secs()?+1000
+        "scope":{"kind":"service","home_id":"business-home","service_id":"echo","protocol":"tcp"},"not_before_unix_secs":1,"not_after_unix_secs":unix_time_secs()?+1000
     }))?;
     let bytes = serde_json::to_vec(&travel)?;
     let signature = f
@@ -302,7 +302,7 @@ fn invalid_business_catalog_never_falls_back_to_generic_scope() -> Result<()> {
     let credential = crate::tests::travel_credential(TravelCredentialScope::Global);
     let valid = HomeCatalog {
         home_id: "business-home".into(),
-        home_alias: "PTY".into(),
+        home_alias: "Echo".into(),
         endpoint_credential: Some(f.endpoint.clone()),
         service_grant: Some(f.grant.clone()),
         services: vec![service()],

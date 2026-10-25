@@ -118,6 +118,12 @@ from transport lifetime.
 checks in-process identity validation, absence of legacy listeners, invalid bindings and
 connection-cancellation cleanup. The full Docker runner additionally exercises encrypted
 in-process TCP/UDP against both the old target adapter and an issuer-free embedded Home.
+Its business stage provisions two serving-only echo Homes with application protocol
+`example.echo.v1` and checks one service-class identity across them: exact discovery,
+rejection of other services, concurrent sockets, independent disconnect and reconnect,
+discovery of a Home provisioned after the credential was issued, resumable and relocatable
+installation, and closure of every socket on revocation or expiry while another valid
+identity still reaches both Homes.
 `tests/check-sdk-consumer.sh` builds independent default-feature and feature-disabled
 consumers without generated Web assets and checks typed business API access. Per-crate
 README examples are compiled by `cargo test --doc -p flowsplice-home-core -p flowsplice-travel-core`.

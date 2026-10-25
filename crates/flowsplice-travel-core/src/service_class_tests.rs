@@ -25,7 +25,7 @@ impl Fixture {
         let descriptor = ServiceClassDescriptor {
             version: 1,
             approving_home_id: "issuer".into(),
-            application_protocol: "flowsplice.pty.v1".into(),
+            application_protocol: "example.echo.v1".into(),
             protocol: ServiceProtocol::Tcp,
         };
         Ok(Self {
@@ -59,12 +59,12 @@ impl Fixture {
         };
         Ok(HomeCatalog {
             home_id: id.into(),
-            home_alias: "PTY".into(),
+            home_alias: "Echo".into(),
             endpoint_credential: Some(endpoint),
             service_grant: Some(SignedHomeServiceGrant::sign(&grant, &self.key)?),
             services: vec![Service {
                 id: service_id.into(),
-                alias: "PTY".into(),
+                alias: "Echo".into(),
                 target: "127.0.0.1:22".into(),
                 protocol: ServiceProtocol::Tcp,
             }],
@@ -77,25 +77,25 @@ fn targets_discover_two_and_later_third_without_matching_display_aliases() -> Re
     let mut catalog = Catalog {
         generation: 1,
         homes: vec![
-            f.home("mac", "terminal", "flowsplice.pty.v1")?,
-            f.home("vps", "console", "flowsplice.pty.v1")?,
-            f.home("ordinary", "terminal", "other.application")?,
+            f.home("mac", "echo", "example.echo.v1")?,
+            f.home("vps", "echo-alt", "example.echo.v1")?,
+            f.home("ordinary", "echo", "other.application")?,
         ],
     };
     let initial = targets(&catalog, &f.trust, &f.descriptor, NOW)?;
     assert_eq!(initial.len(), 2);
-    assert_eq!(initial[0].id, serde_json::to_string(&("mac", "terminal"))?);
+    assert_eq!(initial[0].id, serde_json::to_string(&("mac", "echo"))?);
     assert_eq!(initial[1].home_id, "vps");
     catalog
         .homes
-        .push(f.home("later", "pty-new", "flowsplice.pty.v1")?);
+        .push(f.home("later", "echo-new", "example.echo.v1")?);
     assert_eq!(targets(&catalog, &f.trust, &f.descriptor, NOW)?.len(), 3);
     Ok(())
 }
 #[test]
 fn targets_reject_missing_tampered_expired_or_wrong_home_material() -> Result<()> {
     let f = Fixture::new()?;
-    let good = f.home("mac", "terminal", "flowsplice.pty.v1")?;
+    let good = f.home("mac", "echo", "example.echo.v1")?;
     let mut invalid = Vec::new();
     let mut home = good.clone();
     home.service_grant = None;

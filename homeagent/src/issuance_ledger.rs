@@ -494,7 +494,7 @@ mod tests {
             descriptor: ServiceClassDescriptor {
                 version: 1,
                 approving_home_id: "home-1".into(),
-                application_protocol: "flowsplice.pty.v1".into(),
+                application_protocol: "example.echo.v1".into(),
                 protocol: ServiceProtocol::Tcp,
             },
             label: "iPad".into(),

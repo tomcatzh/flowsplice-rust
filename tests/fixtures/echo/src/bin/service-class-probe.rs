@@ -1,176 +1,102 @@
 //! Disposable E2E for one service-class identity shared across multiple Home sockets.
+//!
+//! Every matching Home runs the in-process line echo from `socket-probe home`, which
+//! answers each received line with the same bytes prefixed by `in-process:`.
 use anyhow::{Context, Result, bail, ensure};
 use flowsplice_core::business::ServiceClassDescriptor;
 use flowsplice_core::protocol::ServiceProtocol;
 use flowsplice_enrollment::load_json;
-use flowsplice_pty_client::PtyClient;
-use flowsplice_pty_protocol::{Mode, Operation, Reply, ServerMessage, Session, SessionDetails};
 use flowsplice_storage::{StateStore, Table, WriteBatch};
 use flowsplice_travel_core::{
-    ServiceBinding, TravelCore,
+    ServiceBinding, SocketStream, TravelCore,
     business::BusinessEnrollmentOptions,
     service_class::{self, ApprovedServiceClass, ServiceClassTarget},
 };
-use std::{collections::BTreeMap, path::Path, time::Duration};
-use tokio::sync::mpsc;
+use std::{collections::HashSet, path::Path, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use uuid::Uuid;
 
-struct Probe {
-    client: PtyClient,
-    events: mpsc::Receiver<ServerMessage>,
-    output: Vec<u8>,
-    ownership: BTreeMap<Uuid, (u64, Option<Uuid>)>,
-    initial: Vec<Session>,
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Admission includes signed route authorization and the first Carrier race.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Authorization loss must end every open class socket within this bound.
+const ACCESS_END_TIMEOUT: Duration = Duration::from_secs(180);
+/// Covers the Travel Carrier recovery deadline before a refused connection reports failure.
+const REFUSED_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One open line-echo connection to a discovered class target.
+struct Echo {
+    reader: BufReader<ReadHalf<SocketStream>>,
+    writer: WriteHalf<SocketStream>,
 }
-impl Probe {
+impl Echo {
     async fn connect(runtime: &TravelCore, target: &ServiceClassTarget) -> Result<Self> {
-        let (client, events) =
-            PtyClient::connect_shared(runtime, &binding(target), "class probe".into()).await?;
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, runtime.connect_tcp(&binding(target)))
+            .await
+            .context("class connection timed out")??;
+        let (reader, writer) = tokio::io::split(stream);
         let mut this = Self {
-            client,
-            events,
-            output: Vec::new(),
-            ownership: BTreeMap::new(),
-            initial: Vec::new(),
+            reader: BufReader::new(reader),
+            writer,
         };
-        ensure!(
-            matches!(this.next().await?, ServerMessage::Hello { .. }),
-            "missing initial Hello"
-        );
-        let ServerMessage::Response {
-            result: Reply::Sessions { sessions },
-            ..
-        } = this.next().await?
-        else {
-            bail!("missing actionable session list");
-        };
-        this.initial = sessions;
+        this.roundtrip().await?;
         no_listeners()?;
         Ok(this)
     }
-    async fn next(&mut self) -> Result<ServerMessage> {
-        let message = tokio::time::timeout(Duration::from_secs(15), self.events.recv())
-            .await?
-            .context("terminal connection ended")?;
-        match &message {
-            ServerMessage::Output { data, .. } => {
-                self.output.extend(data);
-                if self.output.len() > 1024 * 1024 {
-                    self.output.drain(..self.output.len() - 1024 * 1024);
-                }
-            }
-            ServerMessage::Ownership {
-                session_id,
-                epoch,
-                writer,
-            } => {
-                self.ownership.insert(
-                    *session_id,
-                    (*epoch, writer.as_ref().map(|w| w.attachment_id)),
-                );
-            }
-            ServerMessage::Response {
-                result:
-                    Reply::Attached {
-                        session,
-                        writer_epoch,
-                        ..
-                    },
-                ..
-            } => {
-                self.ownership.insert(
-                    session.id,
-                    (
-                        *writer_epoch,
-                        session.writer.as_ref().map(|w| w.attachment_id),
-                    ),
-                );
-            }
-            _ => {}
-        }
-        Ok(message)
-    }
-    async fn request(&mut self, operation: Operation) -> Result<Reply> {
-        let id = self.client.send(operation).await?;
-        loop {
-            if let ServerMessage::Response { request_id, result } = self.next().await?
-                && request_id == id
-            {
-                return Ok(result);
-            }
-        }
-    }
-    async fn ok(&mut self, operation: Operation) -> Result<()> {
-        ensure!(
-            self.request(operation).await? == Reply::Ok,
-            "operation did not succeed"
-        );
-        Ok(())
-    }
-    async fn text(&mut self, marker: &str) -> Result<()> {
-        let result = tokio::time::timeout(Duration::from_secs(15), async {
-            while !String::from_utf8_lossy(&self.output).contains(marker) {
-                self.next().await?;
-            }
+    async fn roundtrip(&mut self) -> Result<()> {
+        // Non-ASCII content proves the class stream carries arbitrary UTF-8 bytes unchanged.
+        let marker = format!("类授权-class-{}", Uuid::new_v4());
+        tokio::time::timeout(IO_TIMEOUT, async {
+            self.writer.write_all(marker.as_bytes()).await?;
+            self.writer.write_all(b"\n").await?;
+            self.writer.flush().await?;
+            let mut line = Vec::new();
+            self.reader.read_until(b'\n', &mut line).await?;
+            ensure!(
+                line == format!("in-process:{marker}\n").into_bytes(),
+                "class echo returned missing, mixed or corrupt bytes"
+            );
             Ok::<_, anyhow::Error>(())
         })
         .await
-        .with_context(|| format!("terminal marker timed out: {marker}"))?;
-        result.with_context(|| format!("waiting for terminal marker: {marker}"))
+        .context("class echo round-trip timed out")?
     }
-    async fn input(&mut self, attachment: Uuid, epoch: u64, text: &str) -> Result<()> {
-        self.ok(Operation::Input {
-            attachment_id: attachment,
-            writer_epoch: epoch,
-            data: text.as_bytes().to_vec(),
-        })
-        .await
-    }
-    async fn details(&mut self) -> Result<Vec<SessionDetails>> {
-        let Reply::SessionDetails { sessions } = self.request(Operation::ListDetails).await? else {
-            bail!("details failed");
-        };
-        Ok(sessions)
-    }
-    async fn wait_empty(&mut self) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !self.list().await?.is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+    /// Orderly disconnect: half-close, then require the Home's matching EOF.
+    async fn close(mut self) -> Result<()> {
+        tokio::time::timeout(IO_TIMEOUT, async {
+            self.writer.shutdown().await?;
+            let mut rest = Vec::new();
+            self.reader.read_to_end(&mut rest).await?;
+            ensure!(rest.is_empty(), "class echo sent bytes after half-close");
             Ok::<_, anyhow::Error>(())
         })
-        .await??;
+        .await
+        .context("class echo half-close timed out")?
+    }
+    /// Waits, without sending application bytes, until authorization loss ends the stream.
+    async fn ended(&mut self) -> Result<()> {
+        let mut buffer = [0_u8; 1024];
+        match self.reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => Ok(()),
+            Ok(_) => bail!("class stream delivered unsolicited bytes"),
+        }
+    }
+    /// An ended stream must fail or stay at EOF; it must never echo again.
+    async fn rejects_traffic(mut self) -> Result<()> {
+        let attempt = async {
+            self.writer.write_all(b"forbidden\n").await?;
+            self.writer.flush().await?;
+            let mut line = Vec::new();
+            self.reader.read_until(b'\n', &mut line).await?;
+            Ok::<_, std::io::Error>(line)
+        };
+        match tokio::time::timeout(IO_TIMEOUT, attempt).await {
+            Ok(Ok(line)) => ensure!(line.is_empty(), "ended class socket still echoed input"),
+            Ok(Err(_)) => {}
+            Err(_) => bail!("ended class socket neither failed nor reached EOF"),
+        }
         Ok(())
     }
-    async fn list(&mut self) -> Result<Vec<Session>> {
-        let Reply::Sessions { sessions } = self.request(Operation::List).await? else {
-            bail!("list failed");
-        };
-        Ok(sessions)
-    }
-}
-fn attachment(reply: Reply) -> Result<(Uuid, Uuid, Mode, u64)> {
-    if let Reply::Attached {
-        session,
-        attachment_id,
-        mode,
-        writer_epoch,
-    } = reply
-    {
-        Ok((session.id, attachment_id, mode, writer_epoch))
-    } else {
-        bail!("join/new failed: {reply:?}");
-    }
-}
-#[allow(clippy::format_collect)]
-fn print_command(marker: &str) -> String {
-    // Octal encoding prevents a command echo from satisfying an output assertion.
-    let encoded: String = marker
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("\\{byte:03o}"))
-        .collect();
-    format!("printf '{encoded}\\n'\r")
 }
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 fn no_listeners() -> Result<()> {
@@ -199,7 +125,7 @@ fn no_listeners() -> Result<()> {
                 ensure!(
                     !(udp || f.get(3) == Some(&"0A"))
                         || !f.get(9).is_some_and(|i| sockets.contains(*i)),
-                    "PTY Travel owns a TCP listener or UDP socket"
+                    "service-class Travel owns a TCP listener or UDP socket"
                 );
             }
         }
@@ -212,6 +138,9 @@ fn binding(target: &ServiceClassTarget) -> ServiceBinding {
         service_id: target.service_id.clone(),
         protocol: target.service.protocol,
     }
+}
+fn summary(target: &ServiceClassTarget) -> serde_json::Value {
+    serde_json::json!({"home_id":target.home_id,"service_id":target.service_id})
 }
 fn arguments(args: &[String]) -> Result<&str> {
     match args.first().map(String::as_str) {
@@ -299,7 +228,7 @@ async fn targets(
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let targets = runtime.service_class_targets(approved).await?;
-            let homes: std::collections::HashSet<_> = targets.iter().map(|t| &t.home_id).collect();
+            let homes: HashSet<_> = targets.iter().map(|t| &t.home_id).collect();
             if homes.len() >= 2 {
                 return Ok(targets);
             }
@@ -309,36 +238,16 @@ async fn targets(
     .await
     .context("two class Homes were not discovered")?
 }
-async fn new_named(probe: &mut Probe) -> Result<(Uuid, Uuid, u64)> {
-    let (session, attachment, mode, epoch) = attachment(
-        probe
-            .request(Operation::NewNamed {
-                name: "同名 class 终端".into(),
-                columns: 80,
-                rows: 24,
-            })
-            .await?,
-    )?;
-    ensure!(mode == Mode::ReadWrite, "new class session is not writable");
-    let details = probe.details().await?;
-    let detail = details
-        .iter()
-        .find(|detail| detail.id == session)
-        .context("new metadata absent")?;
-    ensure!(
-        detail.name == "同名 class 终端"
-            && detail.connection_count == 1
-            && detail.last_connected_at_unix_secs.is_some(),
-        "class session metadata incorrect"
-    );
-    Ok((session, attachment, epoch))
+fn matches_class(target: &ServiceClassTarget, descriptor: &ServiceClassDescriptor) -> bool {
+    target.service.application_protocol == descriptor.application_protocol
+        && target.service.protocol == descriptor.protocol
 }
-async fn marker(probe: &mut Probe, attachment: Uuid, epoch: u64) -> Result<()> {
-    let value = format!("类授权-中文-{}", Uuid::new_v4());
-    probe
-        .input(attachment, epoch, &print_command(&value))
-        .await?;
-    probe.text(&value).await
+async fn refused(runtime: &TravelCore, binding: &ServiceBinding, timeout: Duration) -> Result<()> {
+    match tokio::time::timeout(timeout, runtime.connect_tcp(binding)).await {
+        Ok(Err(_)) => Ok(()),
+        Ok(Ok(_)) => bail!("unauthorized class binding was admitted"),
+        Err(_) => bail!("unauthorized class binding neither connected nor failed within bound"),
+    }
 }
 async fn future(
     runtime: &TravelCore,
@@ -380,57 +289,44 @@ async fn future(
     })
     .await
     .context("future matching Home was not discovered")??;
-    let mut probe = Probe::connect(runtime, &target).await?;
     ensure!(
-        probe.initial.is_empty(),
-        "future connect created an automatic session"
+        matches_class(&target, &approved.descriptor),
+        "future discovery included a wrong class"
     );
-    let (_, id, epoch) = new_named(&mut probe).await?;
-    marker(&mut probe, id, epoch).await?;
-    probe.input(id, epoch, "exit\r").await?;
-    probe.wait_empty().await?;
-    probe.client.shutdown().await;
+    let mut echo = Echo::connect(runtime, &target).await?;
+    echo.roundtrip().await?;
+    echo.close().await?;
     println!(
         "{}",
-        serde_json::json!({"checkpoint":"service-class-future-complete","home_id":home})
+        serde_json::json!({"checkpoint":"service-class-future-complete","home_id":home,"service_id":target.service_id})
     );
     Ok(())
 }
 async fn access_end(
-    first: &mut Probe,
-    second: &mut Probe,
-    aid: Uuid,
-    bid: Uuid,
-    ae: u64,
-    be: u64,
+    runtime: &TravelCore,
+    (mut first, first_target): (Echo, &ServiceClassTarget),
+    (mut second, second_target): (Echo, &ServiceClassTarget),
 ) -> Result<()> {
     println!("{{\"checkpoint\":\"service-class-access-ready\"}}");
-    tokio::time::timeout(Duration::from_secs(180), async {
-        tokio::join!(
-            async { while first.events.recv().await.is_some() {} },
-            async { while second.events.recv().await.is_some() {} }
-        );
+    let (a, b) = tokio::time::timeout(ACCESS_END_TIMEOUT, async {
+        tokio::join!(first.ended(), second.ended())
     })
     .await
     .context("class authorization loss did not close both sockets")?;
-    for (probe, id, epoch) in [(first, aid, ae), (second, bid, be)] {
-        // Event EOF precedes publication of worker completion. send() reports
-        // local queue admission, not remote execution; join teardown before
-        // asserting that a completed connection rejects further operations.
-        probe.client.shutdown().await;
-        ensure!(
-            probe
-                .client
-                .send(Operation::Input {
-                    attachment_id: id,
-                    writer_epoch: epoch,
-                    data: b"forbidden\r".to_vec()
-                })
-                .await
-                .is_err(),
-            "closed class socket accepted input"
-        );
-    }
+    a?;
+    b?;
+    let (a, b) = tokio::join!(first.rejects_traffic(), second.rejects_traffic());
+    a?;
+    b?;
+    // A new socket needs a fresh route authorization, which the ended credential cannot obtain.
+    let (first_binding, second_binding) = (binding(first_target), binding(second_target));
+    let (a, b) = tokio::join!(
+        refused(runtime, &first_binding, REFUSED_CONNECT_TIMEOUT),
+        refused(runtime, &second_binding, REFUSED_CONNECT_TIMEOUT)
+    );
+    a.context("fresh class connection after access loss")?;
+    b.context("fresh class connection after access loss")?;
+    no_listeners()?;
     println!("{{\"checkpoint\":\"service-class-access-ended\"}}");
     Ok(())
 }
@@ -447,14 +343,12 @@ async fn exercise(mode: &str, args: &[String]) -> Result<()> {
         &descriptor,
     )
     .await?;
+    no_listeners()?;
     let found = targets(&runtime, &approved).await?;
     ensure!(
         found
             .iter()
-            .all(
-                |target| target.service.application_protocol == descriptor.application_protocol
-                    && target.service.protocol == descriptor.protocol
-            ),
+            .all(|target| matches_class(target, &descriptor)),
         "discovery included a wrong class"
     );
     let first_target = &found[0];
@@ -462,32 +356,36 @@ async fn exercise(mode: &str, args: &[String]) -> Result<()> {
         .iter()
         .find(|target| target.home_id != first_target.home_id)
         .context("second distinct Home missing")?;
-    let wrong = ServiceBinding {
-        home_id: args[4].clone(),
-        service_id: args[5].clone(),
-        protocol: ServiceProtocol::Tcp,
-    };
-    ensure!(
-        runtime.connect_tcp(&wrong).await.is_err(),
-        "guessed nonclass service was admitted"
+    for wrong in [
+        ServiceBinding {
+            home_id: args[4].clone(),
+            service_id: args[5].clone(),
+            protocol: ServiceProtocol::Tcp,
+        },
+        // A guessed service ID on a discovered class Home is not part of the class.
+        ServiceBinding {
+            home_id: first_target.home_id.clone(),
+            service_id: args[5].clone(),
+            protocol: ServiceProtocol::Tcp,
+        },
+    ] {
+        refused(&runtime, &wrong, CONNECT_TIMEOUT)
+            .await
+            .context("guessed nonclass service")?;
+    }
+    let (first, second) = tokio::join!(
+        Echo::connect(&runtime, first_target),
+        Echo::connect(&runtime, second_target)
     );
-    let (a, b) = tokio::join!(
-        Probe::connect(&runtime, first_target),
-        Probe::connect(&runtime, second_target)
-    );
-    let (mut first, mut second) = (a?, b?);
-    ensure!(
-        first.initial.is_empty() && second.initial.is_empty(),
-        "connect created a session or fixture not empty"
-    );
-    let (sid_a, aid, ae) = new_named(&mut first).await?;
-    let (sid_b, bid, be) = new_named(&mut second).await?;
-    ensure!(sid_a != sid_b, "two Homes reused session identity");
-    marker(&mut first, aid, ae).await?;
-    marker(&mut second, bid, be).await?;
+    let (mut first, mut second) = (first?, second?);
+    for _ in 0..3 {
+        let (a, b) = tokio::join!(first.roundtrip(), second.roundtrip());
+        a?;
+        b?;
+    }
     let state = serde_json::json!({"request_id":approved.request_id,"credential_id":approved.credential_id,"travel_id":approved.travel_id,
-        "sessions":[{"home_id":first_target.home_id,"service_id":first_target.service_id,"session_id":sid_a},
-        {"home_id":second_target.home_id,"service_id":second_target.service_id,"session_id":sid_b}]});
+        "discovered":found.iter().map(summary).collect::<Vec<_>>(),
+        "connections":[summary(first_target), summary(second_target)]});
     std::fs::write(&args[6], serde_json::to_vec(&state)?)?;
     println!(
         "{}",
@@ -495,40 +393,32 @@ async fn exercise(mode: &str, args: &[String]) -> Result<()> {
     );
     no_listeners()?;
     if mode == "access-end" {
-        access_end(&mut first, &mut second, aid, bid, ae, be).await?;
+        access_end(&runtime, (first, first_target), (second, second_target)).await?;
     } else {
-        first.ok(Operation::Detach { attachment_id: aid }).await?;
-        first.client.shutdown().await;
-        marker(&mut second, bid, be).await?;
-        let mut rejoined = Probe::connect(&runtime, first_target).await?;
-        ensure!(
-            rejoined.initial.len() == 1 && rejoined.initial[0].id == sid_a,
-            "reconnect created or lost shell"
-        );
-        let (_, id, joined_mode, epoch) = attachment(
-            rejoined
-                .request(Operation::Join {
-                    session_id: sid_a,
-                    mode: Mode::ReadWrite,
-                    columns: 80,
-                    rows: 24,
-                })
-                .await?,
-        )?;
-        ensure!(joined_mode == Mode::ReadWrite, "detached writer survived");
-        marker(&mut rejoined, id, epoch).await?;
+        // Disconnecting one Home leaves the shared runtime and other sockets usable.
+        first.close().await?;
+        second.roundtrip().await?;
+        let mut rejoined = Echo::connect(&runtime, first_target).await?;
+        let (a, b) = tokio::join!(rejoined.roundtrip(), second.roundtrip());
+        a?;
+        b?;
         if mode == "future" {
             future(&runtime, &approved, Path::new(&args[7]), &found).await?;
+            // Discovering another Home must not disturb already-open sockets.
+            let (a, b) = tokio::join!(rejoined.roundtrip(), second.roundtrip());
+            a?;
+            b?;
         }
-        rejoined.input(id, epoch, "exit\r").await?;
-        second.input(bid, be, "exit\r").await?;
-        rejoined.wait_empty().await?;
-        second.wait_empty().await?;
-        rejoined.client.shutdown().await;
+        rejoined.close().await?;
+        second.close().await?;
     }
-    first.client.shutdown().await;
-    second.client.shutdown().await;
-    runtime.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+        .await
+        .context("class runtime shutdown timed out")?;
+    ensure!(
+        runtime.status().await.active_flows == 0,
+        "class runtime shutdown retained active flows"
+    );
     no_listeners()?;
     println!(
         "{}",
@@ -541,7 +431,9 @@ async fn main() -> Result<()> {
     flowsplice_core::init_crypto();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = arguments(&args)?;
-    tokio::time::timeout(Duration::from_secs(240), async {
+    // Access loss waits for stream teardown and then for a refused fresh connection.
+    let limit = if mode == "access-end" { 420 } else { 240 };
+    tokio::time::timeout(Duration::from_secs(limit), async {
         match mode {
             "enroll" => enroll(&args[1..]).await,
             "check-only" => check_only(&args[1..]),

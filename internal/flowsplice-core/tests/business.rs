@@ -28,9 +28,9 @@ fn key() -> Result<EcdsaKeyPair> {
 }
 fn service() -> BusinessService {
     BusinessService {
-        service_id: "pty".into(),
+        service_id: "echo".into(),
         protocol: ServiceProtocol::Tcp,
-        application_protocol: "flowsplice-pty/1".into(),
+        application_protocol: "example-echo/1".into(),
         capabilities: vec!["read".into(), "write".into()],
     }
 }
@@ -97,7 +97,7 @@ impl Fixture {
             approving_home_id: "super-home".into(),
             endpoint: signed_endpoint,
             grant: SignedHomeServiceGrant::sign(&grant, &home_key)?,
-            service_id: "pty".into(),
+            service_id: "echo".into(),
         };
         let travel: TravelCredential = serde_json::from_value(json!({
             "version":1,"object_type":"flowsplice.travel_credential","deployment_id":"deployment",
@@ -107,7 +107,7 @@ impl Fixture {
             "management_spki_sha256":"88".repeat(32),"business_spki_sha256":"99".repeat(32),
             "management_ca_sha256":"aa".repeat(32),"business_ca_sha256":"bb".repeat(32),
             "management_certificate_sha256":"cc".repeat(32),"business_certificate_sha256":"dd".repeat(32),
-            "scope":{"kind":"service","home_id":"business-home","service_id":"pty","protocol":"tcp"},
+            "scope":{"kind":"service","home_id":"business-home","service_id":"echo","protocol":"tcp"},
             "not_before_unix_secs":400,"not_after_unix_secs":6000
         }))?;
         Ok(Self {
@@ -313,8 +313,8 @@ fn service_and_catalog_validation_reject_ambiguity_and_transport_widening() -> R
         assert!(s.validate().is_err());
     }
     let allowed = Service {
-        id: "pty".into(),
-        alias: "PTY".into(),
+        id: "echo".into(),
+        alias: "Echo".into(),
         protocol: ServiceProtocol::Tcp,
         target: "in-process".into(),
     };
@@ -445,7 +445,7 @@ fn even_resigned_approvals_cannot_widen_scope_or_validity() -> Result<()> {
         },
         TravelCredentialScope::Service {
             home_id: "other".into(),
-            service_id: "pty".into(),
+            service_id: "echo".into(),
             protocol: ServiceProtocol::Tcp,
         },
         TravelCredentialScope::Service {
@@ -455,7 +455,7 @@ fn even_resigned_approvals_cannot_widen_scope_or_validity() -> Result<()> {
         },
         TravelCredentialScope::Service {
             home_id: "business-home".into(),
-            service_id: "pty".into(),
+            service_id: "echo".into(),
             protocol: ServiceProtocol::Udp,
         },
     ];

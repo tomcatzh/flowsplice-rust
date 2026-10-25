@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Directed business acceptance against an already-running disposable Compose topology."""
+"""Directed business and service-class acceptance against an already-running disposable Compose topology."""
 import hashlib
 import http.client
 import importlib.util
@@ -164,7 +164,7 @@ class Run:
             shutil.rmtree(self.directory, ignore_errors=True)
 
     def execute(self):
-        services = [{"service_id": value, "protocol": "tcp", "application_protocol": "flowsplice.pty.v1",
+        services = [{"service_id": value, "protocol": "tcp", "application_protocol": "example.echo.v1",
                      "capabilities": ["read", "write"]} for value in ("svc-alpha", "svc-beta", "svc-denied")]
         (self.directory / "services.json").write_text(json.dumps(services))
         setup = self.start("setup", "flowsplice-homeagent", ["init", "--server", self.server,
@@ -249,12 +249,12 @@ class Run:
         command(["docker", "restart", business_home])
         self.probe("home-restarted", travel_args)
         self.passed += ["idempotent-install-resume", "descriptor-config-binding", "business-home-restart"]
-        if os.environ.get("FLOWSPLICE_PTY_E2E", "0") == "1":
-            pty_spec = importlib.util.spec_from_file_location("pty_acceptance", HERE / "check-pty.py")
-            pty = importlib.util.module_from_spec(pty_spec)
-            pty_spec.loader.exec_module(pty)
-            self.command, self.require, self.wait, self.issuer = command, require, wait, issuer
-            pty.execute(self, business_home, alpha, root, scope)
+        # One class identity across this Home, a second serving-only Home and a future Home.
+        class_spec = importlib.util.spec_from_file_location("service_class_acceptance", HERE / "check-service-class.py")
+        class_acceptance = importlib.util.module_from_spec(class_spec)
+        class_spec.loader.exec_module(class_acceptance)
+        self.command, self.require, self.wait, self.issuer = command, require, wait, issuer
+        class_acceptance.execute(self, alpha, root, scope)
         print(json.dumps({"checkpoint": "business-e2e-complete", "passed": self.passed,
                           "logs": str(self.evidence)}))
 
