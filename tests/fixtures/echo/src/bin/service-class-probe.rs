@@ -228,6 +228,18 @@ async fn targets(
     approved: &ApprovedServiceClass,
 ) -> Result<Vec<ServiceClassTarget>> {
     tokio::time::timeout(Duration::from_secs(30), async {
+        // A restarted runtime starts from its cached catalog, which can still list Homes that
+        // have since left. A catalog subscription is recorded only after a fresh signed control
+        // snapshot was applied in this process, so wait for one before choosing targets.
+        while runtime
+            .diagnostics()
+            .await
+            .control_plane
+            .catalog_subscription_relay
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         loop {
             let targets = runtime.service_class_targets(approved).await?;
             let homes: HashSet<_> = targets.iter().map(|t| &t.home_id).collect();
