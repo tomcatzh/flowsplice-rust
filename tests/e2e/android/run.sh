@@ -23,6 +23,16 @@ if [[ ! -x "${adb}" ]]; then
   echo 'Android Debug Bridge was not found in the configured SDK' >&2
   exit 1
 fi
+# The test replaces and clears io.zxf.flowsplice.travel, so it runs only on an emulator. With a
+# phone attached as well, ANDROID_SERIAL must name the emulator.
+if [[ -z "${ANDROID_SERIAL:-}" ]]; then
+  ANDROID_SERIAL="$("${adb}" devices | awk 'NR > 1 && $2 == "device" {count++; serial = $1} END {if (count == 1) print serial}')"
+fi
+if [[ "${ANDROID_SERIAL}" != emulator-* ]]; then
+  echo 'Android Travel E2E clears the Travel app; set ANDROID_SERIAL to a ready emulator' >&2
+  exit 1
+fi
+export ANDROID_SERIAL
 if [[ "$("${adb}" get-state 2>/dev/null)" != "device" ]]; then
   echo 'No ready Android emulator or device is connected' >&2
   exit 1
