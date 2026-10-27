@@ -604,6 +604,21 @@ python3 "${repo_root}/tests/e2e/tcp-probe.py" \
   --payload dynamic-home-global-issuer-business \
   --wait-secs 90
 
+# The first data address of every Relay now accepts TCP but is no Relay (the echo service), so a
+# Carrier opens only if Travel races all data addresses instead of trying them in turn.
+docker compose -f "${compose_file}" stop dynamictravel
+python3 "${repo_root}/tests/e2e/set-relay-data-aliases.py" \
+  "${generated_dir}/dynamic-travel/travelagent.toml" \
+  --data-addr echo:7001 \
+  --relay relay-1=relay1:8443 \
+  --relay relay-2=relay2:8443
+docker compose -f "${compose_file}" up -d dynamictravel
+python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+  --port 13083 \
+  --payload travel-races-relay-data-addresses \
+  --wait-secs 90
+printf '%s\n' '{"checkpoint": "travel-races-relay-data-addresses"}'
+
 mkdir -p "${generated_dir}/first-travel"
 cp "${generated_dir}/offline/test-password.txt" \
   "${generated_dir}/first-travel/test-password.txt"

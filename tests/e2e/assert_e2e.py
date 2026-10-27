@@ -1981,6 +1981,7 @@ checks = [
     "home-two-serving-only-profile",
     "home-two-serving-only-has-no-issuer-routes-or-keys",
     "dynamic-global-home-approved-third-home",
+    "travel-races-relay-data-addresses",
     "home-two-state-persists-across-issuer-to-serving-only-restart",
     "same-tcp-flow-relay-failover",
     "home-two-same-tcp-flow-relay-failover",

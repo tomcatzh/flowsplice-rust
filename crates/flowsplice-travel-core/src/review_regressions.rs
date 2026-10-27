@@ -34,7 +34,7 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use super::{
     AppState, Mapping, RelayAddressOverride, RemoteEnrollmentOptions, TravelCore,
-    discover_bootstrap_relay, enroll_remote, load_app_state, relay_data_addresses,
+    discover_bootstrap_relay, enroll_remote, first_success, load_app_state, relay_data_addresses,
     relay_management_candidates, run_catalog_session,
 };
 
@@ -464,6 +464,62 @@ fn r08_bootstrap_hints_keep_signed_addresses_as_recoverable_fallbacks() {
         candidate.expected_id.as_deref() == Some("relay-1")
             && candidate.management_spki_sha256.as_deref() == Some(manual_pin.as_str())
     }));
+}
+
+/// Marks its attempt as dropped, so a test can see that the race released a loser.
+struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn data_addresses_race_so_a_silent_first_address_cannot_block_the_carrier() -> Result<()> {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = DropFlag(std::sync::Arc::clone(&dropped));
+    let silent = Box::pin(async move {
+        let _flag = flag;
+        std::future::pending::<Result<&str>>().await
+    });
+    let failing = Box::pin(async { bail!("connection refused") });
+    let working = Box::pin(async {
+        sleep(Duration::from_millis(50)).await;
+        Ok("relay")
+    });
+    let started = tokio::time::Instant::now();
+    let winner = timeout(
+        Duration::from_secs(1),
+        first_success(vec![silent, failing, working]),
+    )
+    .await
+    .context("the race waited for the silent address")??;
+    assert_eq!(winner, "relay");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the losing attempt kept running after the race"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn data_address_race_reports_a_failure_only_when_every_address_failed() -> Result<()> {
+    let first = Box::pin(async { bail!("first address failed") });
+    let second = Box::pin(async {
+        sleep(Duration::from_millis(10)).await;
+        bail!("second address failed")
+    });
+    let Err(error) = first_success::<()>(vec![first, second]).await else {
+        bail!("the race succeeded although every address failed");
+    };
+    assert_eq!(error.to_string(), "second address failed");
+    let Err(error) = first_success::<()>(Vec::new()).await else {
+        bail!("the race succeeded without an address");
+    };
+    assert_eq!(error.to_string(), "no Relay data address");
+    Ok(())
 }
 
 #[tokio::test]

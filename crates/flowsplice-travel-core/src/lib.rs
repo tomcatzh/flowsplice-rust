@@ -3622,50 +3622,23 @@ async fn open_business_on(
         trusted_home_business_pins(&trust, home_id, endpoint_credential, unix_time_secs()?)?
     };
     let (grant, relay_id) = request_route(state, relay, home_id).await?;
-    let addresses =
-        relay_data_addresses(&relay_id, &grant.data_addr, &config.relay_address_overrides);
-    let mut connected = None;
-    let mut last_error = None;
-    for address in addresses {
-        match timeout(
-            Duration::from_secs(config.handshake_timeout_secs),
-            TcpStream::connect(address),
-        )
-        .await
-        {
-            Ok(Ok(socket)) => {
-                connected = Some(socket);
-                break;
-            }
-            Ok(Err(error)) => last_error = Some(anyhow!(error)),
-            Err(_) => last_error = Some(anyhow!("relay data connection timed out")),
-        }
-    }
-    let mut socket =
-        connected.ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("no Relay data address")))?;
-    socket.set_nodelay(true)?;
-    timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
-        write_preface(
-            &mut socket,
-            RouteSide::Travel,
-            grant.route_id,
-            &grant.route_secret,
-        ),
-    )
-    .await
-    .context("relay data preface timed out")??;
-    let mut stream = timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
-        state
-            .tls
-            .business_connector
-            .connect(identity_server_name()?, socket),
-    )
-    .await
-    .context("business TLS handshake timed out")??;
-    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
-    require_peer(&identity, Role::Home, Some(home_id), &home_spki_pins)?;
+    // Race every data address of the Relay, like the Carrier race itself: an address that is
+    // unreachable, or accepts TCP but is no Relay, must not consume the attempt. The Relay
+    // pairs only the first Travel side of a route, so a later arrival is rejected there.
+    let attempts =
+        relay_data_addresses(&relay_id, &grant.data_addr, &config.relay_address_overrides)
+            .into_iter()
+            .map(|address| {
+                Box::pin(open_route_data(
+                    state,
+                    address,
+                    &grant,
+                    home_id,
+                    &home_spki_pins,
+                )) as RouteDataAttempt<'_>
+            })
+            .collect();
+    let mut stream = first_success(attempts).await?;
     write_json(
         &mut stream,
         &DataFrame::Open {
@@ -3699,6 +3672,77 @@ async fn open_business_on(
         DataFrame::OpenError { reason, .. } => bail!("home rejected carrier: {reason}"),
         _ => bail!("invalid carrier OPEN response"),
     }
+}
+
+type RouteDataAttempt<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<TlsStream<TcpStream>>> + Send + 'a>>;
+
+/// Claims the Travel side of a granted route through one Relay data address and verifies the
+/// pinned Home over business TLS.
+async fn open_route_data(
+    state: &AppState,
+    address: &str,
+    grant: &RouteGrant,
+    home_id: &str,
+    home_spki_pins: &[String],
+) -> Result<TlsStream<TcpStream>> {
+    let handshake_timeout = Duration::from_secs(state.config.handshake_timeout_secs);
+    let mut socket = timeout(handshake_timeout, TcpStream::connect(address))
+        .await
+        .context("relay data connection timed out")??;
+    socket.set_nodelay(true)?;
+    timeout(
+        handshake_timeout,
+        write_preface(
+            &mut socket,
+            RouteSide::Travel,
+            grant.route_id,
+            &grant.route_secret,
+        ),
+    )
+    .await
+    .context("relay data preface timed out")??;
+    let stream = timeout(
+        handshake_timeout,
+        state
+            .tls
+            .business_connector
+            .connect(identity_server_name()?, socket),
+    )
+    .await
+    .context("business TLS handshake timed out")??;
+    let identity = peer_identity(stream.get_ref().1.peer_certificates())?;
+    require_peer(&identity, Role::Home, Some(home_id), home_spki_pins)?;
+    Ok(stream)
+}
+
+/// Polls all attempts concurrently and returns the first success, dropping the others.
+/// Returns the last failure when every attempt fails.
+async fn first_success<T>(
+    mut attempts: Vec<std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>>,
+) -> Result<T> {
+    let mut last_error = None;
+    std::future::poll_fn(|cx| {
+        let mut index = 0;
+        while index < attempts.len() {
+            match attempts[index].as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(value)) => return std::task::Poll::Ready(Ok(value)),
+                std::task::Poll::Ready(Err(error)) => {
+                    last_error = Some(error);
+                    drop(attempts.swap_remove(index));
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        if attempts.is_empty() {
+            std::task::Poll::Ready(Err(last_error
+                .take()
+                .unwrap_or_else(|| anyhow!("no Relay data address"))))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 async fn relay_candidates(state: &AppState) -> Vec<RelayCandidate> {
