@@ -13,11 +13,8 @@ final class FlowSpliceMacUITestsLaunchTests: XCTestCase {
         addTeardownBlock { app.terminate() }
         app.launch()
         if !app.windows.firstMatch.exists {
-            let statusItem = app.statusItems.firstMatch
-            XCTAssertTrue(statusItem.waitForExistence(timeout: 3))
-            statusItem.click()
             let openButton = app.buttons["Open FlowSplice"]
-            XCTAssertTrue(openButton.waitForExistence(timeout: 3))
+            openStatusMenu(app.statusItems.firstMatch, showing: openButton)
             openButton.click()
         }
         XCTAssertTrue(app.staticTexts["Online"].waitForExistence(timeout: 6))

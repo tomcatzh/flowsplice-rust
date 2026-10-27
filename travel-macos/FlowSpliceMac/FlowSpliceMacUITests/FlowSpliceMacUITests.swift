@@ -182,10 +182,8 @@ final class FlowSpliceMacUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Online"].waitForExistence(timeout: 6))
 
         let statusItem = app.statusItems.firstMatch
-        XCTAssertTrue(statusItem.waitForExistence(timeout: 3))
-        statusItem.click()
         let trueQuitButton = element(in: app, identifier: "menu-true-quit")
-        XCTAssertTrue(trueQuitButton.waitForExistence(timeout: 3))
+        openStatusMenu(statusItem, showing: trueQuitButton)
         trueQuitButton.click()
         let quitDialog = app.dialogs.matching(
             NSPredicate(format: "label ==[c] %@ OR identifier == %@", "alert", "_NS:87")
@@ -198,8 +196,7 @@ final class FlowSpliceMacUITests: XCTestCase {
         XCTAssertNotEqual(app.state, .notRunning)
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 5))
 
-        statusItem.click()
-        XCTAssertTrue(trueQuitButton.waitForExistence(timeout: 3))
+        openStatusMenu(statusItem, showing: trueQuitButton)
         trueQuitButton.click()
         XCTAssertTrue(quitDialog.waitForExistence(timeout: 3))
         attachDebugHierarchy(quitDialog.debugDescription, name: "statusbar-quit-dialog-before-confirm")
@@ -215,13 +212,12 @@ final class FlowSpliceMacUITests: XCTestCase {
         let app = makeApp(enrolled: false)
         addTeardownBlock { self.forceTerminateFlowSpliceApp() }
         app.launch()
+        showMainWindowIfNeeded(in: app)
         XCTAssertTrue(app.staticTexts["Enroll this Mac"].waitForExistence(timeout: 5))
 
         let statusItem = app.statusItems.firstMatch
-        XCTAssertTrue(statusItem.waitForExistence(timeout: 3))
-        statusItem.click()
         let trueQuitButton = element(in: app, identifier: "menu-true-quit")
-        XCTAssertTrue(trueQuitButton.waitForExistence(timeout: 3))
+        openStatusMenu(statusItem, showing: trueQuitButton)
         trueQuitButton.click()
 
         let quitDialog = app.dialogs.matching(
@@ -415,14 +411,8 @@ final class FlowSpliceMacUITests: XCTestCase {
     @MainActor
     private func showMainWindowIfNeeded(in app: XCUIApplication) {
         guard !app.windows.firstMatch.exists else { return }
-        let statusItem = app.statusItems.firstMatch
-        XCTAssertTrue(statusItem.waitForExistence(timeout: 3))
-        statusItem.click()
         let openButton = app.buttons["Open FlowSplice"]
-        if !openButton.waitForExistence(timeout: 1) {
-            statusItem.click()
-        }
-        XCTAssertTrue(openButton.waitForExistence(timeout: 3))
+        openStatusMenu(app.statusItems.firstMatch, showing: openButton)
         openButton.click()
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 3))
     }
@@ -650,4 +640,27 @@ final class FlowSpliceMacUITests: XCTestCase {
         }
     }
 
+}
+
+extension XCTestCase {
+    /// Clicks the FlowSplice menu-bar item until `expected` appears in its menu. macOS 27 keeps
+    /// menu-bar items that do not fit, or that the user hid, behind MenuBarAgent's "Show hidden
+    /// menu bar items" control and folds them away again on its own, so a click can land on
+    /// nothing. The control toggles, which is why a failed click is followed by another reveal.
+    @MainActor
+    func openStatusMenu(_ statusItem: XCUIElement, showing expected: XCUIElement) {
+        XCTAssertTrue(statusItem.waitForExistence(timeout: 3))
+        for attempt in 0..<3 {
+            if attempt > 0 || !statusItem.isHittable {
+                let reveal = XCUIApplication(bundleIdentifier: "com.apple.MenuBarAgent")
+                    .menuBars.buttons.firstMatch
+                if reveal.waitForExistence(timeout: 1) {
+                    reveal.click()
+                }
+            }
+            statusItem.click()
+            if expected.waitForExistence(timeout: 3) { return }
+        }
+        XCTFail("The FlowSplice menu-bar menu did not open.")
+    }
 }
