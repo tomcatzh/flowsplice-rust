@@ -4,6 +4,10 @@ import UIKit
 import XCTest
 
 final class FlowSpliceTravelUITests: XCTestCase {
+    /// Local mapping port of the Docker E2E. Simulators share the Mac's loopback, so parallel
+    /// acceptance gives each simulator its own port.
+    private var localPort: UInt16 = 10_800
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
@@ -39,12 +43,13 @@ final class FlowSpliceTravelUITests: XCTestCase {
     @MainActor
     func testDockerRemoteEnrollmentCatalogMappingAndRecovery() throws {
         let environment = ProcessInfo.processInfo.environment
-        guard tcpPortIsReachable(host: "127.0.0.1", port: 18_446) else {
-            throw XCTSkip("The local Docker Relay is not running.")
-        }
         let relay = argumentValue("--flowsplice-e2e-relay")
             ?? environment["FLOWSPLICE_APPLE_E2E_RELAY"]
             ?? "127.0.0.1:18446"
+        // Parallel acceptance moves the Relay's host port, so probe the Relay under test.
+        guard let endpoint = ipv4Endpoint(relay), tcpPortIsReachable(host: endpoint.host, port: endpoint.port) else {
+            throw XCTSkip("The local Docker Relay is not running.")
+        }
         let password = environment["FLOWSPLICE_APPLE_E2E_PASSWORD"] ?? "flowsplice-e2e-private-key-password"
         let defaultTravelID = UIDevice.current.userInterfaceIdiom == .pad ? "apple-e2e-ipad-mini" : "apple-e2e-iphone"
         let travelID = argumentValue("--flowsplice-e2e-travel-id")
@@ -60,6 +65,11 @@ final class FlowSpliceTravelUITests: XCTestCase {
                 ?? environment["FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS"]
                 ?? "900"
         ) ?? 900
+        localPort = UInt16(
+            argumentValue("--flowsplice-e2e-local-port")
+                ?? environment["FLOWSPLICE_APPLE_E2E_LOCAL_PORT"]
+                ?? "10800"
+        ) ?? 10_800
         let app = XCUIApplication()
         app.launchEnvironment = [
             "FLOWSPLICE_UI_TEST_RESET": "1",
@@ -102,7 +112,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
         let port = app.textFields["mapping-port"]
         XCTAssertTrue(port.wait(for: \.isHittable, toEqual: true, timeout: 10))
         port.tap()
-        port.typeText("10800")
+        port.typeText(String(localPort))
         XCTAssertTrue(app.buttons["mapping-save"].isEnabled)
         app.buttons["mapping-save"].tap()
         XCTAssertTrue(app.descendants(matching: .any)["mapping-home-1-tcp-echo"].waitForExistence(timeout: 30))
@@ -287,7 +297,7 @@ final class FlowSpliceTravelUITests: XCTestCase {
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = UInt16(10_800).bigEndian
+        address.sin_port = localPort.bigEndian
         guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
             throw URLError(.badURL)
         }
@@ -326,6 +336,13 @@ final class FlowSpliceTravelUITests: XCTestCase {
                 userInfo: [NSLocalizedDescriptionKey: "Unexpected echo response: \(String(decoding: response, as: UTF8.self))"]
             )
         }
+    }
+
+    /// "host:port" of an IPv4 test address, such as the Relay the E2E harness passes in.
+    private func ipv4Endpoint(_ address: String) -> (host: String, port: UInt16)? {
+        guard let separator = address.lastIndex(of: ":"),
+              let port = UInt16(address[address.index(after: separator)...]) else { return nil }
+        return (String(address[..<separator]), port)
     }
 
     private func tcpPortIsReachable(host: String, port: UInt16) -> Bool {

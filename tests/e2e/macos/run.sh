@@ -8,7 +8,8 @@ password_file="${1:?macOS Travel private-key password file is required}"
 port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
 relay_address="${2:-127.0.0.1:$((18446 + port_offset))}"
 travel_id="${3:-macos-e2e-travel}"
-local_port="${FLOWSPLICE_MACOS_E2E_LOCAL_PORT:-10800}"
+# The mapping listens on the Mac's loopback, so it follows the port offset like the published ports.
+local_port="${FLOWSPLICE_MACOS_E2E_LOCAL_PORT:-$((10800 + port_offset))}"
 test_mode="${FLOWSPLICE_MACOS_TEST_MODE:-remote}"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 

@@ -8,6 +8,8 @@ deployment_root_input="${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-${repo_root}/tests
 password_file="${1:?Apple Travel private-key password file is required}"
 port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
 relay_address="${2:-127.0.0.1:$((18446 + port_offset))}"
+# The simulator shares the Mac's loopback, so the mapping port follows the port offset too.
+local_port="${FLOWSPLICE_APPLE_E2E_LOCAL_PORT:-$((10800 + port_offset))}"
 simulator_name="${3:-iPhone 17 Pro}"
 travel_id="${4:-apple-e2e-travel}"
 background_seconds="${FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS:-120}"
@@ -155,19 +157,22 @@ plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${pr
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS" -string "${sustained_seconds}" "${xctestrun_file}"
+plutil -insert "${environment_path}.FLOWSPLICE_APPLE_E2E_LOCAL_PORT" -string "${local_port}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E" -string "1" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_RELAY" -string "${relay_address}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_PASSWORD" -string "${private_key_password}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_TRAVEL_ID" -string "${travel_id}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS" -string "${background_seconds}" "${xctestrun_file}"
 plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS" -string "${sustained_seconds}" "${xctestrun_file}"
+plutil -insert "${testing_environment_path}.FLOWSPLICE_APPLE_E2E_LOCAL_PORT" -string "${local_port}" "${xctestrun_file}"
 test_arguments="$(
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
     '--flowsplice-apple-e2e' \
     '--flowsplice-e2e-relay' "${relay_address}" \
     '--flowsplice-e2e-travel-id' "${travel_id}" \
     '--flowsplice-e2e-background-seconds' "${background_seconds}" \
-    '--flowsplice-e2e-sustained-seconds' "${sustained_seconds}"
+    '--flowsplice-e2e-sustained-seconds' "${sustained_seconds}" \
+    '--flowsplice-e2e-local-port' "${local_port}"
 )"
 plutil -replace "${test_target_path}.CommandLineArguments" -json "${test_arguments}" "${xctestrun_file}"
 plutil -replace "${test_target_path}.ParallelizationEnabled" -bool NO "${xctestrun_file}"

@@ -238,11 +238,11 @@ final class FlowSpliceMacUITests: XCTestCase {
         guard environment["FLOWSPLICE_MACOS_E2E"] == "1" else {
             throw XCTSkip("The Docker-backed macOS E2E was not requested.")
         }
-        guard tcpPortIsReachable(host: "127.0.0.1", port: 18_446) else {
+        let relay = environment["FLOWSPLICE_MACOS_E2E_RELAY"] ?? "127.0.0.1:18446"
+        // Parallel acceptance moves the Relay's host port, so probe the Relay under test.
+        guard let endpoint = ipv4Endpoint(relay), tcpPortIsReachable(host: endpoint.host, port: endpoint.port) else {
             throw XCTSkip("The local Docker Relay is not running.")
         }
-
-        let relay = environment["FLOWSPLICE_MACOS_E2E_RELAY"] ?? "127.0.0.1:18446"
         let password = environment["FLOWSPLICE_MACOS_E2E_PASSWORD"] ?? "flowsplice-e2e-private-key-password"
         let travelID = environment["FLOWSPLICE_MACOS_E2E_TRAVEL_ID"] ?? "macos-e2e-travel"
         let localPort = UInt16(environment["FLOWSPLICE_MACOS_E2E_LOCAL_PORT"] ?? "10800") ?? 10_800
@@ -620,6 +620,13 @@ final class FlowSpliceMacUITests: XCTestCase {
               response.suffix(payload.count).elementsEqual(payload) else {
             throw URLError(.cannotParseResponse)
         }
+    }
+
+    /// "host:port" of an IPv4 test address, such as the Relay the E2E harness passes in.
+    private func ipv4Endpoint(_ address: String) -> (host: String, port: UInt16)? {
+        guard let separator = address.lastIndex(of: ":"),
+              let port = UInt16(address[address.index(after: separator)...]) else { return nil }
+        return (String(address[..<separator]), port)
     }
 
     private func tcpPortIsReachable(host: String, port: UInt16) -> Bool {
