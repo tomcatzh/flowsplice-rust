@@ -101,8 +101,7 @@ class TravelCoreDockerE2ETest {
                     clockTicks.toDouble() / elapsedSeconds * 100.0
             val idleWriteBytes =
                 (idleFinished.writeBytes - idleStarted.writeBytes).coerceAtLeast(0)
-            val screenOffGraceLockHeld =
-                shell("dumpsys power").contains("$APP_ID:screen-off-grace")
+            val screenOffGraceLockHeld = heldWakeLocks().contains("$APP_ID:screen-off-grace")
             val performance = JSONObject()
                 .put("sample_seconds", elapsedSeconds)
                 .put("idle_cpu_percent_one_core", idleCpuPercent)
@@ -318,6 +317,19 @@ class TravelCoreDockerE2ETest {
         .trim()
         .substringBefore(' ')
         .toLong()
+
+    /**
+     * The wake locks held now. `dumpsys power` also prints a log of recent acquire and release
+     * events, which keeps a lock's tag for some time after its release, for example from the
+     * screen-off phase of an earlier run on the same device.
+     */
+    private fun heldWakeLocks(): String {
+        val lines = shell("dumpsys power").lines()
+        val header = lines.indexOfFirst { it.startsWith("Wake Locks: size=") }
+        if (header < 0) return ""
+        val size = lines[header].substringAfter("size=").trim().toIntOrNull() ?: 0
+        return lines.drop(header + 1).take(size).joinToString("\n")
+    }
 
     private fun shell(command: String): String {
         val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation
