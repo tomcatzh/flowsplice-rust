@@ -19,14 +19,14 @@ services:
     command: ["/usr/local/bin/flowsplice-relay", "--config", "/config/relay.toml"]
     environment:
       RUST_LOG: flowsplice_relay=debug,info
-      FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR: "${FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR:-10.0.2.2:18447}"
+      FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR: "${FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR:-10.0.2.2:${FLOWSPLICE_E2E_PORT_18447:-18447}}"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
     ports:
-      - "127.0.0.1:18446:8443"
-      - "127.0.0.1:18447:8444"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_18446:-18446}:8443"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_18447:-18447}:8444"
     networks: [flowsplice]
 
   relay2:
@@ -40,8 +40,8 @@ services:
       - ./generated/certs:/certs:ro
       - ./generated/state:/state
     ports:
-      - "127.0.0.1:28446:8443"
-      - "127.0.0.1:28447:8444"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_28446:-28446}:8443"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_28447:-28447}:8444"
     networks: [flowsplice]
 
   server:
@@ -72,7 +72,7 @@ services:
       - ./generated/state:/state
       - ./generated/offline:/issuer
     ports:
-      - "127.0.0.1:19084:9081"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_19084:-19084}:9081"
     networks: [flowsplice]
 
   homeagent2:
@@ -89,7 +89,7 @@ services:
       - ./generated/state:/state
       - ./generated/offline-home2:/issuer
     ports:
-      - "127.0.0.1:29084:9081"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_29084:-29084}:9081"
     networks: [flowsplice]
 
   homeagent2serving:
@@ -128,7 +128,7 @@ services:
       FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
     depends_on: [server]
     ports:
-      - "127.0.0.1:39086:9082"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_39086:-39086}:9082"
     volumes:
       - ./generated/dynamic-home-issuer:/dynamic-home
       - ./generated:/generated:ro
@@ -145,7 +145,7 @@ services:
       FLOWSPLICE_HOME_INSTALL_DIR: /dynamic-home
     depends_on: [server]
     ports:
-      - "127.0.0.1:39087:9082"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_39087:-39087}:9082"
     volumes:
       - ./generated/dynamic-home-global:/dynamic-home
       - ./generated:/generated:ro
@@ -177,16 +177,16 @@ services:
       FLOWSPLICE_ALLOW_REMOTE_KEY_PASSWORD_ROTATION_TEST_ONLY: "1"
     depends_on: [relay1, relay2, homeagent, homeagent2]
     ports:
-      - "127.0.0.1:19083:9080"
-      - "127.0.0.1:11083:10080"
-      - "127.0.0.1:11084:10081/udp"
-      - "127.0.0.1:11085:10082"
-      - "127.0.0.1:11086:10083"
-      - "127.0.0.1:11087:10084"
-      - "127.0.0.1:11088:10085"
-      - "127.0.0.1:11089:10086"
-      - "127.0.0.1:11090:10087"
-      - "127.0.0.1:11091:10088"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_19083:-19083}:9080"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11083:-11083}:10080"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11084:-11084}:10081/udp"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11085:-11085}:10082"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11086:-11086}:10083"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11087:-11087}:10084"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11088:-11088}:10085"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11089:-11089}:10086"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11090:-11090}:10087"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_11091:-11091}:10088"
     volumes:
       - ./generated/config:/config:ro
       - ./generated/certs:/certs:ro
@@ -204,7 +204,7 @@ services:
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /first-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent]
     ports:
-      - "127.0.0.1:12083:10080"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_12083:-12083}:10080"
     volumes:
       - ./generated/first-travel:/first-travel
       - ./generated/config:/config:ro
@@ -221,7 +221,7 @@ services:
       FLOWSPLICE_TEST_PRIVATE_KEY_PASSWORD_FILE: /dynamic-travel/test-password.txt
     depends_on: [relay1, relay2, homeagent, dynamichome-global]
     ports:
-      - "127.0.0.1:13083:10080"
+      - "127.0.0.1:${FLOWSPLICE_E2E_PORT_13083:-13083}:10080"
     volumes:
       - ./generated/dynamic-travel:/dynamic-travel
       - ./generated/config:/config:ro

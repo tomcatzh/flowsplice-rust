@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import socket
 import time
+
+# --port is a default host port; FLOWSPLICE_E2E_PORT_OFFSET moves every published port when
+# several E2E topologies run at once (tests/e2e/run.sh).
+PORT_OFFSET = int(os.environ.get("FLOWSPLICE_E2E_PORT_OFFSET", "0"))
 
 
 def exchange(host: str, port: int, payload: bytes) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=3) as stream:
+        with socket.create_connection((host, port + PORT_OFFSET), timeout=3) as stream:
             stream.settimeout(5)
             stream.sendall(payload + b"\n")
             response = b""

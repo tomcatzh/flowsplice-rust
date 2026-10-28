@@ -2,16 +2,20 @@
 import argparse
 import http.client
 import json
+import os
 from pathlib import Path
 import sys
 import time
 
 TOKEN = "flowsplice-e2e-home-issuer-administrator-token"
+# Ports passed in are the default host ports; FLOWSPLICE_E2E_PORT_OFFSET moves every published port
+# when several E2E topologies run at once (tests/e2e/run.sh).
+PORT_OFFSET = int(os.environ.get("FLOWSPLICE_E2E_PORT_OFFSET", "0"))
 
 
 def request(port: int, method: str, path: str, body=None):
     encoded = None if body is None else json.dumps(body).encode()
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    connection = http.client.HTTPConnection("127.0.0.1", port + PORT_OFFSET, timeout=20)
     connection.request(
         method,
         path,

@@ -4,7 +4,8 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 android_root="${repo_root}/travel-android"
 password_file="${1:?Android Travel private-key password file is required}"
-relay_address="${2:-10.0.2.2:18446}"
+port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
+relay_address="${2:-10.0.2.2:$((18446 + port_offset))}"
 if [[ -z "${JAVA_HOME:-}" && -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]]; then
   export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 fi

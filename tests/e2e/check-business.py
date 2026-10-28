@@ -123,7 +123,7 @@ class Run:
     def reject(self, path, body):
         self.checkpoint = "reject-" + path.rsplit("/", 1)[-1]
         # Require an actual client-error HTTP response; no exception is treated as rejection.
-        connection = http.client.HTTPConnection("127.0.0.1", 19084, timeout=20)
+        connection = http.client.HTTPConnection("127.0.0.1", 19084 + issuer.PORT_OFFSET, timeout=20)
         try:
             connection.request("POST", path, body=json.dumps(body).encode(), headers={
                 "Authorization": "Bearer " + issuer.TOKEN,

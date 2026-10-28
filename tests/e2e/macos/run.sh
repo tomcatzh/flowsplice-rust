@@ -5,7 +5,8 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 mac_root="${repo_root}/travel-macos/FlowSpliceMac"
 compose_file="${repo_root}/tests/e2e/compose.yaml"
 password_file="${1:?macOS Travel private-key password file is required}"
-relay_address="${2:-127.0.0.1:18446}"
+port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
+relay_address="${2:-127.0.0.1:$((18446 + port_offset))}"
 travel_id="${3:-macos-e2e-travel}"
 local_port="${FLOWSPLICE_MACOS_E2E_LOCAL_PORT:-10800}"
 test_mode="${FLOWSPLICE_MACOS_TEST_MODE:-remote}"
@@ -322,13 +323,13 @@ selected_relay="$(tr -d '\r\n' <"${marker_dir}/selected-relay")"
 case "${selected_relay}" in
   relay-1)
     relay_service='relay1'
-    relay_management_port=18446
-    relay_data_port=18447
+    relay_management_port=$((18446 + port_offset))
+    relay_data_port=$((18447 + port_offset))
     ;;
   relay-2)
     relay_service='relay2'
-    relay_management_port=28446
-    relay_data_port=28447
+    relay_management_port=$((28446 + port_offset))
+    relay_data_port=$((28447 + port_offset))
     ;;
   *)
     echo "macOS E2E selected an unknown Relay: ${selected_relay}" >&2

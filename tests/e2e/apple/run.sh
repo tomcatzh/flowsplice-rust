@@ -6,7 +6,8 @@ apple_root="${repo_root}/travel-apple/FlowSpliceTravel"
 compose_file="${repo_root}/tests/e2e/compose.yaml"
 deployment_root_input="${FLOWSPLICE_E2E_DEPLOYMENT_ROOT_FILE:-${repo_root}/tests/e2e/generated/certs/deployment-root.pub}"
 password_file="${1:?Apple Travel private-key password file is required}"
-relay_address="${2:-127.0.0.1:18446}"
+port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
+relay_address="${2:-127.0.0.1:$((18446 + port_offset))}"
 simulator_name="${3:-iPhone 17 Pro}"
 travel_id="${4:-apple-e2e-travel}"
 background_seconds="${FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS:-120}"
@@ -254,7 +255,8 @@ docker compose -f "${compose_file}" stop relay1 >/dev/null
 sleep 5
 docker compose -f "${compose_file}" start relay1 >/dev/null
 for _ in $(seq 1 30); do
-  if nc -z 127.0.0.1 18446 2>/dev/null && nc -z 127.0.0.1 18447 2>/dev/null; then
+  if nc -z 127.0.0.1 "$((18446 + port_offset))" 2>/dev/null \
+    && nc -z 127.0.0.1 "$((18447 + port_offset))" 2>/dev/null; then
     break
   fi
   sleep 1

@@ -8,13 +8,43 @@ log_file="${generated_dir}/e2e.log"
 export FLOWSPLICE_E2E_UID="$(id -u)"
 export FLOWSPLICE_E2E_GID="$(id -g)"
 export COMPOSE_PROJECT_NAME="${FLOWSPLICE_E2E_PROJECT_NAME:-flowsplice-e2e-$$}"
+# An image this run names itself is removed when it ends; a named one stays for reuse.
+own_image=0
+[[ -n "${FLOWSPLICE_E2E_IMAGE:-}" ]] || own_image=1
 export FLOWSPLICE_E2E_IMAGE="${FLOWSPLICE_E2E_IMAGE:-flowsplice-e2e-0-3-$$:local}"
+# FLOWSPLICE_E2E_PORT_OFFSET moves every published host port, so that several topologies can run
+# at once (tests/e2e/run-parallel.py). Scripts keep the default port numbers and add the offset
+# where they open a host socket; Compose reads the moved ports from FLOWSPLICE_E2E_PORT_<default>.
+port_offset="${FLOWSPLICE_E2E_PORT_OFFSET:-0}"
+if [[ ! "${port_offset}" =~ ^[0-9]+$ ]] || (( port_offset > 20000 )); then
+  printf 'FLOWSPLICE_E2E_PORT_OFFSET must be an integer from 0 to 20000.\n' >&2
+  exit 1
+fi
+export FLOWSPLICE_E2E_PORT_OFFSET="${port_offset}"
+for port in 11083 11084 11085 11086 11087 11088 11089 11090 11091 12083 13083 \
+  18446 18447 19083 19084 28446 28447 29084 39086 39087; do
+  export "FLOWSPLICE_E2E_PORT_${port}=$((port + port_offset))"
+done
+host_port() {
+  printf '%s' "$(($1 + port_offset))"
+}
+apple_devices="${FLOWSPLICE_APPLE_E2E_DEVICES:-iphone ipad}"
+for device in ${apple_devices}; do
+  if [[ "${device}" != "iphone" && "${device}" != "ipad" ]]; then
+    printf 'FLOWSPLICE_APPLE_E2E_DEVICES may name only iphone and ipad.\n' >&2
+    exit 1
+  fi
+done
 docker_pull="${FLOWSPLICE_DOCKER_PULL:-false}"
 if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2
   exit 1
 fi
 skip_build="${FLOWSPLICE_E2E_SKIP_BUILD:-0}"
+if [[ "${FLOWSPLICE_E2E_BUILD_ONLY:-0}" == "1" && "${own_image}" == "1" ]]; then
+  printf 'FLOWSPLICE_E2E_BUILD_ONLY needs FLOWSPLICE_E2E_IMAGE to name the shared image.\n' >&2
+  exit 1
+fi
 if [[ "${skip_build}" != "0" && "${skip_build}" != "1" ]]; then
   printf 'FLOWSPLICE_E2E_SKIP_BUILD must be 0 or 1.\n' >&2
   exit 1
@@ -48,6 +78,10 @@ else
     -f "${repo_root}/docker/e2e.Dockerfile" \
     -t "${FLOWSPLICE_E2E_IMAGE}" \
     "${repo_root}"
+fi
+if [[ "${FLOWSPLICE_E2E_BUILD_ONLY:-0}" == "1" ]]; then
+  # Builds the image for runs that share it (tests/e2e/run-parallel.py).
+  exit 0
 fi
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
   # Use the image's pinned OpenSSL: host OpenSSL builds differ, and the generator discards
@@ -303,6 +337,9 @@ finish() {
     tail -n 120 "${log_file}" >&2
   fi
   teardown
+  if (( own_image == 1 )); then
+    docker image rm "${FLOWSPLICE_E2E_IMAGE}" >/dev/null 2>&1
+  fi
   trap - EXIT
   exit "${status}"
 }
@@ -869,32 +906,36 @@ if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
   docker compose -f "${compose_file}" up -d --no-deps relay1 relay2 homeagent
   "${repo_root}/tests/e2e/android/run.sh" \
     "${generated_dir}/offline/test-password.txt" \
-    "10.0.2.2:18446"
+    "10.0.2.2:$(host_port 18446)"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
 if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" ]]; then
-  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:18447"
+  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:$(host_port 18447)"
   docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
   docker compose -f "${compose_file}" up -d --no-deps relay2 homeagent
-  "${repo_root}/tests/e2e/apple/run.sh" \
-    "${generated_dir}/offline/test-password.txt" \
-    "127.0.0.1:18446" \
-    "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
-    "apple-e2e-iphone"
-  "${repo_root}/tests/e2e/apple/run.sh" \
-    "${generated_dir}/offline/test-password.txt" \
-    "127.0.0.1:18446" \
-    "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
-    "apple-e2e-ipad-mini"
+  if [[ " ${apple_devices} " == *" iphone "* ]]; then
+    "${repo_root}/tests/e2e/apple/run.sh" \
+      "${generated_dir}/offline/test-password.txt" \
+      "127.0.0.1:$(host_port 18446)" \
+      "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
+      "apple-e2e-iphone"
+  fi
+  if [[ " ${apple_devices} " == *" ipad "* ]]; then
+    "${repo_root}/tests/e2e/apple/run.sh" \
+      "${generated_dir}/offline/test-password.txt" \
+      "127.0.0.1:$(host_port 18446)" \
+      "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
+      "apple-e2e-ipad-mini"
+  fi
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
 if [[ "${FLOWSPLICE_MACOS_E2E:-0}" == "1" ]]; then
-  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:18447"
+  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:$(host_port 18447)"
   docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
   docker compose -f "${compose_file}" up -d --no-deps relay2 homeagent
   "${repo_root}/tests/e2e/macos/run.sh" \
     "${generated_dir}/offline/test-password.txt" \
-    "127.0.0.1:18446" \
+    "127.0.0.1:$(host_port 18446)" \
     "macos-e2e-travel"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi

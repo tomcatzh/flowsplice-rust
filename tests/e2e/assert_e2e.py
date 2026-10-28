@@ -16,12 +16,19 @@ ISSUER_AUTHORIZATION = "Bearer flowsplice-e2e-home-issuer-administrator-token"
 COMPOSE_FILE = Path(__file__).resolve().parent / "compose.yaml"
 COMPOSE_NETWORK = f"{os.environ.get('COMPOSE_PROJECT_NAME', 'e2e')}_flowsplice"
 E2E_IMAGE = os.environ.get("FLOWSPLICE_E2E_IMAGE", "flowsplice-e2e:local")
+# Host ports in this file are the default ports; FLOWSPLICE_E2E_PORT_OFFSET moves every published
+# port when several E2E topologies run at once (tests/e2e/run.sh).
+PORT_OFFSET = int(os.environ.get("FLOWSPLICE_E2E_PORT_OFFSET", "0"))
+
+
+def host(port: int) -> tuple[str, int]:
+    return ("127.0.0.1", port + PORT_OFFSET)
 
 
 def http_get(path: str, headers: dict[str, str] | None = None):
     request_headers = {"Authorization": AUTHORIZATION}
     request_headers.update(headers or {})
-    conn = http.client.HTTPConnection("127.0.0.1", 19083, timeout=3)
+    conn = http.client.HTTPConnection("127.0.0.1", 19083 + PORT_OFFSET, timeout=3)
     conn.request("GET", path, headers=request_headers)
     response = conn.getresponse()
     body = response.read()
@@ -33,7 +40,7 @@ def http_get(path: str, headers: dict[str, str] | None = None):
 def issuer_get(path: str, headers: dict[str, str] | None = None):
     request_headers = {"Authorization": ISSUER_AUTHORIZATION}
     request_headers.update(headers or {})
-    connection = http.client.HTTPConnection("127.0.0.1", 19084, timeout=3)
+    connection = http.client.HTTPConnection("127.0.0.1", 19084 + PORT_OFFSET, timeout=3)
     connection.request("GET", path, headers=request_headers)
     response = connection.getresponse()
     body = response.read()
@@ -47,7 +54,7 @@ def issuer_get(path: str, headers: dict[str, str] | None = None):
 
 
 def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
+    connection = http.client.HTTPConnection("127.0.0.1", port + PORT_OFFSET, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
     connection.request(
         method,
@@ -71,7 +78,7 @@ def issuer_request(port: int, method: str, path: str, body=None, expect_ok=True)
 
 
 def issuer_raw_status(port: int, method: str, path: str, body=None) -> int:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
+    connection = http.client.HTTPConnection("127.0.0.1", port + PORT_OFFSET, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
     connection.request(
         method,
@@ -90,7 +97,7 @@ def issuer_raw_status(port: int, method: str, path: str, body=None) -> int:
 
 
 def travel_request(method: str, path: str, body=None, expect_ok=True):
-    connection = http.client.HTTPConnection("127.0.0.1", 19083, timeout=180)
+    connection = http.client.HTTPConnection("127.0.0.1", 19083 + PORT_OFFSET, timeout=180)
     encoded = None if body is None else json.dumps(body).encode()
     connection.request(
         method,
@@ -283,7 +290,7 @@ def wait_business_port(port: int, payload: bytes, timeout_secs: int = 45) -> Non
     last_error = None
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as stream:
+            with socket.create_connection(host(port), timeout=3) as stream:
                 stream.settimeout(12)
                 exchange_line(stream, payload)
                 return
@@ -297,7 +304,7 @@ def wait_port_closed(port: int, timeout_secs: int = 15) -> None:
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1) as stream:
+            with socket.create_connection(host(port), timeout=1) as stream:
                 stream.settimeout(1)
                 stream.sendall(b"listener-must-be-closed\n")
                 if stream.recv(1) == b"":
@@ -417,7 +424,7 @@ def wait_catalog_homes(expected: set[str]) -> dict:
 
 
 def expect_mapping_unavailable_without_cross_home_fallback(port: int) -> None:
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+    with socket.create_connection(host(port), timeout=5) as stream:
         stream.settimeout(6)
         stream.sendall(b"must-not-cross-home-boundary\n")
         try:
@@ -432,10 +439,10 @@ def expect_mapping_unavailable_without_cross_home_fallback(port: int) -> None:
 
 
 def check_multi_home_business_routing() -> None:
-    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one:
+    with socket.create_connection(host(11083), timeout=5) as home_one:
         home_one.settimeout(15)
         exchange_line(home_one, b"same-service-on-home-one")
-    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
+    with socket.create_connection(host(11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"same-service-on-home-two", b"home-2")
     # This service exists on home-1 only, while the mapping explicitly selects
@@ -450,8 +457,8 @@ def check_target_failures_are_home_isolated() -> None:
 
 def check_home_lifecycle_is_isolated() -> None:
     with (
-        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
+        socket.create_connection(host(11083), timeout=5) as home_one,
+        socket.create_connection(host(11085), timeout=5) as home_two,
     ):
         home_one.settimeout(15)
         home_two.settimeout(15)
@@ -482,7 +489,7 @@ def check_home_lifecycle_is_isolated() -> None:
         check=True,
     )
     wait_catalog_homes({"home-1", "home-2"})
-    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
+    with socket.create_connection(host(11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-returned", b"home-2")
 
@@ -506,7 +513,7 @@ def check_serving_only_home2_profile() -> None:
         check=True,
     )
     wait_catalog_homes({"home-1", "home-2"})
-    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
+    with socket.create_connection(host(11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-serving-only", b"home-2")
     time.sleep(7)
@@ -687,7 +694,7 @@ def check_expired_snapshot_bootstraps_through_learned_relay() -> None:
     relay2_success_after = refreshed_relays["relay-2"]["last_success_unix_secs"]
     assert relay2_success_after is not None
     assert relay2_success_before is None or relay2_success_after > relay2_success_before
-    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as stream:
+    with socket.create_connection(host(11083), timeout=5) as stream:
         stream.settimeout(15)
         exchange_line(stream, b"fresh-directory-via-learned-relay")
 
@@ -722,7 +729,7 @@ def wait_active_relay(excluded: str | None = None) -> str:
 def check_tcp_relay_failover(
     port: int = 11083, expected_home: bytes | None = None
 ) -> tuple[str, str]:
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+    with socket.create_connection(host(port), timeout=5) as stream:
         stream.settimeout(30)
         connection_id = exchange_line(
             stream, b"before-relay-failure", expected_home
@@ -757,7 +764,7 @@ def check_udp() -> None:
     expected = b"flowsplice-udp-e2e"
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
         datagram.settimeout(8)
-        datagram.sendto(expected, ("127.0.0.1", 11084))
+        datagram.sendto(expected, host(11084))
         received, _ = datagram.recvfrom(65535)
     assert received == expected
 
@@ -1295,7 +1302,7 @@ def activate_remote_enrollment(request_id: str, password: str) -> tuple[dict, st
         check=True,
     )
     ready = wait_ready()
-    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as stream:
+    with socket.create_connection(host(11083), timeout=5) as stream:
         stream.settimeout(15)
         exchange_line(stream, b"remote-enrollment-identity-active")
     deadline = time.monotonic() + 45
@@ -1382,7 +1389,7 @@ def check_home2_remote_enrollment(password: str) -> str:
         check=True,
     )
     wait_scoped_catalog({"home-2": {"tcp-echo", "target-failure"}})
-    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
+    with socket.create_connection(host(11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"remote-home-two-scope", b"home-2")
     expect_mapping_unavailable_without_cross_home_fallback(11083)
@@ -1439,8 +1446,8 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
     )
     assert listener_probe.returncode != 0, listener_probe.stdout
     with (
-        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
+        socket.create_connection(host(11083), timeout=5) as home_one,
+        socket.create_connection(host(11085), timeout=5) as home_two,
     ):
         home_one.settimeout(20)
         home_two.settimeout(20)
@@ -1486,7 +1493,7 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
     last_error = None
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", 11083), timeout=3) as fresh:
+            with socket.create_connection(host(11083), timeout=3) as fresh:
                 fresh.settimeout(6)
                 exchange_line(fresh, b"new-route-after-server-recovery")
                 return
@@ -1618,7 +1625,7 @@ def check_home_statistics_write_failures_are_isolated() -> None:
         )
         assert armed["remaining"] == 1, armed
         payload = f"{service}-statistics-write-failure".encode()
-        with socket.create_connection(("127.0.0.1", business_port), timeout=5) as stream:
+        with socket.create_connection(host(business_port), timeout=5) as stream:
             stream.settimeout(15)
             exchange_line(stream, payload, expected_home)
 
@@ -1635,7 +1642,7 @@ def check_home_statistics_write_failures_are_isolated() -> None:
 
         # Business remains available while the node is recovering its best-effort statistics
         # write path. The next successful flush must include the delta restored after failure.
-        with socket.create_connection(("127.0.0.1", business_port), timeout=5) as stream:
+        with socket.create_connection(host(business_port), timeout=5) as stream:
             stream.settimeout(15)
             exchange_line(stream, b"business-survives-statistics-write-failure", expected_home)
         deadline = time.monotonic() + 20
@@ -1756,8 +1763,8 @@ def check_scoped_authorization_and_home_revocation(
     }
 
     with (
-        socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one,
-        socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two,
+        socket.create_connection(host(11083), timeout=5) as home_one,
+        socket.create_connection(host(11085), timeout=5) as home_two,
     ):
         home_one.settimeout(10)
         home_two.settimeout(10)
@@ -1819,15 +1826,15 @@ def check_scoped_authorization_and_home_revocation(
     wait_scoped_catalog(
         {"home-1": {"tcp-echo"}, "home-2": {"tcp-echo", "target-failure"}}
     )
-    with socket.create_connection(("127.0.0.1", 11083), timeout=5) as home_one:
+    with socket.create_connection(host(11083), timeout=5) as home_one:
         home_one.settimeout(15)
         exchange_line(home_one, b"home-one-service-scope")
-    with socket.create_connection(("127.0.0.1", 11085), timeout=5) as home_two:
+    with socket.create_connection(host(11085), timeout=5) as home_two:
         home_two.settimeout(15)
         exchange_line(home_two, b"home-two-home-scope", b"home-2")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
         datagram.settimeout(4)
-        datagram.sendto(b"must-not-pass-service-scope", ("127.0.0.1", 11084))
+        datagram.sendto(b"must-not-pass-service-scope", host(11084))
         try:
             received, _ = datagram.recvfrom(65535)
         except socket.timeout:
@@ -1865,7 +1872,7 @@ def check_tls_policy_and_slow_loris_deadline() -> None:
     tls12.minimum_version = ssl.TLSVersion.TLSv1_2
     tls12.maximum_version = ssl.TLSVersion.TLSv1_2
     try:
-        with socket.create_connection(("127.0.0.1", 18446), timeout=3) as raw:
+        with socket.create_connection(host(18446), timeout=3) as raw:
             with tls12.wrap_socket(raw, server_hostname="relay-1.flowsplice"):
                 pass
     except (OSError, ssl.SSLError):
