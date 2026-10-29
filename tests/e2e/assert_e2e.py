@@ -1908,70 +1908,126 @@ def checkpoint(name: str) -> None:
     print(json.dumps({"checkpoint": name}), flush=True)
 
 
+results: dict = {}
+
+
+def run_home_issued_enrollment() -> None:
+    results["credential_id"] = check_home_issued_enrollment()
+
+
+def run_duplicate_enrollment() -> None:
+    results["issuance_generation"] = check_duplicate_enrollment_issue_is_idempotent(results["credential_id"])
+
+
+def run_password_rotation() -> None:
+    results["state"] = check_private_key_password_rotation(
+        results["credential_id"], results["issuance_generation"]
+    )
+
+
+def run_prepare_remote_enrollment() -> None:
+    results["remote_request_id"], results["remote_identity_password"] = prepare_remote_enrollment()
+
+
+def run_home1_relay_failover() -> None:
+    results["failed_relay"], results["replacement_relay"] = check_tcp_relay_failover()
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "up",
+            "-d",
+            "--no-deps",
+            {"relay-1": "relay1", "relay-2": "relay2"}[results["failed_relay"]],
+        ],
+        check=True,
+    )
+    wait_ready()
+
+
+def run_home2_relay_failover() -> None:
+    results["home2_failed_relay"], _ = check_tcp_relay_failover(11085, b"home-2")
+
+
+def run_scoped_authorization() -> None:
+    check_scoped_authorization_and_home_revocation(results["home2_failed_relay"], results["credential_id"])
+
+
+def run_activate_remote_enrollment() -> None:
+    results["state"], results["remote_credential_id"] = activate_remote_enrollment(
+        results["remote_request_id"], results["remote_identity_password"]
+    )
+    assert results["remote_credential_id"] != results.get("credential_id")
+
+
+def run_home2_remote_enrollment() -> None:
+    results["home2_remote_credential_id"] = check_home2_remote_enrollment(results["remote_identity_password"])
+    assert results["home2_remote_credential_id"] not in {
+        results.get("credential_id"),
+        results["remote_credential_id"],
+    }
+
+
+# Each stage names the modules it tests (see tests/test-map.csv) and the stages whose results it
+# needs. FLOWSPLICE_E2E_MODULES, set by run.sh, selects stages by module; the stages they need run
+# too, and every stage keeps its place in this order.
+STAGES = [
+    ("travel-runtime-mapping", {"MAPPING"}, (), check_travel_runtime_mapping_rebind_and_persistence),
+    ("expired-snapshot-learned-relay", {"TRUST", "CONTROL"}, (), check_expired_snapshot_bootstraps_through_learned_relay),
+    ("home-issued-enrollment", {"ENROLL", "LOCALUI"}, (), run_home_issued_enrollment),
+    ("duplicate-enrollment-idempotency", {"ENROLL"}, ("home-issued-enrollment",), run_duplicate_enrollment),
+    ("private-key-password-rotation", {"ENROLL", "CONTROL"}, ("duplicate-enrollment-idempotency",), run_password_rotation),
+    ("prepare-remote-enrollment", {"ENROLL"}, (), run_prepare_remote_enrollment),
+    ("udp", {"UDP"}, (), check_udp),
+    ("multi-home-business-routing", {"MAPPING"}, (), check_multi_home_business_routing),
+    ("per-home-target-failures", {"MAPPING", "CARRIER"}, (), check_target_failures_are_home_isolated),
+    ("home-lifecycle-isolation", {"MAPPING", "CONTROL"}, (), check_home_lifecycle_is_isolated),
+    ("serving-only-home2", {"ENROLL"}, (), check_serving_only_home2_profile),
+    ("server-outage-established-flow", {"CARRIER", "CONTROL"}, (), check_server_failure_does_not_break_established_data_flow),
+    ("embedded-spa", {"LOCALUI", "ENROLL"}, (), check_embedded_spa),
+    ("duplicate-travel-login", {"CONTROL"}, (), check_duplicate_travel_login_is_rejected),
+    ("tls-policy-and-slow-loris", {"WIRE"}, (), check_tls_policy_and_slow_loris_deadline),
+    ("statistics-pipeline", {"STATS"}, (), check_statistics_pipeline),
+    ("home-statistics-write-failure-isolation", {"STATS"}, (), check_home_statistics_write_failures_are_isolated),
+    ("home1-tcp-relay-failover", {"CARRIER"}, (), run_home1_relay_failover),
+    ("home2-tcp-relay-failover", {"CARRIER"}, (), run_home2_relay_failover),
+    ("scoped-authorization-and-revocation", {"AUTHZ"}, ("home-issued-enrollment", "home2-tcp-relay-failover"), run_scoped_authorization),
+    ("activate-remote-enrollment", {"ENROLL"}, ("prepare-remote-enrollment",), run_activate_remote_enrollment),
+    ("home2-remote-enrollment", {"ENROLL", "AUTHZ"}, ("activate-remote-enrollment",), run_home2_remote_enrollment),
+]
+MODULES = {
+    "TRUST", "WIRE", "ENROLL", "AUTHZ", "CONTROL", "CARRIER", "UDP", "MAPPING", "CLASS", "STATS", "SDK",
+    "RUNTIME", "LOCALUI", "DIAG", "PACKAGING",
+}
+requested = os.environ.get("FLOWSPLICE_E2E_MODULES", "all").replace(",", " ").split() or ["all"]
+everything = requested == ["all"]
+if not everything and not set(requested) <= MODULES:
+    raise SystemExit(f"unknown FLOWSPLICE_E2E_MODULES entries: {sorted(set(requested) - MODULES)}")
+wanted = {name for name, modules, _, _ in STAGES if everything or modules & set(requested)}
+needs = {name: set(required) for name, _, required, _ in STAGES}
+while True:
+    added = set().union(*(needs[name] for name in wanted)) - wanted
+    if not added:
+        break
+    wanted |= added
+
 checkpoint("initial-ready")
-state = wait_ready()
-checkpoint("travel-runtime-mapping")
-check_travel_runtime_mapping_rebind_and_persistence()
-checkpoint("expired-snapshot-learned-relay")
-check_expired_snapshot_bootstraps_through_learned_relay()
-checkpoint("home-issued-enrollment")
-credential_id = check_home_issued_enrollment()
-checkpoint("duplicate-enrollment-idempotency")
-issuance_generation = check_duplicate_enrollment_issue_is_idempotent(credential_id)
-checkpoint("private-key-password-rotation")
-state = check_private_key_password_rotation(credential_id, issuance_generation)
-checkpoint("prepare-remote-enrollment")
-remote_request_id, remote_identity_password = prepare_remote_enrollment()
-checkpoint("udp")
-check_udp()
-checkpoint("multi-home-business-routing")
-check_multi_home_business_routing()
-checkpoint("per-home-target-failures")
-check_target_failures_are_home_isolated()
-checkpoint("home-lifecycle-isolation")
-check_home_lifecycle_is_isolated()
-checkpoint("serving-only-home2")
-check_serving_only_home2_profile()
-checkpoint("server-outage-established-flow")
-check_server_failure_does_not_break_established_data_flow()
-checkpoint("embedded-spa")
-check_embedded_spa()
-checkpoint("duplicate-travel-login")
-check_duplicate_travel_login_is_rejected()
-checkpoint("tls-policy-and-slow-loris")
-check_tls_policy_and_slow_loris_deadline()
-checkpoint("statistics-pipeline")
-check_statistics_pipeline()
-checkpoint("home-statistics-write-failure-isolation")
-check_home_statistics_write_failures_are_isolated()
-checkpoint("home1-tcp-relay-failover")
-failed_relay, replacement_relay = check_tcp_relay_failover()
-subprocess.run(
-    [
-        "docker",
-        "compose",
-        "-f",
-        str(COMPOSE_FILE),
-        "up",
-        "-d",
-        "--no-deps",
-        {"relay-1": "relay1", "relay-2": "relay2"}[failed_relay],
-    ],
-    check=True,
-)
-wait_ready()
-checkpoint("home2-tcp-relay-failover")
-home2_failed_relay, _ = check_tcp_relay_failover(11085, b"home-2")
-checkpoint("scoped-authorization-and-revocation")
-check_scoped_authorization_and_home_revocation(home2_failed_relay, credential_id)
-checkpoint("activate-remote-enrollment")
-state, remote_credential_id = activate_remote_enrollment(
-    remote_request_id, remote_identity_password
-)
-assert remote_credential_id != credential_id
-checkpoint("home2-remote-enrollment")
-home2_remote_credential_id = check_home2_remote_enrollment(remote_identity_password)
-assert home2_remote_credential_id not in {credential_id, remote_credential_id}
+results["state"] = wait_ready()
+for name, _, _, run in STAGES:
+    if name in wanted:
+        checkpoint(name)
+        run()
+if not everything:
+    print(json.dumps({"result": "ok", "modules": requested, "stages": [name for name, *_ in STAGES if name in wanted]}))
+    raise SystemExit(0)
+state = results["state"]
+failed_relay, replacement_relay = results["failed_relay"], results["replacement_relay"]
+home2_failed_relay = results["home2_failed_relay"]
+remote_credential_id = results["remote_credential_id"]
+home2_remote_credential_id = results["home2_remote_credential_id"]
+
 checks = [
     "ipv4-ipv6-loopback-ui-policy",
     "travel-runtime-mapping-hot-rebind-and-restart-persistence",

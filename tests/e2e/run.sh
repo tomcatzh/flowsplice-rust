@@ -35,6 +35,35 @@ for device in ${apple_devices}; do
     exit 1
   fi
 done
+# FLOWSPLICE_E2E_MODULES selects the E2E checks by module (tests/test-map.csv, docs/TESTING.md):
+# "all" (default), "none" for the topology and the native phases only, or modules such as
+# "CARRIER STATS". The topology, the trust inputs and their quick checks always run.
+e2e_modules="${FLOWSPLICE_E2E_MODULES:-all}"
+e2e_modules="${e2e_modules//,/ }"
+for module in ${e2e_modules}; do
+  case "${module}" in
+    TRUST|WIRE|ENROLL|AUTHZ|CONTROL|CARRIER|UDP|MAPPING|CLASS|STATS|SDK|RUNTIME|LOCALUI|DIAG|PACKAGING) ;;
+    all|none)
+      if [[ "${e2e_modules// /}" != "${module}" ]]; then
+        printf 'FLOWSPLICE_E2E_MODULES may name "%s" only on its own.\n' "${module}" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      printf 'Unknown FLOWSPLICE_E2E_MODULES entry: %s\n' "${module}" >&2
+      exit 1
+      ;;
+  esac
+done
+export FLOWSPLICE_E2E_MODULES="${e2e_modules}"
+checks_for() {
+  [[ " ${e2e_modules} " == *" all "* ]] && return 0
+  local module
+  for module in "$@"; do
+    [[ " ${e2e_modules} " == *" ${module} "* ]] && return 0
+  done
+  return 1
+}
 docker_pull="${FLOWSPLICE_DOCKER_PULL:-false}"
 if [[ "${docker_pull}" != "false" && "${docker_pull}" != "true" ]]; then
   printf 'FLOWSPLICE_DOCKER_PULL must be true or false.\n' >&2
@@ -556,351 +585,367 @@ enroll_dynamic_home() {
   printf '%s\n' "${home_id}"
 }
 
-dynamic_serving_home_id="$(enroll_dynamic_home \
-  dynamichome-serving serving_only "${generated_dir}/dynamic-home-serving")"
-dynamic_issuer_home_id="$(enroll_dynamic_home \
-  dynamichome-issuer home_issuer "${generated_dir}/dynamic-home-issuer")"
-dynamic_global_home_id="$(enroll_dynamic_home \
-  dynamichome-global global_issuer "${generated_dir}/dynamic-home-global")"
+if checks_for ENROLL CARRIER; then
+  dynamic_serving_home_id="$(enroll_dynamic_home \
+    dynamichome-serving serving_only "${generated_dir}/dynamic-home-serving")"
+  dynamic_issuer_home_id="$(enroll_dynamic_home \
+    dynamichome-issuer home_issuer "${generated_dir}/dynamic-home-issuer")"
+  dynamic_global_home_id="$(enroll_dynamic_home \
+    dynamichome-global global_issuer "${generated_dir}/dynamic-home-global")"
 
-for directory in dynamic-home-issuer dynamic-home-global; do
-  python3 -c 'from pathlib import Path; p=Path(__import__("sys").argv[1]); s=p.read_text(); s=s.replace("ui_listen = \"127.0.0.1:9082\"", "ui_listen = \"0.0.0.0:9082\""); s=s.replace("[issuer]\n", "[issuer]\ntest_allow_remote_listen = true\ntest_admin_token = \"flowsplice-e2e-home-issuer-administrator-token\"\n", 1); p.write_text(s)' \
-    "${generated_dir}/${directory}/homeagent.toml"
-done
-docker compose -f "${compose_file}" up -d \
-  dynamichome-serving dynamichome-issuer dynamichome-global
-for port in 39086 39087; do
-  dynamic_home_ready=0
-  for _ in $(seq 1 60); do
-    if python3 "${repo_root}/tests/e2e/home-issuer-client.py" status \
-      --port "${port}" >/dev/null 2>&1; then
-      dynamic_home_ready=1
+  for directory in dynamic-home-issuer dynamic-home-global; do
+    python3 -c 'from pathlib import Path; p=Path(__import__("sys").argv[1]); s=p.read_text(); s=s.replace("ui_listen = \"127.0.0.1:9082\"", "ui_listen = \"0.0.0.0:9082\""); s=s.replace("[issuer]\n", "[issuer]\ntest_allow_remote_listen = true\ntest_admin_token = \"flowsplice-e2e-home-issuer-administrator-token\"\n", 1); p.write_text(s)' \
+      "${generated_dir}/${directory}/homeagent.toml"
+  done
+  docker compose -f "${compose_file}" up -d \
+    dynamichome-serving dynamichome-issuer dynamichome-global
+  for port in 39086 39087; do
+    dynamic_home_ready=0
+    for _ in $(seq 1 60); do
+      if python3 "${repo_root}/tests/e2e/home-issuer-client.py" status \
+        --port "${port}" >/dev/null 2>&1; then
+        dynamic_home_ready=1
+        break
+      fi
+      sleep 1
+    done
+    if (( dynamic_home_ready == 0 )); then
+      echo "Dynamic Home issuer on port ${port} did not become ready" >&2
+      exit 1
+    fi
+  done
+  python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is (p == "39087"); assert s["home_enrollment_available"] is (p == "39087")' \
+    39086 "${repo_root}/tests/e2e/home-issuer-client.py"
+  python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is True; assert s["home_enrollment_available"] is True' \
+    39087 "${repo_root}/tests/e2e/home-issuer-client.py"
+
+  dynamic_third_home_id="$(enroll_dynamic_home \
+    dynamichome-third serving_only "${generated_dir}/dynamic-home-third" 39087)"
+  if [[ -z "${dynamic_third_home_id}" ]]; then
+    echo 'Dynamic Global Home did not approve the third Home' >&2
+    exit 1
+  fi
+  printf '{"checkpoint": "dynamic-global-home-approved-third-home", "home_id": "%s"}\n' \
+    "${dynamic_third_home_id}"
+
+  mkdir -p "${generated_dir}/dynamic-travel"
+  cp "${generated_dir}/offline/test-password.txt" \
+    "${generated_dir}/dynamic-travel/test-password.txt"
+  chmod 600 "${generated_dir}/dynamic-travel/test-password.txt"
+  docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
+    /usr/local/bin/flowsplice-travelagent enroll-remote \
+    --travel-id dynamic-home-issued-travel \
+    --home-id "${dynamic_global_home_id}" \
+    --install-dir /dynamic-travel \
+    --relay relay2:8443 \
+    --deployment-root-public-key /certs/deployment-root.pub \
+    --test-allow-remote-listen \
+    --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
+    --test-password-file /dynamic-travel/test-password.txt \
+    --wait-timeout-secs 180 \
+    >"${generated_dir}/dynamic-travel/enroll.log" 2>&1 &
+  first_enroll_pid=$!
+  dynamic_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+    --port 39087 \
+    --travel-id dynamic-home-issued-travel \
+    --wait-secs 120)"
+  dynamic_travel_request_id="$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+    "${dynamic_travel_pending}")"
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 39087 \
+    --request-id "${dynamic_travel_request_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --scope global \
+    --valid-days 180 >/dev/null
+  wait "${first_enroll_pid}"
+  first_enroll_pid=""
+  printf '\n[[homes]]\nid = "home-1"\n' \
+    >>"${generated_dir}/dynamic-travel/travelagent.toml"
+  docker compose -f "${compose_file}" up -d dynamictravel
+  configure_travel_mapping dynamictravel \
+    flowsplice-e2e-dynamic-home-travel-administrator-token \
+    home-1 tcp-echo tcp 0.0.0.0:10080
+  python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+    --port 13083 \
+    --payload dynamic-home-global-issuer-business \
+    --wait-secs 90
+
+  # The first data address of every Relay now accepts TCP but is no Relay (the echo service), so a
+  # Carrier opens only if Travel races all data addresses instead of trying them in turn.
+  docker compose -f "${compose_file}" stop dynamictravel
+  python3 "${repo_root}/tests/e2e/set-relay-data-aliases.py" \
+    "${generated_dir}/dynamic-travel/travelagent.toml" \
+    --data-addr echo:7001 \
+    --relay relay-1=relay1:8443 \
+    --relay relay-2=relay2:8443
+  docker compose -f "${compose_file}" up -d dynamictravel
+  python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+    --port 13083 \
+    --payload travel-races-relay-data-addresses \
+    --wait-secs 90
+  printf '%s\n' '{"checkpoint": "travel-races-relay-data-addresses"}'
+fi
+
+if checks_for ENROLL AUTHZ; then
+  mkdir -p "${generated_dir}/first-travel"
+  cp "${generated_dir}/offline/test-password.txt" \
+    "${generated_dir}/first-travel/test-password.txt"
+  chmod 600 "${generated_dir}/first-travel/test-password.txt"
+  if [[ -e "${generated_dir}/first-travel/travelagent.toml" || \
+        -e "${generated_dir}/first-travel/cert" ]]; then
+    echo 'first remote Travel was not clean before bootstrap' >&2
+    exit 1
+  fi
+  docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
+    /usr/local/bin/flowsplice-travelagent enroll-remote \
+    --travel-id first-remote-e2e \
+    --home-id home-1 \
+    --install-dir /first-travel \
+    --relay relay2:8443 \
+    --deployment-root-public-key /certs/deployment-root.pub \
+    --test-allow-remote-listen \
+    --test-admin-token flowsplice-e2e-first-remote-administrator-token \
+    --test-password-file /first-travel/test-password.txt \
+    --wait-timeout-secs 180 \
+    >"${generated_dir}/first-travel/enroll.log" 2>&1 &
+  first_enroll_pid=$!
+  bootstrap_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+    --port 19084 \
+    --travel-id first-remote-e2e \
+    --wait-secs 120)"
+  bootstrap_request_id="$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+    "${bootstrap_pending}")"
+  bootstrap_verification_code="$(python3 -c \
+    'import json,sys; value=json.loads(sys.argv[1]); assert value["bootstrap"] is True; print(value["verification_code"])' \
+    "${bootstrap_pending}")"
+  if ! grep -Fq "Home verification code: ${bootstrap_verification_code}" \
+    "${generated_dir}/first-travel/enroll.log"; then
+    echo 'Home and Travel bootstrap verification codes did not match' >&2
+    exit 1
+  fi
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 19084 \
+    --request-id "${bootstrap_request_id}" \
+    --password-file "${generated_dir}/offline/wrong-password.txt" \
+    --scope global \
+    --valid-days 365 \
+    --expect-failure
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 19084 \
+    --request-id "${bootstrap_request_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --scope global \
+    --valid-days 365 \
+    --output "${generated_dir}/first-travel/approval.json" >/dev/null
+  wait "${first_enroll_pid}"
+  first_enroll_pid=""
+  for required in \
+    travelagent.toml \
+    cert/travel-management.crt \
+    cert/travel-management.key \
+    cert/travel-business.crt \
+    cert/travel-business.key \
+    state/travel-state.redb; do
+    if [[ ! -s "${generated_dir}/first-travel/${required}" ]]; then
+      echo "first remote Travel did not create ${required}" >&2
+      exit 1
+    fi
+  done
+  if [[ -e "${generated_dir}/first-travel/bootstrap-enrollment.json" ]]; then
+    echo 'completed first enrollment retained its retrieval token' >&2
+    exit 1
+  fi
+  if grep -Fq 'flowsplice-e2e-private-key-password' \
+    "${generated_dir}/first-travel/travelagent.toml"; then
+    echo 'generated Travel config contains a private-key password' >&2
+    exit 1
+  fi
+  if grep -Eq '^(mappings =|\[\[mappings\]\])' \
+    "${generated_dir}/first-travel/travelagent.toml"; then
+    echo 'first remote enrollment generated an unsolicited business mapping' >&2
+    exit 1
+  fi
+  bootstrap_credential_id="$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["enrollment"]["approval"]["credential_id"])' \
+    "${generated_dir}/first-travel/approval.json")"
+  docker compose -f "${compose_file}" up -d firsttravel
+  configure_travel_mapping firsttravel \
+    flowsplice-e2e-first-remote-administrator-token \
+    home-1 tcp-echo tcp 0.0.0.0:10080
+  python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+    --port 12083 \
+    --payload first-remote-enrollment-business \
+    --wait-secs 90
+  bootstrap_acknowledged=0
+  for _ in $(seq 1 45); do
+    current_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+      --port 19084)"
+    if python3 -c \
+      'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
+      "${current_pending}" "${bootstrap_request_id}"; then
+      bootstrap_acknowledged=1
       break
     fi
     sleep 1
   done
-  if (( dynamic_home_ready == 0 )); then
-    echo "Dynamic Home issuer on port ${port} did not become ready" >&2
+  if (( bootstrap_acknowledged == 0 )); then
+    echo 'first remote enrollment was not acknowledged and retired by Home' >&2
     exit 1
   fi
-done
-python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is (p == "39087"); assert s["home_enrollment_available"] is (p == "39087")' \
-  39086 "${repo_root}/tests/e2e/home-issuer-client.py"
-python3 -c 'import json,subprocess,sys; p=sys.argv[1]; s=json.loads(subprocess.check_output([sys.executable, sys.argv[2], "status", "--port", p])); assert s["global_authority_available"] is True; assert s["home_enrollment_available"] is True' \
-  39087 "${repo_root}/tests/e2e/home-issuer-client.py"
-
-dynamic_third_home_id="$(enroll_dynamic_home \
-  dynamichome-third serving_only "${generated_dir}/dynamic-home-third" 39087)"
-if [[ -z "${dynamic_third_home_id}" ]]; then
-  echo 'Dynamic Global Home did not approve the third Home' >&2
-  exit 1
-fi
-printf '{"checkpoint": "dynamic-global-home-approved-third-home", "home_id": "%s"}\n' \
-  "${dynamic_third_home_id}"
-
-mkdir -p "${generated_dir}/dynamic-travel"
-cp "${generated_dir}/offline/test-password.txt" \
-  "${generated_dir}/dynamic-travel/test-password.txt"
-chmod 600 "${generated_dir}/dynamic-travel/test-password.txt"
-docker compose -f "${compose_file}" run --no-deps --rm dynamictravel \
-  /usr/local/bin/flowsplice-travelagent enroll-remote \
-  --travel-id dynamic-home-issued-travel \
-  --home-id "${dynamic_global_home_id}" \
-  --install-dir /dynamic-travel \
-  --relay relay2:8443 \
-  --deployment-root-public-key /certs/deployment-root.pub \
-  --test-allow-remote-listen \
-  --test-admin-token flowsplice-e2e-dynamic-home-travel-administrator-token \
-  --test-password-file /dynamic-travel/test-password.txt \
-  --wait-timeout-secs 180 \
-  >"${generated_dir}/dynamic-travel/enroll.log" 2>&1 &
-first_enroll_pid=$!
-dynamic_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 39087 \
-  --travel-id dynamic-home-issued-travel \
-  --wait-secs 120)"
-dynamic_travel_request_id="$(python3 -c \
-  'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
-  "${dynamic_travel_pending}")"
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 39087 \
-  --request-id "${dynamic_travel_request_id}" \
-  --password-file "${generated_dir}/offline/test-password.txt" \
-  --scope global \
-  --valid-days 180 >/dev/null
-wait "${first_enroll_pid}"
-first_enroll_pid=""
-printf '\n[[homes]]\nid = "home-1"\n' \
-  >>"${generated_dir}/dynamic-travel/travelagent.toml"
-docker compose -f "${compose_file}" up -d dynamictravel
-configure_travel_mapping dynamictravel \
-  flowsplice-e2e-dynamic-home-travel-administrator-token \
-  home-1 tcp-echo tcp 0.0.0.0:10080
-python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 13083 \
-  --payload dynamic-home-global-issuer-business \
-  --wait-secs 90
-
-# The first data address of every Relay now accepts TCP but is no Relay (the echo service), so a
-# Carrier opens only if Travel races all data addresses instead of trying them in turn.
-docker compose -f "${compose_file}" stop dynamictravel
-python3 "${repo_root}/tests/e2e/set-relay-data-aliases.py" \
-  "${generated_dir}/dynamic-travel/travelagent.toml" \
-  --data-addr echo:7001 \
-  --relay relay-1=relay1:8443 \
-  --relay relay-2=relay2:8443
-docker compose -f "${compose_file}" up -d dynamictravel
-python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 13083 \
-  --payload travel-races-relay-data-addresses \
-  --wait-secs 90
-printf '%s\n' '{"checkpoint": "travel-races-relay-data-addresses"}'
-
-mkdir -p "${generated_dir}/first-travel"
-cp "${generated_dir}/offline/test-password.txt" \
-  "${generated_dir}/first-travel/test-password.txt"
-chmod 600 "${generated_dir}/first-travel/test-password.txt"
-if [[ -e "${generated_dir}/first-travel/travelagent.toml" || \
-      -e "${generated_dir}/first-travel/cert" ]]; then
-  echo 'first remote Travel was not clean before bootstrap' >&2
-  exit 1
-fi
-docker compose -f "${compose_file}" run --no-deps --rm firsttravel \
-  /usr/local/bin/flowsplice-travelagent enroll-remote \
-  --travel-id first-remote-e2e \
-  --home-id home-1 \
-  --install-dir /first-travel \
-  --relay relay2:8443 \
-  --deployment-root-public-key /certs/deployment-root.pub \
-  --test-allow-remote-listen \
-  --test-admin-token flowsplice-e2e-first-remote-administrator-token \
-  --test-password-file /first-travel/test-password.txt \
-  --wait-timeout-secs 180 \
-  >"${generated_dir}/first-travel/enroll.log" 2>&1 &
-first_enroll_pid=$!
-bootstrap_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 19084 \
-  --travel-id first-remote-e2e \
-  --wait-secs 120)"
-bootstrap_request_id="$(python3 -c \
-  'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
-  "${bootstrap_pending}")"
-bootstrap_verification_code="$(python3 -c \
-  'import json,sys; value=json.loads(sys.argv[1]); assert value["bootstrap"] is True; print(value["verification_code"])' \
-  "${bootstrap_pending}")"
-if ! grep -Fq "Home verification code: ${bootstrap_verification_code}" \
-  "${generated_dir}/first-travel/enroll.log"; then
-  echo 'Home and Travel bootstrap verification codes did not match' >&2
-  exit 1
-fi
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19084 \
-  --request-id "${bootstrap_request_id}" \
-  --password-file "${generated_dir}/offline/wrong-password.txt" \
-  --scope global \
-  --valid-days 365 \
-  --expect-failure
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19084 \
-  --request-id "${bootstrap_request_id}" \
-  --password-file "${generated_dir}/offline/test-password.txt" \
-  --scope global \
-  --valid-days 365 \
-  --output "${generated_dir}/first-travel/approval.json" >/dev/null
-wait "${first_enroll_pid}"
-first_enroll_pid=""
-for required in \
-  travelagent.toml \
-  cert/travel-management.crt \
-  cert/travel-management.key \
-  cert/travel-business.crt \
-  cert/travel-business.key \
-  state/travel-state.redb; do
-  if [[ ! -s "${generated_dir}/first-travel/${required}" ]]; then
-    echo "first remote Travel did not create ${required}" >&2
-    exit 1
-  fi
-done
-if [[ -e "${generated_dir}/first-travel/bootstrap-enrollment.json" ]]; then
-  echo 'completed first enrollment retained its retrieval token' >&2
-  exit 1
-fi
-if grep -Fq 'flowsplice-e2e-private-key-password' \
-  "${generated_dir}/first-travel/travelagent.toml"; then
-  echo 'generated Travel config contains a private-key password' >&2
-  exit 1
-fi
-if grep -Eq '^(mappings =|\[\[mappings\]\])' \
-  "${generated_dir}/first-travel/travelagent.toml"; then
-  echo 'first remote enrollment generated an unsolicited business mapping' >&2
-  exit 1
-fi
-bootstrap_credential_id="$(python3 -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["enrollment"]["approval"]["credential_id"])' \
-  "${generated_dir}/first-travel/approval.json")"
-docker compose -f "${compose_file}" up -d firsttravel
-configure_travel_mapping firsttravel \
-  flowsplice-e2e-first-remote-administrator-token \
-  home-1 tcp-echo tcp 0.0.0.0:10080
-python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 12083 \
-  --payload first-remote-enrollment-business \
-  --wait-secs 90
-bootstrap_acknowledged=0
-for _ in $(seq 1 45); do
-  current_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-    --port 19084)"
-  if python3 -c \
+  first_travel_outbox="$(docker compose -f "${compose_file}" exec -T firsttravel \
+    wget -qO- \
+      --header='Authorization: Bearer flowsplice-e2e-first-remote-administrator-token' \
+      http://127.0.0.1:9080/api/enrollment)"
+  python3 -c \
     'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
-    "${current_pending}" "${bootstrap_request_id}"; then
-    bootstrap_acknowledged=1
-    break
-  fi
-  sleep 1
-done
-if (( bootstrap_acknowledged == 0 )); then
-  echo 'first remote enrollment was not acknowledged and retired by Home' >&2
-  exit 1
-fi
-first_travel_outbox="$(docker compose -f "${compose_file}" exec -T firsttravel \
-  wget -qO- \
-    --header='Authorization: Bearer flowsplice-e2e-first-remote-administrator-token' \
-    http://127.0.0.1:9080/api/enrollment)"
-python3 -c \
-  'import json,sys; request_id=sys.argv[2]; assert all(item["request_id"] != request_id for item in json.loads(sys.argv[1]))' \
-  "${first_travel_outbox}" "${bootstrap_request_id}"
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" revoke \
-  --port 19084 \
-  --credential-id "${bootstrap_credential_id}" \
-  --password-file "${generated_dir}/offline/test-password.txt" \
-  --reason 'first remote enrollment E2E completed'
-python3 "${repo_root}/tests/e2e/tcp-probe.py" \
-  --port 12083 \
-  --payload revoked-first-remote-enrollment \
-  --wait-secs 90 \
-  --expect-unavailable
-docker compose -f "${compose_file}" stop firsttravel
-
-mkdir -p "${generated_dir}/travel"
-cp "${generated_dir}/offline/test-password.txt" \
-  "${generated_dir}/travel/test-password.txt"
-chmod 600 "${generated_dir}/travel/test-password.txt"
-if [[ -e "${generated_dir}/travel/travelagent.toml" || \
-      -e "${generated_dir}/travel/cert" ]]; then
-  echo 'main Travel was not clean before remote enrollment' >&2
-  exit 1
-fi
-docker compose -f "${compose_file}" run --no-deps --rm travelagent \
-  /usr/local/bin/flowsplice-travelagent enroll-remote \
-  --travel-id travel-1 \
-  --home-id home-1 \
-  --install-dir /travel \
-  --relay relay2:8443 \
-  --deployment-root-public-key /certs/deployment-root.pub \
-  --test-password-file /travel/test-password.txt \
-  --wait-timeout-secs 180 \
-  >"${generated_dir}/travel/enroll.log" 2>&1 &
-first_enroll_pid=$!
-main_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
-  --port 19084 \
-  --travel-id travel-1 \
-  --wait-secs 120)"
-main_travel_request_id="$(python3 -c \
-  'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
-  "${main_travel_pending}")"
-main_travel_verification_code="$(python3 -c \
-  'import json,sys; value=json.loads(sys.argv[1]); assert value["bootstrap"] is True; print(value["verification_code"])' \
-  "${main_travel_pending}")"
-if ! grep -Fq "Home verification code: ${main_travel_verification_code}" \
-  "${generated_dir}/travel/enroll.log"; then
-  echo 'Home and main Travel verification codes did not match' >&2
-  exit 1
-fi
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19084 \
-  --request-id "${main_travel_request_id}" \
-  --password-file "${generated_dir}/offline/wrong-password.txt" \
-  --scope global \
-  --valid-days 365 \
-  --expect-failure
-python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
-  --port 19084 \
-  --request-id "${main_travel_request_id}" \
-  --password-file "${generated_dir}/offline/test-password.txt" \
-  --scope global \
-  --valid-days 365 >/dev/null
-wait "${first_enroll_pid}"
-first_enroll_pid=""
-for required in \
-  travelagent.toml \
-  cert/enrollment-request.json \
-  cert/travel-management.crt \
-  cert/travel-management.key \
-  cert/travel-business.crt \
-  cert/travel-business.key \
-  cert/deployment-root.pub \
-  cert/deployment-trust.json \
-  state/travel-state.redb; do
-  if [[ ! -s "${generated_dir}/travel/${required}" ]]; then
-    echo "main remote Travel did not create ${required}" >&2
-    exit 1
-  fi
-done
-if [[ -e "${generated_dir}/travel/bootstrap-enrollment.json" ]]; then
-  echo 'completed main Travel enrollment retained its retrieval token' >&2
-  exit 1
-fi
-if grep -Eq '^(mappings =|\[\[mappings\]\])' \
-  "${generated_dir}/travel/travelagent.toml"; then
-  echo 'main remote enrollment generated an unsolicited business mapping' >&2
-  exit 1
+    "${first_travel_outbox}" "${bootstrap_request_id}"
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" revoke \
+    --port 19084 \
+    --credential-id "${bootstrap_credential_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --reason 'first remote enrollment E2E completed'
+  python3 "${repo_root}/tests/e2e/tcp-probe.py" \
+    --port 12083 \
+    --payload revoked-first-remote-enrollment \
+    --wait-secs 90 \
+    --expect-unavailable
+  docker compose -f "${compose_file}" stop firsttravel
 fi
 
-docker compose -f "${compose_file}" up -d travelagent
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-1 tcp-echo tcp 0.0.0.0:10080
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-1 udp-echo udp 0.0.0.0:10081
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-2 tcp-echo tcp 0.0.0.0:10082
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-2 home-1-only tcp 0.0.0.0:10083
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-1 target-failure tcp 0.0.0.0:10084
-configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
-  home-2 target-failure tcp 0.0.0.0:10085
-bash "${repo_root}/tests/e2e/check-socket-api.sh"
-python3 -u "${repo_root}/tests/e2e/check-business.py"
-python3 -u "${repo_root}/tests/e2e/assert_e2e.py"
-docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
-for event in \
-  'event="relay_directory_updated"' \
-  'event="carrier_race_started"' \
-  'event="active_carrier_race_sent"' \
-  'event="carrier_race_ack"' \
-  'event="carrier_reevaluation_scheduled"' \
-  'event="flow_detached"' \
-  'event="carrier_recovery_started"' \
-  'event="tcp_retransmit"'; do
-  if ! grep -Fq "${event}" "${log_file}"; then
-    echo "missing required E2E log event: ${event}" >&2
+if [[ "${e2e_modules}" != "none" ]]; then
+  mkdir -p "${generated_dir}/travel"
+  cp "${generated_dir}/offline/test-password.txt" \
+    "${generated_dir}/travel/test-password.txt"
+  chmod 600 "${generated_dir}/travel/test-password.txt"
+  if [[ -e "${generated_dir}/travel/travelagent.toml" || \
+        -e "${generated_dir}/travel/cert" ]]; then
+    echo 'main Travel was not clean before remote enrollment' >&2
     exit 1
   fi
-done
-for event in \
-  'event="travel_credential_revoked_by_home"' \
-  'event="travel_authorization_published"' \
-  'event="travel_authorization_ack"' \
-  'event="travel_authorization_applied"' \
-  'event="revoked_flow_closed"'; do
-  if ! grep -Fq "${event}" "${log_file}"; then
-    echo "missing required live-revocation E2E log event: ${event}" >&2
+  docker compose -f "${compose_file}" run --no-deps --rm travelagent \
+    /usr/local/bin/flowsplice-travelagent enroll-remote \
+    --travel-id travel-1 \
+    --home-id home-1 \
+    --install-dir /travel \
+    --relay relay2:8443 \
+    --deployment-root-public-key /certs/deployment-root.pub \
+    --test-password-file /travel/test-password.txt \
+    --wait-timeout-secs 180 \
+    >"${generated_dir}/travel/enroll.log" 2>&1 &
+  first_enroll_pid=$!
+  main_travel_pending="$(python3 "${repo_root}/tests/e2e/home-issuer-client.py" pending \
+    --port 19084 \
+    --travel-id travel-1 \
+    --wait-secs 120)"
+  main_travel_request_id="$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["request_id"])' \
+    "${main_travel_pending}")"
+  main_travel_verification_code="$(python3 -c \
+    'import json,sys; value=json.loads(sys.argv[1]); assert value["bootstrap"] is True; print(value["verification_code"])' \
+    "${main_travel_pending}")"
+  if ! grep -Fq "Home verification code: ${main_travel_verification_code}" \
+    "${generated_dir}/travel/enroll.log"; then
+    echo 'Home and main Travel verification codes did not match' >&2
     exit 1
   fi
-done
-if ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=false' "${log_file}"; then
-  echo 'missing stable active-Carrier reevaluation result' >&2
-  exit 1
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 19084 \
+    --request-id "${main_travel_request_id}" \
+    --password-file "${generated_dir}/offline/wrong-password.txt" \
+    --scope global \
+    --valid-days 365 \
+    --expect-failure
+  python3 "${repo_root}/tests/e2e/home-issuer-client.py" approve \
+    --port 19084 \
+    --request-id "${main_travel_request_id}" \
+    --password-file "${generated_dir}/offline/test-password.txt" \
+    --scope global \
+    --valid-days 365 >/dev/null
+  wait "${first_enroll_pid}"
+  first_enroll_pid=""
+  for required in \
+    travelagent.toml \
+    cert/enrollment-request.json \
+    cert/travel-management.crt \
+    cert/travel-management.key \
+    cert/travel-business.crt \
+    cert/travel-business.key \
+    cert/deployment-root.pub \
+    cert/deployment-trust.json \
+    state/travel-state.redb; do
+    if [[ ! -s "${generated_dir}/travel/${required}" ]]; then
+      echo "main remote Travel did not create ${required}" >&2
+      exit 1
+    fi
+  done
+  if [[ -e "${generated_dir}/travel/bootstrap-enrollment.json" ]]; then
+    echo 'completed main Travel enrollment retained its retrieval token' >&2
+    exit 1
+  fi
+  if grep -Eq '^(mappings =|\[\[mappings\]\])' \
+    "${generated_dir}/travel/travelagent.toml"; then
+    echo 'main remote enrollment generated an unsolicited business mapping' >&2
+    exit 1
+  fi
+
+  docker compose -f "${compose_file}" up -d travelagent
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-1 tcp-echo tcp 0.0.0.0:10080
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-1 udp-echo udp 0.0.0.0:10081
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-2 tcp-echo tcp 0.0.0.0:10082
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-2 home-1-only tcp 0.0.0.0:10083
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-1 target-failure tcp 0.0.0.0:10084
+  configure_travel_mapping travelagent flowsplice-e2e-administrator-token \
+    home-2 target-failure tcp 0.0.0.0:10085
+  if checks_for SDK RUNTIME; then
+    bash "${repo_root}/tests/e2e/check-socket-api.sh"
+  fi
+  if checks_for ENROLL SDK CLASS AUTHZ; then
+    python3 -u "${repo_root}/tests/e2e/check-business.py"
+  fi
+  python3 -u "${repo_root}/tests/e2e/assert_e2e.py"
+  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
+  # Each group of required log events comes from the checks of its module.
+  required_events=()
+  if checks_for CONTROL; then
+    required_events+=('event="relay_directory_updated"')
+  fi
+  if checks_for CARRIER; then
+    required_events+=(
+      'event="carrier_race_started"'
+      'event="active_carrier_race_sent"'
+      'event="carrier_race_ack"'
+      'event="carrier_reevaluation_scheduled"'
+      'event="flow_detached"'
+      'event="carrier_recovery_started"'
+      'event="tcp_retransmit"'
+    )
+  fi
+  if checks_for AUTHZ; then
+    required_events+=(
+      'event="travel_credential_revoked_by_home"'
+      'event="travel_authorization_published"'
+      'event="travel_authorization_ack"'
+      'event="travel_authorization_applied"'
+      'event="revoked_flow_closed"'
+    )
+  fi
+  for event in ${required_events[@]+"${required_events[@]}"}; do
+    if ! grep -Fq "${event}" "${log_file}"; then
+      echo "missing required E2E log event: ${event}" >&2
+      exit 1
+    fi
+  done
+  if checks_for CARRIER && ! grep -Eq 'event="carrier_reevaluation_scheduled".*stable=true.*switched=false' "${log_file}"; then
+    echo 'missing stable active-Carrier reevaluation result' >&2
+    exit 1
+  fi
 fi
 if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
   docker compose -f "${compose_file}" up -d --no-deps relay1 relay2 homeagent

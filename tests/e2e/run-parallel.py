@@ -3,10 +3,11 @@
 
 Platforms cannot share one topology: the Apple and macOS tests stop and restart a Relay while their
 app is connected, and Android needs another Relay discovery address than the Apple platforms.
-Each platform therefore runs the complete tests/e2e/run.sh in its own checkout of the current
-commit (with its own tests/e2e/generated), Compose project and block of host ports
-(FLOWSPLICE_E2E_PORT_OFFSET), with only its own native phase enabled. The E2E image is built once
-and shared. The summary lists every platform with its log.
+Each platform therefore runs tests/e2e/run.sh in its own checkout of the current commit (with its
+own tests/e2e/generated), Compose project and block of host ports (FLOWSPLICE_E2E_PORT_OFFSET), with
+only its own native phase enabled. --modules selects the E2E checks each topology runs first
+(--native-only runs none). The E2E image is built once and shared. The summary lists every
+platform with its log.
 
 Example:
   tests/e2e/run-parallel.py /tmp/flowsplice-acceptance --platforms android,iphone,ipad,macos
@@ -36,7 +37,14 @@ parser.add_argument("--iphone-simulator", default=os.environ.get("FLOWSPLICE_APP
 parser.add_argument("--ipad-simulator", default=os.environ.get("FLOWSPLICE_APPLE_IPAD_SIMULATOR", "iPad mini (A17 Pro)"))
 parser.add_argument("--port-offset", type=int, default=100,
                     help="offset of the first platform's ports from the defaults; each further platform adds 100")
+parser.add_argument("--modules", default="all",
+                    help='E2E checks each topology runs before its native phase: "all", "none" or modules (docs/TESTING.md)')
+parser.add_argument("--native-only", action="store_true", help='same as --modules none')
+parser.add_argument("--apple-short", action="store_true",
+                    help="30 s background and 60 s sustained phases on iPhone and iPad instead of 120 s and 900 s")
 args = parser.parse_args()
+if args.native_only:
+    args.modules = "none"
 platforms = [name for name in args.platforms.split(",") if name]
 for name in platforms:
     if name not in PLATFORMS:
@@ -94,8 +102,10 @@ def platform_environment(name):
         flags.update(FLOWSPLICE_APPLE_E2E="1", FLOWSPLICE_APPLE_E2E_DEVICES=name,
                      FLOWSPLICE_APPLE_IPHONE_SIMULATOR=args.iphone_simulator,
                      FLOWSPLICE_APPLE_IPAD_SIMULATOR=args.ipad_simulator)
+    if args.apple_short:
+        flags.update(FLOWSPLICE_APPLE_E2E_BACKGROUND_SECONDS="30", FLOWSPLICE_APPLE_E2E_SUSTAINED_SECONDS="60")
     return dict(environment, **flags, FLOWSPLICE_E2E_SKIP_BUILD="1", FLOWSPLICE_E2E_PORT_OFFSET=str(offsets[name]),
-                FLOWSPLICE_E2E_PROJECT_NAME=f"flowsplice-e2e-{name}-{os.getpid()}")
+                FLOWSPLICE_E2E_PROJECT_NAME=f"flowsplice-e2e-{name}-{os.getpid()}", FLOWSPLICE_E2E_MODULES=args.modules)
 
 
 def run_platform(name, source):
@@ -130,7 +140,7 @@ try:
         results.update({name: {"result": "failed", "reason": "image build failed; see image-build.log"} for name in platforms})
 finally:
     subprocess.run(["docker", "image", "rm", "--force", image], capture_output=True, check=False)
-summary = {"commit": commit, "platforms": results}
+summary = {"commit": commit, "modules": args.modules, "apple_short": args.apple_short, "platforms": results}
 (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 print(json.dumps(summary, indent=2))
 raise SystemExit(0 if all(record.get("result") == "passed" for record in results.values()) else 1)
