@@ -74,8 +74,20 @@ export GRADLE_USER_HOME="${stage}/gradle-home"
 export TMPDIR="${stage}/tmp"
 (
   cd "${android_root}"
-  ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
-    :app:assembleDebug :app:assembleDebugAndroidTest
+  # The stage's own Gradle home downloads Gradle and every dependency on each run. Retry when a
+  # download fails on the network; the next attempt keeps what the stage already holds.
+  for attempt in 1 2 3; do
+    gradle_log="${stage}/gradle-attempt-${attempt}.log"
+    if ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
+      :app:assembleDebug :app:assembleDebugAndroidTest 2>&1 | tee "${gradle_log}"; then
+      exit 0
+    fi
+    if ! grep -Eq 'Could not (GET|HEAD|resolve)|Premature EOF|terminated the handshake|Read timed out|Connection reset' "${gradle_log}"; then
+      exit 1
+    fi
+    echo "Gradle attempt ${attempt} failed on the network; retrying" >&2
+  done
+  exit 1
 )
 
 app_id='io.zxf.flowsplice.travel'
