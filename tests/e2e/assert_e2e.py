@@ -247,14 +247,20 @@ def read_control_high_water() -> dict:
     return state
 
 
-def wait_issuer_ready(port: int) -> None:
+def wait_issuer_ready(port: int, credential_id: str) -> None:
+    # The issuer answers before the Home has applied its first authorization snapshot from the
+    # Server, and lists no credentials until then, so also wait for a credential it issued.
     deadline = time.monotonic() + 90
     last_error = None
     while time.monotonic() < deadline:
         try:
             response = issuer_request(port, "GET", "/api/status")
-            if response["home_id"] == "home-1":
+            if response["home_id"] == "home-1" and any(
+                credential["credential_id"] == credential_id
+                for credential in issued_credentials(port)
+            ):
                 return
+            last_error = f"credential {credential_id} not listed yet"
         except Exception as error:
             last_error = error
         time.sleep(1)
@@ -1217,7 +1223,7 @@ def check_private_key_password_rotation(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent", "travelagent"],
         check=True,
     )
-    wait_issuer_ready(19084)
+    wait_issuer_ready(19084, credential_id)
     check_duplicate_enrollment_issue_is_idempotent(
         credential_id, issuance_generation
     )
