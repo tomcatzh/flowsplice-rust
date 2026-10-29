@@ -259,6 +259,7 @@ final class FlowSpliceMacUITests: XCTestCase {
         applyE2EKeychainEnvironment(to: app)
         app.launchArguments = ["--reset-state", "--real-backend", "--ui-test-allow-termination"]
         addTeardownBlock {
+            self.allowOwnLocalNetworkPrompt()
             app.terminate()
             let cleanup = XCUIApplication()
             cleanup.launchEnvironment["FLOWSPLICE_UI_TESTING"] = "1"
@@ -326,6 +327,7 @@ final class FlowSpliceMacUITests: XCTestCase {
         // The test deliberately keeps the selected Relay offline for five seconds.
         // Observe beyond Travel Core's 60-second recovery deadline so a socket
         // timeout cannot be mistaken for a failed same-Flow recovery.
+        allowOwnLocalNetworkPrompt()
         var persistentFlow: Int32? = try openEchoConnection(port: localPort, timeoutSeconds: 75)
         defer {
             if let persistentFlow { close(persistentFlow) }
@@ -627,6 +629,25 @@ final class FlowSpliceMacUITests: XCTestCase {
         guard let separator = address.lastIndex(of: ":"),
               let port = UInt16(address[address.index(after: separator)...]) else { return nil }
         return (String(address[..<separator]), port)
+    }
+
+    /// macOS asks once per app identity before Travel reaches a private Relay address, such as a
+    /// container address it races. An unanswered prompt would cover the next UI test on this Mac,
+    /// so accept FlowSplice's own prompt; prompts of other apps are left alone.
+    private func allowOwnLocalNetworkPrompt() {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.UserNotificationCenter")
+        guard system.state != .notRunning else { return }
+        for dialog in system.dialogs.allElementsBoundByIndex + system.alerts.allElementsBoundByIndex {
+            let message = dialog.staticTexts.allElementsBoundByIndex
+                .map { $0.label + " " + ($0.value as? String ?? "") }.joined(separator: " ")
+            guard message.contains("FlowSplice"),
+                  message.contains("本地网络") || message.lowercased().contains("local network") else { continue }
+            if let button = dialog.buttons.allElementsBoundByIndex.first(where: {
+                ["允许", "Allow"].contains($0.title) && $0.isEnabled && $0.isHittable
+            }) {
+                button.click()
+            }
+        }
     }
 
     private func tcpPortIsReachable(host: String, port: UInt16) -> Bool {
