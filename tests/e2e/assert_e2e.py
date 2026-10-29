@@ -1504,6 +1504,11 @@ def check_server_failure_does_not_break_established_data_flow() -> None:
 
 
 def check_statistics_pipeline() -> None:
+    # Reports need business traffic; when the stage runs alone no earlier stage has produced any.
+    for port, expected_home in ((11083, None), (11085, b"home-2")):
+        with socket.create_connection(host(port), timeout=5) as stream:
+            stream.settimeout(15)
+            exchange_line(stream, b"statistics-traffic", expected_home)
     deadline = time.monotonic() + 45
     last = None
     while time.monotonic() < deadline:

@@ -440,13 +440,28 @@ configure_travel_mapping() {
     echo "${service} Travel API did not become ready" >&2
     exit 1
   fi
-  docker compose -f "${compose_file}" exec -T "${service}" \
-    wget -qO- \
-    --header="Authorization: Bearer ${token}" \
-    --header='Origin: http://127.0.0.1:9080' \
-    --header='Content-Type: application/json' \
-    --post-data="${payload}" \
-    http://127.0.0.1:9080/api/mappings >/dev/null
+  # Python instead of wget: a rejected mapping must report the API's error message.
+  local response
+  if ! response="$(docker compose -f "${compose_file}" exec -T "${service}" python3 - "${token}" "${payload}" 2>&1 <<'PY'
+import sys
+import urllib.error
+import urllib.request
+
+token, payload = sys.argv[1], sys.argv[2]
+request = urllib.request.Request(
+    "http://127.0.0.1:9080/api/mappings", data=payload.encode(), method="POST",
+    headers={"Authorization": "Bearer " + token, "Origin": "http://127.0.0.1:9080",
+             "Content-Type": "application/json"})
+try:
+    urllib.request.urlopen(request, timeout=30).read()
+except urllib.error.HTTPError as error:
+    print(f"HTTP {error.code}: {error.read().decode(errors='replace')[:500]}")
+    sys.exit(1)
+PY
+  )"; then
+    echo "${service} rejected mapping ${home_id}/${service_id}: ${response}" >&2
+    exit 1
+  fi
 }
 
 if docker compose -f "${compose_file}" exec -T homeagent \
