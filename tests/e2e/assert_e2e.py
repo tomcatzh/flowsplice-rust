@@ -726,6 +726,26 @@ def wait_active_relay(excluded: str | None = None) -> str:
     raise AssertionError(f"Travel did not select a replacement Relay; excluded={excluded}")
 
 
+def wait_stable_active_relay(seconds: float = 6) -> str:
+    """The active Relay once it has not changed for `seconds`.
+
+    Shortly after a Relay restarts, or early in a run while reevaluation is still frequent, the
+    Travel may still move its Carrier between Relays.
+    """
+    deadline = time.monotonic() + 60
+    current, since = None, time.monotonic()
+    while time.monotonic() < deadline:
+        status, _, body = http_get("/api/status", {"Accept": "application/json"})
+        active = json.loads(body)["active_relays"] if status == 200 else []
+        observed = active[0] if len(active) == 1 else None
+        if observed != current:
+            current, since = observed, time.monotonic()
+        elif current is not None and time.monotonic() - since >= seconds:
+            return current
+        time.sleep(0.2)
+    raise AssertionError(f"Travel did not settle on one Relay; last={current}")
+
+
 def check_tcp_relay_failover(
     port: int = 11083, expected_home: bytes | None = None
 ) -> tuple[str, str]:
@@ -734,7 +754,7 @@ def check_tcp_relay_failover(
         connection_id = exchange_line(
             stream, b"before-relay-failure", expected_home
         )
-        active = wait_active_relay()
+        active = wait_stable_active_relay()
         time.sleep(3)
         assert (
             exchange_line(stream, b"after-stable-reevaluation", expected_home)
@@ -1994,7 +2014,7 @@ STAGES = [
     ("embedded-spa", {"LOCALUI", "ENROLL"}, (), check_embedded_spa),
     ("duplicate-travel-login", {"CONTROL"}, (), check_duplicate_travel_login_is_rejected),
     ("tls-policy-and-slow-loris", {"WIRE"}, (), check_tls_policy_and_slow_loris_deadline),
-    ("statistics-pipeline", {"STATS"}, (), check_statistics_pipeline),
+    ("statistics-pipeline", {"STATS"}, ("per-home-target-failures",), check_statistics_pipeline),
     ("home-statistics-write-failure-isolation", {"STATS"}, (), check_home_statistics_write_failures_are_isolated),
     ("home1-tcp-relay-failover", {"CARRIER"}, (), run_home1_relay_failover),
     ("home2-tcp-relay-failover", {"CARRIER"}, (), run_home2_relay_failover),

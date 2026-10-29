@@ -339,7 +339,7 @@ e2e-stage:server-outage-established-flow,L3,CARRIER CONTROL,docker,FLOWSPLICE_E2
 e2e-stage:embedded-spa,L3,ENROLL LOCALUI,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:duplicate-travel-login,L3,CONTROL,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:tls-policy-and-slow-loris,L3,WIRE,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
-e2e-stage:statistics-pipeline,L3,STATS,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
+e2e-stage:statistics-pipeline,L3,STATS,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,needs per-home-target-failures
 e2e-stage:home-statistics-write-failure-isolation,L3,STATS,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:home1-tcp-relay-failover,L3,CARRIER,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:home2-tcp-relay-failover,L3,CARRIER,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
