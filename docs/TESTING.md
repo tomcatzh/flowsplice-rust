@@ -61,4 +61,10 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
 - Only one macOS UI test may run at a time on this Mac. Run FlowSplice and Vaultty acceptance one after the other; both also use the same Android emulator.
 - The Android Travel E2E clears the Travel app, so it runs only on an emulator.
 - Before a macOS run, make sure no system dialog (for example "… quit unexpectedly") covers the screen.
+- The first iOS simulator run of the background-audio phase on a Mac makes macOS ask whether
+  `SimulatorTrampoline.xpc` (the simulator's audio bridge) may use the microphone. The app only plays
+  audio; deny it. Unanswered, the prompt stalls the simulator's audio, so the app is killed, and it
+  covers any macOS UI test running at the same time.
+- The macOS UI test accepts FlowSplice's own "find devices on the local network" prompt; prompts of
+  other apps are left alone.
 - When a test is added or renamed, regenerate `tests/test-map.csv`; `--check` fails until it is current.
