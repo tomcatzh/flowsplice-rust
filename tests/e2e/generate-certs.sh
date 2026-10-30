@@ -95,9 +95,22 @@ for authority in home1-authority home2-authority global-authority home-enrollmen
     --password-file "${password_file}" \
     --output "${authorization_dir}/${authority}-public-key.txt"
 done
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-  -aes-256-cbc -pass "file:${password_file}" \
-  -out "${root_dir}/deployment-root.key" >/dev/null 2>&1
+# The native test apps bundle the deployment root, so a new root would make every native test
+# build new (tests/e2e/native-build-cache.py). With FLOWSPLICE_E2E_ROOT_CACHE mounted, keep one
+# root across runs; when several topologies start at once, the first one to publish its root wins.
+root_cache="${FLOWSPLICE_E2E_ROOT_CACHE:-}"
+if [[ -n "${root_cache}" && -s "${root_cache}/deployment-root.key" ]]; then
+  cp "${root_cache}/deployment-root.key" "${root_dir}/deployment-root.key"
+else
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    -aes-256-cbc -pass "file:${password_file}" \
+    -out "${root_dir}/deployment-root.key" >/dev/null 2>&1
+  if [[ -n "${root_cache}" ]]; then
+    install -m 600 "${root_dir}/deployment-root.key" "${root_cache}/.deployment-root.key.$$"
+    ln "${root_cache}/.deployment-root.key.$$" "${root_cache}/deployment-root.key" 2>/dev/null || true
+    rm -f "${root_cache}/.deployment-root.key.$$"
+  fi
+fi
 python3 "${script_dir}/authority-public-key.py" \
   --authority-key "${root_dir}/deployment-root.key" \
   --password-file "${password_file}" \

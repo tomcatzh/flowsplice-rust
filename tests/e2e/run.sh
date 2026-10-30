@@ -112,11 +112,22 @@ if [[ "${FLOWSPLICE_E2E_BUILD_ONLY:-0}" == "1" ]]; then
   # Builds the image for runs that share it (tests/e2e/run-parallel.py).
   exit 0
 fi
+# On a Mac the native test builds are cached (tests/e2e/native-build-cache.py); they bundle the
+# deployment root, so generate-certs.sh keeps one root there across runs.
+if [[ -z "${FLOWSPLICE_E2E_CACHE_DIR:-}" && "$(uname -s)" == "Darwin" ]]; then
+  export FLOWSPLICE_E2E_CACHE_DIR="${HOME}/Library/Caches/FlowSpliceE2E"
+fi
+root_cache_args=()
+if [[ -n "${FLOWSPLICE_E2E_CACHE_DIR:-}" ]]; then
+  mkdir -p "${FLOWSPLICE_E2E_CACHE_DIR}/deployment-root"
+  root_cache_args=(-v "${FLOWSPLICE_E2E_CACHE_DIR}/deployment-root:/root-cache" -e FLOWSPLICE_E2E_ROOT_CACHE=/root-cache)
+fi
 if [[ "${FLOWSPLICE_E2E_REUSE_GENERATED:-0}" != "1" ]]; then
   # Use the image's pinned OpenSSL: host OpenSSL builds differ, and the generator discards
   # their errors, so keep a trace that names a failing command.
   if ! docker run --rm \
     --user "${FLOWSPLICE_E2E_UID}:${FLOWSPLICE_E2E_GID}" \
+    ${root_cache_args[@]+"${root_cache_args[@]}"} \
     -v "${repo_root}/tests/e2e:/e2e" -w /e2e \
     "${FLOWSPLICE_E2E_IMAGE}" \
     bash -x /e2e/generate-certs.sh >"${generated_dir}/generate-certs.trace" 2>&1; then
@@ -962,18 +973,11 @@ if [[ "${e2e_modules}" != "none" ]]; then
     exit 1
   fi
 fi
-if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
-  docker compose -f "${compose_file}" up -d --no-deps relay1 relay2 homeagent
-  "${repo_root}/tests/e2e/android/run.sh" \
-    "${generated_dir}/offline/test-password.txt" \
-    "10.0.2.2:$(host_port 18446)"
-  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
-fi
-# iPhone, iPad and macOS share this topology and run at the same time. They use the same discovery
-# address, their own Travel IDs and local mapping ports, and take turns stopping a Relay
-# (tests/e2e/relay-outage.py).
+# Each native runner logs to its own file and ends with one {"native": ...} result line, which
+# tests/e2e/run-parallel.py reads.
 native_names=()
 native_pids=()
+native_failed=0
 start_native() {
   local name="$1"
   shift
@@ -988,6 +992,39 @@ start_native() {
   native_names+=("${name}")
   native_pids+=($!)
 }
+finish_natives() {
+  local index=0 name result
+  while [[ "${index}" -lt "${#native_pids[@]}" ]]; do
+    name="${native_names[${index}]}"
+    if wait "${native_pids[${index}]}"; then
+      result=passed
+    else
+      result=failed
+      native_failed=1
+    fi
+    echo "--- native ${name} log (${generated_dir}/native-${name}.log)"
+    cat "${generated_dir}/native-${name}.log"
+    printf '{"native":"%s","result":"%s","seconds":%s}\n' "${name}" "${result}" \
+      "$(cat "${generated_dir}/native-${name}.seconds" 2>/dev/null || echo null)"
+    index="$((index + 1))"
+  done
+  if [[ "${#native_pids[@]}" -gt 0 ]]; then
+    docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
+  fi
+  native_names=()
+  native_pids=()
+}
+# Android needs its own Relay discovery address (10.0.2.2), so it runs before the Apple platforms.
+if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
+  docker compose -f "${compose_file}" up -d --no-deps relay1 relay2 homeagent
+  start_native android "${repo_root}/tests/e2e/android/run.sh" \
+    "${generated_dir}/offline/test-password.txt" \
+    "10.0.2.2:$(host_port 18446)"
+  finish_natives
+fi
+# iPhone, iPad and macOS share this topology and run at the same time. They use the same discovery
+# address, their own Travel IDs and local mapping ports, and take turns stopping a Relay
+# (tests/e2e/relay-outage.py).
 if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" || "${FLOWSPLICE_MACOS_E2E:-0}" == "1" ]]; then
   export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:$(host_port 18447)"
   docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
@@ -1016,25 +1053,7 @@ if [[ "${FLOWSPLICE_MACOS_E2E:-0}" == "1" ]]; then
     "127.0.0.1:$(host_port 18446)" \
     "macos-e2e-travel"
 fi
-native_failed=0
-native_index=0
-while [[ "${native_index}" -lt "${#native_pids[@]}" ]]; do
-  native_name="${native_names[${native_index}]}"
-  if wait "${native_pids[${native_index}]}"; then
-    native_result=passed
-  else
-    native_result=failed
-    native_failed=1
-  fi
-  echo "--- native ${native_name} log (${generated_dir}/native-${native_name}.log)"
-  cat "${generated_dir}/native-${native_name}.log"
-  printf '{"native":"%s","result":"%s","seconds":%s}\n' "${native_name}" "${native_result}" \
-    "$(cat "${generated_dir}/native-${native_name}.seconds" 2>/dev/null || echo null)"
-  native_index="$((native_index + 1))"
-done
-if [[ "${#native_pids[@]}" -gt 0 ]]; then
-  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
-fi
+finish_natives
 if [[ "${native_failed}" -ne 0 ]]; then
   echo 'a native Travel E2E failed; see its log above' >&2
   exit 1

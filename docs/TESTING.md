@@ -66,6 +66,14 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
 - Only one macOS UI test may run at a time on this Mac. Run FlowSplice and Vaultty acceptance one after the other; both also use the same Android emulator.
 - A native test that stops a Relay uses `tests/e2e/relay-outage.py`: one outage at a time per topology,
   and the Relay counts as back only when its listeners are ready and the Server has it in the directory.
+- Native test builds (iOS, macOS, Android) are reused while nothing they are built from changes
+  (`tests/e2e/native-build-cache.py`): program sources and the platform's own directory, toolchains
+  and the bundled deployment root. Changes to tests, docs, the backend services or another platform
+  do not rebuild them. The cache is `~/Library/Caches/FlowSpliceE2E` (`FLOWSPLICE_E2E_CACHE_DIR`) and
+  keeps three builds per platform; `FLOWSPLICE_E2E_NATIVE_CACHE=0` always builds.
+  - Because the apps bundle the test deployment root, `generate-certs.sh` keeps one root in that cache
+    on a Mac; every other key and certificate is still new each run. Delete
+    `~/Library/Caches/FlowSpliceE2E/deployment-root` for a new root.
 - The Android Travel E2E clears the Travel app, so it runs only on an emulator.
 - Before a macOS run, make sure no system dialog (for example "… quit unexpectedly") covers the screen.
 - The first iOS simulator run of the background-audio phase on a Mac makes macOS ask whether

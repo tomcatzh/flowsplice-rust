@@ -145,14 +145,21 @@ capture_keychain_state >"${keychain_state_before}"
 security create-keychain -p "${ui_keychain_password}" "${ui_keychain_path}" >/dev/null
 security unlock-keychain -p "${ui_keychain_password}" "${ui_keychain_path}" >/dev/null
 
-xcodebuild \
+# An unchanged build is reused; local mode bundles no deployment root.
+build_inputs=(--extra "${test_mode}")
+if [[ "${test_mode}" == 'remote' ]]; then
+  build_inputs+=(--input "${frozen_deployment_root}")
+fi
+python3 "${repo_root}/tests/e2e/native-build-cache.py" macos "${derived_data}/Build/Products" \
+  "${build_inputs[@]}" --output "${test_output}" -- \
+  xcodebuild \
   -project "${mac_root}/FlowSpliceMac.xcodeproj" \
   -scheme FlowSpliceMac \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "${derived_data}" \
   -parallel-testing-enabled NO \
   "${trust_xcode_args[@]}" \
-  build-for-testing >"${test_output}" 2>&1
+  build-for-testing
 
 mac_bundle="$(find "${derived_data}/Build/Products" -type d -name 'FlowSpliceMac.app' -print -quit)"
 if [[ -z "${mac_bundle}" ]]; then

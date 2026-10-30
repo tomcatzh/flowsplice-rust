@@ -112,7 +112,10 @@ python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
   --source "${staged_deployment_root}" --destination "${frozen_deployment_root}"
 printf '%s\n' "${frozen_deployment_root}" >"${trust_input_list}"
 
-xcodebuild \
+# iPhone and iPad run the same simulator build, and an unchanged build is reused.
+python3 "${repo_root}/tests/e2e/native-build-cache.py" ios "${derived_data}/Build/Products" \
+  --input "${frozen_deployment_root}" --output "${test_output}" -- \
+  xcodebuild \
   -project "${apple_root}/FlowSpliceTravel.xcodeproj" \
   -scheme FlowSpliceTravel \
   -destination "platform=iOS Simulator,id=${simulator_id}" \
@@ -120,7 +123,7 @@ xcodebuild \
   -parallel-testing-enabled NO \
   "FLOWSPLICE_PRIVATE_TRUST_FILE=${frozen_deployment_root}" \
   "FLOWSPLICE_TRUST_INPUT_LIST=${trust_input_list}" \
-  build-for-testing >"${test_output}" 2>&1
+  build-for-testing
 apple_bundle="$(find "${derived_data}/Build/Products" -type d -name 'FlowSpliceTravel.app' -print -quit)"
 if [[ -z "${apple_bundle}" ]]; then
   echo 'Xcode did not produce the Apple Travel app bundle for deployment-root verification' >&2
