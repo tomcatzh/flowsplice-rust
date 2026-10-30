@@ -67,4 +67,9 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
   covers any macOS UI test running at the same time.
 - The macOS UI test accepts FlowSplice's own "find devices on the local network" prompt; prompts of
   other apps are left alone.
+- The iPhone and iPad tests reach relay2 at its container address, so OrbStack must bridge the
+  topology's Docker network to macOS. It bridges at most 8 active networks, other running Compose
+  projects included, and logs "too many active networks" in `~/.orbstack/log/vmgr.log` for the rest.
+  `tests/e2e/apple/run.sh` waits for the route before the UI test (`FLOWSPLICE_APPLE_E2E_ROUTE_WAIT_SECONDS`,
+  default 3600), so in a parallel run one Apple platform can wait for another to finish.
 - When a test is added or renamed, regenerate `tests/test-map.csv`; `--check` fails until it is current.

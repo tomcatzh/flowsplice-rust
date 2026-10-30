@@ -19,6 +19,8 @@ if [[ "${sustained_seconds}" -gt "${longest_background_seconds}" ]]; then
   longest_background_seconds="${sustained_seconds}"
 fi
 phase_wait_seconds="$((longest_background_seconds + 180))"
+# Long enough for another platform's run to end and free an OrbStack network slot (see below).
+route_wait_seconds="${FLOWSPLICE_APPLE_E2E_ROUTE_WAIT_SECONDS:-3600}"
 screen_off_seconds="$((background_seconds / 2))"
 if [[ "${screen_off_seconds}" -lt 15 ]]; then
   screen_off_seconds=15
@@ -176,6 +178,32 @@ test_arguments="$(
 )"
 plutil -replace "${test_target_path}.CommandLineArguments" -json "${test_arguments}" "${xctestrun_file}"
 plutil -replace "${test_target_path}.ParallelizationEnabled" -bool NO "${xctestrun_file}"
+
+# Enrollment gives Travel a loopback address for relay1 only, so the simulator reaches relay2 at its
+# container address. macOS routes container addresses only for the Docker networks OrbStack bridges:
+# at most 8 active ones, other running Compose projects included, in the order they became active.
+# Without a route the Relay outage step has no Relay to fail over to, so wait for a slot to free up.
+relay2_container="$(docker compose -f "${compose_file}" ps -q relay2)"
+relay2_address="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${relay2_container}")"
+default_interface="$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')"
+route_waited=0
+while true; do
+  relay2_interface="$(route -n get "${relay2_address}" 2>/dev/null | awk '/interface:/ { print $2 }')"
+  if [[ -n "${relay2_interface}" && "${relay2_interface}" != "${default_interface}" ]]; then
+    break
+  fi
+  if [[ "${route_waited}" -ge "${route_wait_seconds}" ]]; then
+    echo "macOS has no route to relay2 at ${relay2_address} after ${route_waited} s." >&2
+    echo 'OrbStack bridges at most 8 active Docker networks to macOS ("too many active networks" in ~/.orbstack/log/vmgr.log); stop another Compose project and rerun.' >&2
+    exit 1
+  fi
+  if (( route_waited % 60 == 0 )); then
+    echo "Waiting for macOS to route relay2 at ${relay2_address}: OrbStack has not bridged this topology's network yet" >&2
+  fi
+  sleep 5
+  route_waited="$((route_waited + 5))"
+done
+
 xcrun simctl spawn "${simulator_id}" log stream \
   --style compact \
   --level info \
