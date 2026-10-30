@@ -27,7 +27,8 @@ fi
 export TMPDIR="${stage}/tmp"
 (
   cd "${android_root}"
-  # Retry when a download fails on the network; the next attempt keeps what was downloaded.
+  # Retry when a download fails on the network, after a pause: network faults here tend to last a
+  # minute or so. The next attempt keeps what was downloaded.
   for attempt in 1 2 3; do
     gradle_log="${stage}/gradle-attempt-${attempt}.log"
     if ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
@@ -37,7 +38,10 @@ export TMPDIR="${stage}/tmp"
     if ! grep -Eiq 'could not (get|head|resolve)|premature eof|terminated the handshake|read timed out|connection reset' "${gradle_log}"; then
       exit 1
     fi
-    echo "Gradle attempt ${attempt} failed on the network; retrying" >&2
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "Gradle attempt ${attempt} failed on the network; retrying in $((attempt * 30)) s" >&2
+      sleep "$((attempt * 30))"
+    fi
   done
   exit 1
 )
