@@ -52,13 +52,20 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
   - A stage also runs every stage it needs (the `STAGES` table in `tests/e2e/assert_e2e.py`).
   - `all` is the default.
 - **L4 without the L3 checks:** `python3 tests/e2e/run-parallel.py OUT --platforms android,macos --native-only`.
-  - It starts each platform's topology and goes straight to the native phase.
+  - It starts the platforms' topologies and goes straight to the native phases.
   - Add `--apple-short` for 30 s and 60 s background phases on iPhone and iPad.
-- **Complete:** `python3 tests/e2e/run-parallel.py OUT` runs all modules and all platforms in parallel, one topology each.
+- **Complete:** `python3 tests/e2e/run-parallel.py OUT` runs everything at once in three topologies:
+  - `l3`: all modules, once;
+  - `apple`: iPhone, iPad and macOS together, with their own Travel IDs and mapping ports, taking
+    turns stopping a Relay (`tests/e2e/relay-outage.py`);
+  - `android`: alone, because the emulator needs another Relay discovery address (`10.0.2.2`).
+  - The apple topology starts first, so it gets an OrbStack bridge (see the rules below).
 
 ## Rules
 
 - Only one macOS UI test may run at a time on this Mac. Run FlowSplice and Vaultty acceptance one after the other; both also use the same Android emulator.
+- A native test that stops a Relay uses `tests/e2e/relay-outage.py`: one outage at a time per topology,
+  and the Relay counts as back only when its listeners are ready and the Server has it in the directory.
 - The Android Travel E2E clears the Travel app, so it runs only on an emulator.
 - Before a macOS run, make sure no system dialog (for example "… quit unexpectedly") covers the screen.
 - The first iOS simulator run of the background-audio phase on a Mac makes macOS ask whether
@@ -71,5 +78,6 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
   topology's Docker network to macOS. It bridges at most 8 active networks, other running Compose
   projects included, and logs "too many active networks" in `~/.orbstack/log/vmgr.log` for the rest.
   `tests/e2e/apple/run.sh` waits for the route before the UI test (`FLOWSPLICE_APPLE_E2E_ROUTE_WAIT_SECONDS`,
-  default 3600), so in a parallel run one Apple platform can wait for another to finish.
+  default 3600). The parallel runner starts the apple topology first and the others once macOS routes
+  it; if other running projects hold all 8 slots, stop one.
 - When a test is added or renamed, regenerate `tests/test-map.csv`; `--check` fails until it is current.

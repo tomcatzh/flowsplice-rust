@@ -322,37 +322,15 @@ fi
 
 selected_relay="$(tr -d '\r\n' <"${marker_dir}/selected-relay")"
 case "${selected_relay}" in
-  relay-1)
-    relay_service='relay1'
-    relay_management_port=$((18446 + port_offset))
-    relay_data_port=$((18447 + port_offset))
-    ;;
-  relay-2)
-    relay_service='relay2'
-    relay_management_port=$((28446 + port_offset))
-    relay_data_port=$((28447 + port_offset))
-    ;;
+  relay-1) relay_service='relay1' ;;
+  relay-2) relay_service='relay2' ;;
   *)
     echo "macOS E2E selected an unknown Relay: ${selected_relay}" >&2
     exit 1
     ;;
 esac
 
-docker compose -f "${compose_file}" stop "${relay_service}" >/dev/null
-sleep 5
-docker compose -f "${compose_file}" start "${relay_service}" >/dev/null
-for _ in $(seq 1 60); do
-  if nc -z 127.0.0.1 "${relay_management_port}" 2>/dev/null && \
-     nc -z 127.0.0.1 "${relay_data_port}" 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-if ! nc -z 127.0.0.1 "${relay_management_port}" 2>/dev/null || \
-   ! nc -z 127.0.0.1 "${relay_data_port}" 2>/dev/null; then
-  echo "${selected_relay} did not recover after restart" >&2
-  exit 1
-fi
+python3 "${repo_root}/tests/e2e/relay-outage.py" "${relay_service}" --seconds 5
 printf 'complete\n' >"${marker_dir}/network-outage-complete"
 
 set +e

@@ -969,34 +969,74 @@ if [[ "${FLOWSPLICE_ANDROID_E2E:-0}" == "1" ]]; then
     "10.0.2.2:$(host_port 18446)"
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
 fi
-if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" ]]; then
+# iPhone, iPad and macOS share this topology and run at the same time. They use the same discovery
+# address, their own Travel IDs and local mapping ports, and take turns stopping a Relay
+# (tests/e2e/relay-outage.py).
+native_names=()
+native_pids=()
+start_native() {
+  local name="$1"
+  shift
+  (
+    started="$(date +%s)"
+    set +e
+    "$@"
+    status=$?
+    printf '%s\n' "$(($(date +%s) - started))" >"${generated_dir}/native-${name}.seconds"
+    exit "${status}"
+  ) >"${generated_dir}/native-${name}.log" 2>&1 &
+  native_names+=("${name}")
+  native_pids+=($!)
+}
+if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" || "${FLOWSPLICE_MACOS_E2E:-0}" == "1" ]]; then
   export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:$(host_port 18447)"
   docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
   docker compose -f "${compose_file}" up -d --no-deps relay2 homeagent
-  if [[ " ${apple_devices} " == *" iphone "* ]]; then
+fi
+if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" && " ${apple_devices} " == *" iphone "* ]]; then
+  start_native iphone env FLOWSPLICE_APPLE_E2E_LOCAL_PORT="$(host_port 10800)" \
     "${repo_root}/tests/e2e/apple/run.sh" \
-      "${generated_dir}/offline/test-password.txt" \
-      "127.0.0.1:$(host_port 18446)" \
-      "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
-      "apple-e2e-iphone"
-  fi
-  if [[ " ${apple_devices} " == *" ipad "* ]]; then
+    "${generated_dir}/offline/test-password.txt" \
+    "127.0.0.1:$(host_port 18446)" \
+    "${FLOWSPLICE_APPLE_IPHONE_SIMULATOR:-iPhone 17 Pro}" \
+    "apple-e2e-iphone"
+fi
+if [[ "${FLOWSPLICE_APPLE_E2E:-0}" == "1" && " ${apple_devices} " == *" ipad "* ]]; then
+  start_native ipad env FLOWSPLICE_APPLE_E2E_LOCAL_PORT="$(host_port 10801)" \
     "${repo_root}/tests/e2e/apple/run.sh" \
-      "${generated_dir}/offline/test-password.txt" \
-      "127.0.0.1:$(host_port 18446)" \
-      "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
-      "apple-e2e-ipad-mini"
-  fi
-  docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
+    "${generated_dir}/offline/test-password.txt" \
+    "127.0.0.1:$(host_port 18446)" \
+    "${FLOWSPLICE_APPLE_IPAD_SIMULATOR:-iPad mini (A17 Pro)}" \
+    "apple-e2e-ipad-mini"
 fi
 if [[ "${FLOWSPLICE_MACOS_E2E:-0}" == "1" ]]; then
-  export FLOWSPLICE_E2E_DISCOVERY_DATA_ADDR="127.0.0.1:$(host_port 18447)"
-  docker compose -f "${compose_file}" up -d --no-deps --force-recreate relay1
-  docker compose -f "${compose_file}" up -d --no-deps relay2 homeagent
-  "${repo_root}/tests/e2e/macos/run.sh" \
+  start_native macos env FLOWSPLICE_MACOS_E2E_LOCAL_PORT="$(host_port 10802)" \
+    "${repo_root}/tests/e2e/macos/run.sh" \
     "${generated_dir}/offline/test-password.txt" \
     "127.0.0.1:$(host_port 18446)" \
     "macos-e2e-travel"
+fi
+native_failed=0
+native_index=0
+while [[ "${native_index}" -lt "${#native_pids[@]}" ]]; do
+  native_name="${native_names[${native_index}]}"
+  if wait "${native_pids[${native_index}]}"; then
+    native_result=passed
+  else
+    native_result=failed
+    native_failed=1
+  fi
+  echo "--- native ${native_name} log (${generated_dir}/native-${native_name}.log)"
+  cat "${generated_dir}/native-${native_name}.log"
+  printf '{"native":"%s","result":"%s","seconds":%s}\n' "${native_name}" "${native_result}" \
+    "$(cat "${generated_dir}/native-${native_name}.seconds" 2>/dev/null || echo null)"
+  native_index="$((native_index + 1))"
+done
+if [[ "${#native_pids[@]}" -gt 0 ]]; then
   docker compose -f "${compose_file}" logs --no-color >"${log_file}" 2>&1
+fi
+if [[ "${native_failed}" -ne 0 ]]; then
+  echo 'a native Travel E2E failed; see its log above' >&2
+  exit 1
 fi
 docker compose -f "${compose_file}" ps

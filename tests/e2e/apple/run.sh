@@ -284,16 +284,7 @@ wait_for_app_phase() {
 }
 
 wait_for_app_phase network-outage-ready
-docker compose -f "${compose_file}" stop relay1 >/dev/null
-sleep 5
-docker compose -f "${compose_file}" start relay1 >/dev/null
-for _ in $(seq 1 30); do
-  if nc -z 127.0.0.1 "$((18446 + port_offset))" 2>/dev/null \
-    && nc -z 127.0.0.1 "$((18447 + port_offset))" 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
+python3 "${repo_root}/tests/e2e/relay-outage.py" relay1 --seconds 5
 
 wait_for_app_phase screen-off-ready
 xcrun simctl io "${simulator_id}" screenConfig power off
