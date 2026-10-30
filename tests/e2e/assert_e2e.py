@@ -867,6 +867,8 @@ def check_embedded_spa() -> None:
         assert b'data-page="statistics"' in issuer_javascript
         assert "首页只显示仍需人工处理的申请".encode() in issuer_javascript
         assert "凭据历史只在打开本页".encode() in issuer_javascript
+        assert "正在从 Server 同步授权".encode() in issuer_javascript
+        assert b"Travel authorization has not synchronized from Server" in issuer_javascript
         assert b"page_size" in issuer_javascript
         assert b"document.title" in issuer_javascript
         assert "统计数据只在打开本页".encode() in issuer_javascript
@@ -1235,6 +1237,38 @@ def check_private_key_password_rotation(
         >= before_restart["relay_directory_generation"]
     )
     return ready
+
+
+def check_issuer_reports_unsynchronized_authorization(credential_id: str) -> dict:
+    # A Home restarted without the Server has no authorization snapshot. Its issuer must say so
+    # instead of listing no credentials, and list them once the Server is back.
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "stop", "server"], check=True
+    )
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "restart", "homeagent"], check=True
+    )
+    path = "/api/credentials?status=all&page=1&page_size=100"
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            status = issuer_raw_status(19084, "GET", path)
+            break
+        except (ConnectionError, OSError) as error:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"Home issuer did not answer after restart: {error}")
+            time.sleep(1)
+    assert status == 503, status
+    unsynchronized = issuer_request(19084, "GET", path, expect_ok=False)
+    assert unsynchronized["error"] == (
+        "Travel authorization has not synchronized from Server"
+    ), unsynchronized
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--no-deps", "server"],
+        check=True,
+    )
+    wait_issuer_ready(19084, credential_id)
+    return wait_ready()
 
 
 def wait_remote_enrollment_status(request_id: str, field: str, expected=True) -> dict:
@@ -1956,6 +1990,10 @@ def run_password_rotation() -> None:
     )
 
 
+def run_issuer_authorization_sync() -> None:
+    results["state"] = check_issuer_reports_unsynchronized_authorization(results["credential_id"])
+
+
 def run_prepare_remote_enrollment() -> None:
     results["remote_request_id"], results["remote_identity_password"] = prepare_remote_enrollment()
 
@@ -2010,6 +2048,7 @@ STAGES = [
     ("home-issued-enrollment", {"ENROLL", "LOCALUI"}, (), run_home_issued_enrollment),
     ("duplicate-enrollment-idempotency", {"ENROLL"}, ("home-issued-enrollment",), run_duplicate_enrollment),
     ("private-key-password-rotation", {"ENROLL", "CONTROL"}, ("duplicate-enrollment-idempotency",), run_password_rotation),
+    ("issuer-authorization-sync", {"CONTROL", "LOCALUI"}, ("home-issued-enrollment",), run_issuer_authorization_sync),
     ("prepare-remote-enrollment", {"ENROLL"}, (), run_prepare_remote_enrollment),
     ("udp", {"UDP"}, (), check_udp),
     ("multi-home-business-routing", {"MAPPING"}, (), check_multi_home_business_routing),
@@ -2103,6 +2142,7 @@ checks = [
     "home-private-key-password-rotation",
     "travel-private-key-password-rotation",
     "password-rotation-survives-restart",
+    "issuer-reports-unsynchronized-authorization",
     "deployment-root-private-key-not-mounted-in-home",
     "durable-control-high-water-survives-restart",
     "expired-snapshot-bootstrap-through-learned-relay",

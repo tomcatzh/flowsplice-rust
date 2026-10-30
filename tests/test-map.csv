@@ -77,6 +77,7 @@ rust:enrollment_request_is_single_use_and_survives_restart,L1,ENROLL,host,cargo 
 rust:request_id_cannot_be_reused_with_different_content,L1,ENROLL,host,cargo test --workspace,homeagent/src/issuance_ledger.rs,
 rust:legacy_json_shape_and_envelope_matching_are_preserved,L1,ENROLL,host,cargo test --workspace,homeagent/src/issuance_ledger.rs,
 rust:service_class_ledger_replay_keeps_complete_named_intent,L1,ENROLL,host,cargo test --workspace,homeagent/src/issuance_ledger.rs,
+rust:issuer_reports_unsynchronized_authorization_instead_of_an_empty_list,L1,ENROLL,host,cargo test --workspace,homeagent/src/main.rs,
 rust:issuer_validity_supports_default_days_and_short_lived_minutes,L1,ENROLL,host,cargo test --workspace,homeagent/src/main.rs,
 rust:remote_enrollment_inbox_has_bounded_capacity_and_retention,L1,ENROLL,host,cargo test --workspace,homeagent/src/main.rs,
 rust:list_pagination_is_bounded_and_clamps_after_removal,L1,ENROLL,host,cargo test --workspace,homeagent/src/main.rs,
@@ -272,6 +273,7 @@ e2e:issuance-ledger-survives-home-restart,L3,ENROLL,docker,make e2e,tests/e2e/as
 e2e:home-private-key-password-rotation,L3,ENROLL,docker,make e2e,tests/e2e/assert_e2e.py,
 e2e:travel-private-key-password-rotation,L3,ENROLL,docker,make e2e,tests/e2e/assert_e2e.py,
 e2e:password-rotation-survives-restart,L3,ENROLL,docker,make e2e,tests/e2e/assert_e2e.py,
+e2e:issuer-reports-unsynchronized-authorization,L3,CONTROL LOCALUI,docker,make e2e,tests/e2e/assert_e2e.py,
 e2e:deployment-root-private-key-not-mounted-in-home,L3,TRUST,docker,make e2e,tests/e2e/assert_e2e.py,
 e2e:durable-control-high-water-survives-restart,L3,AUTHZ CONTROL,docker,make e2e,tests/e2e/assert_e2e.py,
 e2e:expired-snapshot-bootstrap-through-learned-relay,L3,TRUST CONTROL,docker,make e2e,tests/e2e/assert_e2e.py,
@@ -329,6 +331,7 @@ e2e-stage:expired-snapshot-learned-relay,L3,CONTROL TRUST,docker,FLOWSPLICE_E2E_
 e2e-stage:home-issued-enrollment,L3,ENROLL LOCALUI,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:duplicate-enrollment-idempotency,L3,ENROLL,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,needs home-issued-enrollment
 e2e-stage:private-key-password-rotation,L3,CONTROL ENROLL,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,needs duplicate-enrollment-idempotency
+e2e-stage:issuer-authorization-sync,L3,CONTROL LOCALUI,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,needs home-issued-enrollment
 e2e-stage:prepare-remote-enrollment,L3,ENROLL,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:udp,L3,UDP,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage
 e2e-stage:multi-home-business-routing,L3,MAPPING,docker,FLOWSPLICE_E2E_MODULES=<module> make e2e,tests/e2e/assert_e2e.py,selectable stage

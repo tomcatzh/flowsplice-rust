@@ -61,6 +61,11 @@ let approvalBusiness: BusinessBinding | undefined;
 let approvalClass: ServiceClass | undefined;
 let approvalHomeServices: BusinessService[] | undefined;
 let revokeCredentialId: string | null = null;
+let credentialSyncRetry: number | undefined;
+
+// Returned by /api/credentials until the Home has its first authorization snapshot from Server.
+const AUTHORIZATION_NOT_SYNCHRONIZED = "Travel authorization has not synchronized from Server";
+const CREDENTIAL_SYNC_RETRY_MS = 2000;
 
 function escapeHtml(value: string): string {
   const span = document.createElement("span");
@@ -249,7 +254,22 @@ async function renderCredentials(): Promise<void> {
     status: credentialStatus,
   });
   if (credentialSearch) params.set("search", credentialSearch);
-  const response = await json<Paged<Credential>>(`/api/credentials?${params.toString()}`);
+  window.clearTimeout(credentialSyncRetry);
+  let response: Paged<Credential>;
+  try {
+    response = await json<Paged<Credential>>(`/api/credentials?${params.toString()}`);
+  } catch (error) {
+    if (!(error instanceof Error && error.message.includes(AUTHORIZATION_NOT_SYNCHRONIZED))) throw error;
+    const table = document.querySelector<HTMLElement>("#credentials");
+    if (!table) return;
+    table.innerHTML = '<tr><td colspan="5" class="empty">正在从 Server 同步授权…</td></tr>';
+    const pager = document.querySelector<HTMLElement>("#credential-pager");
+    if (pager) pager.innerHTML = "";
+    credentialSyncRetry = window.setTimeout(() => {
+      if (currentPage === "credentials") void renderCredentials().catch((retryError) => flash(friendlyError(retryError), true));
+    }, CREDENTIAL_SYNC_RETRY_MS);
+    return;
+  }
   credentialPage = response.page;
   const table = document.querySelector<HTMLElement>("#credentials");
   if (!table) return;
@@ -592,7 +612,7 @@ async function renderCredentialsPage(): Promise<void> {
     <label class="saved-confirmation"><input id="password-saved" type="checkbox">我已将新密码保存在自己的密码管理工具中</label>
     <div class="dialog-actions"><button id="close-password-dialog" type="button" class="secondary">取消</button><button id="rotate-password" type="submit">确认轮换</button></div>
   </form></dialog>
-  <footer>凭据历史只在打开本页、筛选、翻页或点击刷新时读取。</footer>`;
+  <footer>凭据历史只在打开本页、筛选、翻页或点击刷新时读取；Home 尚未从 Server 同步授权时，同步完成后会自动读取一次。</footer>`;
   bindPageTabs();
   const search = document.querySelector<HTMLInputElement>("#credential-search");
   if (search) search.value = credentialSearch;

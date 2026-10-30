@@ -2423,9 +2423,7 @@ async fn api_issued_credentials(
     .into_iter()
     .flatten()
     .collect::<std::collections::HashSet<_>>();
-    let Some(authorization) = state.authorization.current() else {
-        return Ok(Json(paginate(Vec::new(), page, page_size)));
-    };
+    let authorization = synchronized(state.authorization.current())?;
     let root =
         std::fs::read_to_string(&state.config.deployment_root_public_key).map_err(api_error)?;
     let labels = state
@@ -2893,6 +2891,24 @@ async fn revoke_from_home(
     Ok(Json(serde_json::json!({ "generation": generation })))
 }
 
+const AUTHORIZATION_NOT_SYNCHRONIZED: &str =
+    "Travel authorization has not synchronized from Server";
+
+/// The Home keeps only rollback state on disk. It learns its Travel credentials from the Server's
+/// signed snapshot, so right after a start, or while the Server is unreachable, it has none to list.
+fn synchronized<T>(
+    authorization: Option<T>,
+) -> std::result::Result<T, (StatusCode, Json<ApiError>)> {
+    authorization.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: AUTHORIZATION_NOT_SYNCHRONIZED.to_owned(),
+            }),
+        )
+    })
+}
+
 fn api_error(error: impl Into<anyhow::Error>) -> (StatusCode, Json<ApiError>) {
     let error = error.into();
     (
@@ -2974,14 +2990,29 @@ fn local_ui_request_allowed(request: &Request, listen: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, extract::Request, http::Method};
+    use axum::{
+        body::Body,
+        extract::Request,
+        http::{Method, StatusCode},
+    };
 
     use super::{
-        Config, local_ui_request_allowed, paginate, pagination_values,
-        remote_enrollment_capacity_available, remote_enrollment_inbox_expired,
-        requested_validity_secs,
+        AUTHORIZATION_NOT_SYNCHRONIZED, Config, local_ui_request_allowed, paginate,
+        pagination_values, remote_enrollment_capacity_available, remote_enrollment_inbox_expired,
+        requested_validity_secs, synchronized,
     };
     use anyhow::Result;
+
+    #[test]
+    fn issuer_reports_unsynchronized_authorization_instead_of_an_empty_list() {
+        assert!(matches!(
+            synchronized::<u64>(None),
+            Err((status, body))
+                if status == StatusCode::SERVICE_UNAVAILABLE
+                    && body.error == AUTHORIZATION_NOT_SYNCHRONIZED
+        ));
+        assert_eq!(synchronized(Some(17_u64)).ok(), Some(17));
+    }
 
     #[test]
     fn issuer_validity_supports_default_days_and_short_lived_minutes() -> Result<()> {
