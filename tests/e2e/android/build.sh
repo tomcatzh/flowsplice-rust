@@ -17,19 +17,24 @@ python3 "${repo_root}/scripts/private-travel-trust.py" copy-root \
   --destination "${android_root}/app/src/debug/assets/bootstrap/deployment-root.pub"
 mkdir -p "${stage}/tmp"
 export CARGO_TARGET_DIR="${stage}/cargo-target"
-export GRADLE_USER_HOME="${stage}/gradle-home"
+# Gradle and its dependencies are public downloads, so on a Mac they stay in the E2E cache and a
+# rebuild does not fetch them again. Private packaging keeps its own stage-owned Gradle home.
+if [[ -n "${FLOWSPLICE_E2E_CACHE_DIR:-}" ]]; then
+  export GRADLE_USER_HOME="${FLOWSPLICE_E2E_CACHE_DIR}/gradle-home"
+else
+  export GRADLE_USER_HOME="${stage}/gradle-home"
+fi
 export TMPDIR="${stage}/tmp"
 (
   cd "${android_root}"
-  # The stage's own Gradle home downloads Gradle and every dependency on each run. Retry when a
-  # download fails on the network; the next attempt keeps what the stage already holds.
+  # Retry when a download fails on the network; the next attempt keeps what was downloaded.
   for attempt in 1 2 3; do
     gradle_log="${stage}/gradle-attempt-${attempt}.log"
     if ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
       :app:assembleDebug :app:assembleDebugAndroidTest 2>&1 | tee "${gradle_log}"; then
       exit 0
     fi
-    if ! grep -Eq 'Could not (GET|HEAD|resolve)|Premature EOF|terminated the handshake|Read timed out|Connection reset' "${gradle_log}"; then
+    if ! grep -Eiq 'could not (get|head|resolve)|premature eof|terminated the handshake|read timed out|connection reset' "${gradle_log}"; then
       exit 1
     fi
     echo "Gradle attempt ${attempt} failed on the network; retrying" >&2

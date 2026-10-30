@@ -18,6 +18,7 @@ import argparse
 import fcntl
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,15 @@ def key():
         digest.update(f"{command} {version}\n".encode())
     for path in args.input:
         digest.update(f"input {hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode())
+    # The build command's flags count too, and so does any repository script it runs. Per-run paths
+    # and simulator IDs do not: iPhone and iPad share one simulator build.
+    for argument in args.command:
+        script = Path(argument)
+        if script.is_absolute() and script.is_file() and script.resolve().is_relative_to(REPO):
+            digest.update(f"script {hashlib.sha256(script.read_bytes()).hexdigest()}\n".encode())
+        masked = re.sub(r"/[^\s,=]*", "<path>", argument)
+        masked = re.sub(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", "<id>", masked)
+        digest.update(f"argument {masked}\n".encode())
     for value in args.extra:
         digest.update(f"extra {value}\n".encode())
     return digest.hexdigest()

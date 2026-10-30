@@ -67,10 +67,12 @@ python3 tests/test-map.py           # regenerate the map after adding or renamin
 - A native test that stops a Relay uses `tests/e2e/relay-outage.py`: one outage at a time per topology,
   and the Relay counts as back only when its listeners are ready and the Server has it in the directory.
 - Native test builds (iOS, macOS, Android) are reused while nothing they are built from changes
-  (`tests/e2e/native-build-cache.py`): program sources and the platform's own directory, toolchains
-  and the bundled deployment root. Changes to tests, docs, the backend services or another platform
-  do not rebuild them. The cache is `~/Library/Caches/FlowSpliceE2E` (`FLOWSPLICE_E2E_CACHE_DIR`) and
-  keeps three builds per platform; `FLOWSPLICE_E2E_NATIVE_CACHE=0` always builds.
+  (`tests/e2e/native-build-cache.py`): program sources and the platform's own directory, toolchains,
+  the build command and the scripts it runs, and the bundled deployment root. Changes to other tests,
+  docs, the backend services or another platform do not rebuild them. The cache is
+  `~/Library/Caches/FlowSpliceE2E` (`FLOWSPLICE_E2E_CACHE_DIR`) and keeps three builds per platform;
+  `FLOWSPLICE_E2E_NATIVE_CACHE=0` always builds. The Android E2E build also keeps its Gradle downloads
+  there (`gradle-home`); private packaging keeps its own stage-owned Gradle home.
   - Because the apps bundle the test deployment root, `generate-certs.sh` keeps one root in that cache
     on a Mac; every other key and certificate is still new each run. Delete
     `~/Library/Caches/FlowSpliceE2E/deployment-root` for a new root.
